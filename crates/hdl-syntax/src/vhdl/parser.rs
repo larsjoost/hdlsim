@@ -1122,8 +1122,8 @@ impl<'a> Parser<'a> {
             self.builder.start_node_at(mark, SyntaxKind::ConcAssign);
             self.bump();
             self.bump(); // <=
-            // Waveform: `expr [after t] {, expr [after t]}`, and conditional
-            // form `expr when cond [else expr when cond]... [else expr]`.
+                         // Waveform: `expr [after t] {, expr [after t]}`, and conditional
+                         // form `expr when cond [else expr when cond]... [else expr]`.
             self.parse_expression();
             if self.at_kw("after") {
                 self.bump();
@@ -2199,8 +2199,10 @@ end configuration;
 package p is new ieee.std_logic_1164.all generic map (W => 8);
 "#);
         let _ = sexp;
-        let sexp = ok(r#"package my_pkg is new work.generic_pkg generic map (W => 8);
-"#);
+        let sexp = ok(
+            r#"package my_pkg is new work.generic_pkg generic map (W => 8);
+"#,
+        );
         assert!(sexp.contains("(PackageInst"), "{}", sexp);
     }
 
@@ -2237,8 +2239,13 @@ begin
 end;
 "#);
         for node in [
-            "(TypeDecl", "(FileDecl", "(AliasDecl", "(AttrDecl", "(AttrSpec",
-            "(VariableDecl", "(ForSpec",
+            "(TypeDecl",
+            "(FileDecl",
+            "(AliasDecl",
+            "(AttrDecl",
+            "(AttrSpec",
+            "(VariableDecl",
+            "(ForSpec",
         ] {
             assert!(sexp.contains(node), "{} missing in {}", node, sexp);
         }

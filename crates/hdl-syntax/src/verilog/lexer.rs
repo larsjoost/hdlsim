@@ -261,7 +261,13 @@ impl<'a> Lexer<'a> {
         self.pos += 1; // `'`
         if matches!(
             self.peek(0),
-            Some(b'0') | Some(b'1') | Some(b'x') | Some(b'X') | Some(b'z') | Some(b'Z') | Some(b'?')
+            Some(b'0')
+                | Some(b'1')
+                | Some(b'x')
+                | Some(b'X')
+                | Some(b'z')
+                | Some(b'Z')
+                | Some(b'?')
         ) {
             self.pos += 1;
             self.tokens.push(Token::new(
@@ -515,20 +521,20 @@ mod tests {
         assert_eq!(
             ks,
             vec![
-                TokenKind::Ident,     // \a+b
+                TokenKind::Ident, // \a+b
                 TokenKind::Whitespace,
-                TokenKind::Punct,     // =
+                TokenKind::Punct, // =
                 TokenKind::Whitespace,
                 TokenKind::IntLiteral, // '0
                 TokenKind::Whitespace,
-                TokenKind::Punct,     // +
+                TokenKind::Punct, // +
                 TokenKind::Whitespace,
                 TokenKind::IntLiteral, // '1
                 TokenKind::Whitespace,
-                TokenKind::Punct,     // +
+                TokenKind::Punct, // +
                 TokenKind::Whitespace,
                 TokenKind::IntLiteral, // 'x
-                TokenKind::Punct,     // ;
+                TokenKind::Punct,      // ;
                 TokenKind::Eof
             ]
         );

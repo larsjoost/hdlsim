@@ -485,11 +485,9 @@ impl<'a> Parser<'a> {
             TokenKind::Ident => match text.as_str() {
                 "input" | "output" | "inout" => self.parse_port_decl_stmt(),
                 "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" | "tri"
-                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1"
-                | "bit" | "byte" | "shortint" | "int" | "longint" | "string" | "chandle"
-                | "vectored" | "scalared" | "var" | "const" | "rand" | "randc" => {
-                    self.parse_decl()
-                }
+                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1" | "bit"
+                | "byte" | "shortint" | "int" | "longint" | "string" | "chandle" | "vectored"
+                | "scalared" | "var" | "const" | "rand" | "randc" => self.parse_decl(),
                 "parameter" | "localparam" => self.parse_param_decl(),
                 "assign" => self.parse_assign(),
                 "always" | "always_comb" | "always_ff" | "always_latch" => self.parse_always(),
@@ -751,8 +749,7 @@ impl<'a> Parser<'a> {
     fn parse_function(&mut self) {
         self.builder.start_node(SyntaxKind::Function);
         self.bump(); // function
-        if self.eat_kw("automatic") {
-        }
+        if self.eat_kw("automatic") {}
         if self.at_kw("void") {
             self.bump();
         } else if self.at_kw("integer")
@@ -1004,10 +1001,8 @@ impl<'a> Parser<'a> {
         if is_union {
             // keyword already consumed; `packed`/`signed` may follow either way
         }
-        if self.eat_kw("packed") {
-        }
-        if self.eat_kw("signed") {
-        }
+        if self.eat_kw("packed") {}
+        if self.eat_kw("signed") {}
         self.expect_punct('{', "to open the struct body");
         loop {
             if self.at_punct('}') || self.peek().kind == TokenKind::Eof {
@@ -1384,10 +1379,7 @@ impl<'a> Parser<'a> {
             // Case qualifiers bind to the following case statement.
             TokenKind::Ident if text == "unique" || text == "unique0" || text == "priority" => {
                 self.builder.start_node(SyntaxKind::Case);
-                while self.at_kw("unique")
-                    || self.at_kw("unique0")
-                    || self.at_kw("priority")
-                {
+                while self.at_kw("unique") || self.at_kw("unique0") || self.at_kw("priority") {
                     self.bump();
                 }
                 self.parse_case_tail();
