@@ -21,6 +21,7 @@
 //!   of re-parsing.
 //! - Diagnostics accumulate in one `Diagnostics` list with source spans.
 
+pub mod bundle;
 pub mod providers;
 
 use hdl_ir::elab::UnitResolver;

@@ -28,6 +28,9 @@ pub enum SimEvent {
     },
     /// A `$display`/`$write`/`report` line of text.
     Message { text: String, time_fs: u64 },
+    /// A test failed: `assert`/`report` with severity `error`/`failure`, or a
+    /// Verilog `$error`/`$fatal`. CLI runners exit non-zero when this fires.
+    TestFailed { text: String, time_fs: u64 },
     /// `$finish` / `std.env.finish` was called.
     Finish { time_fs: u64 },
     /// Simulation stopped (end of events, no $finish).

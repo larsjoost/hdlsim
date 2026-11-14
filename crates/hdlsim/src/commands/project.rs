@@ -2,7 +2,7 @@
 //! JSON manifest) from sources + library mappings. Thin wrapper over
 //! [`crate::project::generate`].
 
-use super::{build_manager, extract_common, Command};
+use super::{build_manager, extract_common, remap_into_bundle, Command};
 use crate::project::{generate, ProjectFormat, ProjectSpec};
 use std::path::PathBuf;
 
@@ -63,7 +63,12 @@ impl Command for Project {
         if spec.files.is_empty() {
             return Err("no input files".to_string());
         }
-        let mgr = build_manager(&opts)?;
+        let (mgr, root) = build_manager(&opts)?;
+        spec.files = spec
+            .files
+            .iter()
+            .map(|f| remap_into_bundle(f, &root))
+            .collect();
         spec.libraries = opts
             .libs
             .iter()

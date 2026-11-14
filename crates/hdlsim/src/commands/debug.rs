@@ -4,7 +4,7 @@
 //! Also usable as a library: `hdl_sim::debug::Watcher` is an `Observer` you can
 //! attach to any `Simulator` in your own tooling.
 
-use super::{build_manager, extract_common, parse_time, Command};
+use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command};
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::debug::{fmt_time, fmt_value, Watcher};
@@ -82,7 +82,8 @@ impl Command for Debug {
         let top = top.ok_or(
             "debug needs --top TB (file arguments may be omitted when libraries are configured)",
         )?;
-        let mut mgr = build_manager(&opts)?;
+        let (mut mgr, root) = build_manager(&opts)?;
+        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {
@@ -109,6 +110,10 @@ impl Command for Debug {
         sim.add_observer(Box::new(Transcript));
         sim.run(max_time_fs);
         println!("hdlsim debug: stopped at t={}", fmt_time(sim.time()));
+        if sim.failures() > 0 {
+            println!("hdlsim debug: FAILED — {} test failure(s)", sim.failures());
+            return Ok(1);
+        }
         for m in &mems {
             let Some(id) = sim.signal_id(m) else {
                 eprintln!("hdlsim debug: no signal named '{}'", m);

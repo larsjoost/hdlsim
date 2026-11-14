@@ -81,6 +81,8 @@ pub struct Simulator {
     observers: Vec<Box<dyn Observer>>,
     finished: bool,
     stopped: bool,
+    /// Number of test failures seen (severity error/failure, `$error`/`$fatal`).
+    failures: u64,
     monitor: Vec<Vec<Expr>>,
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
@@ -126,6 +128,7 @@ impl Simulator {
             observers: Vec::new(),
             finished: false,
             stopped: false,
+            failures: 0,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             stop_flag: None,
             monitor: Vec::new(),
@@ -186,6 +189,12 @@ impl Simulator {
     // ---- introspection (debug API) ---------------------------------------------
     // These let external tools (and `hdlsim debug`) inspect the running design
     // without the kernel changing: find signals, read values, dump memories.
+
+    /// Number of test failures so far (severity error/failure, `$error`/`$fatal`).
+    /// CLI runners exit non-zero when this is > 0 after `run`.
+    pub fn failures(&self) -> u64 {
+        self.failures
+    }
 
     /// Find a signal by id (`"#57"`), full hierarchical name (`tb.dut.q`), or
     /// leaf name (`q`). Leaf match returns the first hit.
@@ -296,6 +305,13 @@ impl Simulator {
         for o in &mut self.observers {
             o.on_event(&ev);
         }
+    }
+
+    /// Record a test failure (emits [`SimEvent::TestFailed`]).
+    fn fail(&mut self, text: String) {
+        self.failures += 1;
+        let time_fs = self.time;
+        self.emit(SimEvent::TestFailed { text, time_fs });
     }
 
     // ---- main loop ------------------------------------------------------------
@@ -768,11 +784,15 @@ impl Simulator {
                     let severity = args
                         .get(2)
                         .map(|a| string_of(&self.eval_expr(a, None)))
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
                     self.emit(SimEvent::Message {
                         text: format!("assertion failed at t={}: {}\n", self.time, msg),
                         time_fs: self.time,
                     });
+                    if matches!(severity.as_str(), "error" | "failure") {
+                        self.fail(format!("assertion failed at t={}: {}", self.time, msg));
+                    }
                     if severity == "failure" {
                         self.emit(SimEvent::Message {
                             text: format!(
@@ -793,11 +813,15 @@ impl Simulator {
                 let severity = args
                     .get(1)
                     .map(|a| string_of(&self.eval_expr(a, None)))
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 self.emit(SimEvent::Message {
                     text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
                     time_fs: self.time,
                 });
+                if matches!(severity.as_str(), "error" | "failure") {
+                    self.fail(format!("report severity {}: {}", severity, msg));
+                }
                 if severity == "failure" {
                     self.emit(SimEvent::Message {
                         text: format!(
@@ -808,6 +832,25 @@ impl Simulator {
                     });
                     self.stopped = true;
                 }
+            }
+            "error" | "fatal" => {
+                // Verilog $error / $fatal — a failed test.
+                let text = self.fmt_args(&args);
+                self.emit(SimEvent::Message {
+                    text: format!("{}: {}\n", name, text),
+                    time_fs: self.time,
+                });
+                self.fail(format!("${} at t={}: {}", name, self.time, text));
+                if name == "fatal" {
+                    self.stopped = true;
+                }
+            }
+            "warning" | "info" => {
+                let text = self.fmt_args(&args);
+                self.emit(SimEvent::Message {
+                    text: format!("{}: {}\n", name, text),
+                    time_fs: self.time,
+                });
             }
             "finish" => {
                 self.finished = true;

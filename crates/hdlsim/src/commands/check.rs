@@ -1,7 +1,7 @@
 //! `hdlsim check` — compile only (parse + lower + resolve), print diagnostics,
 //! no simulation. Like `vlog -lint` / `ghdl -a`.
 
-use super::{build_manager, extract_common, Command};
+use super::{build_manager, extract_common, remap_into_bundle, Command};
 use hdl_ir::elab;
 use hdl_ir::Design;
 use std::path::PathBuf;
@@ -21,7 +21,8 @@ impl Command for Check {
         if files.is_empty() {
             return Err("no input files".to_string());
         }
-        let mut mgr = build_manager(&opts)?;
+        let (mut mgr, root) = build_manager(&opts)?;
+        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         // Resolve every compiled top-level candidate: elaborate each module

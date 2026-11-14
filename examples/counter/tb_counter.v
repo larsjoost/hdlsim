@@ -21,14 +21,14 @@ module tb_counter;
             @(posedge clk);
             #1; // let the NBA update land before sampling
             if (q !== (i + 1)) begin
-                $display("FAIL: after %0d clocks q=%h expected %0d", i + 1, q, i + 1);
+                $error("FAIL: after %0d clocks q=%h expected %0d", i + 1, q, i + 1);
                 errors = errors + 1;
             end
         end
         if (errors == 0)
             $display("PASS: counter counted 1..10 correctly (q=%h)", q);
         else
-            $display("FAIL: %0d errors", errors);
+            $error("FAIL: %0d errors", errors);
         $finish;
     end
 endmodule

@@ -6,6 +6,7 @@
 //! [`extract_common`] and turned into a `LibraryManager` by [`build_manager`].
 
 mod ast;
+mod bundle;
 mod check;
 mod debug;
 mod init;
@@ -13,7 +14,7 @@ mod project;
 mod run;
 
 use hdl_lib::LibraryManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Extension seam: implement for a new subcommand, add one entry to [`COMMANDS`].
 pub trait Command {
@@ -42,6 +43,7 @@ impl Command for Help {
         println!("common flags: -L name=path   map a logical library to a directory");
         println!("              --config FILE  library config (default: ./hdlsim.ini if present)");
         println!("              -I DIR         add an `include search directory");
+        println!("              --bundle FILE  read the whole project from a reproducer .tar");
         Ok(0)
     }
 }
@@ -52,6 +54,9 @@ pub struct CommonOpts {
     pub libs: Vec<(String, PathBuf)>,
     pub config: Option<PathBuf>,
     pub incdirs: Vec<PathBuf>,
+    /// `--bundle repro.tar`: extract this reproducer bundle to a temp dir and
+    /// resolve the whole project (config, libraries, include dirs) from there.
+    pub bundle: Option<PathBuf>,
 }
 
 /// Split `args` into common library flags and the rest.
@@ -78,6 +83,12 @@ pub fn extract_common(args: &[String]) -> Result<(CommonOpts, Vec<String>), Stri
                     .push(PathBuf::from(args.get(i + 1).ok_or("-I needs a value")?));
                 i += 2;
             }
+            "--bundle" => {
+                opts.bundle = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--bundle needs a value")?,
+                ));
+                i += 2;
+            }
             other => {
                 rest.push(other.to_string());
                 i += 1;
@@ -100,8 +111,40 @@ pub fn parse_lib_mapping(v: &str) -> Result<(String, PathBuf), String> {
 
 /// Build a `LibraryManager` from common options: config file (explicit
 /// `--config`, else `./hdlsim.ini` if it exists), then `-L` mappings, then `-I`.
-pub fn build_manager(opts: &CommonOpts) -> Result<LibraryManager, String> {
+///
+/// With `--bundle FILE` the bundle is extracted to a fresh temp dir first and
+/// everything (config, libraries, include dirs) resolves from there; the
+/// returned `Option<PathBuf>` is that extraction root (so callers can remap
+/// file arguments into it), `None` otherwise.
+pub fn build_manager(opts: &CommonOpts) -> Result<(LibraryManager, Option<PathBuf>), String> {
     let mut mgr = LibraryManager::new();
+    let mut root: Option<PathBuf> = None;
+    if let Some(b) = &opts.bundle {
+        let bytes =
+            std::fs::read(b).map_err(|e| format!("cannot read bundle {}: {}", b.display(), e))?;
+        let dir = std::env::temp_dir().join(format!("hdlsim_bundle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        hdl_lib::bundle::extract_to(&bytes, &dir)
+            .map_err(|e| format!("bad bundle {}: {}", b.display(), e))?;
+        root = Some(dir.clone());
+        let cfg = dir.join("hdlsim.ini");
+        if cfg.is_file() {
+            mgr.load_config(&cfg)?;
+        }
+        // Bundles record include dirs as inc/0, inc/1, ...
+        let inc = dir.join("inc");
+        if inc.is_dir() {
+            let mut subs: Vec<PathBuf> = std::fs::read_dir(&inc)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            subs.sort();
+            for s in subs {
+                if s.is_dir() {
+                    mgr.add_incdir(s);
+                }
+            }
+        }
+    }
     let config = match &opts.config {
         Some(c) => Some(c.clone()),
         None => {
@@ -109,16 +152,38 @@ pub fn build_manager(opts: &CommonOpts) -> Result<LibraryManager, String> {
             default.is_file().then_some(default)
         }
     };
-    if let Some(c) = &config {
-        mgr.load_config(c)?;
+    if root.is_none() {
+        if let Some(c) = &config {
+            mgr.load_config(c)?;
+        }
     }
     for (name, path) in &opts.libs {
-        mgr.add_library_dir(name, path);
+        // With a bundle, relative -L paths resolve inside the extraction root.
+        let p = match &root {
+            Some(r) if !path.exists() => r.join(path),
+            _ => path.clone(),
+        };
+        mgr.add_library_dir(name, &p);
     }
     for d in &opts.incdirs {
-        mgr.add_incdir(d.clone());
+        let p = match &root {
+            Some(r) if !d.exists() => r.join(d),
+            _ => d.clone(),
+        };
+        mgr.add_incdir(p);
     }
-    Ok(mgr)
+    Ok((mgr, root))
+}
+
+/// Remap a CLI file argument into the bundle extraction root when it does not
+/// exist on disk but does inside the bundle.
+pub fn remap_into_bundle(f: &Path, root: &Option<PathBuf>) -> PathBuf {
+    if let Some(r) = root {
+        if !f.exists() && r.join(f).exists() {
+            return r.join(f);
+        }
+    }
+    f.to_path_buf()
 }
 
 /// Parse a time like `100ns`, `10us`, `1ms`, `500` (bare = ns) into femtoseconds.
@@ -149,6 +214,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &init::Init,
     &project::Project,
     &debug::Debug,
+    &bundle::Bundle,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.

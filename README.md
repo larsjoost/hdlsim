@@ -87,6 +87,8 @@ hdlsim run --top tb                           # no files: resolve everything fro
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
 hdlsim run --top tb tb.v --live              # live wave window in the browser
 hdlsim project --top cpu --format vivado-tcl # export Vivado TCL project files
+hdlsim bundle --out repro.tar --top tb [files]  # pack the project into one .tar reproducer
+hdlsim run --bundle repro.tar --top tb       # reproduce straight from the bundle
 hdlsim debug --top tb --dump                 # dump the elaborated design (signals, processes)
 hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
@@ -95,6 +97,41 @@ hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by 
 The `debug` command (and the `hdl_sim::debug` module: `Watcher`, `fmt_value`,
 `fmt_time`) is also the debugging toolkit for your own tooling built on the
 libraries — attach a `Watcher` observer to any `Simulator`.
+
+### Exit codes
+
+`hdlsim run` (and `debug`) exit **0 when all tests pass** and **1 when any test
+fails** — a VHDL `assert`/`report` with severity `error`/`failure`, or a Verilog
+`$error`/`$fatal` (the kernel emits `SimEvent::TestFailed`; `Simulator::failures()`
+exposes the count to library users). Compile errors also exit 1, usage errors
+exit 2. So CI and `run_tests.sh` scripts can rely on the exit code alone.
+
+## Reporting bugs — reproducer bundles
+
+If hdlsim fails on your project (compile error, wrong simulation result), pack
+it into a single file and attach it to an issue:
+
+```
+cd your-project
+hdlsim bundle --out repro.tar --top tb_my_test my_tb.vhd ...   # add -L/--config as usual
+# repro.tar now contains: your sources, every library dir from hdlsim.ini/-L,
+# include dirs, a generated hdlsim.ini, and a REPRO.md with the exact commands
+```
+
+Reproduce it (with any hdlsim build) either by extracting:
+
+```
+tar -xf repro.tar -C repro && cd repro && hdlsim run --top tb_my_test
+```
+
+or directly from the bundle, without extracting:
+
+```
+hdlsim run --bundle repro.tar --top tb_my_test
+```
+
+`--bundle` works on `run`, `check`, `debug`, and `project`. Issues:
+<https://github.com/larsjoost/hdlsim/issues/new>
 
 ## Examples
 

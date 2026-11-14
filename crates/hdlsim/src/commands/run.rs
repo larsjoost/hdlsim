@@ -1,6 +1,6 @@
 //! `hdlsim run` — compile (with libraries) and simulate one design.
 
-use super::{build_manager, extract_common, parse_time, Command};
+use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command};
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::{Observer, SimEvent, Simulator};
@@ -87,7 +87,8 @@ impl Command for Run {
         }
         // Compile the explicit files, then let elaboration pull in any missing
         // design units from the configured libraries on demand.
-        let mut mgr = build_manager(&opts)?;
+        let (mut mgr, root) = build_manager(&opts)?;
+        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {
@@ -158,6 +159,12 @@ impl Command for Run {
             sim.flat().signals.len(),
             sim.flat().procs.len()
         );
+        // A failed unit test (assert/report severity error|failure, $error/$fatal)
+        // makes the whole run fail: exit code 1 so CI/scripts catch it.
+        if sim.failures() > 0 {
+            println!("hdlsim: FAILED — {} test failure(s)", sim.failures());
+            return Ok(1);
+        }
         if let Some(bus) = &live_bus {
             // End the SSE streams (they drain their backlog first), but keep
             // the HTTP server up so the finished waves stay in the browser
