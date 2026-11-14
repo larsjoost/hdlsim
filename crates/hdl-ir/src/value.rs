@@ -213,7 +213,7 @@ impl Value {
                 }
                 // Arithmetic needs full-width evaluation, not per-bit.
                 match op {
-                    Add | Sub | Mul | Div | Mod | Shl | Shr => {
+                    Add | Sub | Mul | Div | Mod | Shl | Shr | Sar => {
                         return self.arith(op, rhs, w);
                     }
                     _ => {}
@@ -247,6 +247,20 @@ impl Value {
                     }
                     Shl => a.wrapping_shl(b as u32),
                     Shr => a.wrapping_shr(b as u32),
+                    // Arithmetic: sign-extend to i64, shift, keep low w bits.
+                    Sar => {
+                        let sh = (b as u32) % 64;
+                        let sa: u64 = if w >= 64 {
+                            ((a as i64) >> sh) as u64
+                        } else if (a >> (w - 1)) & 1 == 1 {
+                            // negative: sign-extend then shift
+                            let ext = (a | (u64::MAX << w)) as i64;
+                            (ext >> sh) as u64
+                        } else {
+                            a >> sh
+                        };
+                        sa & (if w >= 64 { u64::MAX } else { (1u64 << w) - 1 })
+                    }
                     _ => unreachable!("arith: non-arith op"),
                 };
                 Value::from_u64(w, r)
@@ -444,6 +458,8 @@ pub enum BinOp {
     Mod,
     Shl,
     Shr,
+    /// Arithmetic shift right (sign-preserving) — VHDL `sra`.
+    Sar,
     Lt,
     Le,
     Gt,

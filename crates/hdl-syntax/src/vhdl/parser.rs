@@ -149,7 +149,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn bump(&mut self) -> Token {
+    /// Emit pending trivia tokens into the currently open node and advance
+    /// past them, so a node opened next starts at a real token.
+    fn bump_trivia(&mut self) {
         while self.pos < self.tokens.len() {
             let t = &self.tokens[self.pos];
             if matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment) {
@@ -160,6 +162,17 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+    }
+
+    /// Open a node at the next real token (skipping trivia first, so trivia
+    /// never becomes a child of the new node).
+    fn start(&mut self, kind: SyntaxKind) {
+        self.bump_trivia();
+        self.builder.start_node(kind);
+    }
+
+    fn bump(&mut self) -> Token {
+        self.bump_trivia();
         let t = self.tokens[self.pos].clone();
         self.builder
             .token(SyntaxKind::from_token(t.kind), t.span.len());
@@ -264,7 +277,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_library_clause(&mut self) {
-        self.builder.start_node(SyntaxKind::LibraryClause);
+        self.start(SyntaxKind::LibraryClause);
         self.bump(); // library
         while self.peek().kind == TokenKind::Ident {
             self.parse_name();
@@ -277,7 +290,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_use_clause(&mut self) {
-        self.builder.start_node(SyntaxKind::UseClause);
+        self.start(SyntaxKind::UseClause);
         self.bump(); // use
         loop {
             self.parse_name();
@@ -292,7 +305,7 @@ impl<'a> Parser<'a> {
     // ---- entity / architecture -------------------------------------------------
 
     fn parse_entity(&mut self) {
-        self.builder.start_node(SyntaxKind::Entity);
+        self.start(SyntaxKind::Entity);
         self.bump(); // entity
         self.expect_ident("for the entity name");
         self.expect_kw("is", "after the entity name");
@@ -323,7 +336,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_architecture(&mut self) {
-        self.builder.start_node(SyntaxKind::Architecture);
+        self.start(SyntaxKind::Architecture);
         self.bump(); // architecture
         self.expect_ident("for the architecture name");
         self.expect_kw("of", "after the architecture name");
@@ -345,7 +358,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_generic_clause(&mut self) {
-        self.builder.start_node(SyntaxKind::GenericClause);
+        self.start(SyntaxKind::GenericClause);
         self.bump(); // generic
         self.expect_punct('(', "to open the generic list");
         while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
@@ -360,7 +373,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_port_clause(&mut self) {
-        self.builder.start_node(SyntaxKind::PortClause);
+        self.start(SyntaxKind::PortClause);
         self.bump(); // port
         self.expect_punct('(', "to open the port list");
         while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
@@ -376,7 +389,7 @@ impl<'a> Parser<'a> {
 
     /// `name [, name...] : [mode] type_mark [constraint] [:= default]`.
     fn parse_interface_decl(&mut self, kind: SyntaxKind) {
-        self.builder.start_node(kind);
+        self.start(kind);
         loop {
             if self.peek().kind == TokenKind::Ident {
                 self.parse_name();
@@ -441,7 +454,7 @@ impl<'a> Parser<'a> {
 
     /// `signal|constant|variable names : type [constraint] [:= init] ;`
     fn parse_simple_decl(&mut self, kind: SyntaxKind, _kw: &str) {
-        self.builder.start_node(kind);
+        self.start(kind);
         self.bump(); // keyword
         loop {
             if self.peek().kind == TokenKind::Ident {
@@ -466,7 +479,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_decl(&mut self) {
-        self.builder.start_node(SyntaxKind::TypeDecl);
+        self.start(SyntaxKind::TypeDecl);
         self.bump(); // type
         self.expect_ident("for the type name");
         self.expect_kw("is", "after the type name");
@@ -513,7 +526,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_subtype_decl(&mut self) {
-        self.builder.start_node(SyntaxKind::SubtypeDecl);
+        self.start(SyntaxKind::SubtypeDecl);
         self.bump(); // subtype
         self.expect_ident("for the subtype name");
         self.expect_kw("is", "after the subtype name");
@@ -529,7 +542,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_component_decl(&mut self) {
-        self.builder.start_node(SyntaxKind::ComponentDecl);
+        self.start(SyntaxKind::ComponentDecl);
         self.bump(); // component
         self.expect_ident("for the component name");
         if self.eat_kw("is") {
@@ -555,7 +568,7 @@ impl<'a> Parser<'a> {
     /// Function/procedure declaration and (optional) body. Bodies are parsed
     /// into the tree; lowering them is a later milestone.
     fn parse_subprogram(&mut self) {
-        self.builder.start_node(SyntaxKind::Function);
+        self.start(SyntaxKind::Function);
         self.bump(); // function | procedure
         self.expect_ident("for the subprogram name");
         if self.eat_punct('(') {
@@ -608,7 +621,7 @@ impl<'a> Parser<'a> {
     /// separately by the caller.
     fn parse_type_mark(&mut self) {
         if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
+            self.start(SyntaxKind::Name);
             self.bump();
             while self.at_punct('.') {
                 self.bump();
@@ -628,7 +641,7 @@ impl<'a> Parser<'a> {
 
     /// `(expr to|downto expr)` / `(expr)` / `range ...` — an index/range constraint.
     fn parse_constraint(&mut self) {
-        self.builder.start_node(SyntaxKind::Range);
+        self.start(SyntaxKind::Range);
         self.expect_punct('(', "to open the constraint");
         self.parse_range();
         self.expect_punct(')', "to close the constraint");
@@ -646,7 +659,7 @@ impl<'a> Parser<'a> {
     // ---- packages ----------------------------------------------------------------
 
     fn parse_package(&mut self) {
-        self.builder.start_node(SyntaxKind::Package);
+        self.start(SyntaxKind::Package);
         self.bump(); // package
         self.eat_kw("body"); // package body: same node, body flag is in the text
         self.expect_ident("for the package name");
@@ -691,7 +704,7 @@ impl<'a> Parser<'a> {
             self.parse_instantiation();
         } else {
             // Concurrent signal assignment: target <= waveform ;
-            self.builder.start_node(SyntaxKind::ConcAssign);
+            self.start(SyntaxKind::ConcAssign);
             self.parse_name();
             if self.peek_op2().as_deref() == Some("<=") {
                 self.bump();
@@ -714,10 +727,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_process(&mut self) {
-        self.builder.start_node(SyntaxKind::Process);
+        self.start(SyntaxKind::Process);
         self.bump(); // process
         if self.eat_punct('(') {
-            self.builder.start_node(SyntaxKind::SensList);
+            self.start(SyntaxKind::SensList);
             while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
                 self.parse_name();
                 if !self.eat_punct(',') {
@@ -746,7 +759,7 @@ impl<'a> Parser<'a> {
 
     /// `label : comp [generic map (...)] port map (...);` or `entity lib.name(arch) ...`.
     fn parse_instantiation(&mut self) {
-        self.builder.start_node(SyntaxKind::Inst);
+        self.start(SyntaxKind::Inst);
         if self.eat_kw("entity") {
             self.parse_name(); // lib.entity
             if self.eat_punct('(') {
@@ -779,7 +792,7 @@ impl<'a> Parser<'a> {
     fn parse_assoc_list(&mut self) {
         self.expect_punct('(', "to open the association list");
         while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
-            self.builder.start_node(SyntaxKind::PortConn);
+            self.start(SyntaxKind::PortConn);
             let named = self.at_punct('.')
                 || (self.peek().kind == TokenKind::Ident
                     && self.peek2_text() == "="
@@ -817,7 +830,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assert(&mut self, _concurrent: bool) {
-        self.builder.start_node(SyntaxKind::AssertStmt);
+        self.start(SyntaxKind::AssertStmt);
         self.bump(); // assert
         self.parse_expression(); // condition
         if self.eat_kw("report") {
@@ -850,14 +863,14 @@ impl<'a> Parser<'a> {
         } else if self.at_kw("wait") {
             self.parse_wait();
         } else if self.at_kw("null") {
-            self.builder.start_node(SyntaxKind::NullStmt);
+            self.start(SyntaxKind::NullStmt);
             self.bump();
             self.expect_punct(';', "after null");
             self.builder.finish_node();
         } else if self.at_kw("assert") {
             self.parse_assert(false);
         } else if self.at_kw("report") {
-            self.builder.start_node(SyntaxKind::AssertStmt);
+            self.start(SyntaxKind::AssertStmt);
             self.bump();
             self.parse_expression();
             if self.eat_kw("severity") && self.peek().kind == TokenKind::Ident {
@@ -866,7 +879,7 @@ impl<'a> Parser<'a> {
             self.expect_punct(';', "to end the report statement");
             self.builder.finish_node();
         } else if self.at_kw("exit") || self.at_kw("next") {
-            self.builder.start_node(SyntaxKind::ExitStmt);
+            self.start(SyntaxKind::ExitStmt);
             self.bump();
             if self.eat_kw("when") {
                 self.parse_expression();
@@ -874,7 +887,7 @@ impl<'a> Parser<'a> {
             self.expect_punct(';', "to end the exit/next statement");
             self.builder.finish_node();
         } else if self.at_kw("return") {
-            self.builder.start_node(SyntaxKind::ReturnStmt);
+            self.start(SyntaxKind::ReturnStmt);
             self.bump();
             if !self.at_punct(';') {
                 self.parse_expression();
@@ -912,7 +925,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_if(&mut self) {
-        self.builder.start_node(SyntaxKind::If);
+        self.start(SyntaxKind::If);
         self.bump(); // if
         self.parse_expression();
         self.expect_kw("then", "after the if condition");
@@ -948,7 +961,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case(&mut self) {
-        self.builder.start_node(SyntaxKind::Case);
+        self.start(SyntaxKind::Case);
         self.bump(); // case
         self.parse_expression();
         self.expect_kw("is", "after the case expression");
@@ -957,9 +970,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.expect_kw("when", "before a case alternative");
-            self.builder.start_node(SyntaxKind::CaseItem);
+            self.start(SyntaxKind::CaseItem);
             if self.eat_kw("others") {
-                self.builder.start_node(SyntaxKind::Others);
+                self.start(SyntaxKind::Others);
                 self.builder.finish_node();
             } else {
                 loop {
@@ -991,7 +1004,7 @@ impl<'a> Parser<'a> {
 
     /// `for i in range loop ... end loop;`
     fn parse_for_loop(&mut self) {
-        self.builder.start_node(SyntaxKind::For);
+        self.start(SyntaxKind::For);
         self.bump(); // for
         self.expect_ident("for the loop variable");
         self.expect_kw("in", "after the loop variable");
@@ -1002,7 +1015,7 @@ impl<'a> Parser<'a> {
         {
             self.parse_name(); // includes the 'range attribute
         } else {
-            self.builder.start_node(SyntaxKind::Range);
+            self.start(SyntaxKind::Range);
             self.parse_range();
             self.builder.finish_node();
         }
@@ -1020,7 +1033,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_loop(&mut self) {
-        self.builder.start_node(SyntaxKind::LoopStmt);
+        self.start(SyntaxKind::LoopStmt);
         if self.eat_kw("while") {
             self.parse_expression();
         } else {
@@ -1040,13 +1053,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_wait(&mut self) {
-        self.builder.start_node(SyntaxKind::Wait);
+        self.start(SyntaxKind::Wait);
         self.bump(); // wait
         if self.eat_kw("until") {
             self.parse_expression();
         }
         if self.eat_kw("on") {
-            self.builder.start_node(SyntaxKind::SensList);
+            self.start(SyntaxKind::SensList);
             loop {
                 self.parse_name();
                 if !self.eat_punct(',') {
@@ -1073,7 +1086,7 @@ impl<'a> Parser<'a> {
     fn parse_name(&mut self) {
         let mark = self.builder.mark();
         if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
+            self.start(SyntaxKind::Name);
             self.bump();
             while self.at_punct('.') {
                 self.bump();
@@ -1200,12 +1213,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) {
         if self.at_punct('-') || self.at_punct('+') {
-            self.builder.start_node(SyntaxKind::UnaryExpr);
+            self.start(SyntaxKind::UnaryExpr);
             self.bump();
             self.parse_unary();
             self.builder.finish_node();
         } else if self.at_kw("not") || self.at_kw("abs") {
-            self.builder.start_node(SyntaxKind::UnaryExpr);
+            self.start(SyntaxKind::UnaryExpr);
             self.bump();
             self.parse_unary();
             self.builder.finish_node();
@@ -1221,12 +1234,12 @@ impl<'a> Parser<'a> {
             | TokenKind::RealLiteral
             | TokenKind::StrLiteral
             | TokenKind::CharLiteral => {
-                self.builder.start_node(SyntaxKind::Literal);
+                self.start(SyntaxKind::Literal);
                 self.bump();
                 self.builder.finish_node();
             }
             TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("others") => {
-                self.builder.start_node(SyntaxKind::Others);
+                self.start(SyntaxKind::Others);
                 self.bump();
                 self.builder.finish_node();
             }
@@ -1237,7 +1250,7 @@ impl<'a> Parser<'a> {
                 ) && self.peek2().kind == TokenKind::StrLiteral =>
             {
                 // Bit string literal: x"FF" / b"01" / o"17".
-                self.builder.start_node(SyntaxKind::Literal);
+                self.start(SyntaxKind::Literal);
                 self.bump();
                 self.bump();
                 self.builder.finish_node();
@@ -1247,13 +1260,14 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Punct if self.peek_text() == "(" => {
                 // Paren expr or aggregate `(a, b, others => x)`.
+                // The mark goes before `(` so the paren is inside the node.
+                let mark = self.builder.mark();
                 self.bump();
                 if self.at_punct(')') {
                     // Empty aggregate `()` — unusual; treat as empty paren.
                     self.expect_punct(')', "to close the empty parentheses");
                     return;
                 }
-                let mark = self.builder.mark();
                 self.parse_expression();
                 if self.eat_punct(',') || self.peek_op2().as_deref() == Some("=>") {
                     // Aggregate.
@@ -1264,7 +1278,7 @@ impl<'a> Parser<'a> {
                             self.bump();
                         }
                         if self.at_kw("others") {
-                            self.builder.start_node(SyntaxKind::Others);
+                            self.start(SyntaxKind::Others);
                             self.bump();
                             self.builder.finish_node();
                         } else {

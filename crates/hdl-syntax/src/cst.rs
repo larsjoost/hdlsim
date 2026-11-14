@@ -225,13 +225,25 @@ impl TreeBuilder {
     /// the new node.
     pub fn start_node_at(&mut self, mark: Mark, kind: SyntaxKind) {
         let mut children = Vec::new();
+        let mut start = mark.offset;
         if let Some(top) = self.stack.last_mut() {
             let from = mark.children.min(top.children.len());
             children = top.children.split_off(from);
+            // Trivia emitted since the mark stays with the parent: it must not
+            // leak into the wrapped node's text.
+            while let Some(GreenChild::Token { kind: k, len }) = children.first() {
+                if matches!(k, SyntaxKind::Whitespace | SyntaxKind::Comment) {
+                    start += len;
+                    let t = children.remove(0);
+                    top.children.push(t);
+                } else {
+                    break;
+                }
+            }
         }
         self.stack.push(OpenNode {
             kind,
-            start: mark.offset,
+            start,
             children,
         });
     }

@@ -1383,6 +1383,7 @@ pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
                 Some(v.resize(*width))
             }
         }
+        Expr::Signed(e) => const_eval(e, env),
         Expr::Call { .. } => None,
     }
 }

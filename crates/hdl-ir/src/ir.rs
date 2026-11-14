@@ -240,6 +240,9 @@ pub enum Expr {
         width: usize,
         signed: bool,
     },
+    /// `signed(x)` — pure signedness marker: same bits/width, but signed
+    /// semantics for arithmetic and comparisons.
+    Signed(Box<Expr>),
 }
 
 impl Expr {
@@ -285,6 +288,7 @@ impl Expr {
                 e.collect_sigs(out)
             }
             Expr::Resize { e, .. } => e.collect_sigs(out),
+            Expr::Signed(e) => e.collect_sigs(out),
         }
     }
 }

@@ -448,6 +448,7 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
             width: *width,
             signed: *signed,
         },
+        Expr::Signed(e) => Expr::Signed(Box::new(remap_expr(e, map))),
         Expr::Sel { e, msb, lsb } => Expr::Sel {
             e: Box::new(remap_expr(e, map)),
             msb: Box::new(remap_expr(msb, map)),

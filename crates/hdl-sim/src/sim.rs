@@ -197,15 +197,22 @@ impl Simulator {
         // Schedule initial processes, plus `always` blocks that wait on no
         // explicit event list: bare `always` (empty list) and `always @*`
         // both execute once at t=0 per the LRM.
-        for (pid, p) in self.flat.procs.iter().enumerate() {
-            let start_now = match (&p.kind, &p.sens) {
-                (ProcKind::Initial, _) => true,
-                (ProcKind::Always, Sens::All) => true,
-                (ProcKind::Always, Sens::List(es)) => es.is_empty(),
-            };
-            if start_now {
-                self.active.push_back(pid as u32);
-            }
+        let start_now: Vec<u32> = self
+            .flat
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(pid, p)| {
+                let start = match (&p.kind, &p.sens) {
+                    (ProcKind::Initial, _) => true,
+                    (ProcKind::Always, Sens::All) => true,
+                    (ProcKind::Always, Sens::List(es)) => es.is_empty(),
+                };
+                start.then_some(pid as u32)
+            })
+            .collect();
+        for pid in start_now {
+            self.activate(pid);
         }
         self.eval_assigns_fixpoint();
         loop {
@@ -264,7 +271,7 @@ impl Simulator {
                     let evs = self.time_events.remove(&t).unwrap_or_default();
                     for ev in evs {
                         match ev {
-                            Ev::Resume(pid) => self.active.push_back(pid),
+                            Ev::Resume(pid) => self.activate(pid),
                         }
                     }
                 }
@@ -284,6 +291,24 @@ impl Simulator {
     }
 
     // ---- process execution ------------------------------------------------------
+
+    /// Queue a process to run, at most once: never if it is already queued or
+    /// parked. Without this, several sensitivity signals changing in one delta
+    /// would queue the process several times and re-run its body repeatedly.
+    fn activate(&mut self, pid: u32) {
+        if self.active.iter().any(|p| *p == pid) || self.waiting.iter().any(|(w, _)| *w == pid) {
+            return;
+        }
+        self.active.push_back(pid);
+    }
+
+    /// Park a process on an event list, at most once per process.
+    fn park(&mut self, pid: u32, edges: Vec<(FlatSigId, EdgeKind)>) {
+        if self.waiting.iter().any(|(w, _)| *w == pid) {
+            return;
+        }
+        self.waiting.push((pid, edges));
+    }
 
     fn run_proc(&mut self, pid: u32) {
         self.emit(SimEvent::ProcActive {
@@ -309,20 +334,17 @@ impl Simulator {
                         // A bare `always` (no event list) re-runs immediately.
                         match &self.flat.procs[pid as usize].sens {
                             Sens::List(es) if !es.is_empty() => {
-                                self.waiting.push((
-                                    pid,
-                                    es.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect(),
-                                ));
+                                let edges =
+                                    es.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                                self.park(pid, edges);
                             }
                             Sens::All => {
                                 let sigs = std::mem::take(&mut self.proc_all[pid as usize]);
-                                self.waiting.push((
-                                    pid,
-                                    sigs.iter().map(|s| (*s, EdgeKind::Any)).collect(),
-                                ));
+                                let edges = sigs.iter().map(|s| (*s, EdgeKind::Any)).collect();
                                 self.proc_all[pid as usize] = sigs;
+                                self.park(pid, edges);
                             }
-                            _ => self.active.push_back(pid),
+                            _ => self.activate(pid),
                         }
                     }
                     break;
@@ -444,7 +466,11 @@ impl Simulator {
                 for (conds, body) in &items {
                     for c in conds {
                         let cv = self.eval_expr(c, None);
-                        if eq_strict(&v, &cv) {
+                        // Case choices match bit-literally after zero-extending
+                        // both sides to the wider width (X in the expression
+                        // matches nothing).
+                        let w = v.width().max(cv.width()).max(1);
+                        if v.resize(w).bits == cv.resize(w).bits {
                             chosen = Some(body.clone());
                             break;
                         }
@@ -472,7 +498,9 @@ impl Simulator {
                         self.nba.push((sig, v.resize(w.max(1))));
                         let _ = cur;
                     } else {
-                        // Memory/part write with NBA: apply at NBA time too.
+                        // Memory/part write with NBA: capture the target
+                        // address now, apply in the NBA region.
+                        let lhs = self.concretize_target(&lhs);
                         self.nba_apply_later(lhs, v);
                     }
                 } else {
@@ -492,7 +520,7 @@ impl Simulator {
                 self.proc_rt[pid as usize]
                     .frames
                     .push(Frame::block(vec![*body]));
-                self.waiting.push((pid, edges));
+                self.park(pid, edges);
                 Control::Wait
             }
             Stmt::For {
@@ -520,6 +548,68 @@ impl Simulator {
                 self.sys_call(&name, args);
                 Control::Done
             }
+        }
+    }
+
+    /// Freeze the index/bound expressions of an assignment target to their
+    /// values *now*, so a deferred (NBA-region) write uses the address that was
+    /// current when the assignment executed — not whatever the index signals
+    /// hold by the time the NBA region runs.
+    fn concretize_target(&mut self, lhs: &Expr) -> Expr {
+        match lhs {
+            Expr::Lit(v) => Expr::Lit(v.clone()),
+            Expr::Sig(s) => Expr::Sig(*s),
+            Expr::Idx { e, i } => {
+                let a = self.eval_expr(i, None);
+                Expr::Idx {
+                    e: Box::new(self.concretize_target(e)),
+                    i: Box::new(Expr::Lit(a)),
+                }
+            }
+            Expr::Sel { e, msb, lsb } => {
+                let m = self.eval_expr(msb, None);
+                let l = self.eval_expr(lsb, None);
+                Expr::Sel {
+                    e: Box::new(self.concretize_target(e)),
+                    msb: Box::new(Expr::Lit(m)),
+                    lsb: Box::new(Expr::Lit(l)),
+                }
+            }
+            Expr::Bin { op, l, r } => Expr::Bin {
+                op: *op,
+                l: Box::new(self.concretize_target(l)),
+                r: Box::new(self.concretize_target(r)),
+            },
+            Expr::Un { op, e } => Expr::Un {
+                op: *op,
+                e: Box::new(self.concretize_target(e)),
+            },
+            Expr::Cond { c, t, e } => Expr::Cond {
+                c: Box::new(self.concretize_target(c)),
+                t: Box::new(self.concretize_target(t)),
+                e: Box::new(self.concretize_target(e)),
+            },
+            Expr::Call { name, args } => Expr::Call {
+                name: name.clone(),
+                args: args.iter().map(|a| self.concretize_target(a)).collect(),
+            },
+            Expr::Concat(es) => {
+                Expr::Concat(es.iter().map(|e| self.concretize_target(e)).collect())
+            }
+            Expr::Replicate { count, e } => Expr::Replicate {
+                count: Box::new(Expr::Lit(self.eval_expr(count, None))),
+                e: Box::new(self.concretize_target(e)),
+            },
+            Expr::Rising(e) => Expr::Rising(Box::new(self.concretize_target(e))),
+            Expr::Falling(e) => Expr::Falling(Box::new(self.concretize_target(e))),
+            Expr::ToInt(e) => Expr::ToInt(Box::new(self.concretize_target(e))),
+            Expr::ToString(e) => Expr::ToString(Box::new(self.concretize_target(e))),
+            Expr::Resize { e, width, signed } => Expr::Resize {
+                e: Box::new(self.concretize_target(e)),
+                width: *width,
+                signed: *signed,
+            },
+            Expr::Signed(e) => Expr::Signed(Box::new(self.concretize_target(e))),
         }
     }
 
@@ -786,42 +876,36 @@ impl Simulator {
     }
 
     fn schedule_sensitive(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
+        let edge_of = |ek: &EdgeKind| match ek {
+            EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
+            EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
+            EdgeKind::Any => true,
+        };
+        // Collect first (borrows self.proc_sens), then queue: a process runs at
+        // most once per delta no matter how many of its signals changed.
+        let mut to_activate: Vec<u32> = Vec::new();
         for (pid, sens) in self.proc_sens.iter().enumerate() {
             // Procs parked at an explicit `@(...)` are resumed via `waiting`.
             if self.waiting.iter().any(|(w, _)| *w == pid as u32) {
                 continue;
             }
-            for (s, ek) in sens {
-                if *s != sig {
-                    continue;
-                }
-                let edge = match ek {
-                    EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
-                    EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
-                    EdgeKind::Any => true,
-                };
-                if edge {
-                    self.active.push_back(pid as u32);
-                }
+            if sens.iter().any(|(s, ek)| *s == sig && edge_of(ek)) {
+                to_activate.push(pid as u32);
             }
+        }
+        for pid in to_activate {
+            self.activate(pid);
         }
         // Processes parked at `@(...)` waits.
         let mut i = 0;
         while i < self.waiting.len() {
-            let edges = &self.waiting[i].1;
-            let hit = edges.iter().any(|(s, ek)| {
-                if *s != sig {
-                    return false;
-                }
-                match ek {
-                    EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
-                    EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
-                    EdgeKind::Any => true,
-                }
-            });
+            let hit = self.waiting[i]
+                .1
+                .iter()
+                .any(|(s, ek)| *s == sig && edge_of(ek));
             if hit {
                 let (pid, _) = self.waiting.remove(i);
-                self.active.push_back(pid);
+                self.activate(pid);
             } else {
                 i += 1;
             }
@@ -916,6 +1000,7 @@ impl Simulator {
             Expr::Bin { l, r, .. } => self.expr_signed(l, locals) && self.expr_signed(r, locals),
             Expr::Un { e, .. } => self.expr_signed(e, locals),
             Expr::Resize { e, signed, .. } => *signed || self.expr_signed(e, locals),
+            Expr::Signed(_) => true,
             _ => false,
         }
     }
@@ -951,6 +1036,7 @@ impl Simulator {
             Expr::ToInt(_) => 32,
             Expr::ToString(_) => 8 * 12, // decimal digits, upper bound
             Expr::Resize { width, .. } => *width,
+            Expr::Signed(e) => self.expr_width(e, locals),
         }
     }
 
@@ -1094,6 +1180,7 @@ impl Simulator {
                     v.resize(*width)
                 }
             }
+            Expr::Signed(e) => self.eval_expr(e, locals),
             Expr::Sel { e, msb, lsb } => {
                 let v = self.eval_expr(e, locals);
                 let msb = self.eval_expr(msb, locals).to_u64().unwrap_or(0) as usize;
@@ -1271,7 +1358,7 @@ fn lhs_sig(e: &Expr) -> Option<FlatSigId> {
 fn string_of(v: &Value) -> String {
     // Interpret value bits as bytes, MSB chunk first (first char = high byte,
     // matching how string literals are packed and Value::concat orders parts).
-    let mut s = String::new();
+    let mut bytes = Vec::new();
     for chunk in v.bits.chunks(8).rev() {
         let mut byte = 0u8;
         for (j, &b) in chunk.iter().enumerate() {
@@ -1280,8 +1367,8 @@ fn string_of(v: &Value) -> String {
             }
         }
         if byte != 0 {
-            s.push(byte as char);
+            bytes.push(byte);
         }
     }
-    s
+    String::from_utf8_lossy(&bytes).into_owned()
 }

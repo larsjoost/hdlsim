@@ -1518,6 +1518,8 @@ impl<'a> Lower<'a> {
                 let inner = &args[0];
                 let signed = match inner {
                     Expr::Sig(s) => self.sig_signed.get(s).copied().unwrap_or(false),
+                    Expr::Signed(_) => true,
+                    Expr::Resize { signed, .. } => *signed,
                     _ => false,
                 };
                 Expr::Resize {
@@ -1526,9 +1528,11 @@ impl<'a> Lower<'a> {
                     signed,
                 }
             }
-            // Type conversions are bit-identical.
-            "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "signed" | "bit_vector"
-            | "std_logic" | "bit" | "integer" | "natural" | "boolean" | "string" | "char"
+            // `signed(x)` keeps the bits but marks signed semantics.
+            "signed" if args.len() == 1 => Expr::Signed(Box::new(args.into_iter().next().unwrap())),
+            // Other type conversions are bit-identical.
+            "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "bit_vector" | "std_logic"
+            | "bit" | "integer" | "natural" | "boolean" | "string" | "char"
                 if args.len() == 1 =>
             {
                 args.into_iter().next().unwrap()
@@ -1626,9 +1630,27 @@ impl<'a> Lower<'a> {
             return Expr::Lit(Value { bits: vec![b] });
         }
         if t.starts_with('"') {
+            let inner = t.trim_matches('"').replace("\"\"", "\"");
+            // In VHDL a string of bit characters is a std_logic_vector value
+            // (`"0000"`), not ASCII text — otherwise a plain string.
+            if !inner.is_empty()
+                && inner
+                    .bytes()
+                    .all(|c| matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'-' | b'?'))
+            {
+                let mut bits = vec![VX; inner.len()];
+                for (i, c) in inner.bytes().enumerate() {
+                    bits[inner.len() - 1 - i] = match c.to_ascii_lowercase() {
+                        b'0' => V0,
+                        b'1' => V1,
+                        b'z' => VZ,
+                        _ => VX,
+                    };
+                }
+                return Expr::Lit(Value { bits });
+            }
             // String literal: first char in the high byte (MSB-first), so
             // `&`-concatenation and string_of read left to right.
-            let inner = t.trim_matches('"').replace("\"\"", "\"");
             let bytes = inner.as_bytes();
             let n = bytes.len().max(1);
             let mut bits = vec![V0; n * 8];
@@ -1735,7 +1757,8 @@ fn vhdl_binop(op: &str) -> Option<BinOp> {
         "xnor" => BinOp::BXnor,
         "sll" | "rol" => BinOp::Shl,
         "srl" | "ror" => BinOp::Shr,
-        "sla" | "sra" => BinOp::Shr, // arithmetic shift approximated
+        "sra" => BinOp::Sar,
+        "sla" => BinOp::Shl,
         _ => return None,
     })
 }

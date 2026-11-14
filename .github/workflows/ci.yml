@@ -33,3 +33,7 @@ jobs:
         run: |
           cargo build --release --offline
           ./target/release/hdlsim --help
+          # smoke: simulate the example testbenches (Verilog, VHDL, RV32I cpu)
+          ./target/release/hdlsim run --top tb_counter --max-time 1us examples/counter/counter.v examples/counter/tb_counter.v | grep -q PASS
+          ./target/release/hdlsim run --top tb_counter --max-time 1us examples/vhdl-counter/counter.vhd examples/vhdl-counter/tb_counter.vhd | grep -q PASS
+          ./examples/riscv-vhdl/run_tests.sh ./target/release/hdlsim
