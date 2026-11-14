@@ -127,6 +127,32 @@ impl<'a> Parser<'a> {
         t.kind == TokenKind::Punct && t.span.len() == 1 && self.peek_text() == c.to_string()
     }
 
+    /// Two adjacent punct tokens forming a two-char operator (`<=`, `:=`, `=>`, `/=`, `**`, `<>`),
+    /// starting `ahead` non-trivia tokens from the current position.
+    fn peek_op2_at(&self, ahead: usize) -> Option<String> {
+        let mut i0 = self.skip_trivia_from(self.pos);
+        for _ in 0..ahead {
+            i0 = self.skip_trivia_from(i0 + 1);
+        }
+        let i1 = self.skip_trivia_from(i0 + 1);
+        if i0 >= self.tokens.len() || i1 >= self.tokens.len() {
+            return None;
+        }
+        let (a, b) = (&self.tokens[i0], &self.tokens[i1]);
+        if a.kind != TokenKind::Punct || b.kind != TokenKind::Punct {
+            return None;
+        }
+        let t = format!(
+            "{}{}",
+            &self.src.text()[a.span.start as usize..a.span.end as usize],
+            &self.src.text()[b.span.start as usize..b.span.end as usize]
+        );
+        match t.as_str() {
+            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" => Some(t),
+            _ => None,
+        }
+    }
+
     /// Two adjacent punct tokens forming a two-char operator (`<=`, `:=`, `=>`, `/=`, `**`, `<>`).
     fn peek_op2(&self) -> Option<String> {
         let i0 = self.skip_trivia_from(self.pos);
@@ -411,6 +437,12 @@ impl<'a> Parser<'a> {
         self.parse_type_mark();
         if self.at_punct('(') {
             self.parse_constraint();
+        } else if self.at_kw("range") {
+            // `natural range 1 to 3` — range constraint without parens.
+            self.start(SyntaxKind::Range);
+            self.bump();
+            self.parse_range();
+            self.builder.finish_node();
         }
         if self.peek_op2().as_deref() == Some(":=") {
             self.bump();
@@ -468,6 +500,11 @@ impl<'a> Parser<'a> {
         self.parse_type_mark();
         if self.at_punct('(') {
             self.parse_constraint();
+        } else if self.at_kw("range") {
+            self.start(SyntaxKind::Range);
+            self.bump();
+            self.parse_range();
+            self.builder.finish_node();
         }
         if self.peek_op2().as_deref() == Some(":=") {
             self.bump();
@@ -545,15 +582,14 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::ComponentDecl);
         self.bump(); // component
         self.expect_ident("for the component name");
-        if self.eat_kw("is") {
-            loop {
-                if self.at_kw("generic") {
-                    self.parse_generic_clause();
-                } else if self.at_kw("port") {
-                    self.parse_port_clause();
-                } else {
-                    break;
-                }
+        self.eat_kw("is"); // `is` is optional
+        loop {
+            if self.at_kw("generic") {
+                self.parse_generic_clause();
+            } else if self.at_kw("port") {
+                self.parse_port_clause();
+            } else {
+                break;
             }
         }
         self.expect_kw("end", "to close the component");
@@ -692,10 +728,15 @@ impl<'a> Parser<'a> {
             self.parse_process();
         } else if self.at_kw("assert") {
             self.parse_assert(true);
-        } else if self.at_kw("block") || self.at_kw("if") || self.at_kw("for") || self.at_kw("case")
-        {
-            self.error_here("generate blocks are not supported yet");
-            self.skip_balanced_until_end("block");
+        } else if self.at_kw("block") {
+            self.parse_block();
+        } else if self.at_kw("for") {
+            self.parse_gen_for();
+        } else if self.at_kw("if") {
+            self.parse_gen_if();
+        } else if self.at_kw("case") {
+            self.error_here("case-generate is not supported yet");
+            self.skip_balanced_until_end("generate");
             self.eat_punct(';');
         } else if self.at_kw("entity")
             || self.at_kw("component")
@@ -712,18 +753,140 @@ impl<'a> Parser<'a> {
             } else {
                 self.error_here("expected '<=' in a concurrent signal assignment");
             }
+            // Waveform: `expr [after t] {, expr [after t]}`, and conditional
+            // form `expr when cond [else expr when cond]... [else expr]`.
             self.parse_expression();
-            // waveform may continue: `, expr after ...` / `after expr` — skip extras.
-            while self.eat_punct(',') {
-                self.parse_expression();
-            }
             if self.at_kw("after") {
                 self.bump();
                 self.parse_expression();
             }
+            loop {
+                if self.at_kw("when") || self.at_kw("else") {
+                    self.bump();
+                    self.parse_expression();
+                    if self.at_kw("after") {
+                        self.bump();
+                        self.parse_expression();
+                    }
+                    continue;
+                }
+                if self.eat_punct(',') {
+                    self.parse_expression();
+                    if self.at_kw("after") {
+                        self.bump();
+                        self.parse_expression();
+                    }
+                    continue;
+                }
+                break;
+            }
             self.expect_punct(';', "to end the concurrent assignment");
             self.builder.finish_node();
         }
+    }
+
+    /// `block [ (guard) ] [is] decls begin concurrent-stmts end block [label] ;`
+    fn parse_block(&mut self) {
+        self.start(SyntaxKind::Block);
+        self.bump(); // block
+        if self.at_punct('(') {
+            self.bump();
+            self.parse_expression();
+            self.expect_punct(')', "to close the block guard");
+        }
+        self.eat_kw("is");
+        while !self.at_kw("begin") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            self.parse_decl();
+        }
+        self.expect_kw("begin", "in block");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            self.parse_concurrent_stmt();
+        }
+        self.expect_kw("end", "to close the block");
+        self.eat_kw("block");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional label
+        }
+        self.expect_punct(';', "to end the block");
+        self.builder.finish_node();
+    }
+
+    /// `[label :] for var in range generate concurrent-stmts end generate [label] ;`
+    fn parse_gen_for(&mut self) {
+        self.start(SyntaxKind::GenFor);
+        self.bump(); // for
+        if self.peek().kind == TokenKind::Ident {
+            self.parse_name();
+        }
+        self.expect_kw("in", "in for-generate");
+        if self.at_kw("range") {
+            self.bump();
+            if self.at_punct('<') {
+                self.bump();
+                self.bump(); // range <>
+            } else {
+                self.parse_expression();
+                if self.at_kw("to") || self.at_kw("downto") {
+                    self.bump();
+                    self.parse_expression();
+                }
+            }
+        } else {
+            self.parse_expression();
+            if self.at_kw("to") || self.at_kw("downto") {
+                self.bump();
+                self.parse_expression();
+            }
+        }
+        self.expect_kw("generate", "in for-generate");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            self.parse_concurrent_stmt();
+        }
+        self.expect_kw("end", "to close for-generate");
+        self.eat_kw("generate");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional label
+        }
+        self.expect_punct(';', "to end for-generate");
+        self.builder.finish_node();
+    }
+
+    /// `[label :] if cond generate stmts [elsif cond generate stmts]* [else generate stmts] end generate [label] ;`
+    fn parse_gen_if(&mut self) {
+        self.start(SyntaxKind::GenIf);
+        self.bump(); // if
+        self.parse_expression();
+        self.expect_kw("generate", "in if-generate");
+        loop {
+            while !self.at_kw("end")
+                && !self.at_kw("elsif")
+                && !self.at_kw("else")
+                && self.peek().kind != TokenKind::Eof
+            {
+                self.parse_concurrent_stmt();
+            }
+            if self.at_kw("elsif") {
+                self.bump();
+                self.parse_expression();
+                self.expect_kw("generate", "in elsif-generate");
+                continue;
+            }
+            if self.at_kw("else") {
+                self.bump();
+                self.expect_kw("generate", "in else-generate");
+                while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                    self.parse_concurrent_stmt();
+                }
+            }
+            break;
+        }
+        self.expect_kw("end", "to close if-generate");
+        self.eat_kw("generate");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional label
+        }
+        self.expect_punct(';', "to end if-generate");
+        self.builder.finish_node();
     }
 
     fn parse_process(&mut self) {
@@ -1114,23 +1277,38 @@ impl<'a> Parser<'a> {
         loop {
             if self.at_punct('(') {
                 self.bump();
-                self.parse_expression();
-                if self.at_kw("to") || self.at_kw("downto") {
-                    // Slice: `name(msb downto lsb)` — wrap name+range in PartSelect.
-                    self.bump(); // to / downto
-                    self.parse_expression();
-                    self.expect_punct(')', "to close the slice");
-                    self.builder.start_node_at(mark, SyntaxKind::PartSelect);
-                    self.builder.finish_node();
-                } else {
-                    // Index or call args.
-                    while self.eat_punct(',') {
+                let mut is_slice = false;
+                if !self.at_punct(')') {
+                    // Args/indices: `expr [, expr]*` where each may be a named
+                    // association `name => expr`; a single `expr to|downto expr`
+                    // is a slice.
+                    loop {
+                        if self.peek().kind == TokenKind::Ident
+                            && self.peek_op2_at(1).as_deref() == Some("=>")
+                        {
+                            self.bump(); // association name
+                            self.bump();
+                            self.bump(); // =>
+                        }
                         self.parse_expression();
+                        if self.at_kw("to") || self.at_kw("downto") {
+                            is_slice = true;
+                            self.bump(); // to / downto
+                            self.parse_expression();
+                        }
+                        if !self.eat_punct(',') {
+                            break;
+                        }
                     }
-                    self.expect_punct(')', "to close the argument/index list");
-                    self.builder.start_node_at(mark, SyntaxKind::Call);
-                    self.builder.finish_node();
                 }
+                self.expect_punct(')', "to close the argument/index/slice list");
+                let kind = if is_slice {
+                    SyntaxKind::PartSelect
+                } else {
+                    SyntaxKind::Call
+                };
+                self.builder.start_node_at(mark, kind);
+                self.builder.finish_node();
             } else if self.at_punct('\'') {
                 self.bump();
                 if self.peek().kind == TokenKind::Ident {
@@ -1230,10 +1408,21 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) {
         let t = self.peek().clone();
         match t.kind {
-            TokenKind::IntLiteral
-            | TokenKind::RealLiteral
-            | TokenKind::StrLiteral
-            | TokenKind::CharLiteral => {
+            TokenKind::IntLiteral | TokenKind::RealLiteral => {
+                self.start(SyntaxKind::Literal);
+                self.bump();
+                // Physical literal: `100 ps` — a number followed by a time unit.
+                if self.peek().kind == TokenKind::Ident
+                    && matches!(
+                        self.peek_text().to_ascii_lowercase().as_str(),
+                        "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "min" | "hr"
+                    )
+                {
+                    self.bump();
+                }
+                self.builder.finish_node();
+            }
+            TokenKind::StrLiteral | TokenKind::CharLiteral => {
                 self.start(SyntaxKind::Literal);
                 self.bump();
                 self.builder.finish_node();

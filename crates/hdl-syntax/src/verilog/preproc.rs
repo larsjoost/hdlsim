@@ -31,20 +31,56 @@ pub fn preprocess(
     diags: &mut Vec<Diagnostic>,
 ) -> String {
     let mut out = String::with_capacity(src.text().len());
-    let mut cond_stack: Vec<bool> = Vec::new(); // each entry: this branch is active
-    let lines: Vec<&str> = src.text().split_inclusive('\n').collect();
-    let mut offsets: Vec<u32> = Vec::with_capacity(lines.len());
+    // Each entry: (this branch is active, some branch of this level was taken).
+    let mut cond_stack: Vec<(bool, bool)> = Vec::new();
+    let raw_lines: Vec<&str> = src.text().split_inclusive('\n').collect();
+    let mut offsets: Vec<u32> = Vec::with_capacity(raw_lines.len());
     let mut acc = 0u32;
-    for l in &lines {
+    for l in &raw_lines {
         offsets.push(acc);
         acc += l.len() as u32;
     }
+    // Some generators (e.g. Xilinx unisim) wrap a long directive across lines
+    // ("`endcellde\nfine"). Join continuation lines while the accumulated name
+    // is a strict prefix of a known directive.
+    let mut lines: Vec<String> = Vec::with_capacity(raw_lines.len());
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let mut line = raw_lines[i].to_string();
+        if let Some(rest) = line.trim_start().strip_prefix('`') {
+            let (name, _) = split_ident(rest);
+            if !name.is_empty()
+                && !KNOWN_DIRECTIVES.contains(&name.as_str())
+                && KNOWN_DIRECTIVES
+                    .iter()
+                    .any(|d| d.starts_with(&name) && *d != name)
+            {
+                while i + 1 < raw_lines.len() {
+                    let next = raw_lines[i + 1].trim();
+                    let candidate = format!("{}{}", name, next);
+                    if KNOWN_DIRECTIVES.contains(&candidate.as_str()) {
+                        line.push_str(next);
+                        i += 1;
+                        break;
+                    }
+                    if KNOWN_DIRECTIVES.iter().any(|d| d.starts_with(&candidate)) {
+                        line.push_str(next);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        lines.push(line);
+        i += 1;
+    }
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        let line_start = offsets[i];
+        let line_start = offsets.get(i).copied().unwrap_or(0);
         if let Some(rest) = trimmed.strip_prefix('`') {
             let (name, args) = split_ident(rest);
-            let active = cond_stack.iter().all(|&a| a);
+            let active = cond_stack.iter().all(|&(a, _)| a);
             match name.as_str() {
                 "define" if active => {
                     let (mname, rest) = split_ident(args.trim_start());
@@ -54,22 +90,31 @@ pub fn preprocess(
                     let (mname, _) = split_ident(args.trim_start());
                     macros.remove(&mname);
                 }
-                "ifdef" | "ifndef" if active => {
+                "ifdef" | "ifndef" => {
                     let (mname, _) = split_ident(args.trim_start());
                     let defined = macros.contains_key(&mname);
-                    let take = if name == "ifdef" { defined } else { !defined };
-                    let outer_all = cond_stack.iter().all(|&a| a);
-                    cond_stack.push(take && outer_all);
+                    let take = (if name == "ifdef" { defined } else { !defined })
+                        && cond_stack.iter().all(|&(a, _)| a);
+                    cond_stack.push((take, take));
+                }
+                "elsif" => {
+                    let n = cond_stack.len();
+                    if n > 0 {
+                        let outer_all = cond_stack[..n - 1].iter().all(|&(x, _)| x);
+                        let (mname, _) = split_ident(args.trim_start());
+                        let cond = macros.contains_key(&mname) && outer_all;
+                        let top = &mut cond_stack[n - 1];
+                        top.0 = !top.1 && cond;
+                        top.1 = top.1 || cond;
+                    }
                 }
                 "else" => {
                     let n = cond_stack.len();
                     if n > 0 {
-                        // Invariant: n > 0 checked above, so last_mut cannot fail.
-                        let outer_all = cond_stack[..n - 1].iter().all(|&a| a);
-                        let top = cond_stack
-                            .last_mut()
-                            .expect("cond_stack non-empty: length checked above");
-                        *top = !*top && outer_all;
+                        let outer_all = cond_stack[..n - 1].iter().all(|&(x, _)| x);
+                        let top = &mut cond_stack[n - 1];
+                        top.0 = !top.1 && outer_all;
+                        top.1 = true;
                     }
                 }
                 "endif" => {
@@ -133,13 +178,40 @@ pub fn preprocess(
                     // Unknown or inactive directive: drop the line.
                 }
             }
-        } else if cond_stack.iter().all(|&a| a) {
+        } else if cond_stack.iter().all(|&(a, _)| a) {
             // Expand object-like macro references in normal text.
             out.push_str(&expand_line(line, macros));
         }
     }
     out
 }
+
+/// Compiler directives the preprocessor knows. Unknown ones are dropped;
+/// wrapping generators may split a directive name across lines, so names that
+/// are a prefix of one of these are joined with the following line(s).
+const KNOWN_DIRECTIVES: &[&str] = &[
+    "define",
+    "undef",
+    "ifdef",
+    "ifndef",
+    "elsif",
+    "else",
+    "endif",
+    "include",
+    "timescale",
+    "celldefine",
+    "endcelldefine",
+    "default_nettype",
+    "resetall",
+    "unconnected_drive",
+    "nounconnected_drive",
+    "protect",
+    "endprotect",
+    "pragma",
+    "line",
+    "begin_keywords",
+    "end_keywords",
+];
 
 fn split_ident(s: &str) -> (String, &str) {
     let mut end = 0;

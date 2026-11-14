@@ -54,6 +54,8 @@ pub enum SyntaxKind {
     GenFor,
     GenIf,
     GenBlock,
+    /// `specify ... endspecify` timing block (parsed, not simulated).
+    Specify,
     /// Module instantiation (`foo bar (...)`).
     Inst,
     /// One port connection in an instantiation (`.name(expr)` or positional).

@@ -416,6 +416,8 @@ impl<'a> Parser<'a> {
             if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
                 self.bump();
             }
+            // Optional range: `parameter [0:0] PRE_REGISTER = 1`.
+            self.parse_optional_range();
             if self.peek().kind == TokenKind::Ident {
                 self.builder.start_node(SyntaxKind::Name);
                 self.bump();
@@ -453,7 +455,8 @@ impl<'a> Parser<'a> {
         match t.kind {
             TokenKind::Ident => match text.as_str() {
                 "input" | "output" | "inout" => self.parse_port_decl_stmt(),
-                "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" => {
+                "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" | "tri"
+                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1" => {
                     self.parse_decl()
                 }
                 "parameter" | "localparam" => self.parse_param_decl(),
@@ -463,6 +466,16 @@ impl<'a> Parser<'a> {
                 "function" => self.parse_function(),
                 "generate" => self.parse_generate(),
                 "endmodule" => {}
+                // `specify ... endspecify` timing blocks: parse as a skipped node.
+                "specify" => {
+                    self.builder.start_node(SyntaxKind::Specify);
+                    self.bump();
+                    while !self.at_kw("endspecify") && self.peek().kind != TokenKind::Eof {
+                        self.bump();
+                    }
+                    self.eat_kw("endspecify");
+                    self.builder.finish_node();
+                }
                 _ => {
                     // Module instantiation: `modname [#(...)] inst (...) ;`
                     if self.peek2().kind == TokenKind::Ident
@@ -548,6 +561,8 @@ impl<'a> Parser<'a> {
         if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
             self.bump();
         }
+        // Optional range: `parameter [7:0] W = 8;`.
+        self.parse_optional_range();
         loop {
             if self.peek().kind == TokenKind::Ident {
                 self.builder.start_node(SyntaxKind::Name);
@@ -592,8 +607,12 @@ impl<'a> Parser<'a> {
         if self.at_punct('(') {
             self.builder.start_node(SyntaxKind::SensList);
             self.bump();
-            // Items: `[posedge|negedge] expr` separated by `,` or `or`.
+            // Items: `[posedge|negedge] expr` separated by `,` or `or`; `@(*)` is all.
             while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('*') {
+                    self.bump();
+                    break;
+                }
                 if self.at_kw("posedge") || self.at_kw("negedge") {
                     self.bump();
                 }
@@ -797,6 +816,23 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) {
         let text = self.peek_text().to_string();
         match self.peek().kind {
+            // `assign` is legal inside generate blocks (module item as statement).
+            TokenKind::Ident if text == "assign" => self.parse_assign(),
+            // `deassign x;` / `force x = e;` / `release x;` — parse and drop the
+            // procedural-assignment part (not simulated).
+            TokenKind::Ident if text == "deassign" || text == "release" => {
+                self.bump();
+                self.parse_expression();
+                self.expect_punct(';', "to end the statement");
+            }
+            TokenKind::Ident if text == "force" => {
+                self.bump();
+                self.parse_expression();
+                if self.eat_punct('=') {
+                    self.parse_expression();
+                }
+                self.expect_punct(';', "to end the force statement");
+            }
             TokenKind::Ident if text == "begin" => {
                 self.builder.start_node(SyntaxKind::Block);
                 self.bump();
