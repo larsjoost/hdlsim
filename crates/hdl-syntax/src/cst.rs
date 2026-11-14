@@ -291,6 +291,107 @@ impl TreeBuilder {
     }
 }
 
+// ---- binary serialization (persistent parse cache) -------------------------
+//
+// Format, little-endian: a node is `u16 kind, u32 len, u32 child_count` followed
+// by its children; a child is `u8 tag` (0 = token: `u16 kind, u32 len`,
+// 1 = node: recurse). Spans are not stored — they are recomputed from lengths
+// on decode, so a decoded tree is indistinguishable from a parsed one.
+
+/// Serialize a whole tree (root included) to bytes.
+pub fn encode_tree(root: &SyntaxNode) -> Vec<u8> {
+    fn enc(w: &mut Vec<u8>, g: &GreenNode) {
+        w.extend_from_slice(&(g.kind.to_index()).to_le_bytes());
+        w.extend_from_slice(&g.len.to_le_bytes());
+        w.extend_from_slice(&(g.children.len() as u32).to_le_bytes());
+        for c in &g.children {
+            match c {
+                GreenChild::Token { kind, len } => {
+                    w.push(0);
+                    w.extend_from_slice(&kind.to_index().to_le_bytes());
+                    w.extend_from_slice(&len.to_le_bytes());
+                }
+                GreenChild::Node(n) => {
+                    w.push(1);
+                    enc(w, n);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    enc(&mut out, &root.green);
+    out
+}
+
+/// Decode bytes produced by [`encode_tree`] back into a tree for `file`.
+/// Returns None on any malformed input (bad kind, truncated, length mismatch).
+pub fn decode_tree(file: FileId, bytes: &[u8]) -> Option<SyntaxNode> {
+    struct R<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> R<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let s = self.buf.get(self.pos..self.pos.checked_add(n)?)?;
+            self.pos += n;
+            Some(s)
+        }
+        fn u8(&mut self) -> Option<u8> {
+            Some(self.take(1)?[0])
+        }
+        fn u16(&mut self) -> Option<u16> {
+            Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+        }
+        fn u32(&mut self) -> Option<u32> {
+            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+        }
+    }
+    fn dec(r: &mut R) -> Option<Rc<GreenNode>> {
+        let kind = SyntaxKind::from_index(r.u16()?)?;
+        let len = r.u32()?;
+        let n = r.u32()? as usize;
+        if n > (1 << 22) {
+            return None; // corrupt child count
+        }
+        let mut children = Vec::with_capacity(n);
+        let mut sum = 0u32;
+        for _ in 0..n {
+            match r.u8()? {
+                0 => {
+                    let k = SyntaxKind::from_index(r.u16()?)?;
+                    let l = r.u32()?;
+                    sum = sum.checked_add(l)?;
+                    children.push(GreenChild::Token { kind: k, len: l });
+                }
+                1 => {
+                    let child = dec(r)?;
+                    sum = sum.checked_add(child.len)?;
+                    children.push(GreenChild::Node(child));
+                }
+                _ => return None,
+            }
+        }
+        if sum != len {
+            return None; // children must tile the node exactly
+        }
+        Some(Rc::new(GreenNode {
+            kind,
+            len,
+            children,
+        }))
+    }
+    let mut r = R { buf: bytes, pos: 0 };
+    let green = dec(&mut r)?;
+    if r.pos != bytes.len() {
+        return None; // trailing garbage
+    }
+    Some(SyntaxNode::from_green(
+        green.clone(),
+        Span::new(file, 0, green.len),
+        None,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +498,30 @@ mod tests {
         );
         assert!(root.parent().is_none());
         let _ = db;
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_parsed_trees() {
+        for (name, src, verilog) in [
+            ("t.v", "module m(input clk, output reg [7:0] q);\nalways @(posedge clk) q <= q + 1;\nendmodule\n", true),
+            ("t.vhd", "entity e is port (a : in bit); end;\narchitecture r of e is begin a <= not a; end;\n", false),
+        ] {
+            let mut db = SourceDb::new();
+            let id = db.add_file(name, src).unwrap();
+            let root = if verilog {
+                crate::verilog::parser::parse_file(id, db.file(id)).root
+            } else {
+                crate::vhdl::parser::parse_file(id, db.file(id)).root
+            };
+            let bytes = encode_tree(&root);
+            let back = decode_tree(id, &bytes).expect("decode ok");
+            assert_eq!(back.text(&db), src, "lossless after roundtrip");
+            assert_eq!(back.debug_sexp(&db), root.debug_sexp(&db));
+            // Corrupt payloads are rejected, never panic.
+            assert!(decode_tree(id, &bytes[..bytes.len() / 2]).is_none());
+            let mut bad = bytes.clone();
+            bad[0] ^= 0xff;
+            let _ = decode_tree(id, &bad); // may or may not fail, but must not panic
+        }
     }
 }

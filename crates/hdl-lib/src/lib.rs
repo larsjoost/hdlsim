@@ -23,6 +23,7 @@
 
 pub mod builtin;
 pub mod bundle;
+pub mod cache;
 pub mod providers;
 
 use hdl_ir::elab::UnitResolver;
@@ -50,6 +51,10 @@ pub struct LibraryManager {
     indexed: bool,
     /// Canonical paths already compiled this session.
     compiled: HashSet<PathBuf>,
+    /// Persistent parse cache (`.hdlsim-cache/`); None unless enabled.
+    cache: Option<cache::Cache>,
+    /// Parse-cache hits this session.
+    cache_hits: u64,
 }
 
 impl LibraryManager {
@@ -63,7 +68,26 @@ impl LibraryManager {
             index: HashMap::new(),
             indexed: false,
             compiled: HashSet::new(),
+            cache: None,
+            cache_hits: 0,
         }
+    }
+
+    /// Enable the persistent parse cache in `c`.
+    pub fn enable_cache(&mut self, c: cache::Cache) {
+        self.cache = Some(c);
+    }
+
+    /// Enable the cache from the environment (default `.hdlsim-cache/`,
+    /// `HDLSIM_CACHE_DIR` to override, `HDLSIM_NO_CACHE` to disable). Used by
+    /// the CLI; library users opt in via [`LibraryManager::enable_cache`].
+    pub fn use_env_cache(&mut self) {
+        self.cache = cache::Cache::from_env();
+    }
+
+    /// Parse-cache hits this session.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits
     }
 
     /// Add a provider at the end of the search path.
@@ -155,7 +179,19 @@ impl LibraryManager {
         if !self.compiled.insert(canon) {
             return Ok(()); // already compiled this session
         }
-        compile_one(path, &self.incdirs, &mut self.db, &mut self.diags, design)
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        let cache = self.cache.as_ref();
+        compile_one(
+            path,
+            &text,
+            &self.incdirs,
+            &mut self.db,
+            &mut self.diags,
+            design,
+            cache,
+            &mut self.cache_hits,
+        )
     }
 
     /// Compile a list of explicit files (e.g. the CLI's file arguments).
@@ -228,23 +264,71 @@ pub fn parse_library_config(text: &str, base: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Compile one source file into `design` (preprocess → parse → lower).
-/// Verilog now; VHDL joins when the VHDL front-end lands.
+/// Try the persistent parse cache for `text` (as file `id`). On a hit, bumps
+/// `cache_hits` and returns the decoded tree, diagnostics, and timescale.
+fn cached_parse(
+    cache: Option<&cache::Cache>,
+    path: &Path,
+    id: hdl_syntax::source::FileId,
+    text: &str,
+    cache_hits: &mut u64,
+) -> Option<(hdl_syntax::cst::SyntaxNode, Vec<Diagnostic>, Option<String>)> {
+    let c = cache?;
+    let payload = c.get(path, cache::hash64(text))?;
+    let mut r = cache::Cursor::new(&payload);
+    let timescale = match r.u8()? {
+        0 => None,
+        1 => Some(String::from_utf8(r.bytes()?.to_vec()).ok()?),
+        _ => return None,
+    };
+    let root = hdl_syntax::cst::decode_tree(id, r.bytes()?)?;
+    let diags = hdl_syntax::diagnostic::decode_diags(id, r.rest())?;
+    *cache_hits += 1;
+    Some((root, diags, timescale))
+}
+
+/// Store a parse result in the persistent cache (best-effort).
+fn store_parse(
+    cache: Option<&cache::Cache>,
+    path: &Path,
+    text: &str,
+    root: &hdl_syntax::cst::SyntaxNode,
+    diags: &[Diagnostic],
+    timescale: Option<&str>,
+) {
+    let Some(c) = cache else { return };
+    let mut p = Vec::new();
+    match timescale {
+        None => cache::w_u8(&mut p, 0),
+        Some(t) => {
+            cache::w_u8(&mut p, 1);
+            cache::w_bytes(&mut p, t.as_bytes());
+        }
+    }
+    cache::w_bytes(&mut p, &hdl_syntax::cst::encode_tree(root));
+    p.extend_from_slice(&hdl_syntax::diagnostic::encode_diags(diags));
+    c.put(path, cache::hash64(text), &p);
+}
+
+/// Compile one source file into `design` (preprocess → parse → lower), using
+/// the persistent parse cache when `cache` is Some. The cache key is the hash
+/// of the text that was actually parsed (post-preprocessor for Verilog).
 pub fn compile_one(
     path: &Path,
+    text: &str,
     incdirs: &[PathBuf],
     db: &mut SourceDb,
     diags: &mut Diagnostics,
     design: &mut Design,
+    cache: Option<&cache::Cache>,
+    cache_hits: &mut u64,
 ) -> Result<(), String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let lang = Language::from_path(path)
         .ok_or_else(|| format!("unknown file extension: {}", path.display()))?;
     match lang {
         Language::Verilog => {
             let raw_id = db
-                .add_file(path.display().to_string(), text)
+                .add_file(path.display().to_string(), text.to_string())
                 .map_err(|e| e.to_string())?;
             let mut macros = HashMap::new();
             let mut pdiags = Vec::new();
@@ -252,40 +336,51 @@ pub fn compile_one(
                 preproc::preprocess(raw_id, db.file(raw_id), incdirs, &mut macros, &mut pdiags);
             diags.extend(pdiags);
             let id = db
-                .add_file(path.display().to_string(), expanded)
+                .add_file(path.display().to_string(), expanded.clone())
                 .map_err(|e| e.to_string())?;
-            let parsed = parser::parse_file(id, db.file(id));
-            diags.extend(parsed.diags);
-            let time_unit_fs = parsed
-                .timescale
+            let (root, parse_diags, timescale) =
+                match cached_parse(cache, path, id, &expanded, cache_hits) {
+                    Some(t) => t,
+                    None => {
+                        let parsed = parser::parse_file(id, db.file(id));
+                        store_parse(
+                            cache,
+                            path,
+                            &expanded,
+                            &parsed.root,
+                            &parsed.diags,
+                            parsed.timescale.as_deref(),
+                        );
+                        (parsed.root, parsed.diags, parsed.timescale)
+                    }
+                };
+            diags.extend(parse_diags);
+            let time_unit_fs = timescale
                 .as_deref()
                 .map(parser::timescale_to_fs)
                 .unwrap_or(1_000_000); // LRM default: 1 ns
             let mut lower_diags = Vec::new();
-            let modules = verilog_lower::lower_file_with_time(
-                id,
-                &parsed.root,
-                db,
-                &mut lower_diags,
-                time_unit_fs,
-            );
+            let modules =
+                verilog_lower::lower_file_with_time(id, &root, db, &mut lower_diags, time_unit_fs);
             diags.extend(lower_diags);
             design.modules.extend(modules);
         }
         Language::Vhdl => {
-            let raw_id = db
-                .add_file(path.display().to_string(), text)
+            let id = db
+                .add_file(path.display().to_string(), text.to_string())
                 .map_err(|e| e.to_string())?;
-            let parsed = hdl_syntax::vhdl::parser::parse_file(raw_id, db.file(raw_id));
-            diags.extend(parsed.diags);
+            let (root, parse_diags) = match cached_parse(cache, path, id, text, cache_hits) {
+                Some((root, diags, _ts)) => (root, diags),
+                None => {
+                    let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+                    store_parse(cache, path, text, &parsed.root, &parsed.diags, None);
+                    (parsed.root, parsed.diags)
+                }
+            };
+            diags.extend(parse_diags);
             let mut lower_diags = Vec::new();
-            let modules = hdl_ir::vhdl_lower::lower_file(
-                raw_id,
-                &parsed.root,
-                db,
-                &mut lower_diags,
-                1_000_000,
-            );
+            let modules =
+                hdl_ir::vhdl_lower::lower_file(id, &root, db, &mut lower_diags, 1_000_000);
             diags.extend(lower_diags);
             design.modules.extend(modules);
         }
@@ -373,5 +468,58 @@ mod tests {
             "{}",
             mgr.diags().render_all(mgr.db())
         );
+    }
+
+    #[test]
+    fn parse_cache_hits_across_managers() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_cache_it_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("counter.v"),
+            "module counter(input clk, output reg [7:0] q); always @(posedge clk) q <= q + 1; endmodule\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tb.vhd"),
+            "entity tb is end entity;\narchitecture sim of tb is\n  signal q : bit;\nbegin\n  q <= '1';\nend;\n",
+        )
+        .unwrap();
+        let cdir = dir.join(".hdlsim-cache");
+
+        // First manager (cold cache): parses and populates the cache.
+        let mut m1 = LibraryManager::new();
+        m1.enable_cache(cache::Cache::open(cdir.clone()).unwrap());
+        let mut d1 = Design::default();
+        m1.compile_file(&mut d1, &dir.join("counter.v")).unwrap();
+        m1.compile_file(&mut d1, &dir.join("tb.vhd")).unwrap();
+        assert!(d1.modules.iter().any(|m| m.name == "counter"));
+        assert_eq!(m1.cache_hits(), 0);
+        assert!(!m1.diags().has_errors());
+
+        // Second manager (warm cache): same sources, parse skipped.
+        let mut m2 = LibraryManager::new();
+        m2.enable_cache(cache::Cache::open(cdir.clone()).unwrap());
+        let mut d2 = Design::default();
+        m2.compile_file(&mut d2, &dir.join("counter.v")).unwrap();
+        m2.compile_file(&mut d2, &dir.join("tb.vhd")).unwrap();
+        assert_eq!(m2.cache_hits(), 2, "both files should hit the cache");
+        assert!(d2.modules.iter().any(|m| m.name == "counter"));
+        assert!(!m2.diags().has_errors());
+
+        // Edited source → hash changes → miss, re-parse.
+        std::fs::write(
+            dir.join("counter.v"),
+            "module counter(input clk, output reg [7:0] q); always @(posedge clk) q <= q; endmodule\n",
+        )
+        .unwrap();
+        let mut m3 = LibraryManager::new();
+        m3.enable_cache(cache::Cache::open(cdir).unwrap());
+        let mut d3 = Design::default();
+        m3.compile_file(&mut d3, &dir.join("counter.v")).unwrap();
+        assert_eq!(m3.cache_hits(), 0, "edited file must miss the cache");
+        assert!(d3.modules.iter().any(|m| m.name == "counter"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

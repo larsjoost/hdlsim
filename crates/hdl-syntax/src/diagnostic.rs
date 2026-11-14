@@ -65,6 +65,32 @@ impl Diagnostic {
         self
     }
 
+    /// Binary encoding of one diagnostic (spans stored as offsets; the `FileId`
+    /// is re-attached by [`decode_diags`]).
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(match self.severity {
+            Severity::Error => 0,
+            Severity::Warning => 1,
+            Severity::Note => 2,
+        });
+        w_str(out, self.code);
+        match self.span {
+            Some(s) => {
+                out.push(1);
+                out.extend_from_slice(&s.start.to_le_bytes());
+                out.extend_from_slice(&s.end.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        w_str(out, &self.message);
+        match &self.help {
+            Some(h) => {
+                out.push(1);
+                w_str(out, h);
+            }
+            None => out.push(0),
+        }
+    }
     /// rustc-style rendering:
     /// ```text
     /// error[E0001]: missing semicolon
@@ -129,6 +155,98 @@ impl Diagnostic {
         }
         out
     }
+}
+
+fn w_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Known diagnostic codes (interned as `&'static str` on decode; unknown codes
+/// from a corrupt cache collapse to "E0000").
+const KNOWN_CODES: &[&str] = &[
+    "E0001", "E0002", "E0101", "E0102", "E0103", "E0104", "E0105", "E0106", "E0201", "E0202",
+    "E0301", "E0401", "E0501", "W0001", "W0401",
+];
+
+fn intern_code(s: &str) -> &'static str {
+    KNOWN_CODES
+        .iter()
+        .find(|c| **c == s)
+        .copied()
+        .unwrap_or("E0000")
+}
+
+/// Serialize a diagnostic list (little-endian, length-prefixed).
+pub fn encode_diags(ds: &[Diagnostic]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(ds.len() as u32).to_le_bytes());
+    for d in ds {
+        d.encode(&mut out);
+    }
+    out
+}
+
+/// Decode [`encode_diags`] output, re-attaching `file` to every span.
+pub fn decode_diags(file: crate::source::FileId, bytes: &[u8]) -> Option<Vec<Diagnostic>> {
+    struct R<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> R<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let s = self.buf.get(self.pos..self.pos.checked_add(n)?)?;
+            self.pos += n;
+            Some(s)
+        }
+        fn u8(&mut self) -> Option<u8> {
+            Some(self.take(1)?[0])
+        }
+        fn u32(&mut self) -> Option<u32> {
+            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+        }
+        fn str(&mut self) -> Option<&'a str> {
+            let n = self.u32()? as usize;
+            std::str::from_utf8(self.take(n)?).ok()
+        }
+    }
+    let mut r = R { buf: bytes, pos: 0 };
+    let n = r.u32()? as usize;
+    if n > (1 << 20) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let severity = match r.u8()? {
+            0 => Severity::Error,
+            1 => Severity::Warning,
+            2 => Severity::Note,
+            _ => return None,
+        };
+        let code = intern_code(r.str()?);
+        let span = match r.u8()? {
+            0 => None,
+            1 => Some(crate::source::Span::new(file, r.u32()?, r.u32()?)),
+            _ => return None,
+        };
+        let message = r.str()?.to_string();
+        let help = match r.u8()? {
+            0 => None,
+            1 => Some(r.str()?.to_string()),
+            _ => return None,
+        };
+        out.push(Diagnostic {
+            code,
+            severity,
+            span,
+            message,
+            help,
+        });
+    }
+    if r.pos != bytes.len() {
+        return None;
+    }
+    Some(out)
 }
 
 /// An ordered collection of diagnostics. Iteration is deterministic: insertion
@@ -242,5 +360,38 @@ mod tests {
         assert!(!ds.has_errors());
         ds.push(Diagnostic::error("E0001", None, "e"));
         assert!(ds.has_errors());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::source::{FileId, Span};
+
+    #[test]
+    fn diags_encode_decode_roundtrip() {
+        let ds = vec![
+            Diagnostic::error("E0301", Some(Span::new(FileId(0), 3, 9)), "expected `;`")
+                .with_help("add it"),
+            Diagnostic::warning("W0001", None, "file-level warning"),
+            Diagnostic {
+                code: "E9999", // unknown code collapses to E0000, no panic/leak
+                severity: Severity::Note,
+                span: None,
+                message: "note".into(),
+                help: None,
+            },
+        ];
+        let bytes = encode_diags(&ds);
+        let back = decode_diags(FileId(0), &bytes).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].code, "E0301");
+        assert_eq!(back[0].severity, Severity::Error);
+        assert_eq!(back[0].span, Some(Span::new(FileId(0), 3, 9)));
+        assert_eq!(back[0].message, "expected `;`");
+        assert_eq!(back[0].help.as_deref(), Some("add it"));
+        assert_eq!(back[1].span, None);
+        assert_eq!(back[2].code, "E0000");
+        assert!(decode_diags(FileId(0), &bytes[..3]).is_none());
     }
 }

@@ -21,6 +21,11 @@ the graphical wave display are all implemented here.
   compiled into the binary) and parsed by the same front-end; they are found via
   `$HDLSIM_STDLIB`, an installed `share/hdlsim/stdlib` next to the executable, or
   the source tree, and are searched last so `-L ieee=...` overrides them.
+- **Persistent parse cache.** The CLI caches each file's parse tree under
+  `.hdlsim-cache/` (own binary format, keyed by source-text hash + format
+  version), so repeated runs skip lexing/parsing unchanged files. Control with
+  `HDLSIM_NO_CACHE=1` or `HDLSIM_CACHE_DIR=path`. Within one run, each file is
+  compiled at most once regardless.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves

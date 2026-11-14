@@ -208,7 +208,131 @@ pub enum SyntaxKind {
     Others,
 }
 
+/// All variants in declaration order — index == `kind as u16`.
+pub const ALL: &[SyntaxKind] = &[
+    SyntaxKind::Ident,
+    SyntaxKind::IntLiteral,
+    SyntaxKind::RealLiteral,
+    SyntaxKind::StrLiteral,
+    SyntaxKind::CharLiteral,
+    SyntaxKind::SysTask,
+    SyntaxKind::Directive,
+    SyntaxKind::Punct,
+    SyntaxKind::Whitespace,
+    SyntaxKind::Comment,
+    SyntaxKind::Error,
+    SyntaxKind::Eof,
+    SyntaxKind::Root,
+    SyntaxKind::ErrorToken,
+    SyntaxKind::Module,
+    SyntaxKind::PortList,
+    SyntaxKind::Port,
+    SyntaxKind::Decl,
+    SyntaxKind::Range,
+    SyntaxKind::ParamDecl,
+    SyntaxKind::Assign,
+    SyntaxKind::Always,
+    SyntaxKind::SensList,
+    SyntaxKind::Initial,
+    SyntaxKind::Function,
+    SyntaxKind::Generate,
+    SyntaxKind::GenFor,
+    SyntaxKind::GenIf,
+    SyntaxKind::GenBlock,
+    SyntaxKind::Specify,
+    SyntaxKind::Inst,
+    SyntaxKind::PortConn,
+    SyntaxKind::ParamAssign,
+    SyntaxKind::Task,
+    SyntaxKind::EventDecl,
+    SyntaxKind::Defparam,
+    SyntaxKind::Final,
+    SyntaxKind::Typedef,
+    SyntaxKind::EnumType,
+    SyntaxKind::StructType,
+    SyntaxKind::Cast,
+    SyntaxKind::SvaStmt,
+    SyntaxKind::GenCase,
+    SyntaxKind::Block,
+    SyntaxKind::If,
+    SyntaxKind::Case,
+    SyntaxKind::CaseItem,
+    SyntaxKind::StmtAssign,
+    SyntaxKind::Delay,
+    SyntaxKind::Wait,
+    SyntaxKind::For,
+    SyntaxKind::While,
+    SyntaxKind::Repeat,
+    SyntaxKind::Forever,
+    SyntaxKind::DoWhile,
+    SyntaxKind::Disable,
+    SyntaxKind::ForkJoin,
+    SyntaxKind::Trigger,
+    SyntaxKind::SysCall,
+    SyntaxKind::BinExpr,
+    SyntaxKind::UnaryExpr,
+    SyntaxKind::CondExpr,
+    SyntaxKind::Call,
+    SyntaxKind::Concat,
+    SyntaxKind::Replicate,
+    SyntaxKind::PartSelect,
+    SyntaxKind::Index,
+    SyntaxKind::ParenExpr,
+    SyntaxKind::Name,
+    SyntaxKind::Literal,
+    SyntaxKind::LibraryClause,
+    SyntaxKind::UseClause,
+    SyntaxKind::Entity,
+    SyntaxKind::GenericClause,
+    SyntaxKind::PortClause,
+    SyntaxKind::PortDecl,
+    SyntaxKind::GenericDecl,
+    SyntaxKind::Architecture,
+    SyntaxKind::Package,
+    SyntaxKind::SignalDecl,
+    SyntaxKind::ConstantDecl,
+    SyntaxKind::VariableDecl,
+    SyntaxKind::ComponentDecl,
+    SyntaxKind::TypeDecl,
+    SyntaxKind::SubtypeDecl,
+    SyntaxKind::Process,
+    SyntaxKind::ConcAssign,
+    SyntaxKind::SeqAssign,
+    SyntaxKind::VarAssign,
+    SyntaxKind::AssertStmt,
+    SyntaxKind::NullStmt,
+    SyntaxKind::LoopStmt,
+    SyntaxKind::ExitStmt,
+    SyntaxKind::CallStmt,
+    SyntaxKind::ReturnStmt,
+    SyntaxKind::ConfigDecl,
+    SyntaxKind::ContextClause,
+    SyntaxKind::PackageInst,
+    SyntaxKind::AliasDecl,
+    SyntaxKind::AttrDecl,
+    SyntaxKind::AttrSpec,
+    SyntaxKind::FileDecl,
+    SyntaxKind::ForSpec,
+    SyntaxKind::SelectedAssign,
+    SyntaxKind::ExtName,
+    SyntaxKind::Allocator,
+    SyntaxKind::Aggregate,
+    SyntaxKind::Attr,
+    SyntaxKind::Qualified,
+    SyntaxKind::Others,
+];
+
 impl SyntaxKind {
+    /// Stable numeric index of this kind (declaration order == discriminant).
+    pub fn to_index(self) -> u16 {
+        self as u16
+    }
+
+    /// Inverse of [`SyntaxKind::to_index`].
+    pub fn from_index(v: u16) -> Option<SyntaxKind> {
+        ALL.get(v as usize).copied()
+    }
+
     pub fn from_token(kind: TokenKind) -> SyntaxKind {
         match kind {
             TokenKind::Ident => SyntaxKind::Ident,
@@ -370,5 +494,20 @@ impl SyntaxKind {
                 | SyntaxKind::Name
                 | SyntaxKind::Literal
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_index_roundtrips_for_all_variants() {
+        assert_eq!(ALL.len(), 110);
+        for (i, k) in ALL.iter().enumerate() {
+            assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
+            assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));
+        }
+        assert_eq!(SyntaxKind::from_index(65535), None);
     }
 }
