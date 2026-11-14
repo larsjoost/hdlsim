@@ -5,7 +5,6 @@
 use hdl_ir::elab;
 use hdl_sim::{Observer, SimEvent, Simulator};
 use hdlsim::compile::compile_paths;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 struct Messages(Arc<Mutex<Vec<String>>>);
