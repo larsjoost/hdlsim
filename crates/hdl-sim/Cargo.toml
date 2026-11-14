@@ -1,0 +1,9 @@
+[package]
+name = "hdl-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Event-driven simulation kernel: logic values, time, scheduler, observer bus"
+license = "MIT"
+
+[dependencies]
+hdl-ir = { path = "../hdl-ir" }

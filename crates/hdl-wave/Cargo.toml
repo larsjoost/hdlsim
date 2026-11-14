@@ -1,0 +1,9 @@
+[package]
+name = "hdl-wave"
+version = "0.1.0"
+edition = "2021"
+description = "Wave sinks and viewers: VCD, self-contained HTML/SVG, live HTTP+SSE, ASCII"
+license = "MIT"
+
+[dependencies]
+hdl-sim = { path = "../hdl-sim" }

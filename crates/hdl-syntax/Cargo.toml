@@ -1,0 +1,8 @@
+[package]
+name = "hdl-syntax"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable lexers, parsers, and syntax trees (CST/AST) for Verilog and VHDL"
+license = "MIT"
+
+[dependencies]
