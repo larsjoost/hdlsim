@@ -1,11 +1,19 @@
 //! VHDL parser: tokens → lossless CST (rowan-style via [`TreeBuilder`]).
 //!
 //! One function per grammar production, mirroring IEEE 1076 clause names.
-//! Covers the practical subset: library/use clauses, entities, architectures,
-//! packages (declarations; subprogram bodies are parsed but lowered later),
-//! processes, concurrent/sequential statements, and the full expression
-//! precedence chain. VHDL is case-insensitive: keyword checks lowercase the
-//! token text; the CST keeps the original text (lossless).
+//! Covers VHDL-93/2002 plus the VHDL-2008 constructs in common use: library/
+//! use/context clauses, entities, architectures, packages (+ instantiation),
+//! configurations, all declaration forms (signal/constant/variable/shared/
+//! file, type incl. enum/range/array/record/access/file/protected/units,
+//! subtype with resolution function, alias, attribute decl+spec, component,
+//! subprograms, for-specifications), processes (incl. `postponed`), blocks
+//! (incl. `guarded`), generate for/if/case, instantiations (entity/component/
+//! configuration aspects), concurrent/sequential statements (incl. selected
+//! signal assignment, force/release, exit/next with labels, matching `case?`),
+//! and the full expression chain (incl. qualified `T'(x)`, allocators `new`,
+//! `null`, external names `<< ... >>`, conditional `??`). VHDL is
+//! case-insensitive: keyword checks lowercase the token text; the CST keeps
+//! the original text (lossless).
 //!
 //! Recovery: unknown constructs produce an `ErrorToken` + diagnostic and the
 //! parser skips to the next `;` or a known keyword, so one bad unit does not
@@ -84,7 +92,9 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> &Token {
-        &self.tokens[self.skip_trivia_from(self.pos)]
+        // Clamp: at end of input this yields the trailing Eof token, never a panic.
+        let i = self.skip_trivia_from(self.pos);
+        &self.tokens[i.min(self.tokens.len() - 1)]
     }
 
     fn peek2(&self) -> &Token {
@@ -108,6 +118,15 @@ impl<'a> Parser<'a> {
         let j = self.skip_trivia_from(i + 1);
         let k = self.skip_trivia_from(j + 1);
         let t = &self.tokens[k.min(self.tokens.len() - 1)];
+        &self.src.text()[t.span.start as usize..t.span.end as usize]
+    }
+
+    fn peek4_text(&self) -> &str {
+        let i = self.skip_trivia_from(self.pos);
+        let j = self.skip_trivia_from(i + 1);
+        let k = self.skip_trivia_from(j + 1);
+        let l = self.skip_trivia_from(k + 1);
+        let t = &self.tokens[l.min(self.tokens.len() - 1)];
         &self.src.text()[t.span.start as usize..t.span.end as usize]
     }
 
@@ -199,6 +218,10 @@ impl<'a> Parser<'a> {
 
     fn bump(&mut self) -> Token {
         self.bump_trivia();
+        if self.pos >= self.tokens.len() {
+            // Past the trailing Eof: hand it out again without advancing.
+            return self.tokens[self.tokens.len() - 1].clone();
+        }
         let t = self.tokens[self.pos].clone();
         self.builder
             .token(SyntaxKind::from_token(t.kind), t.span.len());
@@ -278,10 +301,19 @@ impl<'a> Parser<'a> {
             } else if self.at_kw("architecture") {
                 self.parse_architecture();
             } else if self.at_kw("package") {
-                self.parse_package();
+                // VHDL-2008 package instantiation is also a design unit:
+                // `package p is new g ...;`
+                if self.peek3_text().eq_ignore_ascii_case("is")
+                    && self.peek4_text().eq_ignore_ascii_case("new")
+                {
+                    self.parse_package_inst();
+                } else {
+                    self.parse_package();
+                }
             } else if self.at_kw("configuration") {
-                self.error_here("configuration declarations are not supported yet");
-                self.skip_to_semicolon();
+                self.parse_configuration();
+            } else if self.at_kw("context") {
+                self.parse_context_clause();
             } else {
                 self.error_here(
                     "expected a design unit (entity/architecture/package) or context clause",
@@ -292,6 +324,75 @@ impl<'a> Parser<'a> {
         while self.pos < self.tokens.len() {
             self.bump();
         }
+        self.builder.finish_node();
+    }
+
+    /// VHDL-2008 context clause: `context lib.name[, ...];`
+    fn parse_context_clause(&mut self) {
+        self.start(SyntaxKind::ContextClause);
+        self.bump(); // context
+        loop {
+            self.parse_name();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the context clause");
+        self.builder.finish_node();
+    }
+
+    /// `configuration name of entity is { block_config } end [configuration] [name];`
+    fn parse_configuration(&mut self) {
+        self.start(SyntaxKind::ConfigDecl);
+        self.bump(); // configuration
+        self.expect_ident("for the configuration name");
+        self.expect_kw("of", "in the configuration declaration");
+        self.parse_name(); // entity (possibly selected)
+        self.expect_kw("is", "in the configuration declaration");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("for") {
+                self.parse_config_for();
+            } else {
+                self.error_here("expected a `for` block configuration");
+                self.skip_to_semicolon();
+            }
+        }
+        self.expect_kw("end", "to close the configuration declaration");
+        self.eat_kw("configuration");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional configuration name
+        }
+        self.expect_punct(';', "to end the configuration declaration");
+        self.builder.finish_node();
+    }
+
+    /// One `for <block spec> ... end for;` inside a configuration declaration.
+    fn parse_config_for(&mut self) {
+        self.start(SyntaxKind::ForSpec);
+        self.bump(); // for
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("for") {
+                self.parse_config_for(); // nested block configuration
+            } else if self.at_kw("use") {
+                self.bump();
+                if self.at_kw("entity") || self.at_kw("configuration") {
+                    self.bump();
+                }
+                self.parse_name(); // lib.ent / configuration name
+                if self.eat_punct('(') {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.bump(); // architecture name
+                    }
+                    self.expect_punct(')', "to close the architecture selection");
+                }
+                self.expect_punct(';', "to end the `use` clause in a configuration");
+            } else {
+                self.bump();
+            }
+        }
+        self.expect_kw("end", "to close the configuration for-block");
+        self.eat_kw("for");
+        self.expect_punct(';', "to end the configuration for-block");
         self.builder.finish_node();
     }
 
@@ -467,15 +568,32 @@ impl<'a> Parser<'a> {
             _ if self.at_kw("subtype") => self.parse_subtype_decl(),
             _ if self.at_kw("component") => self.parse_component_decl(),
             _ if self.at_kw("function") || self.at_kw("procedure") => self.parse_subprogram(),
-            _ if self.at_kw("attribute")
-                || self.at_kw("alias")
-                || self.at_kw("file")
-                || self.at_kw("shared")
-                || self.at_kw("use")
-                || self.at_kw("for") =>
+            _ if self.at_kw("shared") => {
+                // `shared variable v : t;` — VariableDecl with the `shared`
+                // keyword kept in the tree.
+                self.start(SyntaxKind::VariableDecl);
+                self.bump(); // shared
+                self.expect_kw("variable", "after `shared`");
+                self.parse_simple_decl_body();
+                self.builder.finish_node();
+            }
+            _ if self.at_kw("alias") => self.parse_alias(),
+            _ if self.at_kw("attribute") => {
+                // `attribute a : type;` (decl) vs `attribute a of t : l is e;` (spec)
+                if self.peek3_text() == ":" {
+                    self.parse_attr_decl();
+                } else {
+                    self.parse_attr_spec();
+                }
+            }
+            _ if self.at_kw("file") => self.parse_file_object_decl(),
+            _ if self.at_kw("use") => self.parse_use_clause(),
+            _ if self.at_kw("for") => self.parse_for_spec(),
+            _ if self.at_kw("package")
+                && self.peek2().kind == TokenKind::Ident
+                && self.peek3_text().eq_ignore_ascii_case("is") =>
             {
-                // `use`/`for` (attribute specs) etc.: skip to ';'.
-                self.skip_to_semicolon();
+                self.parse_package_inst();
             }
             _ => {
                 self.error_here("expected a declaration");
@@ -484,10 +602,155 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// VHDL-2008 package instantiation: `package p is new g [generic map (...)];`
+    fn parse_package_inst(&mut self) {
+        self.start(SyntaxKind::PackageInst);
+        self.bump(); // package
+        self.expect_ident("for the instantiated package name");
+        self.expect_kw("is", "in the package instantiation");
+        self.expect_kw("new", "in the package instantiation");
+        self.parse_name(); // generic package name
+        if self.at_kw("generic") {
+            self.bump();
+            self.expect_kw("map", "after generic");
+            self.parse_assoc_list();
+        }
+        self.expect_punct(';', "to end the package instantiation");
+        self.builder.finish_node();
+    }
+
+    /// `alias name [(signature)] [: subtype] is target;`
+    fn parse_alias(&mut self) {
+        self.start(SyntaxKind::AliasDecl);
+        self.bump(); // alias
+        self.parse_name();
+        if self.eat_punct('(') {
+            // Subprogram signature: `[...]` / `(param; ...)` — skip balanced.
+            let mut depth = 1;
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('(') {
+                    depth += 1;
+                } else if self.at_punct(')') {
+                    depth -= 1;
+                }
+                self.bump();
+            }
+        }
+        if self.eat_punct(':') {
+            self.parse_type_mark();
+            if self.at_punct('(') {
+                self.parse_constraint();
+            }
+        }
+        self.expect_kw("is", "in the alias declaration");
+        self.parse_name();
+        self.expect_punct(';', "to end the alias declaration");
+        self.builder.finish_node();
+    }
+
+    /// `attribute name : type;`
+    fn parse_attr_decl(&mut self) {
+        self.start(SyntaxKind::AttrDecl);
+        self.bump(); // attribute
+        self.expect_ident("for the attribute name");
+        self.expect_punct(':', "in the attribute declaration");
+        self.parse_type_mark();
+        self.expect_punct(';', "to end the attribute declaration");
+        self.builder.finish_node();
+    }
+
+    /// `attribute name of target {, target} : label is expression;`
+    fn parse_attr_spec(&mut self) {
+        self.start(SyntaxKind::AttrSpec);
+        self.bump(); // attribute
+        self.expect_ident("for the attribute name");
+        self.expect_kw("of", "in the attribute specification");
+        loop {
+            self.parse_name();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(':', "before the spec label");
+        self.expect_ident("for the specification label");
+        self.expect_kw("is", "in the attribute specification");
+        self.parse_expression();
+        self.expect_punct(';', "to end the attribute specification");
+        self.builder.finish_node();
+    }
+
+    /// `file f [, g] : type [open mode is expr];`
+    fn parse_file_object_decl(&mut self) {
+        self.start(SyntaxKind::FileDecl);
+        self.bump(); // file
+        loop {
+            if self.peek().kind == TokenKind::Ident {
+                self.parse_name();
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(':', "before the file type");
+        self.parse_type_mark();
+        if self.at_kw("open") {
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // read_mode / write_mode / append_mode
+            }
+            self.expect_kw("is", "in the file open clause");
+            self.parse_expression();
+        }
+        self.expect_punct(';', "to end the file declaration");
+        self.builder.finish_node();
+    }
+
+    /// Component configuration specification:
+    /// `for lbl {, lbl} | all : comp use entity|configuration ...;`
+    fn parse_for_spec(&mut self) {
+        self.start(SyntaxKind::ForSpec);
+        self.bump(); // for
+        loop {
+            if self.at_kw("all") {
+                self.bump();
+            } else if self.peek().kind == TokenKind::Ident {
+                self.parse_name();
+            } else {
+                self.error_here("expected a label or `all` in the for-specification");
+                break;
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(':', "in the for-specification");
+        self.parse_name(); // component name
+        self.expect_kw("use", "in the for-specification");
+        if self.at_kw("entity") || self.at_kw("configuration") {
+            self.bump();
+        }
+        self.parse_name();
+        if self.eat_punct('(') {
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // architecture name
+            }
+            self.expect_punct(')', "to close the architecture selection");
+        }
+        self.expect_punct(';', "to end the for-specification");
+        self.builder.finish_node();
+    }
+
     /// `signal|constant|variable names : type [constraint] [:= init] ;`
     fn parse_simple_decl(&mut self, kind: SyntaxKind, _kw: &str) {
         self.start(kind);
         self.bump(); // keyword
+        self.parse_simple_decl_body();
+        self.builder.finish_node();
+    }
+
+    /// Body of a simple decl with the node already open and the keyword consumed:
+    /// `names : [bus|register] type [constraint] [:= init] ;`
+    fn parse_simple_decl_body(&mut self) {
         loop {
             if self.peek().kind == TokenKind::Ident {
                 self.parse_name();
@@ -497,6 +760,10 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(':', "before the type mark");
+        // Signal kind modifiers (VHDL-93): `signal s : register std_logic;`
+        if self.at_kw("bus") || self.at_kw("register") {
+            self.bump();
+        }
         self.parse_type_mark();
         if self.at_punct('(') {
             self.parse_constraint();
@@ -512,7 +779,6 @@ impl<'a> Parser<'a> {
             self.parse_expression();
         }
         self.expect_punct(';', "to end the declaration");
-        self.builder.finish_node();
     }
 
     fn parse_type_decl(&mut self) {
@@ -540,6 +806,9 @@ impl<'a> Parser<'a> {
         } else if self.at_kw("range") {
             self.bump();
             self.parse_range();
+            if self.at_kw("units") {
+                self.parse_units();
+            }
         } else if self.at_kw("array") {
             // array (range) of type — parse loosely.
             self.bump();
@@ -553,7 +822,63 @@ impl<'a> Parser<'a> {
                 self.parse_constraint();
             }
         } else if self.at_kw("record") {
-            self.skip_balanced_until_end("record");
+            // `record field {, field} : type [constraint] ; ... end record;`
+            self.bump();
+            loop {
+                if self.at_kw("end") || self.peek().kind == TokenKind::Eof {
+                    break;
+                }
+                loop {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.parse_name();
+                    }
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+                self.expect_punct(':', "before the record field type");
+                self.parse_type_mark();
+                if self.at_punct('(') {
+                    self.parse_constraint();
+                } else if self.at_kw("range") {
+                    self.start(SyntaxKind::Range);
+                    self.bump();
+                    self.parse_range();
+                    self.builder.finish_node();
+                }
+                self.expect_punct(';', "to end the record field");
+            }
+            self.expect_kw("end", "to close the record type");
+            self.eat_kw("record");
+        } else if self.at_kw("access") {
+            // `access type_mark [constraint]` — pointer type.
+            self.bump();
+            self.parse_type_mark();
+            if self.at_punct('(') {
+                self.parse_constraint();
+            }
+        } else if self.at_kw("file") {
+            // `file of type_mark` — file type.
+            self.bump();
+            self.expect_kw("of", "in the file type");
+            self.parse_type_mark();
+        } else if self.at_kw("protected") {
+            // `protected ... end protected;` (+ optional `body ... end protected body;`)
+            self.bump();
+            while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                self.parse_decl();
+            }
+            self.expect_kw("end", "to close the protected type");
+            self.eat_kw("protected");
+            if self.at_kw("body") {
+                self.bump();
+                while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                    self.parse_decl();
+                }
+                self.expect_kw("end", "to close the protected body");
+                self.eat_kw("protected");
+                self.eat_kw("body");
+            }
         } else {
             self.error_here("unsupported type definition (only enum/range/array/record-skip)");
             self.skip_to_semicolon();
@@ -562,11 +887,45 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// `units base; name = value unit; ... end units;` — physical type body.
+    fn parse_units(&mut self) {
+        self.bump(); // units
+        loop {
+            if self.at_kw("end") || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            if self.peek().kind == TokenKind::Ident {
+                self.parse_name(); // base unit or derived unit name
+                if self.eat_punct('=') {
+                    self.parse_expression();
+                    if self.peek().kind == TokenKind::Ident {
+                        self.bump(); // unit name
+                    }
+                }
+                self.expect_punct(';', "in the units declaration");
+            } else {
+                self.bump();
+            }
+        }
+        self.expect_kw("end", "to close the units declaration");
+        self.eat_kw("units");
+    }
+
     fn parse_subtype_decl(&mut self) {
         self.start(SyntaxKind::SubtypeDecl);
         self.bump(); // subtype
         self.expect_ident("for the subtype name");
         self.expect_kw("is", "after the subtype name");
+        // Optional resolution function: `subtype s is resolved std_logic;`
+        // or `subtype s is my_resolver std_logic;`
+        if self.at_kw("resolved") {
+            self.bump();
+        } else if self.peek().kind == TokenKind::Ident
+            && self.peek2().kind == TokenKind::Ident
+            && !self.peek2_text().eq_ignore_ascii_case("range")
+        {
+            self.bump(); // resolution function name
+        }
         self.parse_type_mark();
         if self.at_punct('(') {
             self.parse_constraint();
@@ -724,8 +1083,14 @@ impl<'a> Parser<'a> {
             self.bump(); // label
             self.bump(); // ':'
         }
+        // VHDL-2008 `postponed process`
+        if self.at_kw("postponed") {
+            self.bump();
+        }
         if self.at_kw("process") {
             self.parse_process();
+        } else if self.at_kw("with") {
+            self.parse_selected_assign();
         } else if self.at_kw("assert") {
             self.parse_assert(true);
         } else if self.at_kw("block") {
@@ -735,24 +1100,28 @@ impl<'a> Parser<'a> {
         } else if self.at_kw("if") {
             self.parse_gen_if();
         } else if self.at_kw("case") {
-            self.error_here("case-generate is not supported yet");
-            self.skip_balanced_until_end("generate");
-            self.eat_punct(';');
+            self.parse_gen_case();
         } else if self.at_kw("entity")
             || self.at_kw("component")
+            || self.at_kw("configuration")
             || (self.peek().kind == TokenKind::Ident && self.peek2().kind == TokenKind::Ident)
         {
             self.parse_instantiation();
         } else {
-            // Concurrent signal assignment: target <= waveform ;
-            self.start(SyntaxKind::ConcAssign);
+            // Concurrent signal assignment `target <= waveform ;` or a
+            // concurrent procedure call `p(args);` — decided after the target
+            // name, since `cmp_o(0) <= ...` starts like a call.
+            let mark = self.builder.mark();
             self.parse_name();
-            if self.peek_op2().as_deref() == Some("<=") {
-                self.bump();
-                self.bump();
-            } else {
-                self.error_here("expected '<=' in a concurrent signal assignment");
+            if self.peek_op2().as_deref() != Some("<=") {
+                self.builder.start_node_at(mark, SyntaxKind::CallStmt);
+                self.expect_punct(';', "to end the concurrent procedure call");
+                self.builder.finish_node();
+                return;
             }
+            self.builder.start_node_at(mark, SyntaxKind::ConcAssign);
+            self.bump();
+            self.bump(); // <=
             // Waveform: `expr [after t] {, expr [after t]}`, and conditional
             // form `expr when cond [else expr when cond]... [else expr]`.
             self.parse_expression();
@@ -785,7 +1154,94 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `block [ (guard) ] [is] decls begin concurrent-stmts end block [label] ;`
+    /// `with sel select target <= w1 when c1, w2 when c2, ...;`
+    fn parse_selected_assign(&mut self) {
+        self.start(SyntaxKind::SelectedAssign);
+        self.bump(); // with
+        self.parse_expression(); // selector
+        self.expect_kw("select", "in the selected signal assignment");
+        self.parse_name(); // target
+        if self.peek_op2().as_deref() == Some("<=") {
+            self.bump();
+            self.bump();
+        } else {
+            self.error_here("expected '<=' in the selected signal assignment");
+        }
+        loop {
+            self.parse_expression(); // waveform value
+            if self.at_kw("after") {
+                self.bump();
+                self.parse_expression();
+            }
+            self.expect_kw("when", "before the selection choices");
+            if self.at_kw("others") {
+                self.start(SyntaxKind::Others);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                loop {
+                    self.parse_expression();
+                    if !self.eat_punct('|') {
+                        break; // a following `,` separates waveforms, not choices
+                    }
+                }
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the selected signal assignment");
+        self.builder.finish_node();
+    }
+
+    /// `[label :] case expr is when choices => concurrent-stmts ... end generate;`
+    fn parse_gen_case(&mut self) {
+        self.start(SyntaxKind::GenCase);
+        self.bump(); // case
+        self.parse_expression();
+        self.expect_kw("generate", "after the case-generate expression");
+        loop {
+            if self.at_kw("end") || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            self.expect_kw("when", "before a case-generate alternative");
+            self.start(SyntaxKind::CaseItem);
+            if self.at_kw("others") {
+                self.start(SyntaxKind::Others);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                loop {
+                    self.parse_expression();
+                    if self.eat_punct('|') {
+                        continue;
+                    }
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+            }
+            if self.peek_op2().as_deref() == Some("=>") {
+                self.bump();
+                self.bump();
+            } else {
+                self.error_here("expected '=>' in a case-generate alternative");
+            }
+            while !self.at_kw("when") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                self.parse_concurrent_stmt();
+            }
+            self.builder.finish_node();
+        }
+        self.expect_kw("end", "to close the case-generate");
+        self.eat_kw("generate");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional label
+        }
+        self.expect_punct(';', "to end the case-generate");
+        self.builder.finish_node();
+    }
+
+    /// `block [ (guard) ] [guarded] [is] decls begin concurrent-stmts end block [label] ;`
     fn parse_block(&mut self) {
         self.start(SyntaxKind::Block);
         self.bump(); // block
@@ -793,6 +1249,9 @@ impl<'a> Parser<'a> {
             self.bump();
             self.parse_expression();
             self.expect_punct(')', "to close the block guard");
+        }
+        if self.eat_kw("guarded") {
+            // VHDL-2008 guarded block — keyword kept in the tree
         }
         self.eat_kw("is");
         while !self.at_kw("begin") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
@@ -933,6 +1392,8 @@ impl<'a> Parser<'a> {
             }
         } else if self.eat_kw("component") {
             self.parse_name();
+        } else if self.eat_kw("configuration") {
+            self.parse_name(); // configuration aspect
         } else {
             self.parse_name(); // component name (the label was consumed by the caller)
         }
@@ -1044,10 +1505,27 @@ impl<'a> Parser<'a> {
         } else if self.at_kw("exit") || self.at_kw("next") {
             self.start(SyntaxKind::ExitStmt);
             self.bump();
+            // Optional loop label: `exit outer_loop when c;`
+            if self.peek().kind == TokenKind::Ident && !self.at_kw("when") {
+                self.bump();
+            }
             if self.eat_kw("when") {
                 self.parse_expression();
             }
             self.expect_punct(';', "to end the exit/next statement");
+            self.builder.finish_node();
+        } else if self.at_kw("force") || self.at_kw("release") {
+            // VHDL-2008: `force target <= expr;` / `release target;`
+            self.start(SyntaxKind::SeqAssign);
+            self.bump();
+            self.parse_postfix_name();
+            let op = self.peek_op2();
+            if op.as_deref() == Some("<=") || op.as_deref() == Some(":=") {
+                self.bump();
+                self.bump();
+                self.parse_expression();
+            }
+            self.expect_punct(';', "to end the force/release statement");
             self.builder.finish_node();
         } else if self.at_kw("return") {
             self.start(SyntaxKind::ReturnStmt);
@@ -1126,6 +1604,9 @@ impl<'a> Parser<'a> {
     fn parse_case(&mut self) {
         self.start(SyntaxKind::Case);
         self.bump(); // case
+        if self.eat_punct('?') {
+            // VHDL-2008 matching case: `case? expr is ...`
+        }
         self.parse_expression();
         self.expect_kw("is", "after the case expression");
         loop {
@@ -1140,6 +1621,13 @@ impl<'a> Parser<'a> {
             } else {
                 loop {
                     self.parse_expression();
+                    if self.at_kw("to") || self.at_kw("downto") {
+                        self.bump();
+                        self.parse_expression(); // range choice: `when 0 to 3 =>`
+                    }
+                    if self.eat_punct('|') {
+                        continue; // `when 0 | 1 =>`
+                    }
                     if !self.eat_punct(',') {
                         break;
                     }
@@ -1199,10 +1687,10 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::LoopStmt);
         if self.eat_kw("while") {
             self.parse_expression();
+            self.expect_kw("loop", "after the while condition");
         } else {
             self.bump(); // loop
         }
-        self.expect_kw("loop", "after the loop header");
         while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
             self.parse_seq_stmt();
         }
@@ -1310,13 +1798,23 @@ impl<'a> Parser<'a> {
                 self.builder.start_node_at(mark, kind);
                 self.builder.finish_node();
             } else if self.at_punct('\'') {
-                self.bump();
-                if self.peek().kind == TokenKind::Ident {
-                    self.builder.start_node_at(mark, SyntaxKind::Attr);
-                    self.bump(); // attribute name
+                if self.peek2().kind == TokenKind::Punct && self.peek2_text() == "(" {
+                    // Qualified expression: `type_mark'(expr)`
+                    self.bump(); // '
+                    self.builder.start_node_at(mark, SyntaxKind::Qualified);
+                    self.bump(); // (
+                    self.parse_expression();
+                    self.expect_punct(')', "to close the qualified expression");
                     self.builder.finish_node();
                 } else {
-                    self.error_here("expected an attribute name after the tick");
+                    self.bump(); // '
+                    if self.peek().kind == TokenKind::Ident {
+                        self.builder.start_node_at(mark, SyntaxKind::Attr);
+                        self.bump(); // attribute name
+                        self.builder.finish_node();
+                    } else {
+                        self.error_here("expected an attribute name after the tick");
+                    }
                 }
             } else {
                 break;
@@ -1332,6 +1830,14 @@ impl<'a> Parser<'a> {
         let mark = self.builder.mark();
         self.parse_unary();
         self.parse_binops(mark, min_prec);
+        // VHDL-2008 conditional operator `??` (lowest precedence, right-assoc).
+        if min_prec == 1 && self.peek_text() == "?" && self.peek2_text() == "?" {
+            self.builder.start_node_at(mark, SyntaxKind::CondExpr);
+            self.bump();
+            self.bump();
+            self.parse_expr_prec(1);
+            self.builder.finish_node();
+        }
     }
 
     fn current_binop(&self) -> Option<String> {
@@ -1427,6 +1933,41 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.builder.finish_node();
             }
+            TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("null") => {
+                // `null` literal (access value / empty waveform).
+                self.start(SyntaxKind::Literal);
+                self.bump();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("new") => {
+                // Allocator: `new type_mark` / `new type'(expr)` / `new t(range)`.
+                self.start(SyntaxKind::Allocator);
+                self.bump();
+                self.parse_name();
+                self.builder.finish_node();
+            }
+            TokenKind::Punct if self.peek_text() == "<" && self.peek2_text() == "<" => {
+                // VHDL-2008 external name: `<< signal dut.s : std_logic >>`
+                self.start(SyntaxKind::ExtName);
+                self.bump();
+                self.bump(); // <<
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump(); // signal | constant | variable
+                }
+                self.parse_name();
+                self.expect_punct(':', "in the external name");
+                self.parse_type_mark();
+                if self.at_punct('(') {
+                    self.parse_constraint();
+                }
+                if self.peek_text() == ">" && self.peek2_text() == ">" {
+                    self.bump();
+                    self.bump(); // >>
+                } else {
+                    self.error_here("expected '>>' to close the external name");
+                }
+                self.builder.finish_node();
+            }
             TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("others") => {
                 self.start(SyntaxKind::Others);
                 self.bump();
@@ -1473,8 +2014,8 @@ impl<'a> Parser<'a> {
                         } else {
                             self.parse_expression();
                         }
-                        if !self.eat_punct(',') {
-                            break;
+                        if !self.eat_punct(',') && !self.eat_punct('|') {
+                            break; // `|` separates aggregate choices too
                         }
                     }
                     self.expect_punct(')', "to close the aggregate");
@@ -1626,5 +2167,211 @@ end;
         let (p, db) = parse_str(src);
         no_errors(&p, &db);
         assert_eq!(p.root.text(&db), src);
+    }
+
+    /// Parse, assert zero errors + losslessness, return the s-expression.
+    fn ok(src: &str) -> String {
+        let (p, db) = parse_str(src);
+        no_errors(&p, &db);
+        assert_eq!(p.root.text(&db), src, "tree must be lossless");
+        p.root.debug_sexp(&db)
+    }
+
+    #[test]
+    fn parses_configuration_and_context_clause() {
+        let sexp = ok(r#"context ieee.std_logic_1164.all;
+configuration cfg of top is
+  for rtl
+    for u0 : counter
+      use entity work.counter(rtl);
+    end for;
+  end for;
+end configuration;
+"#);
+        assert!(sexp.contains("(ContextClause"), "{}", sexp);
+        assert!(sexp.contains("(ConfigDecl"), "{}", sexp);
+        assert_eq!(sexp.matches("(ForSpec").count(), 2, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_package_instantiation() {
+        let sexp = ok(r#"library ieee;
+package p is new ieee.std_logic_1164.all generic map (W => 8);
+"#);
+        let _ = sexp;
+        let sexp = ok(r#"package my_pkg is new work.generic_pkg generic map (W => 8);
+"#);
+        assert!(sexp.contains("(PackageInst"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_rich_type_declarations() {
+        let sexp = ok(r#"architecture rtl of m is
+    type rec_t is record
+        a : std_logic;
+        b : integer range 0 to 3;
+    end record;
+    type ptr_t is access std_logic_vector(7 downto 0);
+    type file_t is file of std_logic_vector;
+    file f : file_t open read_mode is "in.txt";
+    type prot_t is protected
+        procedure p(x : in integer);
+    end protected;
+    type time_t is range 0 to 1000
+        units
+            fs;
+            ps = 1000 fs;
+            ns = 1000 ps;
+        end units;
+    subtype resolved_s is resolved std_logic;
+    subtype custom_res is my_resolver std_logic;
+    signal s : register std_logic;
+    signal b : bus unsigned(3 downto 0);
+    shared variable sv : integer;
+    alias al : std_logic is s;
+    attribute keep : boolean;
+    attribute keep of s : signal is true;
+    use work.pkg.all;
+    for u0 : counter use entity work.counter(rtl);
+begin
+end;
+"#);
+        for node in [
+            "(TypeDecl", "(FileDecl", "(AliasDecl", "(AttrDecl", "(AttrSpec",
+            "(VariableDecl", "(ForSpec",
+        ] {
+            assert!(sexp.contains(node), "{} missing in {}", node, sexp);
+        }
+    }
+
+    #[test]
+    fn parses_selected_signal_assignment() {
+        let sexp = ok(r#"architecture rtl of m is
+begin
+    with sel select
+        y <= a when 0,
+             b when 1 | 2,
+             c when others;
+end;
+"#);
+        assert!(sexp.contains("(SelectedAssign"), "{}", sexp);
+        assert!(sexp.contains("Others"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_generate_case() {
+        let sexp = ok(r#"architecture rtl of m is
+begin
+    case g_sel generate
+        when 0 =>
+            y <= a;
+        when 1 | 2 =>
+            y <= b;
+        when others =>
+            y <= c;
+    end generate;
+end;
+"#);
+        assert!(sexp.contains("(GenCase"), "{}", sexp);
+        assert_eq!(sexp.matches("(CaseItem").count(), 3, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_concurrent_procedure_call_postponed_and_guarded() {
+        let sexp = ok(r#"architecture rtl of m is
+begin
+    init(x);
+    postponed process(clk) begin
+        q <= d;
+    end process;
+    blk : block (g = '1') guarded is
+    begin
+        q <= d;
+    end block;
+end;
+"#);
+        assert!(sexp.contains("(CallStmt"), "{}", sexp);
+        assert!(sexp.contains("postponed"), "{}", sexp);
+        assert!(sexp.contains("guarded"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_exit_next_labels_force_release_matching_case() {
+        let sexp = ok(r#"architecture rtl of m is
+begin
+    p : process
+    begin
+        outer : loop
+            exit outer when done = '1';
+            next when skip;
+        end loop;
+        force q <= d;
+        release q;
+        case? op is
+            when 0 to 3 | 7 => r <= a;
+            when others => r <= b;
+        end case;
+    end process;
+end;
+"#);
+        assert_eq!(sexp.matches("(ExitStmt").count(), 2, "{}", sexp);
+        // force, release, and the two case-alternative assigns.
+        assert_eq!(sexp.matches("(SeqAssign").count(), 4, "{}", sexp);
+        assert!(sexp.contains("(Case "), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_qualified_allocator_null_extname_condop() {
+        let sexp = ok(r#"architecture rtl of m is
+    type ptr is access integer;
+    variable p : ptr;
+begin
+    p : process
+        variable v : integer;
+    begin
+        v := integer'(42);
+        p := new integer;
+        p := new integer'(7);
+        if v = 0 then v := 1; end if;
+        v := (a ?? b);
+        if p = null then v := 0; end if;
+    end process;
+    q <= << signal dut.internal_sig : std_logic >>;
+end;
+"#);
+        assert!(sexp.contains("(Qualified"), "{}", sexp);
+        assert_eq!(sexp.matches("(Allocator").count(), 2, "{}", sexp);
+        assert!(sexp.contains("(CondExpr"), "{}", sexp);
+        assert!(sexp.contains("(ExtName"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_instantiation_with_configuration_aspect() {
+        let sexp = ok(r#"architecture rtl of top is
+begin
+    u0 : configuration work.cfg port map (clk => clk);
+end;
+"#);
+        assert!(sexp.contains("(Inst"), "{}", sexp);
+    }
+
+    #[test]
+    fn never_panics_on_garbage() {
+        for src in [
+            "",
+            "entity",
+            "configuration",
+            "architecture r of e is begin with select",
+            "package p is new",
+            "type t is record",
+            "<< signal",
+            "case? ",
+            "v := new",
+            "alias",
+            "attribute",
+            "for all :",
+        ] {
+            let _ = parse_str(src);
+        }
     }
 }

@@ -169,7 +169,9 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> &Token {
-        &self.tokens[self.skip_trivia_from(self.pos)]
+        // Clamp: at end of input this yields the trailing Eof token, never a panic.
+        let i = self.skip_trivia_from(self.pos);
+        &self.tokens[i.min(self.tokens.len() - 1)]
     }
 
     fn peek2(&self) -> &Token {
@@ -244,6 +246,10 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+        if self.pos >= self.tokens.len() {
+            // Past the trailing Eof: hand it out again without advancing.
+            return self.tokens[self.tokens.len() - 1].clone();
         }
         let t = self.tokens[self.pos].clone();
         self.builder

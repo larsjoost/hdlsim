@@ -351,6 +351,7 @@ impl SyntaxKind {
                 | SyntaxKind::GenCase
                 | SyntaxKind::ExtName
                 | SyntaxKind::Allocator
+                | SyntaxKind::CondExpr
                 | SyntaxKind::Block
                 | SyntaxKind::If
                 | SyntaxKind::Case
