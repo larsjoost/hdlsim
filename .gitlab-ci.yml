@@ -45,3 +45,7 @@ release-smoke:
     - ./examples/npu-vhdl/run_tests.sh ./target/release/hdlsim
     # smoke: fp32 add/mul example
     - ./examples/fp-vhdl/run_tests.sh ./target/release/hdlsim
+    # smoke: pack the multi-library riscv example into a reproducer bundle
+    # and reproduce a run from the bundle alone
+    - cd examples/riscv-vhdl && "$CI_PROJECT_DIR/target/release/hdlsim" bundle --out /tmp/repro.tar --top tb_alu
+    - ./target/release/hdlsim run --bundle /tmp/repro.tar --top tb_alu --max-time 10us | grep -q PASS
