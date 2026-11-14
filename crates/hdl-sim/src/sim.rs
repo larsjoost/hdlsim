@@ -564,6 +564,13 @@ impl Simulator {
 
     fn exec_stmt(&mut self, pid: u32, stmt: Stmt) -> Control {
         match stmt {
+            Stmt::Spanned { span, inner } => {
+                self.emit(SimEvent::StmtExec {
+                    span,
+                    time_fs: self.time,
+                });
+                return self.exec_stmt(pid, *inner);
+            }
             Stmt::Null => Control::Done,
             Stmt::Block(ss) => {
                 self.proc_rt[pid as usize].frames.push(Frame::block(ss));
@@ -1425,6 +1432,7 @@ struct FnRunner<'a> {
 impl<'a> FnRunner<'a> {
     fn exec(&mut self, stmt: &Stmt) {
         match stmt {
+            Stmt::Spanned { inner, .. } => self.exec(inner),
             Stmt::Block(ss) => {
                 for s in ss {
                     self.exec(s);

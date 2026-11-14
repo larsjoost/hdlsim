@@ -22,6 +22,7 @@ name = "hdl-sim"
 version = "0.1.0"
 dependencies = [
  "hdl-ir",
+ "hdl-syntax",
 ]
 
 [[package]]

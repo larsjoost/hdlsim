@@ -8,9 +8,13 @@
 //! kernel through them.
 
 use hdl_ir::Value;
+use hdl_syntax::source::Span;
 
 #[derive(Clone, Debug)]
 pub enum SimEvent {
+    /// A statement executed (carries its source span) — drives line/branch
+    /// coverage collectors. Emitted for every `Stmt::Spanned`.
+    StmtExec { span: Span, time_fs: u64 },
     /// Simulation time advanced to `time_fs`.
     TimeAdvance { time_fs: u64 },
     /// A signal changed value at `time_fs`.

@@ -6,6 +6,7 @@
 //! ([`crate::elab`]) remaps them into the flat signal space.
 
 use crate::value::{BinOp, UnOp, Value};
+use hdl_syntax::source::Span;
 
 pub type SigId = u32;
 pub type ModId = u32;
@@ -183,6 +184,12 @@ pub enum Stmt {
     },
     ExprStmt(Expr),
     Null,
+    /// Source-span wrapper attached by the lowerers to every statement — used
+    /// for line/branch coverage, never changes semantics.
+    Spanned {
+        span: Span,
+        inner: Box<Stmt>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +303,7 @@ impl Expr {
 impl Stmt {
     pub fn collect_sigs(&self, out: &mut Vec<SigId>) {
         match self {
+            Stmt::Spanned { inner, .. } => inner.collect_sigs(out),
             Stmt::Block(ss) => {
                 for s in ss {
                     s.collect_sigs(out);

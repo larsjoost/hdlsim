@@ -15,3 +15,4 @@ categories = ["simulation", "hardware-support"]
 
 [dependencies]
 hdl-ir.workspace = true
+hdl-syntax.workspace = true
