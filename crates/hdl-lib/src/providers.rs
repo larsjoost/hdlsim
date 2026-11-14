@@ -47,6 +47,16 @@ impl DirProvider {
             extensions: vec!["vhd", "vhdl", "v", "sv"],
         }
     }
+
+    /// A mixed-language library directory (`*.v`, `*.sv`, `*.vhd`, `*.vhdl`)
+    /// — what `-L name=path` and `hdlsim.ini` mappings create.
+    pub fn mixed(name: &str, path: &Path) -> DirProvider {
+        DirProvider {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            extensions: vec!["v", "sv", "vhd", "vhdl"],
+        }
+    }
 }
 
 impl UnitProvider for DirProvider {

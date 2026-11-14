@@ -8,6 +8,7 @@
 mod ast;
 mod check;
 mod init;
+mod project;
 mod run;
 
 use hdl_lib::LibraryManager;
@@ -139,7 +140,14 @@ pub fn parse_time(s: &str) -> Result<u64, String> {
 }
 
 /// Registry of all subcommands. Add one line per new command.
-pub const COMMANDS: &[&dyn Command] = &[&Help, &run::Run, &check::Check, &ast::Ast, &init::Init];
+pub const COMMANDS: &[&dyn Command] = &[
+    &Help,
+    &run::Run,
+    &check::Check,
+    &ast::Ast,
+    &init::Init,
+    &project::Project,
+];
 
 /// Dispatch `args` (without the binary name) to a registered command.
 pub fn dispatch(args: &[String]) -> Result<i32, String> {

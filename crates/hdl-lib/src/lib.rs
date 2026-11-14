@@ -66,9 +66,9 @@ impl LibraryManager {
         self.indexed = false;
     }
 
-    /// Add a named filesystem library directory (Verilog sources).
+    /// Add a named filesystem library directory (Verilog + VHDL sources).
     pub fn add_library_dir(&mut self, name: &str, path: &Path) {
-        self.add_provider(Box::new(DirProvider::verilog(name, path)));
+        self.add_provider(Box::new(DirProvider::mixed(name, path)));
     }
 
     /// Add an include search directory for `` `include ``.
@@ -112,6 +112,15 @@ impl LibraryManager {
             self.add_library_dir(&name, &libpath);
         }
         Ok(())
+    }
+
+    /// All providers as `(library name, [(unit, file)])` — used by
+    /// project-file generation to describe the full library contents.
+    pub fn scan_libraries(&self) -> Vec<(String, Vec<(String, PathBuf)>)> {
+        self.providers
+            .iter()
+            .map(|p| (p.name().to_string(), p.scan()))
+            .collect()
     }
 
     /// Build the unit-name → files index by scanning all providers (once).
