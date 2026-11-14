@@ -17,7 +17,10 @@ the graphical wave display are all implemented here.
   directories (`hdlsim.ini` — created by `hdlsim init` — plus `-L name=dir` flags);
   undefined modules and `` `include `` files are found and compiled on demand in
   dependency order, with an in-session compile cache. `std` and `ieee` are built in
-  (VHDL packages land with the VHDL front-end).
+  as real VHDL source files shipped in the repo (`crates/hdl-lib/stdlib/`, not
+  compiled into the binary) and parsed by the same front-end; they are found via
+  `$HDLSIM_STDLIB`, an installed `share/hdlsim/stdlib` next to the executable, or
+  the source tree, and are searched last so `-L ieee=...` overrides them.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves

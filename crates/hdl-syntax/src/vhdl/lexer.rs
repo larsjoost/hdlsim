@@ -141,11 +141,13 @@ impl<'a> Lexer<'a> {
         self.emit_from(TokenKind::StrLiteral, start);
     }
 
-    /// `'0'` → CharLiteral; otherwise the tick of an attribute/qualified
-    /// expression → Punct('\'').
+    /// `'0'` → CharLiteral; `''''` (apostrophe literal) → CharLiteral of len 4;
+    /// otherwise the tick of an attribute/qualified expression → Punct('\'').
     fn tick_or_char(&mut self) {
-        if self.peek(2) == Some(b'\'') && self.peek(1).is_some() {
-            self.emit(TokenKind::CharLiteral, 3);
+        if self.peek(1) == Some(b'\'') && self.peek(2) == Some(b'\'') {
+            self.emit(TokenKind::CharLiteral, 4); // ''''
+        } else if self.peek(2) == Some(b'\'') && self.peek(1).is_some() {
+            self.emit(TokenKind::CharLiteral, 3); // 'x'
         } else {
             self.emit(TokenKind::Punct, 1);
         }

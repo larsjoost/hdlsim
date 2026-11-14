@@ -265,6 +265,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Is the current token an interface class/mode keyword?
+    fn at_class_or_mode_kw(&self) -> bool {
+        const KWS: &[&str] = &[
+            "in", "out", "inout", "buffer", "linkage", "signal", "constant", "variable",
+        ];
+        self.peek().kind == TokenKind::Ident
+            && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
+    }
+
+    /// Parameter class keyword (signal/constant/variable) — precedes the names.
+    fn at_param_class_kw(&self) -> bool {
+        const KWS: &[&str] = &["signal", "constant", "variable"];
+        self.peek().kind == TokenKind::Ident
+            && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
+    }
+
     fn expect_ident(&mut self, ctx: &str) -> Option<String> {
         if self.peek().kind == TokenKind::Ident {
             let t = self.peek_text().to_string();
@@ -517,8 +533,14 @@ impl<'a> Parser<'a> {
     /// `name [, name...] : [mode] type_mark [constraint] [:= default]`.
     fn parse_interface_decl(&mut self, kind: SyntaxKind) {
         self.start(kind);
+        // Optional parameter class BEFORE the names: `signal s : t`,
+        // `constant c : t`, `variable v : t` (subprogram parameters).
+        if self.at_param_class_kw() {
+            self.bump();
+        }
         loop {
-            if self.peek().kind == TokenKind::Ident {
+            // Names only; a class/mode keyword ends the name list.
+            if self.peek().kind == TokenKind::Ident && !self.at_class_or_mode_kw() {
                 self.parse_name();
             }
             if !self.eat_punct(',') {
@@ -526,7 +548,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(':', "before the mode/type");
-        // Optional mode: in/out/inout/buffer/linkage (an identifier).
+        // Optional mode after the colon: in/out/inout/buffer/linkage.
         if self.at_kw("in")
             || self.at_kw("out")
             || self.at_kw("inout")
@@ -965,7 +987,14 @@ impl<'a> Parser<'a> {
     fn parse_subprogram(&mut self) {
         self.start(SyntaxKind::Function);
         self.bump(); // function | procedure
-        self.expect_ident("for the subprogram name");
+                     // Operator symbols are string literals: `function "and" (...)`.
+        if self.peek().kind == TokenKind::Ident || self.peek().kind == TokenKind::StrLiteral {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        } else {
+            self.error_here("expected a subprogram name");
+        }
         if self.eat_punct('(') {
             while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
                 self.parse_interface_decl(SyntaxKind::PortDecl);
@@ -1048,6 +1077,13 @@ impl<'a> Parser<'a> {
         if self.at_kw("to") || self.at_kw("downto") {
             self.bump();
             self.parse_expression();
+        } else if self.at_kw("range") {
+            // Box constraint: `natural range <>` (unconstrained index).
+            self.bump();
+            if self.peek_text() == "<" && self.peek2_text() == ">" {
+                self.bump();
+                self.bump(); // <>
+            }
         }
     }
 
@@ -1068,6 +1104,8 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_kw("end", "to close the package");
+        self.eat_kw("package"); // `end package [name];`
+        self.eat_kw("body");
         if self.peek().kind == TokenKind::Ident {
             self.bump(); // optional package name
         }

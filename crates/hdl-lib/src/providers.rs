@@ -125,7 +125,8 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Entity names defined by a VHDL file.
+/// Design-unit names defined by a VHDL file: entities, packages, and
+/// configurations (the name is the first identifier that isn't a keyword).
 fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
@@ -135,11 +136,21 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
     parsed
         .root
         .children()
-        .filter(|c| c.kind() == SyntaxKind::Entity)
-        .filter_map(|e| {
-            e.children()
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                SyntaxKind::Entity | SyntaxKind::Package | SyntaxKind::ConfigDecl
+            )
+        })
+        .filter_map(|u| {
+            u.children()
                 .filter(|c| c.kind() == SyntaxKind::Ident)
-                .nth(1) // [0] is the `entity` keyword
+                .find(|n| {
+                    !matches!(
+                        db.span_text(n.span()).to_ascii_lowercase().as_str(),
+                        "entity" | "package" | "body" | "configuration"
+                    )
+                })
                 .map(|n| db.span_text(n.span()).trim().to_string())
         })
         .collect()
