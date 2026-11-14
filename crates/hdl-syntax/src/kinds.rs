@@ -56,12 +56,32 @@ pub enum SyntaxKind {
     GenBlock,
     /// `specify ... endspecify` timing block (parsed, not simulated).
     Specify,
-    /// Module instantiation (`foo bar (...)`).
+    /// Module instantiation (`foo bar (...)`) or gate primitive (`and (o,a,b)`).
     Inst,
     /// One port connection in an instantiation (`.name(expr)` or positional).
     PortConn,
     /// One `#(...)` parameter override: `.name(expr)` or positional expr.
     ParamAssign,
+    /// `task [automatic] name [(ports)]; ... endtask`.
+    Task,
+    /// `event name, ...;`
+    EventDecl,
+    /// `defparam path.param = expr, ...;`
+    Defparam,
+    /// `final` block (SystemVerilog).
+    Final,
+    /// `typedef type name;` (incl. enum/struct/union bodies).
+    Typedef,
+    /// `enum { ... }` type body.
+    EnumType,
+    /// `struct/union [packed] { ... }` type body.
+    StructType,
+    /// Cast: `signed'(e)`, `unsigned'(e)`, or size cast `N'(e)`.
+    Cast,
+    /// SV immediate assertion: `assert/assume/cover/expect (...) ...`.
+    SvaStmt,
+    /// `generate case ... endcase endgenerate`.
+    GenCase,
 
     // --- verilog statements ---
     /// Begin/end or single statement.
@@ -77,6 +97,17 @@ pub enum SyntaxKind {
     Wait,
     /// Procedural `for` loop (vs. generate-for `GenFor`).
     For,
+    /// `while (c) s`, `repeat (n) s`, `forever s`, `do s while (c)`.
+    While,
+    Repeat,
+    Forever,
+    DoWhile,
+    /// `disable name;`
+    Disable,
+    /// `fork ... join` / `join_any` / `join_none`.
+    ForkJoin,
+    /// Event trigger: `-> name;` / `->> name;`.
+    Trigger,
     /// System task call (`$display(...)`).
     SysCall,
 
@@ -145,6 +176,28 @@ pub enum SyntaxKind {
     CallStmt,
     /// `return [expr];` in a subprogram body.
     ReturnStmt,
+    /// `configuration name of entity is ... end;` declaration.
+    ConfigDecl,
+    /// VHDL-2008 context clause: `context lib.name;`.
+    ContextClause,
+    /// VHDL-2008 package instantiation: `package p is new g generic map (...);`.
+    PackageInst,
+    /// `alias name [: type] is target;`.
+    AliasDecl,
+    /// `attribute a : type;` declaration.
+    AttrDecl,
+    /// `attribute a of target : label is expr;` specification.
+    AttrSpec,
+    /// File object declaration: `file f : text open read_mode is "x";`.
+    FileDecl,
+    /// Component configuration specification: `for lbl : comp use ...;`.
+    ForSpec,
+    /// Concurrent selected signal assignment: `with sel select t <= ...;`.
+    SelectedAssign,
+    /// External name (VHDL-2008): `<< signal dut.s : std_logic >>`.
+    ExtName,
+    /// Allocator: `new type_mark [ (expr) | '(expr) ]`.
+    Allocator,
     /// Aggregate `(a, b, others => c)`.
     Aggregate,
     /// Attribute `x'attr`.
@@ -213,6 +266,24 @@ impl SyntaxKind {
                 | SyntaxKind::Inst
                 | SyntaxKind::PortConn
                 | SyntaxKind::ParamAssign
+                | SyntaxKind::Task
+                | SyntaxKind::EventDecl
+                | SyntaxKind::Defparam
+                | SyntaxKind::Final
+                | SyntaxKind::Typedef
+                | SyntaxKind::EnumType
+                | SyntaxKind::StructType
+                | SyntaxKind::Cast
+                | SyntaxKind::SvaStmt
+                | SyntaxKind::GenCase
+                | SyntaxKind::While
+                | SyntaxKind::Repeat
+                | SyntaxKind::Forever
+                | SyntaxKind::DoWhile
+                | SyntaxKind::Disable
+                | SyntaxKind::ForkJoin
+                | SyntaxKind::Trigger
+                | SyntaxKind::ReturnStmt
                 | SyntaxKind::Block
                 | SyntaxKind::If
                 | SyntaxKind::Case
@@ -268,6 +339,18 @@ impl SyntaxKind {
                 | SyntaxKind::Attr
                 | SyntaxKind::Qualified
                 | SyntaxKind::Others
+                | SyntaxKind::ConfigDecl
+                | SyntaxKind::ContextClause
+                | SyntaxKind::PackageInst
+                | SyntaxKind::AliasDecl
+                | SyntaxKind::AttrDecl
+                | SyntaxKind::AttrSpec
+                | SyntaxKind::FileDecl
+                | SyntaxKind::ForSpec
+                | SyntaxKind::SelectedAssign
+                | SyntaxKind::GenCase
+                | SyntaxKind::ExtName
+                | SyntaxKind::Allocator
                 | SyntaxKind::Block
                 | SyntaxKind::If
                 | SyntaxKind::Case

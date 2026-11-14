@@ -5,12 +5,20 @@
 //! on unexpected input it records a diagnostic, skips the offending token, and
 //! continues — the tree always covers the whole file.
 //!
-//! Covered: modules (ANSI and non-ANSI ports), wire/reg/logic/integer/real
-//! declarations, parameters, continuous assign, always (with @ sensitivity,
-//! posedge/negedge), initial, functions, generate for/if, instantiations,
-//! if/else, case/casez/casex, blocking/non-blocking assignments, `#delay`,
-//! system task calls, concatenation/replication, part-selects, and the full
-//! expression operator set via precedence climbing.
+//! Covered: modules (ANSI and non-ANSI ports), net/reg/logic/integer/real/time
+//! and the SystemVerilog scalar types (bit/byte/shortint/int/longint/string/
+//! chandle), parameters (body, `#(...)` header, `parameter type`), continuous
+//! assign (with `#delay` and drive strengths), always/always_comb/always_ff/
+//! always_latch (with @ sensitivity, posedge/negedge, `@*`), initial, final,
+//! functions (incl. `automatic`/`void` and ANSI port lists), tasks, generate
+//! for/if/case and named generate blocks, module and gate-primitive
+//! instantiations, defparam, event declarations and triggers, typedef/enum/
+//! struct/union, if/else, case/casez/casex (incl. `unique`/`priority` and
+//! `inside`), blocking/non-blocking assignments, `#delay`, `@`/wait event
+//! controls, while/repeat/forever/do-while, fork/join, disable, SV immediate
+//! assertions, system task calls, concatenation/replication, part-selects,
+//! casts (`signed'(e)`, `8'(e)`), and the full expression operator set via
+//! precedence climbing. Escaped identifiers (`\foo `) are lexed as names.
 
 use crate::cst::{SyntaxNode, TreeBuilder};
 use crate::diagnostic::Diagnostic;
@@ -285,7 +293,7 @@ impl<'a> Parser<'a> {
         while self.peek().kind != TokenKind::Eof {
             if self.peek().kind == TokenKind::Directive {
                 self.parse_directive();
-            } else if self.at_kw("module") {
+            } else if self.at_kw("module") || self.at_kw("macromodule") {
                 self.parse_module();
             } else {
                 self.error_here("expected `module` or a compiler directive");
@@ -386,6 +394,18 @@ impl<'a> Parser<'a> {
                 || self.at_kw("reg")
                 || self.at_kw("logic")
                 || self.at_kw("signed")
+                || self.at_kw("unsigned")
+                || self.at_kw("ref")
+                || self.at_kw("bit")
+                || self.at_kw("byte")
+                || self.at_kw("shortint")
+                || self.at_kw("int")
+                || self.at_kw("longint")
+                || self.at_kw("integer")
+                || self.at_kw("real")
+                || self.at_kw("time")
+                || self.at_kw("string")
+                || self.at_kw("chandle")
             {
                 self.bump();
             } else {
@@ -413,7 +433,9 @@ impl<'a> Parser<'a> {
             if self.at_kw("parameter") || self.at_kw("localparam") {
                 self.bump();
             }
-            if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
+            if self.at_kw("type") {
+                self.bump();
+            } else if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
                 self.bump();
             }
             // Optional range: `parameter [0:0] PRE_REGISTER = 1`.
@@ -427,6 +449,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct('=', "in parameter declaration");
             self.parse_expression();
+            self.parse_optional_range(); // `parameter type T = logic [7:0]`
             self.builder.finish_node();
             if !self.eat_punct(',') {
                 break;
@@ -456,16 +479,31 @@ impl<'a> Parser<'a> {
             TokenKind::Ident => match text.as_str() {
                 "input" | "output" | "inout" => self.parse_port_decl_stmt(),
                 "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" | "tri"
-                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1" => {
+                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1"
+                | "bit" | "byte" | "shortint" | "int" | "longint" | "string" | "chandle"
+                | "vectored" | "scalared" | "var" | "const" | "rand" | "randc" => {
                     self.parse_decl()
                 }
                 "parameter" | "localparam" => self.parse_param_decl(),
                 "assign" => self.parse_assign(),
                 "always" | "always_comb" | "always_ff" | "always_latch" => self.parse_always(),
                 "initial" => self.parse_initial(),
+                "final" => self.parse_final(),
                 "function" => self.parse_function(),
+                "task" => self.parse_task(),
+                "event" => self.parse_event_decl(),
+                "defparam" => self.parse_defparam(),
+                "typedef" => self.parse_typedef(),
                 "generate" => self.parse_generate(),
-                "endmodule" => {}
+                // `endmodule` here means the enclosing construct was never
+                // closed — report and skip so no loop can spin on it.
+                "endmodule" => {
+                    self.error_here("unexpected `endmodule`");
+                    self.bump();
+                }
+                "and" | "nand" | "or" | "nor" | "xor" | "xnor" | "buf" | "not" | "bufif0"
+                | "bufif1" | "notif0" | "notif1" | "tran" | "tranif0" | "tranif1" | "rtran"
+                | "rtranif0" | "rtranif1" | "pullup" | "pulldown" => self.parse_gate_inst(),
                 // `specify ... endspecify` timing blocks: parse as a skipped node.
                 "specify" => {
                     self.builder.start_node(SyntaxKind::Specify);
@@ -522,16 +560,22 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// `wire [7:0] a = 0, b;` etc.
+    /// `wire [7:0] a = 0, b;` etc. SV modifiers (`var`/`const`/`rand`/`randc`,
+    /// `vectored`/`scalared`) may precede the type keyword.
     fn parse_decl(&mut self) {
         self.builder.start_node(SyntaxKind::Decl);
+        while self.at_kw("var")
+            || self.at_kw("const")
+            || self.at_kw("rand")
+            || self.at_kw("randc")
+            || self.at_kw("vectored")
+            || self.at_kw("scalared")
+        {
+            self.bump();
+        }
         self.bump(); // net/reg type keyword
-        loop {
-            if self.at_kw("signed") {
-                self.bump();
-            } else {
-                break;
-            }
+        while self.at_kw("signed") || self.at_kw("unsigned") {
+            self.bump();
         }
         self.parse_optional_range();
         loop {
@@ -558,7 +602,9 @@ impl<'a> Parser<'a> {
     fn parse_param_decl(&mut self) {
         self.builder.start_node(SyntaxKind::ParamDecl);
         self.bump(); // parameter/localparam
-        if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
+        if self.at_kw("type") {
+            self.bump(); // `parameter type T = ...`
+        } else if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
             self.bump();
         }
         // Optional range: `parameter [7:0] W = 8;`.
@@ -574,6 +620,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct('=', "in parameter declaration");
             self.parse_expression();
+            self.parse_optional_range(); // `parameter type T = logic [7:0]`
             if !self.eat_punct(',') {
                 break;
             }
@@ -582,14 +629,69 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// `assign [#delay] [(strengths)] lhs = [#delay] rhs;`
     fn parse_assign(&mut self) {
         self.builder.start_node(SyntaxKind::Assign);
         self.bump(); // `assign`
+        if self.at_punct('#') {
+            // `assign #5 a = b;` / `assign #(1,2,3) a = b;`
+            self.builder.start_node(SyntaxKind::Delay);
+            self.bump();
+            if self.eat_punct('(') {
+                loop {
+                    self.parse_expression();
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+                self.expect_punct(')', "to close the assign delay");
+            } else {
+                self.parse_primary();
+            }
+            self.builder.finish_node();
+        }
+        if self.at_punct('(') && self.peek2().kind == TokenKind::Ident && self.is_strength(1) {
+            // Drive strength list: `(strong1, pull0)`.
+            self.bump();
+            loop {
+                self.bump(); // strength name
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the strength list");
+        }
         self.parse_expression(); // lhs
         self.expect_punct('=', "in continuous assignment");
+        if self.at_punct('#') {
+            self.builder.start_node(SyntaxKind::Delay);
+            self.bump();
+            self.parse_primary();
+            self.builder.finish_node();
+        }
         self.parse_expression(); // rhs
         self.expect_punct(';', "to end the assignment");
         self.builder.finish_node();
+    }
+
+    /// Is the `ahead`-th non-trivia token one of the drive-strength keywords?
+    fn is_strength(&self, ahead: usize) -> bool {
+        let mut i = self.skip_trivia_from(self.pos);
+        for _ in 0..ahead {
+            i = self.skip_trivia_from(i + 1);
+        }
+        if i >= self.tokens.len() {
+            return false;
+        }
+        let t = &self.tokens[i];
+        if t.kind != TokenKind::Ident {
+            return false;
+        }
+        let text = &self.src.text()[t.span.start as usize..t.span.end as usize];
+        matches!(
+            text,
+            "strong0" | "strong1" | "pull0" | "pull1" | "weak0" | "weak1" | "highz0" | "highz1"
+        )
     }
 
     fn parse_always(&mut self) {
@@ -638,16 +740,28 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// `function [range] name; ... endfunction` (ports are `input` decls).
+    /// `function [automatic] [void|type] [range] name [(ports)] ; body endfunction`.
+    /// Ports may be ANSI-style `(input [7:0] a)` or plain `input a;` decls.
     fn parse_function(&mut self) {
         self.builder.start_node(SyntaxKind::Function);
         self.bump(); // function
-        if self.at_kw("integer")
+        if self.eat_kw("automatic") {
+        }
+        if self.at_kw("void") {
+            self.bump();
+        } else if self.at_kw("integer")
             || self.at_kw("reg")
             || self.at_kw("logic")
             || self.at_kw("wire")
             || self.at_kw("real")
             || self.at_kw("time")
+            || self.at_kw("bit")
+            || self.at_kw("byte")
+            || self.at_kw("shortint")
+            || self.at_kw("int")
+            || self.at_kw("longint")
+            || self.at_kw("string")
+            || self.at_kw("chandle")
         {
             self.bump();
         }
@@ -659,20 +773,24 @@ impl<'a> Parser<'a> {
         } else {
             self.error_here("expected function name");
         }
+        if self.eat_punct('(') {
+            // ANSI function port list.
+            while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                self.parse_port();
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the function port list");
+        }
         self.expect_punct(';', "after the function header");
         while !self.at_kw("endfunction") && self.peek().kind != TokenKind::Eof {
             if self.at_kw("input") || self.at_kw("output") || self.at_kw("inout") {
                 self.parse_port_decl_stmt();
-            } else if self.at_kw("reg")
-                || self.at_kw("logic")
-                || self.at_kw("integer")
-                || self.at_kw("real")
-                || self.at_kw("time")
-                || self.at_kw("genvar")
-            {
-                self.parse_decl();
+            } else if self.at_kw("parameter") || self.at_kw("localparam") {
+                self.parse_param_decl();
             } else {
-                self.parse_statement();
+                self.parse_decl_or_stmt();
             }
         }
         if !self.eat_kw("endfunction") {
@@ -681,14 +799,302 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// `task [automatic] name [(ports)]; decls/stmts endtask`.
+    fn parse_task(&mut self) {
+        self.builder.start_node(SyntaxKind::Task);
+        self.bump(); // task
+        self.eat_kw("automatic");
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        } else {
+            self.error_here("expected task name");
+        }
+        if self.eat_punct('(') {
+            while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                self.parse_port();
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the task port list");
+        }
+        self.expect_punct(';', "after the task header");
+        while !self.at_kw("endtask") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("input") || self.at_kw("output") || self.at_kw("inout") {
+                self.parse_port_decl_stmt();
+            } else {
+                self.parse_decl_or_stmt();
+            }
+        }
+        if !self.eat_kw("endtask") {
+            self.error_here("expected `endtask`");
+        }
+        self.builder.finish_node();
+    }
+
+    /// Decl keywords inside a task/function body vs. plain statements.
+    fn parse_decl_or_stmt(&mut self) {
+        let text = self.peek_text().to_string();
+        match text.as_str() {
+            "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" | "tri" | "tri0"
+            | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1" | "bit" | "byte"
+            | "shortint" | "int" | "longint" | "string" | "chandle" | "var" | "const" | "rand"
+            | "randc" | "vectored" | "scalared" => self.parse_decl(),
+            "parameter" | "localparam" => self.parse_param_decl(),
+            _ => self.parse_statement(),
+        }
+    }
+
+    /// `event a, b;`
+    fn parse_event_decl(&mut self) {
+        self.builder.start_node(SyntaxKind::EventDecl);
+        self.bump(); // event
+        loop {
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                self.error_here("expected an event name");
+                break;
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the event declaration");
+        self.builder.finish_node();
+    }
+
+    /// `defparam a.b.P = expr, ...;`
+    fn parse_defparam(&mut self) {
+        self.builder.start_node(SyntaxKind::Defparam);
+        self.bump(); // defparam
+        loop {
+            // Hierarchical parameter path.
+            self.builder.start_node(SyntaxKind::Name);
+            if self.peek().kind == TokenKind::Ident {
+                self.bump();
+                while self.at_punct('.') {
+                    self.bump();
+                    if self.peek().kind == TokenKind::Ident {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.builder.finish_node();
+            self.expect_punct('=', "in defparam");
+            self.parse_expression();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the defparam statement");
+        self.builder.finish_node();
+    }
+
+    /// `final` block — like `initial`, runs at the end of simulation.
+    fn parse_final(&mut self) {
+        self.builder.start_node(SyntaxKind::Final);
+        self.bump(); // final
+        self.parse_statement();
+        self.builder.finish_node();
+    }
+
+    /// `typedef [enum|struct|union ...] name;` — the type body is parsed as
+    /// EnumType/StructType when present.
+    fn parse_typedef(&mut self) {
+        self.builder.start_node(SyntaxKind::Typedef);
+        self.bump(); // typedef
+        if self.at_kw("enum") {
+            self.parse_enum_type();
+        } else if self.at_kw("struct") || self.at_kw("union") {
+            self.parse_struct_type();
+        } else if self.at_kw("bit")
+            || self.at_kw("logic")
+            || self.at_kw("reg")
+            || self.at_kw("byte")
+            || self.at_kw("shortint")
+            || self.at_kw("int")
+            || self.at_kw("longint")
+            || self.at_kw("integer")
+            || self.at_kw("real")
+            || self.at_kw("time")
+            || self.at_kw("string")
+            || self.at_kw("chandle")
+            || self.at_kw("event")
+        {
+            self.bump();
+            self.parse_optional_range();
+        } else if self.peek().kind == TokenKind::Ident {
+            // `typedef some_type name;` — copy of an existing type.
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            while self.at_punct('.') {
+                self.bump();
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.builder.finish_node();
+            self.parse_optional_range();
+        }
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        } else {
+            self.error_here("expected a typedef name");
+        }
+        self.expect_punct(';', "to end the typedef");
+        self.builder.finish_node();
+    }
+
+    /// `enum [base_type] { A = 0, B, ... }` — base type optional.
+    fn parse_enum_type(&mut self) {
+        self.builder.start_node(SyntaxKind::EnumType);
+        self.bump(); // enum
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump(); // base type
+            self.builder.finish_node();
+            self.parse_optional_range();
+        }
+        self.expect_punct('{', "to open the enum body");
+        loop {
+            if self.at_punct('}') || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                self.error_here("expected an enum literal");
+                break;
+            }
+            if self.eat_punct('=') {
+                self.parse_expression();
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct('}', "to close the enum body");
+        self.builder.finish_node();
+    }
+
+    /// `struct/union [packed] [signed] { field; ... }`
+    fn parse_struct_type(&mut self) {
+        let is_union = self.at_kw("union");
+        self.builder.start_node(SyntaxKind::StructType);
+        self.bump(); // struct | union
+        if is_union {
+            // keyword already consumed; `packed`/`signed` may follow either way
+        }
+        if self.eat_kw("packed") {
+        }
+        if self.eat_kw("signed") {
+        }
+        self.expect_punct('{', "to open the struct body");
+        loop {
+            if self.at_punct('}') || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            // One field: `[modifiers] type [range] name [, name]* ;`
+            while self.at_kw("rand") || self.at_kw("randc") || self.at_kw("const") {
+                self.bump();
+            }
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // field type
+            } else {
+                self.error_here("expected a field type");
+                break;
+            }
+            self.parse_optional_range();
+            loop {
+                if self.peek().kind == TokenKind::Ident {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    self.builder.finish_node();
+                } else {
+                    self.error_here("expected a field name");
+                    break;
+                }
+                self.parse_optional_range();
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(';', "to end the struct field");
+        }
+        self.expect_punct('}', "to close the struct body");
+        self.builder.finish_node();
+    }
+
+    /// Gate primitive instantiation: `and (o, a, b);`, `pullup (x);`,
+    /// optionally with a drive-strength pair `(strong1, pull0)`.
+    fn parse_gate_inst(&mut self) {
+        self.builder.start_node(SyntaxKind::Inst);
+        self.builder.start_node(SyntaxKind::Name);
+        self.bump(); // gate keyword
+        self.builder.finish_node();
+        if self.at_punct('(') && self.peek2().kind == TokenKind::Ident && self.is_strength(1) {
+            self.bump();
+            loop {
+                self.bump();
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the strength list");
+        }
+        // Optional instance name(s): `nand g1 [3:0] (n, a, b);`
+        while self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+            self.parse_optional_range();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct('(', "before the gate ports");
+        loop {
+            if self.at_punct(')') || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            self.parse_port_conn();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(')', "to close the gate ports");
+        self.expect_punct(';', "to end the gate instantiation");
+        self.builder.finish_node();
+    }
+
     fn parse_generate(&mut self) {
         self.builder.start_node(SyntaxKind::Generate);
         self.bump(); // generate
-        while !self.at_kw("endgenerate") && self.peek().kind != TokenKind::Eof {
+        while !self.at_kw("endgenerate")
+            && !self.at_kw("endmodule")
+            && self.peek().kind != TokenKind::Eof
+        {
             if self.at_kw("for") {
                 self.parse_gen_for();
             } else if self.at_kw("if") {
                 self.parse_gen_if();
+            } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
+                self.parse_gen_case();
+            } else if self.at_kw("begin") {
+                self.parse_gen_block();
             } else {
                 self.parse_module_item();
             }
@@ -697,6 +1103,108 @@ impl<'a> Parser<'a> {
             self.error_here("expected `endgenerate`");
         }
         self.builder.finish_node();
+    }
+
+    /// `begin : name module-items end` inside a generate region.
+    fn parse_gen_block(&mut self) {
+        self.builder.start_node(SyntaxKind::GenBlock);
+        self.bump(); // begin
+        if self.eat_punct(':') {
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            }
+        }
+        while !self.at_kw("end")
+            && !self.at_kw("endgenerate")
+            && !self.at_kw("endmodule")
+            && self.peek().kind != TokenKind::Eof
+        {
+            if self.at_kw("for") {
+                self.parse_gen_for();
+            } else if self.at_kw("if") {
+                self.parse_gen_if();
+            } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
+                self.parse_gen_case();
+            } else if self.at_kw("begin") {
+                self.parse_gen_block();
+            } else {
+                self.parse_module_item();
+            }
+        }
+        if !self.eat_kw("end") {
+            self.error_here("expected `end`");
+        }
+        self.builder.finish_node();
+    }
+
+    /// `case (expr) item: items... endcase` in a generate region. Item bodies
+    /// are module items; a new item starts at an expression or `default`.
+    fn parse_gen_case(&mut self) {
+        self.builder.start_node(SyntaxKind::GenCase);
+        self.bump(); // case/casez/casex
+        self.expect_punct('(', "after `case`");
+        self.parse_expression();
+        self.expect_punct(')', "to close the case expression");
+        loop {
+            if self.at_kw("endcase") || self.peek().kind == TokenKind::Eof {
+                break;
+            }
+            self.builder.start_node(SyntaxKind::CaseItem);
+            if self.at_kw("default") {
+                self.bump();
+            } else {
+                loop {
+                    self.parse_expression();
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(':', "before the generate case item body");
+            while !self.at_kw("endcase") && !self.at_gen_case_item_start() {
+                if self.peek().kind == TokenKind::Eof {
+                    break;
+                }
+                if self.at_kw("for") {
+                    self.parse_gen_for();
+                } else if self.at_kw("if") {
+                    self.parse_gen_if();
+                } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
+                    self.parse_gen_case();
+                } else if self.at_kw("begin") {
+                    self.parse_gen_block();
+                } else {
+                    self.parse_module_item();
+                }
+            }
+            self.builder.finish_node();
+        }
+        if !self.eat_kw("endcase") {
+            self.error_here("expected `endcase`");
+        }
+        self.builder.finish_node();
+    }
+
+    /// Heuristic: does the current position start a new generate-case item
+    /// (an expression label or `default`) rather than a module item?
+    fn at_gen_case_item_start(&self) -> bool {
+        if self.at_kw("default") {
+            return true;
+        }
+        // `begin` opens a named generate block in an item body, not a label.
+        if self.at_kw("begin") {
+            return false;
+        }
+        match self.peek().kind {
+            TokenKind::IntLiteral | TokenKind::RealLiteral | TokenKind::StrLiteral => true,
+            TokenKind::Ident => {
+                let t2 = self.peek2_text();
+                matches!(t2.as_str(), ":" | ",")
+            }
+            _ => false,
+        }
     }
 
     fn parse_gen_for(&mut self) {
@@ -867,6 +1375,152 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if text == "case" || text == "casez" || text == "casex" => {
                 self.parse_case();
             }
+            // Case qualifiers bind to the following case statement.
+            TokenKind::Ident if text == "unique" || text == "unique0" || text == "priority" => {
+                self.builder.start_node(SyntaxKind::Case);
+                while self.at_kw("unique")
+                    || self.at_kw("unique0")
+                    || self.at_kw("priority")
+                {
+                    self.bump();
+                }
+                self.parse_case_tail();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "while" => {
+                self.builder.start_node(SyntaxKind::While);
+                self.bump();
+                self.expect_punct('(', "after `while`");
+                self.parse_expression();
+                self.expect_punct(')', "to close the while condition");
+                self.parse_statement();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "repeat" => {
+                self.builder.start_node(SyntaxKind::Repeat);
+                self.bump();
+                self.expect_punct('(', "after `repeat`");
+                self.parse_expression();
+                self.expect_punct(')', "to close the repeat count");
+                self.parse_statement();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "forever" => {
+                self.builder.start_node(SyntaxKind::Forever);
+                self.bump();
+                self.parse_statement();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "do" => {
+                self.builder.start_node(SyntaxKind::DoWhile);
+                self.bump(); // do
+                self.parse_statement();
+                if !self.eat_kw("while") {
+                    self.error_here("expected `while` after a `do` body");
+                }
+                self.expect_punct('(', "after `while`");
+                self.parse_expression();
+                self.expect_punct(')', "to close the do-while condition");
+                self.expect_punct(';', "to end the do-while statement");
+                self.builder.finish_node();
+            }
+            // `wait (expr) stmt` — procedural wait on a condition.
+            TokenKind::Ident if text == "wait" => {
+                self.builder.start_node(SyntaxKind::Wait);
+                self.bump();
+                self.expect_punct('(', "after `wait`");
+                self.parse_expression();
+                self.expect_punct(')', "to close the wait condition");
+                self.parse_statement();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "disable" => {
+                self.builder.start_node(SyntaxKind::Disable);
+                self.bump();
+                if self.peek().kind == TokenKind::Ident {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    while self.at_punct('.') {
+                        self.bump();
+                        if self.peek().kind == TokenKind::Ident {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.builder.finish_node();
+                }
+                self.expect_punct(';', "to end the disable statement");
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "fork" => {
+                self.builder.start_node(SyntaxKind::ForkJoin);
+                self.bump(); // fork
+                if self.eat_punct(':') {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.builder.start_node(SyntaxKind::Name);
+                        self.bump();
+                        self.builder.finish_node();
+                    }
+                }
+                while !self.at_kw("join")
+                    && !self.at_kw("join_any")
+                    && !self.at_kw("join_none")
+                    && self.peek().kind != TokenKind::Eof
+                {
+                    self.parse_statement();
+                }
+                if !(self.eat_kw("join") || self.eat_kw("join_any") || self.eat_kw("join_none")) {
+                    self.error_here("expected `join`, `join_any`, or `join_none`");
+                }
+                self.builder.finish_node();
+            }
+            // SV immediate assertions: `assert (e) [else stmt];` etc.
+            TokenKind::Ident
+                if text == "assert" || text == "assume" || text == "cover" || text == "expect" =>
+            {
+                self.builder.start_node(SyntaxKind::SvaStmt);
+                self.bump();
+                if self.eat_kw("property") {
+                    // Deferred assertion: `assert property (@(posedge clk) e);`
+                    if self.eat_punct('(') {
+                        if !self.at_punct(')') {
+                            self.parse_expression();
+                        }
+                        self.expect_punct(')', "to close the property expression");
+                    }
+                } else if self.eat_punct('(') {
+                    if !self.at_punct(')') {
+                        self.parse_expression();
+                    }
+                    self.expect_punct(')', "to close the assertion condition");
+                }
+                if self.eat_kw("else") {
+                    // The else branch is a full statement and consumes its own `;`.
+                    self.parse_statement();
+                } else {
+                    self.expect_punct(';', "to end the assertion statement");
+                }
+                self.builder.finish_node();
+            }
+            // Event trigger: `-> name;` / `->> name;`.
+            TokenKind::Punct if text == "-" && self.peek2_text() == ">" => {
+                self.builder.start_node(SyntaxKind::Trigger);
+                self.bump(); // -
+                self.bump(); // >
+                if self.at_punct('>') {
+                    self.bump(); // ->>
+                }
+                if self.peek().kind == TokenKind::Ident {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    self.builder.finish_node();
+                } else {
+                    self.error_here("expected an event name after `->`");
+                }
+                self.expect_punct(';', "to end the event trigger");
+                self.builder.finish_node();
+            }
             // Module-level constructs are also legal inside generate blocks.
             TokenKind::Ident
                 if text == "always"
@@ -917,13 +1571,23 @@ impl<'a> Parser<'a> {
                 self.parse_statement(); // body
                 self.builder.finish_node();
             }
+            // `return [expr];` in functions.
+            TokenKind::Ident if text == "return" => {
+                self.builder.start_node(SyntaxKind::ReturnStmt);
+                self.bump();
+                if !self.at_punct(';') {
+                    self.parse_expression();
+                }
+                self.expect_punct(';', "to end the return statement");
+                self.builder.finish_node();
+            }
             TokenKind::SysTask => {
                 self.builder.start_node(SyntaxKind::SysCall);
                 self.bump();
                 if self.eat_punct('(') {
                     if !self.at_punct(')') {
                         loop {
-                            self.parse_expression();
+                            self.parse_call_arg();
                             if !self.eat_punct(',') {
                                 break;
                             }
@@ -980,10 +1644,19 @@ impl<'a> Parser<'a> {
 
     fn parse_case(&mut self) {
         self.builder.start_node(SyntaxKind::Case);
+        self.parse_case_tail();
+        self.builder.finish_node();
+    }
+
+    /// `case...endcase` with the Case node already open (qualifiers included).
+    fn parse_case_tail(&mut self) {
         self.bump(); // case/casez/casex
         self.expect_punct('(', "after `case`");
         self.parse_expression();
         self.expect_punct(')', "to close the case expression");
+        if self.eat_kw("inside") {
+            // SystemVerilog `case (expr) inside [...]`
+        }
         loop {
             if self.at_kw("endcase") || self.peek().kind == TokenKind::Eof {
                 break;
@@ -993,7 +1666,22 @@ impl<'a> Parser<'a> {
                 self.bump();
             } else {
                 loop {
-                    self.parse_expression();
+                    if self.at_punct('[') {
+                        // `case inside` pattern: `[lo:hi]` or `[a, b]`.
+                        self.bump();
+                        loop {
+                            self.parse_expression();
+                            if self.eat_punct(':') {
+                                self.parse_expression(); // range inside the pattern
+                            }
+                            if !self.eat_punct(',') {
+                                break;
+                            }
+                        }
+                        self.expect_punct(']', "to close the inside pattern");
+                    } else {
+                        self.parse_expression();
+                    }
                     if !self.eat_punct(',') {
                         break;
                     }
@@ -1006,7 +1694,8 @@ impl<'a> Parser<'a> {
         if !self.eat_kw("endcase") {
             self.error_here("expected `endcase`");
         }
-        self.builder.finish_node();
+        // No finish_node here: the caller (parse_case / qualifier arm) owns the
+        // Case node and closes it.
     }
 
     // ---- grammar: expressions ------------------------------------------------
@@ -1068,6 +1757,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) {
+        // Casts: `signed'(e)`, `unsigned'(e)`, and size casts `N'(e)`.
+        if (self.at_kw("signed") || self.at_kw("unsigned")) && self.peek2_text() == "'" {
+            self.builder.start_node(SyntaxKind::Cast);
+            self.bump();
+            self.bump(); // '
+            self.parse_unary();
+            self.builder.finish_node();
+            return;
+        }
+        if self.peek().kind == TokenKind::IntLiteral && self.peek2_text() == "'" {
+            self.builder.start_node(SyntaxKind::Cast);
+            self.bump();
+            self.bump(); // '
+            self.parse_unary();
+            self.builder.finish_node();
+            return;
+        }
         // Longest-match multi-char unary op first (`~&`, `~^`…), else single char.
         let op = self
             .peek_op3()
@@ -1099,7 +1805,9 @@ impl<'a> Parser<'a> {
             if self.at_punct('[') {
                 // Index or part-select.
                 let is_part = {
-                    let mut i = self.skip_trivia_from(self.pos + 1);
+                    // Start after the `[` itself: `pos` may still sit on trivia
+                    // preceding it, which would offset the depth scan.
+                    let mut i = self.skip_trivia_from(self.skip_trivia_from(self.pos) + 1);
                     let mut depth = 0;
                     let mut colon = false;
                     while i < self.tokens.len() {
@@ -1140,7 +1848,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if !self.at_punct(')') {
                     loop {
-                        self.parse_expression();
+                        self.parse_call_arg();
                         if !self.eat_punct(',') {
                             break;
                         }
@@ -1151,6 +1859,28 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+    }
+
+    /// One call argument: an expression, or a named argument `.name[(expr)]`.
+    fn parse_call_arg(&mut self) {
+        if self.at_punct('.') {
+            self.builder.start_node(SyntaxKind::PortConn);
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            }
+            if self.eat_punct('(') {
+                if !self.at_punct(')') {
+                    self.parse_expression();
+                }
+                self.expect_punct(')', "to close the named argument");
+            }
+            self.builder.finish_node();
+        } else {
+            self.parse_expression();
         }
     }
 
@@ -1357,8 +2087,253 @@ endmodule
             "`timescale 1ns/1ps\nmodule m;endmodule",
             "always @* begin if end",
             "assign = = =;",
+            "task",
+            "fork",
+            "fork begin end",
+            "while (",
+            "do",
+            "->",
+            "defparam",
+            "typedef enum",
+            "module m; and; endmodule",
+            "module m; assert; endmodule",
+            "module m; wait; endmodule",
         ] {
             let _ = parse_str(src);
         }
+    }
+
+    /// Parse and assert zero error diagnostics; returns the s-expression.
+    fn ok(src: &str) -> String {
+        let (p, db) = parse_str(src);
+        let errs: Vec<_> = p
+            .diags
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "{}\n{}",
+            errs.iter()
+                .map(|d| d.render(&db))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            src
+        );
+        assert_eq!(p.root.text(&db), src, "tree must be lossless");
+        p.root.debug_sexp(&db)
+    }
+
+    #[test]
+    fn parses_task_disable_and_wait() {
+        let sexp = ok(r#"module m;
+task automatic tsk(input [7:0] d, output reg [7:0] q);
+  q = d;
+endtask
+initial begin
+  wait (ready);
+  tsk(.d(8'h01), .q(q));
+  disable tsk;
+end
+endmodule
+"#);
+        assert!(sexp.contains("(Task"), "{}", sexp);
+        assert!(sexp.contains("(Disable"), "{}", sexp);
+        assert!(sexp.contains("(Wait"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_while_repeat_forever_do_while() {
+        let sexp = ok(r#"module m;
+initial begin
+  while (i < 10) i = i + 1;
+  repeat (4) j = j + 1;
+  forever begin #10 clk = ~clk; end
+  do k = k - 1; while (k > 0);
+end
+endmodule
+"#);
+        for node in ["(While", "(Repeat", "(Forever", "(DoWhile"] {
+            assert!(sexp.contains(node), "{} missing in {}", node, sexp);
+        }
+    }
+
+    #[test]
+    fn parses_fork_join_variants() {
+        let sexp = ok(r#"module m;
+initial begin
+  fork : par
+    a = 1;
+    b = 2;
+  join
+  fork
+    c = 3;
+  join_any
+  fork
+    d = 4;
+  join_none
+end
+endmodule
+"#);
+        assert_eq!(sexp.matches("(ForkJoin").count(), 3, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_event_decl_and_triggers() {
+        let sexp = ok(r#"module m;
+event ev;
+initial begin
+  -> ev;
+  ->> ev2;
+end
+endmodule
+"#);
+        assert!(sexp.contains("(EventDecl"), "{}", sexp);
+        assert_eq!(sexp.matches("(Trigger").count(), 2, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_defparam_and_final() {
+        let sexp = ok(r#"module m;
+  defparam u0.WIDTH = 16, u1.DEPTH = 4;
+  final $display("done");
+endmodule
+"#);
+        assert!(sexp.contains("(Defparam"), "{}", sexp);
+        assert!(sexp.contains("(Final"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_generate_case_and_named_block() {
+        let sexp = ok(r#"module m(input [1:0] sel);
+generate
+  case (sel)
+    2'd0: begin : low
+      assign y = a;
+    end
+    default: begin : high
+      assign y = b;
+    end
+  endcase
+endgenerate
+endmodule
+"#);
+        assert!(sexp.contains("(GenCase"), "{}", sexp);
+        assert_eq!(sexp.matches("(GenBlock").count(), 2, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_gate_primitives_with_strength() {
+        let sexp = ok(r#"module m(input a, b, output o);
+  and (o, a, b);
+  nand (strong1, pull0) g1 (n, a, b);
+  pullup (o);
+  bufif1 (t, a, en);
+endmodule
+"#);
+        assert_eq!(sexp.matches("(Inst").count(), 4, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_typedef_enum_and_struct() {
+        let sexp = ok(r#"module m;
+typedef enum logic [1:0] { IDLE = 0, RUN = 1, DONE = 2 } state_t;
+typedef struct packed signed {
+  logic [7:0] hi;
+  logic [7:0] lo;
+} pair_t;
+typedef logic [15:0] word_t;
+endmodule
+"#);
+        assert!(sexp.contains("(EnumType"), "{}", sexp);
+        assert_eq!(sexp.matches("(StructType").count(), 1, "{}", sexp);
+        assert_eq!(sexp.matches("(Typedef").count(), 3, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_casts_in_expressions() {
+        let sexp = ok(r#"module m;
+  assign a = signed'(b) + 8'(c) + unsigned'(d);
+endmodule
+"#);
+        assert_eq!(sexp.matches("(Cast").count(), 3, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_case_qualifiers_and_inside() {
+        let sexp = ok(r#"module m;
+always @* begin
+  priority case (x)
+    0: y = 1;
+    default: y = 0;
+  endcase
+  unique case (z) inside
+    [0:3]: y = 1;
+    default: y = 0;
+  endcase
+end
+endmodule
+"#);
+        assert_eq!(sexp.matches("(Case ").count(), 2, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_sva_immediate_assertions() {
+        let sexp = ok(r#"module m;
+always @(posedge clk) begin
+  assert (cnt < 100) else $error("overflow");
+  assume (req | !grant);
+  cover (a && b);
+end
+endmodule
+"#);
+        assert_eq!(sexp.matches("(SvaStmt").count(), 3, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_assign_with_delay_and_strength() {
+        let sexp = ok(r#"module m;
+  assign #5 a = b;
+  assign (strong1, pull0) c = d;
+  assign e = #10 f;
+endmodule
+"#);
+        assert_eq!(sexp.matches("(Assign").count(), 3, "{}", sexp);
+        assert_eq!(sexp.matches("(Delay").count(), 2, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_function_with_ansi_ports_and_param_type() {
+        let sexp = ok(r#"module m;
+  parameter type T = logic [7:0];
+  function automatic logic [7:0] f(input logic [7:0] a, input int b);
+    logic [7:0] tmp;
+    tmp = a + b;
+    return tmp;
+  endfunction
+endmodule
+"#);
+        assert!(sexp.contains("(Function"), "{}", sexp);
+        assert!(sexp.contains("(Port"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_sv_variable_modifiers_and_types() {
+        let sexp = ok(r#"module m;
+  bit [3:0] nib;
+  string s;
+  var int v;
+  const int C = 3;
+  rand reg [7:0] r;
+  randc int rc;
+endmodule
+"#);
+        assert_eq!(sexp.matches("(Decl").count(), 6, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_escaped_identifiers() {
+        let sexp = ok("module m; wire \\a+b ; assign \\a+b = 1'b0; endmodule\n");
+        assert!(sexp.contains("\\a+b"), "{}", sexp);
     }
 }
