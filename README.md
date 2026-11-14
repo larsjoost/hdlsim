@@ -1,5 +1,7 @@
 # hdlsim
 
+[![CI](https://github.com/larsjoost/hdlsim/actions/workflows/ci.yml/badge.svg)](https://github.com/larsjoost/hdlsim/actions/workflows/ci.yml)
+
 A self-contained VHDL + Verilog simulator written in std-only Rust — no external
 crates, and no wrapping of GHDL, Icarus Verilog, Verilator, or any other existing
 simulator. Lexers, parsers, library manager, elaboration, simulation kernel, and

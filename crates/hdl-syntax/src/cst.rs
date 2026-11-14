@@ -86,6 +86,35 @@ impl SyntaxNode {
     pub fn child(&self, kind: SyntaxKind) -> Option<SyntaxNode> {
         self.children().find(|c| c.kind() == kind)
     }
+
+    /// Compact s-expression dump, e.g. `(Module (Name "m") ...)`. Whitespace and
+    /// comments are omitted. Used by golden tests and `--dump` output.
+    pub fn debug_sexp(&self, db: &SourceDb) -> String {
+        let mut out = String::new();
+        self.write_sexp(db, &mut out);
+        out
+    }
+
+    fn write_sexp(&self, db: &SourceDb, out: &mut String) {
+        if self.green.children.is_empty() {
+            // Leaf token.
+            let text = db.span_text(self.span);
+            let text = text.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("{:?} \"{}\"", self.kind(), text));
+            return;
+        }
+        out.push_str(&format!("({:?}", self.kind()));
+        for child in self.children() {
+            match child.kind() {
+                SyntaxKind::Whitespace | SyntaxKind::Comment => continue,
+                _ => {
+                    out.push(' ');
+                    child.write_sexp(db, out);
+                }
+            }
+        }
+        out.push(')');
+    }
 }
 
 pub struct Children {

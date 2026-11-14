@@ -5,3 +5,5 @@
 //! not by forking this module.
 
 pub mod lexer;
+pub mod parser;
+pub mod preproc;

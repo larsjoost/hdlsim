@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: fmt + build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # The workspace has zero external dependencies, so no network fetch of
+      # crates is needed; --offline proves that.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Build (debug)
+        run: cargo build --offline
+
+      - name: Run tests
+        run: cargo test --offline
+
+      - name: Build release binary and smoke-test it
+        run: |
+          cargo build --release --offline
+          ./target/release/hdlsim --help

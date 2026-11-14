@@ -29,6 +29,66 @@ pub enum SyntaxKind {
     Root,
     /// A token the parser could not place into the grammar (recovery node).
     ErrorToken,
+
+    // --- verilog declarations and module structure ---
+    Module,
+    PortList,
+    Port,
+    /// `wire`/`reg`/`logic`/`integer`/`real`/`genvar` declaration.
+    Decl,
+    /// `[msb:lsb]` or `[width]` range.
+    Range,
+    /// `parameter`/`localparam` declaration.
+    ParamDecl,
+    /// Continuous `assign`.
+    Assign,
+    /// `always` block, optionally with a `@(...)` sensitivity list.
+    Always,
+    /// The `@(...)` sensitivity list of an `always` block.
+    SensList,
+    Initial,
+    Function,
+    Generate,
+    GenFor,
+    GenIf,
+    GenBlock,
+    /// Module instantiation (`foo bar (...)`).
+    Inst,
+    /// One port connection in an instantiation (`.name(expr)` or positional).
+    PortConn,
+
+    // --- verilog statements ---
+    /// Begin/end or single statement.
+    Block,
+    If,
+    Case,
+    CaseItem,
+    /// Blocking (`=`) or non-blocking (`<=`) procedural assignment.
+    StmtAssign,
+    /// `#delay` prefix.
+    Delay,
+    /// System task call (`$display(...)`).
+    SysCall,
+
+    // --- verilog expressions ---
+    BinExpr,
+    UnaryExpr,
+    /// `cond ? a : b`.
+    CondExpr,
+    /// `f(args)` — function call or system function.
+    Call,
+    /// `{a, b, c}` concatenation.
+    Concat,
+    /// `{n{expr}}` replication.
+    Replicate,
+    /// `expr[msb:lsb]` part-select.
+    PartSelect,
+    /// `expr[idx]` indexing.
+    Index,
+    /// A (possibly dotted/hierarchical) name.
+    Name,
+    /// Any literal.
+    Literal,
 }
 
 impl SyntaxKind {
@@ -62,6 +122,47 @@ impl SyntaxKind {
                 | SyntaxKind::Comment
                 | SyntaxKind::Error
                 | SyntaxKind::Eof
+        )
+    }
+
+    /// Whether this kind is a verilog node (used by AST views and golden dumps).
+    pub fn is_verilog_node(self) -> bool {
+        matches!(
+            self,
+            SyntaxKind::Module
+                | SyntaxKind::PortList
+                | SyntaxKind::Port
+                | SyntaxKind::Decl
+                | SyntaxKind::Range
+                | SyntaxKind::ParamDecl
+                | SyntaxKind::Assign
+                | SyntaxKind::Always
+                | SyntaxKind::SensList
+                | SyntaxKind::Initial
+                | SyntaxKind::Function
+                | SyntaxKind::Generate
+                | SyntaxKind::GenFor
+                | SyntaxKind::GenIf
+                | SyntaxKind::GenBlock
+                | SyntaxKind::Inst
+                | SyntaxKind::PortConn
+                | SyntaxKind::Block
+                | SyntaxKind::If
+                | SyntaxKind::Case
+                | SyntaxKind::CaseItem
+                | SyntaxKind::StmtAssign
+                | SyntaxKind::Delay
+                | SyntaxKind::SysCall
+                | SyntaxKind::BinExpr
+                | SyntaxKind::UnaryExpr
+                | SyntaxKind::CondExpr
+                | SyntaxKind::Call
+                | SyntaxKind::Concat
+                | SyntaxKind::Replicate
+                | SyntaxKind::PartSelect
+                | SyntaxKind::Index
+                | SyntaxKind::Name
+                | SyntaxKind::Literal
         )
     }
 }
