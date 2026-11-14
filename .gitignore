@@ -2,4 +2,3 @@
 .hdlsim-cache/
 *.vcd
 *.hwf
-Cargo.lock

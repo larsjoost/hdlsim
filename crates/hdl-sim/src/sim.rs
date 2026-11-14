@@ -90,6 +90,9 @@ pub struct Simulator {
     waiting: Vec<(u32, Vec<(FlatSigId, EdgeKind)>)>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
     rng: std::cell::Cell<u64>,
+    /// External stop request (e.g. the live wave window's Stop button):
+    /// checked once per event-loop iteration in `run`.
+    stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Simulator {
@@ -124,6 +127,7 @@ impl Simulator {
             finished: false,
             stopped: false,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
+            stop_flag: None,
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -159,6 +163,12 @@ impl Simulator {
             let _ = i;
         }
         sim
+    }
+
+    /// Install an external stop flag (e.g. the live wave window's Stop
+    /// button): when set, `run` finishes at the next loop iteration.
+    pub fn set_stop_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.stop_flag = Some(flag);
     }
 
     pub fn add_observer(&mut self, o: Box<dyn Observer>) {
@@ -201,6 +211,12 @@ impl Simulator {
         loop {
             if self.finished || self.stopped {
                 break;
+            }
+            if let Some(f) = &self.stop_flag {
+                if f.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.finished = true;
+                    break;
+                }
             }
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
@@ -261,6 +277,9 @@ impl Simulator {
         }
         if self.finished {
             self.emit(SimEvent::Finish { time_fs: self.time });
+        }
+        for o in &mut self.observers {
+            o.on_finish();
         }
     }
 

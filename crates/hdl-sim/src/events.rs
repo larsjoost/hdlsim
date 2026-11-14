@@ -38,6 +38,8 @@ pub enum SimEvent {
 /// [`crate::Simulator::add_observer`]. See `docs/extensibility.md`.
 pub trait Observer {
     fn on_event(&mut self, ev: &SimEvent);
+    /// Called once after `Simulator::run` returns — sinks flush output here.
+    fn on_finish(&mut self) {}
 }
 
 /// A no-op observer, useful as a base and in tests.

@@ -1,0 +1,41 @@
+# GitLab CI mirror of .github/workflows/ci.yml — the workspace has zero
+# external dependencies, so every cargo invocation uses --offline (which also
+# proves no network fetch of crates is needed). Cargo.lock is committed, so
+# builds are reproducible.
+
+stages:
+  - test
+
+variables:
+  CARGO_TERM_COLOR: always
+
+.rust-job:
+  image: rust:latest
+  before_script:
+    # rust:latest does not always ship rustfmt; make sure it is present.
+    - rustup component add rustfmt || true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+fmt:
+  extends: .rust-job
+  stage: test
+  script:
+    - cargo fmt --check
+
+build-and-test:
+  extends: .rust-job
+  stage: test
+  script:
+    - cargo build --offline
+    - cargo test --offline
+
+release-smoke:
+  extends: .rust-job
+  stage: test
+  script:
+    - cargo build --release --offline
+    - ./target/release/hdlsim --help
+    # smoke: simulate both example testbenches (VHDL + Verilog)
+    - ./target/release/hdlsim run --top tb_counter --max-time 1us examples/vhdl-counter/counter.vhd examples/vhdl-counter/tb_counter.vhd | grep -q PASS
+    - ./target/release/hdlsim run --top tb_counter --max-time 1us examples/counter/counter.v examples/counter/tb_counter.v | grep -q PASS
