@@ -101,6 +101,7 @@ hdlsim debug --top tb --dump                 # dump the elaborated design (signa
 hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
 hdlsim regress --junit results.xml --list tests.txt  # run many testbenches, JUnit XML report
+hdlsim lsp                                   # LSP server on stdio (live parse diagnostics)
 ```
 
 `hdlsim regress` runs each test as its own simulation (fresh design per test)
