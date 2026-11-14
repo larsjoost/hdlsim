@@ -599,7 +599,8 @@ impl<'a> Lower<'a> {
 
     fn lower_type_decl(&mut self, d: &SyntaxNode) {
         let kids = real_children(d);
-        let Some(name_node) = kids.iter().find(|k| k.kind() == SyntaxKind::Ident) else {
+        // kids[0] is the `type` keyword; the name is the next ident.
+        let Some(name_node) = kids.iter().filter(|k| k.kind() == SyntaxKind::Ident).nth(1) else {
             return;
         };
         let name = self.kw(name_node);
@@ -623,14 +624,17 @@ impl<'a> Lower<'a> {
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "array")
         {
             let range = kids.iter().find(|k| k.kind() == SyntaxKind::Range);
-            let elem = kids
-                .iter()
-                .rev()
-                .find(|k| k.kind() == SyntaxKind::Name)
-                .cloned();
+            let elem_pos = kids.iter().rposition(|k| k.kind() == SyntaxKind::Name);
+            let elem = elem_pos.map(|i| kids[i].clone());
+            // Element constraint, if any: `... of std_logic_vector(31 downto 0)`.
+            let elem_constraint = elem_pos.and_then(|i| {
+                kids.iter()
+                    .skip(i + 1)
+                    .find(|k| k.kind() == SyntaxKind::Range)
+            });
             let depth = range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1);
             let (ew, _, _) = match elem {
-                Some(e) => self.resolve_type(&e, None, d.span()),
+                Some(e) => self.resolve_type(&e, elem_constraint, d.span()),
                 None => (8, false, None),
             };
             self.types.insert(name, TypeInfo::Array { elem: ew, depth });
@@ -647,9 +651,11 @@ impl<'a> Lower<'a> {
 
     fn lower_subtype_decl(&mut self, d: &SyntaxNode) {
         let kids = real_children(d);
+        // kids[0] is the `subtype` keyword; the name is the next ident.
         let name = kids
             .iter()
-            .find(|k| k.kind() == SyntaxKind::Ident)
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .nth(1)
             .map(|k| self.kw(k));
         let Some(name) = name else { return };
         // `subtype s is base [(constraint)] [range ...]`
@@ -1031,14 +1037,10 @@ impl<'a> Lower<'a> {
             let is_others = ik.iter().any(|k| k.kind() == SyntaxKind::Others);
             let conds: Vec<Expr> = ik
                 .iter()
-                .filter(|k| is_expr_node(k.kind()))
+                .filter(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Others)
                 .map(|k| self.lower_expr(k, &self.consts.clone()))
                 .collect();
-            let body_node = ik.iter().find(|k| is_stmt_node(k.kind()));
-            let body = match body_node {
-                Some(b) => self.lower_seq_block(b),
-                None => Stmt::Null,
-            };
+            let body = self.lower_seq_block(item);
             if is_others {
                 default = Some(Box::new(body));
             } else {
@@ -1357,11 +1359,16 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::Call => self.lower_call(e, env),
             SyntaxKind::PartSelect => {
-                // name ( msb dir lsb )
+                // name ( msb dir lsb ) — the base name is not a bound expr.
                 let kids = real_children(e);
-                let base = kids.iter().find(|k| k.kind() == SyntaxKind::Name);
-                let exprs: Vec<&SyntaxNode> =
-                    kids.iter().filter(|k| is_expr_node(k.kind())).collect();
+                let base_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+                let base = base_pos.map(|i| &kids[i]);
+                let exprs: Vec<&SyntaxNode> = kids
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, k)| Some(*i) != base_pos && is_expr_node(k.kind()))
+                    .map(|(_, k)| k)
+                    .collect();
                 if exprs.len() < 2 {
                     return Expr::Lit(Value::x(1));
                 }

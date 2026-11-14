@@ -498,6 +498,10 @@ impl<'a> Parser<'a> {
             }
             self.expect_kw("of", "in the array type");
             self.parse_type_mark();
+            if self.at_punct('(') {
+                // Constrained element type: `... of std_logic_vector(31 downto 0)`.
+                self.parse_constraint();
+            }
         } else if self.at_kw("record") {
             self.skip_balanced_until_end("record");
         } else {

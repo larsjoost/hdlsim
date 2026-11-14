@@ -981,6 +981,37 @@ impl Simulator {
                     let w = lv.width().max(rv.width()).max(1);
                     let l2 = sign_extend(&lv, w);
                     let r2 = sign_extend(&rv, w);
+                    // Comparisons must be signed; arithmetic is two's
+                    // complement so the unsigned binop is exact for it.
+                    if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                        let to_i = |v: &Value| -> Option<i128> {
+                            if !v.is_known() {
+                                return None;
+                            }
+                            let mut x: i128 = 0;
+                            for (i, &b) in v.bits.iter().enumerate() {
+                                if b == V1 {
+                                    x |= 1 << i;
+                                }
+                            }
+                            if w < 128 && v.bit(w - 1) == V1 {
+                                x |= -1i128 << w; // sign bit
+                            }
+                            Some(x)
+                        };
+                        return match (to_i(&l2), to_i(&r2)) {
+                            (Some(a), Some(b)) => Value::from_u64(
+                                1,
+                                match op {
+                                    BinOp::Lt => a < b,
+                                    BinOp::Le => a <= b,
+                                    BinOp::Gt => a > b,
+                                    _ => a >= b,
+                                } as u64,
+                            ),
+                            _ => Value::x(1),
+                        };
+                    }
                     return l2.binop(*op, &r2);
                 }
                 lv.binop(*op, &rv)
