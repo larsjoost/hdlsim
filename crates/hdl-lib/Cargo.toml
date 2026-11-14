@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 hdl-syntax = { path = "../hdl-syntax" }
+hdl-ir = { path = "../hdl-ir" }

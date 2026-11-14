@@ -73,12 +73,91 @@ pub struct Flat {
 
 /// Elaborate `design` with `top` as the root. Params use defaults (overrides are
 /// applied per-instance during instantiation by the lowerer).
-pub fn elaborate(design: &Design, top: &str) -> Result<Flat, String> {
+/// Elaboration errors. `UnknownUnit` is retryable: a [`UnitResolver`] may load
+/// the missing unit and elaboration restarts.
+#[derive(Debug)]
+pub enum ElabError {
+    /// A design unit referenced by an instantiation is not compiled yet.
+    UnknownUnit { name: String, where_: String },
+    /// Any other elaboration failure.
+    Message(String),
+}
+
+impl std::fmt::Display for ElabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElabError::UnknownUnit { name, where_ } => {
+                write!(f, "{}: unknown design unit '{}'", where_, name)
+            }
+            ElabError::Message(m) => write!(f, "{}", m),
+        }
+    }
+}
+
+impl std::error::Error for ElabError {}
+
+/// Resolution seam: when elaboration meets a design unit that is not in the
+/// `Design` yet, it asks the resolver to compile/load it into `design`
+/// (e.g. by searching libraries). Returns `Ok(true)` if the unit is now
+/// available and elaboration should retry.
+pub trait UnitResolver {
+    fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String>;
+}
+
+/// Resolver that never loads anything (all units must be compiled up front).
+struct NoResolver;
+
+impl UnitResolver for NoResolver {
+    fn resolve(&mut self, _design: &mut Design, _name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+pub fn elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
+    let mut d = design.clone();
+    elaborate_with(&mut d, top, &mut NoResolver)
+}
+
+/// Elaborate `top`, loading missing design units through `resolver` on demand.
+pub fn elaborate_with(
+    design: &mut Design,
+    top: &str,
+    resolver: &mut dyn UnitResolver,
+) -> Result<Flat, ElabError> {
+    let mut tried: Vec<String> = Vec::new();
+    loop {
+        match try_elaborate(design, top) {
+            Ok(f) => return Ok(f),
+            Err(ElabError::UnknownUnit { name, .. }) => {
+                if tried.iter().any(|t| *t == name) {
+                    return Err(ElabError::Message(format!(
+                        "dependency cycle involving '{}'",
+                        name
+                    )));
+                }
+                tried.push(name.clone());
+                if resolver
+                    .resolve(design, &name)
+                    .map_err(ElabError::Message)?
+                {
+                    continue;
+                }
+                return Err(ElabError::UnknownUnit {
+                    name,
+                    where_: "top".to_string(),
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
     let top_id = design
         .modules
         .iter()
         .position(|m| m.name == top)
-        .ok_or_else(|| format!("top module '{}' not found", top))?;
+        .ok_or_else(|| ElabError::Message(format!("top module '{}' not found", top)))?;
     let mut f = Flat::default();
     let root = f.new_scope("", None);
     f.top_scope = root;
@@ -126,7 +205,7 @@ impl Flat {
         prefix: &str,
         params: &HashMap<String, Value>,
         conns: &[Conn],
-    ) -> Result<Vec<FlatSigId>, String> {
+    ) -> Result<Vec<FlatSigId>, ElabError> {
         let m = &design.modules[mod_id];
         let where_ = if prefix.is_empty() {
             m.name.clone()
@@ -172,7 +251,10 @@ impl Flat {
         for (i, port) in m.ports.iter().enumerate() {
             let conn = conn_for(conns, &m.ports, i);
             let Some(conn) = conn else {
-                return Err(format!("{}: port '{}' not connected", where_, port.name));
+                return Err(ElabError::Message(format!(
+                    "{}: port '{}' not connected",
+                    where_, port.name
+                )));
             };
             let expr = conn.clone();
             match (&expr, port.dir) {
@@ -256,7 +338,10 @@ impl Flat {
                 .modules
                 .iter()
                 .position(|mm| mm.name == inst.module)
-                .ok_or_else(|| format!("{}: unknown module '{}'", where_, inst.module))?;
+                .ok_or_else(|| ElabError::UnknownUnit {
+                    name: inst.module.clone(),
+                    where_: where_.clone(),
+                })?;
             let child_prefix = if prefix.is_empty() {
                 inst.name.clone()
             } else {

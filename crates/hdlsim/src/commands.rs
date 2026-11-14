@@ -1,11 +1,16 @@
 //! Subcommand registry — the CLI extension seam.
 //!
-//! Each subcommand is a module implementing [`Command`] and registered in
-//! [`COMMANDS`]. `dispatch` looks the first argument up in the registry.
+//! Each subcommand is a module under `commands/` implementing [`Command`] and
+//! registered in [`COMMANDS`]. `dispatch` looks the first argument up in the
+//! registry. Shared flags (`-L`, `--config`, `-I`) are parsed once in
+//! [`extract_common`] and turned into a `LibraryManager` by [`build_manager`].
 
-use crate::compile;
-use hdl_ir::elab;
-use hdl_sim::{Observer, SimEvent, Simulator};
+mod ast;
+mod check;
+mod init;
+mod run;
+
+use hdl_lib::LibraryManager;
 use std::path::PathBuf;
 
 /// Extension seam: implement for a new subcommand, add one entry to [`COMMANDS`].
@@ -32,114 +37,86 @@ impl Command for Help {
         for c in COMMANDS {
             println!("  {:<12} {}", c.name(), c.about());
         }
+        println!("common flags: -L name=path   map a logical library to a directory");
+        println!("              --config FILE  library config (default: ./hdlsim.ini if present)");
+        println!("              -I DIR         add an `include search directory");
         Ok(0)
     }
 }
 
-/// Prints `$display`/`report` messages to stdout, like a simulator transcript.
-struct Transcript;
-
-impl Observer for Transcript {
-    fn on_event(&mut self, ev: &SimEvent) {
-        if let SimEvent::Message { text, .. } = ev {
-            print!("{}", text);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-    }
+/// Library/include options shared by `run`, `check`, and future commands.
+#[derive(Default)]
+pub struct CommonOpts {
+    pub libs: Vec<(String, PathBuf)>,
+    pub config: Option<PathBuf>,
+    pub incdirs: Vec<PathBuf>,
 }
 
-struct Run;
+/// Split `args` into common library flags and the rest.
+pub fn extract_common(args: &[String]) -> Result<(CommonOpts, Vec<String>), String> {
+    let mut opts = CommonOpts::default();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-L" | "--lib" => {
+                let v = args.get(i + 1).ok_or("-L needs a name=path value")?;
+                let (n, p) = parse_lib_mapping(v)?;
+                opts.libs.push((n, p));
+                i += 2;
+            }
+            "--config" => {
+                opts.config = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--config needs a value")?,
+                ));
+                i += 2;
+            }
+            "-I" | "--incdir" => {
+                opts.incdirs
+                    .push(PathBuf::from(args.get(i + 1).ok_or("-I needs a value")?));
+                i += 2;
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    Ok((opts, rest))
+}
 
-impl Command for Run {
-    fn name(&self) -> &'static str {
-        "run"
+/// Parse a `name=path` library mapping (`-L work=./rtl`).
+pub fn parse_lib_mapping(v: &str) -> Result<(String, PathBuf), String> {
+    let (n, p) = v
+        .split_once('=')
+        .ok_or_else(|| format!("-L expects name=path, got '{}'", v))?;
+    if n.is_empty() || p.is_empty() {
+        return Err(format!("-L expects name=path, got '{}'", v));
     }
-    fn about(&self) -> &'static str {
-        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--max-time 10us]"
+    Ok((n.to_string(), PathBuf::from(p)))
+}
+
+/// Build a `LibraryManager` from common options: config file (explicit
+/// `--config`, else `./hdlsim.ini` if it exists), then `-L` mappings, then `-I`.
+pub fn build_manager(opts: &CommonOpts) -> Result<LibraryManager, String> {
+    let mut mgr = LibraryManager::new();
+    let config = match &opts.config {
+        Some(c) => Some(c.clone()),
+        None => {
+            let default = PathBuf::from("hdlsim.ini");
+            default.is_file().then_some(default)
+        }
+    };
+    if let Some(c) = &config {
+        mgr.load_config(c)?;
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut top: Option<String> = None;
-        let mut vcd: Option<PathBuf> = None;
-        let mut max_time_fs = u64::MAX;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--top" => {
-                    top = Some(args.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--vcd" => {
-                    vcd = Some(PathBuf::from(args.get(i + 1).ok_or("--vcd needs a value")?));
-                    i += 2;
-                }
-                "--max-time" => {
-                    let v = args.get(i + 1).ok_or("--max-time needs a value")?;
-                    max_time_fs = parse_time(v)?;
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        if files.is_empty() {
-            return Err("no input files".to_string());
-        }
-        let compiled = compile::compile_paths(&files);
-        if compiled.has_errors() {
-            eprint!("{}", compiled.render_diags());
-            return Ok(1);
-        }
-        if !compiled.diags.is_empty() {
-            eprint!("{}", compiled.render_diags());
-        }
-        let top_name = match top {
-            Some(t) => t,
-            None => {
-                if compiled.design.modules.len() == 1 {
-                    compiled.design.modules[0].name.clone()
-                } else {
-                    let names: Vec<&str> = compiled
-                        .design
-                        .modules
-                        .iter()
-                        .map(|m| m.name.as_str())
-                        .collect();
-                    return Err(format!(
-                        "multiple modules ({}); pick one with --top",
-                        names.join(", ")
-                    ));
-                }
-            }
-        };
-        let flat = elab::elaborate(&compiled.design, &top_name)
-            .map_err(|e| format!("elaboration error: {}", e))?;
-        let mut sim = Simulator::new(flat);
-        sim.add_observer(Box::new(Transcript));
-        if let Some(path) = vcd {
-            let file = std::fs::File::create(&path)
-                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
-            let sink = hdl_wave::sinks::vcd::VcdSink::new(file, sim.flat());
-            sim.add_observer(Box::new(hdl_wave::SinkAdapter {
-                sink,
-                flat: sim.flat().clone(),
-            }));
-        }
-        sim.run(max_time_fs);
-        println!(
-            "hdlsim: simulation stopped at t={} fs ({} signals, {} processes)",
-            sim.time(),
-            sim.flat().signals.len(),
-            sim.flat().procs.len()
-        );
-        Ok(0)
+    for (name, path) in &opts.libs {
+        mgr.add_library_dir(name, path);
     }
+    for d in &opts.incdirs {
+        mgr.add_incdir(d.clone());
+    }
+    Ok(mgr)
 }
 
 /// Parse a time like `100ns`, `10us`, `1ms`, `500` (bare = ns) into femtoseconds.
@@ -162,7 +139,7 @@ pub fn parse_time(s: &str) -> Result<u64, String> {
 }
 
 /// Registry of all subcommands. Add one line per new command.
-pub const COMMANDS: &[&dyn Command] = &[&Help, &Run];
+pub const COMMANDS: &[&dyn Command] = &[&Help, &run::Run, &check::Check, &ast::Ast, &init::Init];
 
 /// Dispatch `args` (without the binary name) to a registered command.
 pub fn dispatch(args: &[String]) -> Result<i32, String> {
@@ -201,5 +178,24 @@ mod tests {
         assert_eq!(parse_time("2ms").unwrap(), 2_000_000_000_000);
         assert_eq!(parse_time("3ps").unwrap(), 3_000);
         assert!(parse_time("10xs").is_err());
+    }
+
+    #[test]
+    fn extracts_common_flags() {
+        let args = vec![
+            "-L".to_string(),
+            "work=./rtl".to_string(),
+            "--lib".to_string(),
+            "ieee=./ieee".to_string(),
+            "-I".to_string(),
+            "inc".to_string(),
+            "tb.v".to_string(),
+        ];
+        let (opts, rest) = extract_common(&args).unwrap();
+        assert_eq!(opts.libs.len(), 2);
+        assert_eq!(opts.libs[0].0, "work");
+        assert_eq!(opts.incdirs, vec![PathBuf::from("inc")]);
+        assert_eq!(rest, vec!["tb.v".to_string()]);
+        assert!(parse_lib_mapping("noequals").is_err());
     }
 }

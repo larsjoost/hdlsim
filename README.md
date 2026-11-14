@@ -14,9 +14,10 @@ the graphical wave display are all implemented here.
   (linters, formatters, LSP, doc generators) can build on the same parser:
   `hdl_syntax::parse(Language::Verilog | Language::Vhdl, &source)`.
 - **Automatic dependency search across libraries.** Named libraries mapped to
-  directories (`hdlsim.toml`, global config, `-L name=dir` flags); undefined modules,
-  VHDL entities/packages, and `` `include `` files are found and compiled on demand
-  in dependency order, with an incremental cache. `std` and `ieee` are built in.
+  directories (`hdlsim.ini` — created by `hdlsim init` — plus `-L name=dir` flags);
+  undefined modules and `` `include `` files are found and compiled on demand in
+  dependency order, with an in-session compile cache. `std` and `ieee` are built in
+  (VHDL packages land with the VHDL front-end).
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves
@@ -52,7 +53,25 @@ feature ideas under consideration, and `REVIEWING.md` for the code conventions
 
 ```
 cargo build --release   # std-only, no dependencies to fetch
-cargo test              # unit + golden tests
+cargo test              # unit + integration tests
+```
+
+## Usage
+
+```
+hdlsim init                                  # create a starter hdlsim.ini
+hdlsim check file.v ...                      # parse + lower + resolve, report diagnostics
+hdlsim ast file.v                            # dump the reusable CST (s-expression)
+hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us
+hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from libraries
+```
+
+`hdlsim.ini` (modelsim.ini style) maps logical libraries to directories:
+
+```ini
+[Library]
+work = .
+mylib = libs/mylib
 ```
 
 ## License
