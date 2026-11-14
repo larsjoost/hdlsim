@@ -10,7 +10,7 @@ license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/larsjoost/hdlsim"
 homepage = "https://github.com/larsjoost/hdlsim"
-documentation = "https://docs.rs/hdlsim"
+readme = "README.md"
 authors = ["Lars Joost Jensen <larsjoostjensen@gmail.com>"]
 
 # Path deps also carry a version so `cargo publish` can rewrite them to
