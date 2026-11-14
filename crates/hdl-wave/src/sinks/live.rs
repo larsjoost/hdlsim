@@ -440,15 +440,28 @@ mod tests {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.write_all(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut buf = [0u8; 4096];
-        let n = s.read(&mut buf).unwrap();
-        let text = String::from_utf8_lossy(&buf[..n]);
-        assert!(text.contains("text/event-stream"), "{}", &text[..200]);
+        s.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        // SSE is a stream: keep reading until the history line shows up.
+        let mut text = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !text.contains("data: ") && std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 4096];
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => {}
+            }
+        }
+        assert!(
+            text.contains("text/event-stream"),
+            "{}",
+            &text[..text.len().min(200)]
+        );
         assert!(
             text.contains("data: {\"e\":\"t\",\"t\":42}"),
             "history missing: {}",
-            &text[..300]
+            &text[..text.len().min(300)]
         );
         bus.close();
     }

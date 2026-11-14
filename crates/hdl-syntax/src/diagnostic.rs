@@ -65,47 +65,67 @@ impl Diagnostic {
         self
     }
 
-    /// rustc-style rendering: `file:line:col: error[E0001]: msg` plus a source
-    /// snippet with a caret line, and an optional `help:` line.
+    /// rustc-style rendering:
+    /// ```text
+    /// error[E0001]: missing semicolon
+    ///   --> t.vhd:2:4
+    ///    |
+    ///  2 |   wire x
+    ///    |      ^^^
+    ///    |
+    ///    = help: add `;` here
+    /// ```
     pub fn render(&self, db: &SourceDb) -> String {
         let mut out = String::new();
-        match self.span {
-            Some(span) => {
-                let file = db.file(span.file);
-                let (line, col) = file.line_col(span.start);
-                let _ = write!(
-                    out,
-                    "{}:{}:{}: {}[{}]: {}",
-                    file.name(),
-                    line,
-                    col,
-                    self.severity.name(),
-                    self.code,
-                    self.message
-                );
-                let text = db.line_of(span.file, span.start);
-                let caret_len = span.len().max(1);
-                let _ = write!(
-                    out,
-                    "\n  {} | {}\n    | {}^ {}",
-                    line,
-                    text,
-                    " ".repeat((col - 1) as usize),
-                    "~".repeat(caret_len as usize - 1)
-                );
+        let _ = write!(
+            out,
+            "{}[{}]: {}",
+            self.severity.name(),
+            self.code,
+            self.message
+        );
+        if let Some(span) = self.span {
+            let file = db.file(span.file);
+            let (line, col) = file.line_col(span.start);
+            let w = line.to_string().len(); // gutter width = line-number digits
+            let _ = write!(
+                out,
+                "\n{}--> {}:{}:{}",
+                " ".repeat(w + 1),
+                file.name(),
+                line,
+                col
+            );
+            // Source line with tabs expanded (caret column is computed on the
+            // expanded text so it stays aligned).
+            let raw = db.line_of(span.file, span.start);
+            let text = raw.replace('\t', "    ");
+            let disp_col = {
+                let mut c = 1usize;
+                for ch in raw.chars().take((col - 1) as usize) {
+                    c += if ch == '\t' { 4 } else { 1 };
+                }
+                c
+            };
+            let _ = write!(out, "\n{} |", " ".repeat(w + 1));
+            let _ = write!(out, "\n {:>w$} | {}", line, text, w = w);
+            // Caret run: span clamped to the first line.
+            let line_end = span.start as usize + raw.len();
+            let caret_end = (span.end as usize)
+                .min(line_end)
+                .max(span.start as usize + 1);
+            let caret_len = (caret_end - span.start as usize).max(1);
+            let _ = write!(
+                out,
+                "\n{} | {}{}",
+                " ".repeat(w + 1),
+                " ".repeat(disp_col - 1),
+                "^".repeat(caret_len)
+            );
+            let _ = write!(out, "\n{} |", " ".repeat(w + 1));
+            if let Some(help) = &self.help {
+                let _ = write!(out, "\n{} = help: {}", " ".repeat(w + 1), help);
             }
-            None => {
-                let _ = write!(
-                    out,
-                    "{}[{}]: {}",
-                    self.severity.name(),
-                    self.code,
-                    self.message
-                );
-            }
-        }
-        if let Some(help) = &self.help {
-            let _ = write!(out, "\n  help: {}", help);
         }
         out
     }
@@ -140,11 +160,38 @@ impl Diagnostics {
     }
 
     pub fn render_all(&self, db: &SourceDb) -> String {
-        self.items
+        let mut out = self
+            .items
             .iter()
             .map(|d| d.render(db))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n");
+        // rustc-style summary footer.
+        let errors = self
+            .items
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warnings = self
+            .items
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+        if errors > 0 {
+            out.push_str(&format!(
+                "\nerror: could not compile due to {} previous error{}",
+                errors,
+                if errors == 1 { "" } else { "s" }
+            ));
+        }
+        if warnings > 0 {
+            out.push_str(&format!(
+                "\nwarning: {} warning{} generated",
+                warnings,
+                if warnings == 1 { "" } else { "s" }
+            ));
+        }
+        out
     }
 }
 
@@ -165,13 +212,26 @@ mod tests {
         )
         .with_help("add `;` here");
         let out = d.render(&db);
+        // Exact rustc layout: header, --> line, gutter, source, carets, help.
+        let expected = "error[E0001]: missing semicolon\n  --> t.v:2:4\n   |\n 2 |   wire x\n   |    ^^^\n   |\n   = help: add `;` here";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_all_appends_rustc_style_summary() {
+        let mut db = SourceDb::new();
+        db.add_file("t.v", "module m;\nendmodule\n").unwrap();
+        let mut ds = Diagnostics::new();
+        ds.push(Diagnostic::error("E0001", None, "e1"));
+        ds.push(Diagnostic::error("E0002", None, "e2"));
+        ds.push(Diagnostic::warning("W0001", None, "w"));
+        let out = ds.render_all(&db);
         assert!(
-            out.contains("t.v:2:4: error[E0001]: missing semicolon"),
-            "got: {}",
+            out.contains("error: could not compile due to 2 previous errors"),
+            "{}",
             out
         );
-        assert!(out.contains("  wire x"), "got: {}", out);
-        assert!(out.contains("help: add `;` here"), "got: {}", out);
+        assert!(out.contains("warning: 1 warning generated"), "{}", out);
     }
 
     #[test]
