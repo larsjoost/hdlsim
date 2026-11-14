@@ -882,7 +882,18 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lower one sequential statement, wrapped in a `Stmt::Spanned` with its
+    /// source span (drives line/branch coverage).
     fn lower_seq_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let span = s.span();
+        let inner = self.lower_seq_stmt_impl(s);
+        Stmt::Spanned {
+            span,
+            inner: Box::new(inner),
+        }
+    }
+
+    fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
         match s.kind() {
             SyntaxKind::SeqAssign => {
                 let kids = real_children(s);

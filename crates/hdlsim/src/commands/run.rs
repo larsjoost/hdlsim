@@ -6,6 +6,15 @@ use hdl_ir::Design;
 use hdl_sim::{Observer, SimEvent, Simulator};
 use std::path::PathBuf;
 
+/// Forwards events into a shared [`hdl_sim::coverage::CoverageCollector`].
+struct CovForward(std::rc::Rc<std::cell::RefCell<hdl_sim::coverage::CoverageCollector>>);
+
+impl Observer for CovForward {
+    fn on_event(&mut self, ev: &SimEvent) {
+        self.0.borrow_mut().on_event(ev);
+    }
+}
+
 /// Prints `$display`/`report` messages to stdout, like a simulator transcript.
 struct Transcript;
 
@@ -37,6 +46,8 @@ impl Command for Run {
         let mut live = false;
         let mut port: u16 = 8085;
         let mut max_time_fs = u64::MAX;
+        let mut coverage = false;
+        let mut coverage_out: Option<PathBuf> = None;
         let mut i = 0;
         while i < rest.len() {
             match rest[i].as_str() {
@@ -69,6 +80,16 @@ impl Command for Run {
                 "--max-time" => {
                     let v = rest.get(i + 1).ok_or("--max-time needs a value")?;
                     max_time_fs = parse_time(v)?;
+                    i += 2;
+                }
+                "--coverage" => {
+                    coverage = true;
+                    i += 1;
+                }
+                "--coverage-out" => {
+                    coverage_out = Some(PathBuf::from(
+                        rest.get(i + 1).ok_or("--coverage-out needs a value")?,
+                    ));
                     i += 2;
                 }
                 other if other.starts_with("--") => {
@@ -116,6 +137,18 @@ impl Command for Run {
         }
         let mut sim = Simulator::new(flat);
         sim.add_observer(Box::new(Transcript));
+        // Coverage collector, kept behind a shared handle so we can report
+        // after the run.
+        let cov = if coverage {
+            let widths: Vec<usize> = sim.flat().signals.iter().map(|s| s.width).collect();
+            let c = std::rc::Rc::new(std::cell::RefCell::new(
+                hdl_sim::coverage::CoverageCollector::new(&design, &widths),
+            ));
+            sim.add_observer(Box::new(CovForward(c.clone())));
+            Some(c)
+        } else {
+            None
+        };
         if let Some(path) = vcd {
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
@@ -159,6 +192,17 @@ impl Command for Run {
             sim.flat().signals.len(),
             sim.flat().procs.len()
         );
+        if let Some(cov) = &cov {
+            let report = cov.borrow().report(mgr.db());
+            match &coverage_out {
+                Some(p) => {
+                    std::fs::write(p, &report)
+                        .map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+                    println!("hdlsim: coverage report written to {}", p.display());
+                }
+                None => print!("{}", report),
+            }
+        }
         // A failed unit test (assert/report severity error|failure, $error/$fatal)
         // makes the whole run fail: exit code 1 so CI/scripts catch it.
         if sim.failures() > 0 {

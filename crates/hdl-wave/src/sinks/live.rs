@@ -122,6 +122,7 @@ impl WaveSink for LiveSink {
             SimEvent::Finish { time_fs } => format!("{{\"e\":\"f\",\"t\":{}}}", time_fs),
             SimEvent::Stop { time_fs } => format!("{{\"e\":\"x\",\"t\":{}}}", time_fs),
             SimEvent::ProcActive { .. } => return,
+            SimEvent::StmtExec { .. } => return, // coverage-only, not a wave event
         };
         self.bus.push(line);
     }

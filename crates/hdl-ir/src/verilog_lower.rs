@@ -551,7 +551,19 @@ impl<'a> Lower<'a> {
 
     // ---- statements -----------------------------------------------------------
 
+    /// Lower one statement, wrapped in a `Stmt::Spanned` with its source span
+    /// (drives line/branch coverage). Recursive calls go through this wrapper,
+    /// so every nested statement is spanned too.
     fn lower_stmt(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
+        let span = s.span();
+        let inner = self.lower_stmt_impl(s, env);
+        Stmt::Spanned {
+            span,
+            inner: Box::new(inner),
+        }
+    }
+
+    fn lower_stmt_impl(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
         match s.kind() {
             SyntaxKind::Block => Stmt::Block(
                 real_children(s)

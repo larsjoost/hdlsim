@@ -467,6 +467,10 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
 
 pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
     match s {
+        Stmt::Spanned { span, inner } => Stmt::Spanned {
+            span: *span,
+            inner: Box::new(remap_stmt(inner, map)),
+        },
         Stmt::Block(ss) => Stmt::Block(ss.iter().map(|s| remap_stmt(s, map)).collect()),
         Stmt::If { cond, then, els } => Stmt::If {
             cond: remap_expr(cond, map),
