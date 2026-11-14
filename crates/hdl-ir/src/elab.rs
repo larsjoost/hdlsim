@@ -32,6 +32,8 @@ pub struct FlatSig {
     pub width: usize,
     pub kind: SigKind,
     pub init: Option<Value>,
+    /// `Some(depth)` for memories.
+    pub mem: Option<usize>,
     pub scope: ScopeId,
 }
 
@@ -108,6 +110,7 @@ impl Flat {
             width,
             kind,
             init,
+            mem: None,
             scope,
         });
         id
@@ -143,24 +146,35 @@ impl Flat {
 
         let scope = self.new_scope(&m.name, Some(parent_scope));
 
-        // Create flat signals for all module signals.
+        // Create flat signals for all non-port module signals. Port signals are
+        // not created here: they are aliased to (or bridged with) the parent's
+        // connection during port connection below.
+        let port_sigs: std::collections::HashSet<usize> =
+            m.ports.iter().map(|p| p.sig as usize).collect();
         let mut map: Vec<FlatSigId> = Vec::with_capacity(m.signals.len());
-        for s in &m.signals {
+        for (i, s) in m.signals.iter().enumerate() {
+            if port_sigs.contains(&i) {
+                map.push(FlatSigId::MAX); // placeholder, filled by port connection
+                continue;
+            }
             let name = if prefix.is_empty() {
                 s.name.clone()
             } else {
                 format!("{}.{}", prefix, s.name)
             };
-            map.push(self.new_sig(name, s.width, s.kind, s.init.clone(), scope));
+            let id = self.new_sig(name, s.width, s.kind, s.init.clone(), scope);
+            self.signals[id as usize].mem = s.mem;
+            map.push(id);
         }
 
-        // Connect ports.
+        // Connect ports. `conns` are already remapped to flat (parent) signal
+        // ids by the caller, so they must NOT be remapped through the child map.
         for (i, port) in m.ports.iter().enumerate() {
             let conn = conn_for(conns, &m.ports, i);
             let Some(conn) = conn else {
                 return Err(format!("{}: port '{}' not connected", where_, port.name));
             };
-            let expr = remap_expr(conn, &map);
+            let expr = conn.clone();
             match (&expr, port.dir) {
                 (Expr::Sig(ps), _) => {
                     // Alias: the child port *is* the parent signal.
@@ -170,7 +184,7 @@ impl Flat {
                     let imp_name = format!("{}.{}", where_, port.name);
                     let imp = self.new_sig(
                         imp_name,
-                        expr_width(&expr),
+                        m.signals[port.sig as usize].width.max(1),
                         port_dir_kind(port.dir),
                         None,
                         scope,
@@ -307,27 +321,6 @@ fn port_dir_kind(d: Dir) -> SigKind {
     }
 }
 
-/// Width of an expression's value (static approximation; X-safe default 1).
-fn expr_width(e: &Expr) -> usize {
-    match e {
-        Expr::Lit(v) => v.width(),
-        Expr::Sig(_) => 1, // refined by caller context; implicit wires for outputs
-        // are sized properly by the lowerer in practice
-        Expr::Bin { l, r, .. } => expr_width(l).max(expr_width(r)),
-        Expr::Un { e, .. } => expr_width(e),
-        Expr::Cond { t, e, .. } => expr_width(t).max(expr_width(e)),
-        Expr::Concat(parts) => parts.iter().map(expr_width).sum(),
-        Expr::Sel { msb, lsb, .. } => {
-            // Best effort; lowerer emits constants here in practice.
-            let _ = (msb, lsb);
-            1
-        }
-        Expr::Idx { e, .. } => 1.max(expr_width(e)),
-        Expr::Call { .. } => 1,
-        Expr::Replicate { e, .. } => expr_width(e),
-    }
-}
-
 /// Remap all signal ids in an expression through `map`.
 pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
     match e {
@@ -402,6 +395,16 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             time_fs: *time_fs,
             stmt: Box::new(remap_stmt(stmt, map)),
         },
+        Stmt::Wait { sens, body } => Stmt::Wait {
+            sens: sens
+                .iter()
+                .map(|e| Edge {
+                    sig: map[e.sig as usize],
+                    kind: e.kind,
+                })
+                .collect(),
+            body: Box::new(remap_stmt(body, map)),
+        },
         Stmt::SysCall { name, args } => Stmt::SysCall {
             name: name.clone(),
             args: args.iter().map(|a| remap_expr(a, map)).collect(),
@@ -432,6 +435,7 @@ mod tests {
             width: w,
             kind,
             init: None,
+            mem: None,
         }
     }
 
@@ -482,12 +486,12 @@ mod tests {
     fn elaborates_two_level_hierarchy() {
         let d = two_module_design();
         let f = elaborate(&d, "top").unwrap();
-        // top.w aliased to u0.q: only two flat signals exist.
+        // The child's output port is aliased to the parent's `w` — no separate
+        // u0.q flat signal is created; the child's internal assign remaps to w.
         let names: Vec<&str> = f.signals.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"w"), "{:?}", names);
-        assert!(names.contains(&"u0.q"), "{:?}", names);
-        // The alias means w and u0.q are the same flat id — check via assign.
+        assert_eq!(names, vec!["w"], "{:?}", names);
         assert_eq!(f.assigns.len(), 1);
+        assert!(matches!(f.assigns[0].lhs, Expr::Sig(0)));
         assert!(f.scopes.len() >= 2);
     }
 

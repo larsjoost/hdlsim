@@ -58,6 +58,8 @@ pub struct SignalIr {
     pub width: usize,
     pub kind: SigKind,
     pub init: Option<Value>,
+    /// `Some(depth)` for memories: `reg [7:0] mem [0:255]` → width 8, mem 256.
+    pub mem: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -160,6 +162,11 @@ pub enum Stmt {
     Delay {
         time_fs: u64,
         stmt: Box<Stmt>,
+    },
+    /// `@(edge...) stmt` — suspend the process until a listed edge occurs.
+    Wait {
+        sens: Vec<Edge>,
+        body: Box<Stmt>,
     },
     SysCall {
         name: String,
@@ -295,6 +302,12 @@ impl Stmt {
                 rhs.collect_sigs(out);
             }
             Stmt::Delay { stmt, .. } => stmt.collect_sigs(out),
+            Stmt::Wait { sens, body } => {
+                for e in sens {
+                    out.push(e.sig);
+                }
+                body.collect_sigs(out);
+            }
             Stmt::SysCall { args, .. } => {
                 for a in args {
                     a.collect_sigs(out);

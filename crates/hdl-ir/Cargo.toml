@@ -7,4 +7,5 @@ license = "MIT"
 
 [dependencies]
 hdl-syntax = { path = "../hdl-syntax" }
-hdl-lib = { path = "../hdl-lib" }
+# Note: hdl-ir deliberately does NOT depend on hdl-lib (that would be circular).
+# Name resolution is injected via a ResolveCtx trait implemented by hdl-lib users.

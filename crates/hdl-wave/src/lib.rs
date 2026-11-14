@@ -21,3 +21,6 @@
 //! the network (all assets embedded).
 
 pub mod sinks;
+
+pub use sinks::vcd::VcdSink;
+pub use sinks::{SinkAdapter, WaveSink};

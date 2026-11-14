@@ -17,18 +17,31 @@ use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::source::{FileId, SourceDb, Span};
 use std::collections::HashMap;
 
-/// Lower one parsed file into modules plus diagnostics.
+/// Lower one parsed file into modules plus diagnostics, with the LRM default
+/// time unit of 1 ns.
 pub fn lower_file(
     file: FileId,
     root: &SyntaxNode,
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
 ) -> Vec<ModuleIr> {
+    lower_file_with_time(file, root, db, diags, 1_000_000) // 1 ns in fs
+}
+
+/// Lower one parsed file, with `time_unit_fs` taken from the file's
+/// `` `timescale `` directive (femtoseconds per time unit).
+pub fn lower_file_with_time(
+    file: FileId,
+    root: &SyntaxNode,
+    db: &SourceDb,
+    diags: &mut Vec<Diagnostic>,
+    time_unit_fs: u64,
+) -> Vec<ModuleIr> {
     let _ = file; // spans on nodes already carry the file id
     let mut lx = Lower {
         db,
         diags,
-        time_unit_fs: 1_000_000_000, // 1 ns default
+        time_unit_fs,
         names: HashMap::new(),
     };
     let mut modules = Vec::new();
@@ -51,6 +64,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
         k,
         SyntaxKind::Literal
             | SyntaxKind::Name
+            | SyntaxKind::ParenExpr
             | SyntaxKind::BinExpr
             | SyntaxKind::UnaryExpr
             | SyntaxKind::CondExpr
@@ -87,6 +101,8 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Case
             | SyntaxKind::StmtAssign
             | SyntaxKind::Delay
+            | SyntaxKind::Wait
+            | SyntaxKind::For
             | SyntaxKind::SysCall
     )
 }
@@ -197,6 +213,7 @@ impl<'a> Lower<'a> {
                                 width,
                                 kind,
                                 init: None,
+                                mem: None,
                             });
                             module.ports.push(PortIr {
                                 name: n,
@@ -212,11 +229,7 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::Decl => {
                     let dk = real_children(item);
-                    let width = dk
-                        .iter()
-                        .find(|k| k.kind() == SyntaxKind::Range)
-                        .map(|r| self.range_width(r, &env))
-                        .unwrap_or(1);
+                    let width = self.decl_width(&dk, &env);
                     for k in &dk {
                         if k.kind() == SyntaxKind::Name {
                             let n = self.text(k);
@@ -227,6 +240,7 @@ impl<'a> Lower<'a> {
                                     width,
                                     kind: SigKind::Wire,
                                     init: None,
+                                    mem: None,
                                 });
                                 self.names
                                     .insert(module.signals[id as usize].name.clone(), id);
@@ -295,8 +309,21 @@ impl<'a> Lower<'a> {
             width,
             kind,
             init: None,
+            mem: None,
         });
         module.ports.push(PortIr { name, dir, sig: id });
+    }
+
+    /// Width of a declaration: an explicit `[msb:lsb]` range wins, else the
+    /// type keyword (`integer` = 32 bits, …), else 1.
+    fn decl_width(&mut self, kids: &[SyntaxNode], env: &HashMap<String, Value>) -> usize {
+        if let Some(r) = kids.iter().find(|k| k.kind() == SyntaxKind::Range) {
+            return self.range_width(r, env);
+        }
+        kids.iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .find_map(|k| type_kw_width(&self.text(k)))
+            .unwrap_or(1)
     }
 
     fn range_width(&mut self, r: &SyntaxNode, env: &HashMap<String, Value>) -> usize {
@@ -388,6 +415,18 @@ impl<'a> Lower<'a> {
         while i < kids.len() {
             if kids[i].kind() == SyntaxKind::Name {
                 let name = self.text(&kids[i]);
+                // Optional memory dimension after the name: `reg [7:0] mem [0:255]`.
+                if kids
+                    .get(i + 1)
+                    .map_or(false, |k| k.kind() == SyntaxKind::Range)
+                {
+                    let depth = self.range_width(&kids[i + 1], env);
+                    if let Some(id) = self.sig_id(&name) {
+                        module.signals[id as usize].mem = Some(depth);
+                    }
+                    i += 2;
+                    continue;
+                }
                 // Optional `= expr` after the name.
                 if kids.get(i + 1).map_or(false, |k| self.text(k) == "=") {
                     if let Some(e) = kids.get(i + 2) {
@@ -444,7 +483,10 @@ impl<'a> Lower<'a> {
             ProcKind::Always
         };
         let kids = real_children(p);
-        let mut sens = Sens::All;
+        // No sensitivity list at all (`always #5 ...`): an empty list means
+        // "no event sensitivity — start once at t=0 and loop on the body".
+        // `@*` lowers to Sens::All via the SensList arm below.
+        let mut sens = Sens::List(Vec::new());
         let mut body = None;
         let mut origin = String::new();
         for k in &kids {
@@ -537,12 +579,30 @@ impl<'a> Lower<'a> {
                     .iter()
                     .filter(|k| !(k.kind() == SyntaxKind::Punct && self.text(k) == ";"))
                     .collect();
-                let op_pos = body.iter().position(|k| {
-                    k.kind() == SyntaxKind::Punct && matches!(self.text(k).as_str(), "=" | "<=")
-                });
+                // `<=` arrives as two punct tokens `<` `=`; detect the pair
+                // before treating a lone `=` as a blocking assignment.
+                let mut op_pos = None;
+                let mut nba = false;
+                for i in 0..body.len() {
+                    if body[i].kind() != SyntaxKind::Punct {
+                        continue;
+                    }
+                    let t = self.text(body[i]);
+                    if t == "=" {
+                        if i > 0
+                            && body[i - 1].kind() == SyntaxKind::Punct
+                            && self.text(body[i - 1]) == "<"
+                        {
+                            op_pos = Some(i - 1);
+                            nba = true;
+                        } else {
+                            op_pos = Some(i);
+                        }
+                        break;
+                    }
+                }
                 match op_pos {
                     Some(op) => {
-                        let nba = self.text(body[op]) == "<=";
                         let lhs = body[..op].iter().find(|k| is_expr_node(k.kind()));
                         let rhs = body[op + 1..].iter().find(|k| is_expr_node(k.kind()));
                         match (lhs, rhs) {
@@ -574,6 +634,41 @@ impl<'a> Lower<'a> {
                     .map(|b| Box::new(self.lower_stmt(b, env)))
                     .unwrap_or_else(|| Box::new(Stmt::Null));
                 Stmt::Delay { time_fs, stmt }
+            }
+            SyntaxKind::Wait => {
+                let kids = real_children(s);
+                let sens_node = kids.iter().find(|k| k.kind() == SyntaxKind::SensList);
+                let body = kids
+                    .iter()
+                    .find(|k| is_stmt_node(k.kind()) && k.kind() != SyntaxKind::SensList);
+                let edges = match sens_node.map(|sl| self.lower_sens_list(sl, env)) {
+                    Some(Sens::List(es)) => es,
+                    _ => Vec::new(),
+                };
+                let body = body
+                    .map(|b| Box::new(self.lower_stmt(b, env)))
+                    .unwrap_or_else(|| Box::new(Stmt::Null));
+                Stmt::Wait { sens: edges, body }
+            }
+            SyntaxKind::For => {
+                let kids = real_children(s);
+                let stmts: Vec<&SyntaxNode> =
+                    kids.iter().filter(|k| is_stmt_node(k.kind())).collect();
+                let cond = kids
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|c| self.lower_expr(c, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 1)));
+                if stmts.len() >= 3 {
+                    Stmt::For {
+                        init: Box::new(self.lower_stmt(stmts[0], env)),
+                        cond,
+                        step: Box::new(self.lower_stmt(stmts[1], env)),
+                        body: Box::new(self.lower_stmt(stmts[2], env)),
+                    }
+                } else {
+                    Stmt::Null
+                }
             }
             SyntaxKind::SysCall => {
                 let kids = real_children(s);
@@ -806,6 +901,7 @@ impl<'a> Lower<'a> {
                         width,
                         kind: SigKind::Reg,
                         init: None,
+                        mem: None,
                     });
                     slots.push((n, width));
                 }
@@ -879,30 +975,29 @@ impl<'a> Lower<'a> {
         env: &HashMap<String, Value>,
     ) -> (String, Expr) {
         let kids = real_children(c);
-        let name = kids
-            .iter()
-            .find(|k| k.kind() == SyntaxKind::Name)
-            .map(|k| self.text(k))
-            .unwrap_or_default();
+        // The first Name child is the port/parameter name; the expression is
+        // the first expr node *after* it (a Name can be both).
+        let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+        let name = name_pos.map(|i| self.text(&kids[i])).unwrap_or_default();
         let expr = kids
             .iter()
-            .find(|k| is_expr_node(k.kind()))
-            .map(|k| self.lower_expr(k, env))
+            .enumerate()
+            .find(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()))
+            .map(|(_, k)| self.lower_expr(k, env))
             .unwrap_or(Expr::Lit(Value::x(1)));
         (name, expr)
     }
 
     fn lower_conn(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Conn {
         let kids = real_children(c);
-        let mut name = None;
-        let mut expr = None;
-        for k in &kids {
-            match k.kind() {
-                SyntaxKind::Name => name = Some(self.text(k)),
-                _ if is_expr_node(k.kind()) => expr = Some(self.lower_expr(k, env)),
-                _ => {}
-            }
-        }
+        // First Name child = port name; first expr node after it = connection.
+        let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+        let name = name_pos.map(|i| self.text(&kids[i]));
+        let expr = kids
+            .iter()
+            .enumerate()
+            .find(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()))
+            .map(|(_, k)| self.lower_expr(k, env));
         match (name, expr) {
             (Some(n), Some(e)) => Conn::Named(n, e),
             (None, Some(e)) => Conn::Positional(e),
@@ -928,6 +1023,16 @@ impl<'a> Lower<'a> {
                         self.err(e.span(), format!("unknown identifier '{}'", base));
                         Expr::Lit(Value::x(1))
                     }
+                }
+            }
+            SyntaxKind::ParenExpr => {
+                // Grouping only — lower the inner expression.
+                let inner = real_children(e)
+                    .into_iter()
+                    .find(|k| is_expr_node(k.kind()));
+                match inner {
+                    Some(k) => self.lower_expr(&k, env),
+                    None => Expr::Lit(Value::x(1)),
                 }
             }
             SyntaxKind::BinExpr => {
@@ -1122,6 +1227,18 @@ fn unop_from_str(s: &str) -> Option<UnOp> {
         "~&" => UnOp::RedNand,
         "~|" => UnOp::RedNor,
         "~^" | "^~" => UnOp::RedXnor,
+        _ => return None,
+    })
+}
+
+/// Bit width implied by a Verilog type keyword, if any.
+fn type_kw_width(t: &str) -> Option<usize> {
+    Some(match t {
+        "integer" | "time" => 32,
+        "longint" => 64,
+        "shortint" => 16,
+        "byte" => 8,
+        "real" => 64,
         _ => return None,
     })
 }

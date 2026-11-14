@@ -1,22 +1,23 @@
 //! # hdl-sim
 //!
-//! Event-driven simulation kernel: multi-state logic values, time, delta-cycle
-//! scheduler, and an observer bus. Embeddable as a library — other applications
-//! can run a simulation and react to events with their own observers.
+//! Event-driven simulation kernel: multi-state values, time, delta-cycle
+//! scheduler, observer bus. Embeddable as a library — other applications can run
+//! a simulation and react to [`SimEvent`]s with their own [`Observer`]s.
 //!
-//! Pipeline position: consumes `hdl-ir`, emits `SimEvent`s to observers
-//! (wave sinks, coverage, debugger hooks).
+//! Pipeline position: consumes [`hdl_ir::elab::Flat`], emits events to observers
+//! (wave sinks, coverage, live server).
 //!
-//! Semantics:
-//! - Delta cycles run until stable, then time advances to the next event.
-//! - Verilog: 4-state values (0/1/X/Z), blocking + non-blocking assignment regions,
-//!   `#delay`.
-//! - VHDL: 9-state `std_logic` with resolution, signals update at end of delta.
+//! # Layout
+//! - [`events`]: the closed `SimEvent` enum + `Observer` trait (extension seam).
+//! - [`sim`]: the `Simulator` (active/NBA/time regions, process frames).
 //!
-//! Extension seams: `trait Observer` (closed `SimEvent` enum — new analyses are
-//! new observers, zero kernel edits) and a name→fn registry for system tasks.
-//!
-//! Invariants:
-//! - No allocation in the event loop.
-//! - Observers receive immutable event snapshots and cannot corrupt the kernel.
-//! - Simulation is deterministic for a fixed seed.
+//! # Invariants
+//! - Deterministic for a fixed design and RNG seed.
+//! - Observers get immutable event snapshots; they cannot corrupt the kernel.
+//! - The kernel never panics on design content; runtime problems are events.
+
+pub mod events;
+pub mod sim;
+
+pub use events::{NullObserver, Observer, SimEvent};
+pub use sim::Simulator;

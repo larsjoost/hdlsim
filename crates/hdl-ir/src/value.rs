@@ -143,9 +143,15 @@ impl Value {
                 let w = self.bits.len().max(rhs.bits.len());
                 let mut all_eq = true;
                 let mut any_unknown = false;
+                // Operands are zero-extended to the wider width (unsigned
+                // semantics: reg/wire/integer are all unsigned here).
                 for i in 0..w {
-                    let a = self.bit(i);
-                    let b = rhs.bit(i);
+                    let a = if i < self.bits.len() {
+                        self.bits[i]
+                    } else {
+                        V0
+                    };
+                    let b = if i < rhs.bits.len() { rhs.bits[i] } else { V0 };
                     if strict {
                         if a != b {
                             all_eq = false;

@@ -69,6 +69,10 @@ pub enum SyntaxKind {
     StmtAssign,
     /// `#delay` prefix.
     Delay,
+    /// `@(...)` / `@sig` / `@*` event wait in procedural code.
+    Wait,
+    /// Procedural `for` loop (vs. generate-for `GenFor`).
+    For,
     /// System task call (`$display(...)`).
     SysCall,
 
@@ -87,6 +91,8 @@ pub enum SyntaxKind {
     PartSelect,
     /// `expr[idx]` indexing.
     Index,
+    /// `(expr)` grouping.
+    ParenExpr,
     /// A (possibly dotted/hierarchical) name.
     Name,
     /// Any literal.
@@ -155,6 +161,8 @@ impl SyntaxKind {
                 | SyntaxKind::CaseItem
                 | SyntaxKind::StmtAssign
                 | SyntaxKind::Delay
+                | SyntaxKind::Wait
+                | SyntaxKind::For
                 | SyntaxKind::SysCall
                 | SyntaxKind::BinExpr
                 | SyntaxKind::UnaryExpr
@@ -164,6 +172,7 @@ impl SyntaxKind {
                 | SyntaxKind::Replicate
                 | SyntaxKind::PartSelect
                 | SyntaxKind::Index
+                | SyntaxKind::ParenExpr
                 | SyntaxKind::Name
                 | SyntaxKind::Literal
         )

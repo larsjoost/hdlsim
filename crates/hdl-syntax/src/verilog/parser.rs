@@ -27,6 +27,27 @@ pub struct ParsedFile {
     pub timescale: Option<String>,
 }
 
+/// Parse a `` `timescale `` argument (`"1ns/1ps"`, `"10ps/1ps"`, …) into the
+/// time unit in femtoseconds. Defaults to 1 ns when the text is unusable.
+pub fn timescale_to_fs(text: &str) -> u64 {
+    let unit = text.split('/').next().unwrap_or(text).trim();
+    let (num, u) = unit
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|i| (&unit[..i], &unit[i..]))
+        .unwrap_or((unit, "ns"));
+    let v: f64 = num.parse().unwrap_or(1.0);
+    let mult: f64 = match u {
+        "fs" => 1.0,
+        "ps" => 1e3,
+        "ns" => 1e6,
+        "us" | "µs" => 1e9,
+        "ms" => 1e12,
+        "s" => 1e15,
+        _ => 1e6,
+    };
+    (v * mult).max(1.0) as u64
+}
+
 /// Lex + parse one (already preprocessed) file.
 pub fn parse_file(file: FileId, src: &SourceFile) -> ParsedFile {
     let (tokens, lex_diags) = super::lexer::lex(file, src);
@@ -119,6 +140,11 @@ const MULTI_OPS: &[&str] = &[
     "<<", ">>", "<=", ">=", "==", "!=", "===", "!==", "&&", "||", "**", "~&", "~|", "~^", "^~",
 ];
 
+/// Number of punct tokens in a multi-char operator string.
+fn op_token_count(op: &str) -> usize {
+    op.chars().count()
+}
+
 impl<'a> Parser<'a> {
     // ---- token navigation -------------------------------------------------
 
@@ -151,14 +177,37 @@ impl<'a> Parser<'a> {
 
     /// Two adjacent punct tokens forming a multi-char operator, e.g. `<` `=` → `<=`.
     fn peek_op2(&self) -> Option<String> {
-        let a = self.peek();
-        let b = self.peek2();
-        if a.kind == TokenKind::Punct && b.kind == TokenKind::Punct {
-            let t = format!(
-                "{}{}",
-                &self.src.text()[a.span.start as usize..a.span.end as usize],
-                &self.src.text()[b.span.start as usize..b.span.end as usize]
-            );
+        self.peek_op_n(2)
+    }
+
+    /// Three adjacent punct tokens, for `===` / `!==`.
+    fn peek_op3(&self) -> Option<String> {
+        self.peek_op_n(3)
+    }
+
+    /// Up to `n` adjacent punct tokens forming a known multi-char operator
+    /// (longest match wins).
+    fn peek_op_n(&self, n: usize) -> Option<String> {
+        let i0 = self.skip_trivia_from(self.pos);
+        let mut texts = Vec::new();
+        let mut idx = i0;
+        for _ in 0..n {
+            if idx >= self.tokens.len() {
+                break;
+            }
+            let t = &self.tokens[idx];
+            if t.kind != TokenKind::Punct {
+                break;
+            }
+            texts.push(&self.src.text()[t.span.start as usize..t.span.end as usize]);
+            idx = self.skip_trivia_from(idx + 1);
+        }
+        if texts.len() < 2 {
+            return None;
+        }
+        // Longest match first.
+        for len in (2..=texts.len()).rev() {
+            let t: String = texts[..len].concat();
             if MULTI_OPS.contains(&t.as_str()) {
                 return Some(t);
             }
@@ -532,30 +581,35 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::Always);
         self.bump(); // always*
         if self.eat_punct('@') {
-            if self.at_punct('(') {
-                self.builder.start_node(SyntaxKind::SensList);
-                self.bump();
-                // Items: `[posedge|negedge] expr` separated by `,` or `or`.
-                while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
-                    if self.at_kw("posedge") || self.at_kw("negedge") {
-                        self.bump();
-                    }
-                    self.parse_expression();
-                    if !self.eat_punct(',') && !self.eat_kw("or") {
-                        break;
-                    }
-                }
-                self.expect_punct(')', "to close the sensitivity list");
-                self.builder.finish_node();
-            } else if self.at_punct('*') {
-                self.bump();
-            } else {
-                // `@sig` — single signal.
-                self.parse_expression();
-            }
+            self.parse_sens_list();
         }
         self.parse_statement();
         self.builder.finish_node();
+    }
+
+    /// `@(...)`, `@*`, or `@sig` — shared by `always` and event waits.
+    fn parse_sens_list(&mut self) {
+        if self.at_punct('(') {
+            self.builder.start_node(SyntaxKind::SensList);
+            self.bump();
+            // Items: `[posedge|negedge] expr` separated by `,` or `or`.
+            while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                if self.at_kw("posedge") || self.at_kw("negedge") {
+                    self.bump();
+                }
+                self.parse_expression();
+                if !self.eat_punct(',') && !self.eat_kw("or") {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the sensitivity list");
+            self.builder.finish_node();
+        } else if self.at_punct('*') {
+            self.bump();
+        } else {
+            // `@sig` — single signal.
+            self.parse_expression();
+        }
     }
 
     fn parse_initial(&mut self) {
@@ -793,29 +847,53 @@ impl<'a> Parser<'a> {
                 self.bump(); // empty statement
             }
             TokenKind::Punct if text == "#" => {
+                // `#delay stmt` — the delayed statement is a child of Delay.
                 self.builder.start_node(SyntaxKind::Delay);
                 self.bump();
                 self.parse_primary(); // delay value
+                self.parse_statement(); // delayed statement
                 self.builder.finish_node();
+            }
+            TokenKind::Punct if text == "@" => {
+                // Event wait: `@(posedge clk) stmt`.
+                self.builder.start_node(SyntaxKind::Wait);
+                self.bump();
+                self.parse_sens_list();
                 self.parse_statement();
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "for" => {
+                // Procedural for: `for (init; cond; step) stmt`. Init and step
+                // are assignments without their own trailing `;`.
+                self.builder.start_node(SyntaxKind::For);
+                self.bump();
+                self.expect_punct('(', "after `for`");
+                if !self.at_punct(';') {
+                    self.parse_assign_no_semi();
+                }
+                self.expect_punct(';', "in for header");
+                self.parse_expression(); // condition
+                self.expect_punct(';', "in for header");
+                if !self.at_punct(')') {
+                    self.parse_assign_no_semi();
+                }
+                self.expect_punct(')', "to close the for header");
+                self.parse_statement(); // body
+                self.builder.finish_node();
             }
             TokenKind::SysTask => {
                 self.builder.start_node(SyntaxKind::SysCall);
                 self.bump();
                 if self.eat_punct('(') {
-                    let mut depth = 1;
-                    while depth > 0 && self.peek().kind != TokenKind::Eof {
-                        if self.at_punct('(') {
-                            depth += 1;
-                        } else if self.at_punct(')') {
-                            depth -= 1;
-                        }
-                        if depth > 0 {
+                    if !self.at_punct(')') {
+                        loop {
                             self.parse_expression();
-                        } else {
-                            self.bump();
+                            if !self.eat_punct(',') {
+                                break;
+                            }
                         }
                     }
+                    self.expect_punct(')', "to close the system task call");
                 }
                 self.expect_punct(';', "to end the system task call");
                 self.builder.finish_node();
@@ -921,7 +999,7 @@ impl<'a> Parser<'a> {
     /// the lhs, so each operator wraps lhs+op+rhs into one BinExpr node.
     fn parse_binops(&mut self, mut mark: crate::cst::Mark, min_prec: u8) {
         loop {
-            let op = if let Some(op) = self.peek_op2() {
+            let op = if let Some(op) = self.peek_op3().or_else(|| self.peek_op2()) {
                 op
             } else {
                 let t = self.peek_text().to_string();
@@ -941,9 +1019,8 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.builder.start_node_at(mark, SyntaxKind::BinExpr);
-            // Consume the operator (one or two punct tokens).
-            self.bump();
-            if MULTI_OPS.contains(&op.as_str()) {
+            // Consume the operator (one to three punct tokens).
+            for _ in 0..op_token_count(&op) {
                 self.bump();
             }
             let next_min = if right_assoc { prec } else { prec + 1 };
@@ -955,13 +1032,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) {
-        let text = self.peek_text().to_string();
-        if self.peek().kind == TokenKind::Punct && UNARY_OPS.contains(&text.as_str()) {
+        // Longest-match multi-char unary op first (`~&`, `~^`…), else single char.
+        let op = self
+            .peek_op3()
+            .or_else(|| self.peek_op2())
+            .filter(|o| UNARY_OPS.contains(&o.as_str()))
+            .or_else(|| {
+                let t = self.peek_text().to_string();
+                if self.peek().kind == TokenKind::Punct && UNARY_OPS.contains(&t.as_str()) {
+                    Some(t)
+                } else {
+                    None
+                }
+            });
+        if let Some(op) = op {
             self.builder.start_node(SyntaxKind::UnaryExpr);
-            if MULTI_OPS.contains(&text.as_str()) {
-                self.bump();
-                self.bump();
-            } else {
+            for _ in 0..op_token_count(&op) {
                 self.bump();
             }
             self.parse_unary();
@@ -1072,9 +1158,11 @@ impl<'a> Parser<'a> {
                 self.builder.finish_node();
             }
             TokenKind::Punct if self.peek_text() == "(" => {
+                self.builder.start_node(SyntaxKind::ParenExpr);
                 self.bump();
                 self.parse_expression();
                 self.expect_punct(')', "to close the parenthesized expression");
+                self.builder.finish_node();
             }
             TokenKind::Punct if self.peek_text() == "{" => {
                 self.bump();

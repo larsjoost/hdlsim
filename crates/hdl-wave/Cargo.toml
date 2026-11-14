@@ -6,4 +6,5 @@ description = "Wave sinks and viewers: VCD, self-contained HTML/SVG, live HTTP+S
 license = "MIT"
 
 [dependencies]
+hdl-ir = { path = "../hdl-ir" }
 hdl-sim = { path = "../hdl-sim" }

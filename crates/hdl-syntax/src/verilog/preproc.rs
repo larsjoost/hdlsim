@@ -124,6 +124,11 @@ pub fn preprocess(
                         ),
                     }
                 }
+                "timescale" if active => {
+                    // Pass through: the parser records it on ParsedFile so the
+                    // lowerer can scale `#delay` values.
+                    out.push_str(line);
+                }
                 _ => {
                     // Unknown or inactive directive: drop the line.
                 }
