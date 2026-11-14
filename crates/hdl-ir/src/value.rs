@@ -417,17 +417,6 @@ fn bnot1(a: u8) -> u8 {
         VX
     }
 }
-fn not1(a: u8) -> u8 {
-    // Logical NOT: 1 bit.
-    if !is_known(a) {
-        VX
-    } else if a == V0 {
-        V1
-    } else {
-        V0
-    }
-}
-
 fn bit_op(op: BinOp, a: u8, b: u8) -> u8 {
     match op {
         BinOp::BAnd => and1(a, b),

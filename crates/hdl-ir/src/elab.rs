@@ -224,10 +224,9 @@ impl Flat {
             for l in &f.locals {
                 slots.push(l.width);
             }
-            // Body sig ids: args and locals are function-local; remap locals to
-            // slot space by adding nothing — the lowerer already emitted local ids
-            // in [0..args+locals). Just remap module-level sigs (captured) too.
-            let body = remap_stmt(&f.body, &map);
+            // Function bodies live in slot space (args then locals); the lowerer
+            // already emitted slot ids, so do NOT remap them through the module map.
+            let body = f.body.clone();
             let _ = (arg_ids, local_base);
             self.functions.push(FlatFunc {
                 name: f.name.clone(),

@@ -56,6 +56,8 @@ pub enum SyntaxKind {
     Inst,
     /// One port connection in an instantiation (`.name(expr)` or positional).
     PortConn,
+    /// One `#(...)` parameter override: `.name(expr)` or positional expr.
+    ParamAssign,
 
     // --- verilog statements ---
     /// Begin/end or single statement.
@@ -146,6 +148,7 @@ impl SyntaxKind {
                 | SyntaxKind::GenBlock
                 | SyntaxKind::Inst
                 | SyntaxKind::PortConn
+                | SyntaxKind::ParamAssign
                 | SyntaxKind::Block
                 | SyntaxKind::If
                 | SyntaxKind::Case

@@ -291,6 +291,10 @@ impl<'a> Parser<'a> {
         } else {
             self.error_here("expected module name");
         }
+        // Optional `#(parameter ...)` header parameter list.
+        if self.at_punct('#') {
+            self.parse_header_params();
+        }
         if self.eat_punct('(') {
             self.parse_port_list();
             self.expect_punct(')', "to close the port list");
@@ -350,20 +354,46 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// `#( parameter W = 8, ... )` in a module header: each entry becomes a
+    /// ParamDecl node, so lowering treats header and body params uniformly.
+    fn parse_header_params(&mut self) {
+        self.bump(); // #
+        self.expect_punct('(', "after `#` in module header");
+        while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+            self.builder.start_node(SyntaxKind::ParamDecl);
+            if self.at_kw("parameter") || self.at_kw("localparam") {
+                self.bump();
+            }
+            if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
+                self.bump();
+            }
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                self.error_here("expected parameter name");
+            }
+            self.expect_punct('=', "in parameter declaration");
+            self.parse_expression();
+            self.builder.finish_node();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(')', "to close the parameter list");
+    }
+
+    /// `[msb:lsb]` or `[width]`, with proper expression nodes inside.
     fn parse_optional_range(&mut self) {
         if self.at_punct('[') {
             self.builder.start_node(SyntaxKind::Range);
             self.bump();
-            // Consume until matching `]` (ranges are simple exprs).
-            let mut depth = 1;
-            while depth > 0 && self.peek().kind != TokenKind::Eof {
-                if self.at_punct('[') {
-                    depth += 1;
-                } else if self.at_punct(']') {
-                    depth -= 1;
-                }
-                self.bump();
+            self.parse_expression();
+            if self.eat_punct(':') {
+                self.parse_expression();
             }
+            self.expect_punct(']', "to close the range");
             self.builder.finish_node();
         }
     }
@@ -505,15 +535,17 @@ impl<'a> Parser<'a> {
             if self.at_punct('(') {
                 self.builder.start_node(SyntaxKind::SensList);
                 self.bump();
-                let mut depth = 1;
-                while depth > 0 && self.peek().kind != TokenKind::Eof {
-                    if self.at_punct('(') {
-                        depth += 1;
-                    } else if self.at_punct(')') {
-                        depth -= 1;
+                // Items: `[posedge|negedge] expr` separated by `,` or `or`.
+                while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                    if self.at_kw("posedge") || self.at_kw("negedge") {
+                        self.bump();
                     }
-                    self.bump();
+                    self.parse_expression();
+                    if !self.eat_punct(',') && !self.eat_kw("or") {
+                        break;
+                    }
                 }
+                self.expect_punct(')', "to close the sensitivity list");
                 self.builder.finish_node();
             } else if self.at_punct('*') {
                 self.bump();
@@ -627,19 +659,33 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::Name);
         self.bump();
         self.builder.finish_node();
-        // Optional parameter override `#(...)`.
+        // Optional parameter override `#(...)` — structured as ParamAssign nodes.
         if self.at_punct('#') {
             self.bump();
             self.expect_punct('(', "after `#`");
-            let mut depth = 1;
-            while depth > 0 && self.peek().kind != TokenKind::Eof {
-                if self.at_punct('(') {
-                    depth += 1;
-                } else if self.at_punct(')') {
-                    depth -= 1;
+            while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+                self.builder.start_node(SyntaxKind::ParamAssign);
+                if self.eat_punct('.') {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.builder.start_node(SyntaxKind::Name);
+                        self.bump();
+                        self.builder.finish_node();
+                    }
+                    self.expect_punct('(', "after the parameter name");
+                    if !self.at_punct(')') {
+                        self.parse_expression();
+                    }
+                    self.expect_punct(')', "to close the parameter override");
+                } else {
+                    // Positional override.
+                    self.parse_expression();
                 }
-                self.bump();
+                self.builder.finish_node();
+                if !self.eat_punct(',') {
+                    break;
+                }
             }
+            self.expect_punct(')', "to close the parameter override list");
         }
         // Instance name(s).
         loop {
