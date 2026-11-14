@@ -11,6 +11,7 @@ mod check;
 mod debug;
 mod init;
 mod project;
+mod regress;
 mod run;
 
 use hdl_lib::LibraryManager;
@@ -216,6 +217,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &project::Project,
     &debug::Debug,
     &bundle::Bundle,
+    &regress::Regress,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
