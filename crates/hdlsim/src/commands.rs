@@ -118,6 +118,7 @@ pub fn parse_lib_mapping(v: &str) -> Result<(String, PathBuf), String> {
 /// file arguments into it), `None` otherwise.
 pub fn build_manager(opts: &CommonOpts) -> Result<(LibraryManager, Option<PathBuf>), String> {
     let mut mgr = LibraryManager::new();
+    mgr.use_env_cache(); // `.hdlsim-cache/` unless HDLSIM_NO_CACHE / HDLSIM_CACHE_DIR
     let mut root: Option<PathBuf> = None;
     if let Some(b) = &opts.bundle {
         let bytes =
