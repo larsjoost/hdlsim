@@ -214,6 +214,11 @@ impl<'a> Lower<'a> {
 
     /// Width from a `(msb downto lsb)` / `(msb to lsb)` / `(n)` constraint.
     fn constraint_width(&mut self, c: &SyntaxNode) -> usize {
+        // Box constraint `type range <>` — genuinely unconstrained; do not try
+        // to evaluate the index type name (it would report "unknown identifier").
+        if self.text(c).contains("<>") {
+            return 1;
+        }
         let exprs: Vec<Expr> = real_children(c)
             .into_iter()
             .filter(|k| is_expr_node(k.kind()))

@@ -21,6 +21,7 @@
 //!   of re-parsing.
 //! - Diagnostics accumulate in one `Diagnostics` list with source spans.
 
+pub mod builtin;
 pub mod bundle;
 pub mod providers;
 
@@ -38,6 +39,9 @@ use std::path::{Path, PathBuf};
 /// The library manager: providers (search path) + compile pipeline + cache.
 pub struct LibraryManager {
     providers: Vec<Box<dyn UnitProvider>>,
+    /// Built-in `std`/`ieee` providers, always searched *after* user providers
+    /// so user mappings override them.
+    builtins: Vec<Box<dyn UnitProvider>>,
     incdirs: Vec<PathBuf>,
     db: SourceDb,
     diags: Diagnostics,
@@ -52,6 +56,7 @@ impl LibraryManager {
     pub fn new() -> LibraryManager {
         LibraryManager {
             providers: Vec::new(),
+            builtins: builtin::stdlib_providers(),
             incdirs: Vec::new(),
             db: SourceDb::new(),
             diags: Diagnostics::new(),
@@ -77,9 +82,14 @@ impl LibraryManager {
         self.incdirs.push(path);
     }
 
-    /// Library names in search order (for diagnostics).
+    /// Library names in search order (for diagnostics): user providers first,
+    /// then the built-in `std`/`ieee`.
     pub fn library_names(&self) -> Vec<&str> {
-        self.providers.iter().map(|p| p.name()).collect()
+        self.providers
+            .iter()
+            .chain(self.builtins.iter())
+            .map(|p| p.name())
+            .collect()
     }
 
     pub fn db(&self) -> &SourceDb {
@@ -120,16 +130,18 @@ impl LibraryManager {
     pub fn scan_libraries(&self) -> Vec<(String, Vec<(String, PathBuf)>)> {
         self.providers
             .iter()
+            .chain(self.builtins.iter())
             .map(|p| (p.name().to_string(), p.scan()))
             .collect()
     }
 
-    /// Build the unit-name → files index by scanning all providers (once).
+    /// Build the unit-name → files index by scanning all providers (once):
+    /// user providers first, built-ins last.
     pub fn ensure_index(&mut self) {
         if self.indexed {
             return;
         }
-        for p in &self.providers {
+        for p in self.providers.iter().chain(self.builtins.iter()) {
             for (unit, file) in p.scan() {
                 self.index.entry(unit).or_default().push(file);
             }
@@ -331,5 +343,35 @@ mod tests {
             err
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_standard_libraries_are_wired_last() {
+        let mut mgr = LibraryManager::new();
+        let names = mgr.library_names();
+        assert!(
+            names.contains(&"std") && names.contains(&"ieee"),
+            "{:?}",
+            names
+        );
+        mgr.add_library_dir("work", Path::new("/nonexistent-work-dir"));
+        // User providers come before the built-ins in search order.
+        let names = mgr.library_names();
+        assert_eq!(&names[..1], &["work"]);
+        // The stdlib tree indexes package units, and they compile cleanly
+        // through the real parse+lower pipeline.
+        let dir = builtin::stdlib_dir().expect("stdlib dir in checkout");
+        let mut design = Design::default();
+        mgr.compile_file(&mut design, &dir.join("std/standard.vhd"))
+            .unwrap();
+        mgr.compile_file(&mut design, &dir.join("ieee/std_logic_1164.vhd"))
+            .unwrap();
+        mgr.compile_file(&mut design, &dir.join("ieee/numeric_std.vhd"))
+            .unwrap();
+        assert!(
+            !mgr.diags().has_errors(),
+            "{}",
+            mgr.diags().render_all(mgr.db())
+        );
     }
 }

@@ -60,6 +60,7 @@ impl<'a> Lexer<'a> {
                 b'$' => self.sys_task(),
                 b'`' => self.directive(),
                 b'\'' => self.based_literal(),
+                b'\\' => self.escaped_ident(),
                 b'0'..=b'9' => self.number(),
                 _ if is_ident_start(b) => {
                     self.run_of(TokenKind::Ident, is_ident_continue);
@@ -237,10 +238,52 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Escaped identifier: `\` + a run of non-whitespace bytes. The terminating
+    /// whitespace is *not* part of the token (IEEE 1364: escaped identifier ends
+    /// at the first whitespace). Emitted as one Ident token; the backslash stays
+    /// in the text, keeping the CST lossless.
+    fn escaped_ident(&mut self) {
+        let start = self.pos;
+        self.pos += 1; // `\`
+        while self.pos < self.text.len() && !self.text[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+        self.tokens.push(Token::new(
+            TokenKind::Ident,
+            Span::new(self.file, start as u32, self.pos as u32),
+        ));
+    }
+
     fn based_literal(&mut self) {
-        // `' [sS]? [bBoOdDhH] value` — a based literal without explicit size.
+        // `' [sS]? [bBoOdDhH] value` — a based literal without explicit size,
+        // or an unsized `'0 '1 'x 'z 'X 'Z '?'.
         let start = self.pos;
         self.pos += 1; // `'`
+        if matches!(
+            self.peek(0),
+            Some(b'0')
+                | Some(b'1')
+                | Some(b'x')
+                | Some(b'X')
+                | Some(b'z')
+                | Some(b'Z')
+                | Some(b'?')
+        ) {
+            self.pos += 1;
+            self.tokens.push(Token::new(
+                TokenKind::IntLiteral,
+                Span::new(self.file, start as u32, self.pos as u32),
+            ));
+            return;
+        }
+        if self.peek(0) == Some(b'(') {
+            // Cast tick: `signed'(x)` / `8'(x)` — a lone `'` is punctuation here.
+            self.tokens.push(Token::new(
+                TokenKind::Punct,
+                Span::new(self.file, start as u32, start as u32 + 1),
+            ));
+            return;
+        }
         let mut ok = false;
         if matches!(self.peek(0), Some(b's') | Some(b'S')) {
             self.pos += 1;
@@ -468,6 +511,37 @@ mod tests {
         let (_, diags) = lex_str("\"oops");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("unterminated string"));
+    }
+
+    #[test]
+    fn lexes_escaped_identifiers_and_unsized_literals() {
+        // `\a+b` is one escaped identifier (no whitespace inside); the
+        // terminating whitespace is a separate token.
+        let ks = kinds("\\a+b = '0 + '1 + 'x;");
+        assert_eq!(
+            ks,
+            vec![
+                TokenKind::Ident, // \a+b
+                TokenKind::Whitespace,
+                TokenKind::Punct, // =
+                TokenKind::Whitespace,
+                TokenKind::IntLiteral, // '0
+                TokenKind::Whitespace,
+                TokenKind::Punct, // +
+                TokenKind::Whitespace,
+                TokenKind::IntLiteral, // '1
+                TokenKind::Whitespace,
+                TokenKind::Punct, // +
+                TokenKind::Whitespace,
+                TokenKind::IntLiteral, // 'x
+                TokenKind::Punct,      // ;
+                TokenKind::Eof
+            ]
+        );
+        // The cast tick is punctuation, not a literal start.
+        let ks = kinds("signed'(x) 8'(y)");
+        assert!(ks.contains(&TokenKind::Punct));
+        assert!(!ks.contains(&TokenKind::Error));
     }
 
     #[test]
