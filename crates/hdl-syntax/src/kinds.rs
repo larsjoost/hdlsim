@@ -12,6 +12,8 @@ pub enum SyntaxKind {
     IntLiteral,
     RealLiteral,
     StrLiteral,
+    /// VHDL character literal (`'0'`).
+    CharLiteral,
     /// `$name` system task/function.
     SysTask,
     /// `` `name `` compiler directive / macro reference.
@@ -97,6 +99,58 @@ pub enum SyntaxKind {
     Name,
     /// Any literal.
     Literal,
+
+    // --- vhdl structure ---
+    /// `library x; use y.z.all;` clauses.
+    LibraryClause,
+    UseClause,
+    /// `entity name is ... end [entity] [name];`
+    Entity,
+    /// `generic (...)` / `port (...)` clauses of an entity.
+    GenericClause,
+    PortClause,
+    /// One `name : mode type` entry in a port/generic clause.
+    PortDecl,
+    GenericDecl,
+    /// `architecture name of entity is ... begin ... end [name];`
+    Architecture,
+    /// `package [body] name is ... end [name];`
+    Package,
+    /// Declarative items of an architecture/entity/package body.
+    SignalDecl,
+    ConstantDecl,
+    VariableDecl,
+    ComponentDecl,
+    TypeDecl,
+    SubtypeDecl,
+    /// `process [(sens)] ... begin ... end process;` (concurrent).
+    Process,
+    /// Concurrent signal assignment `a <= b;`.
+    ConcAssign,
+    /// Sequential signal assignment `a <= b;` inside a process.
+    SeqAssign,
+    /// Sequential variable assignment `a := b;`.
+    VarAssign,
+    /// `assert ... report ... severity ...;` / `report ...`.
+    AssertStmt,
+    /// `null;`
+    NullStmt,
+    /// `loop`/`while`/`for` — `for` reuses For; this is `loop`/`while`.
+    LoopStmt,
+    /// `exit;` / `next;`.
+    ExitStmt,
+    /// Procedure call statement `p(args);`.
+    CallStmt,
+    /// `return [expr];` in a subprogram body.
+    ReturnStmt,
+    /// Aggregate `(a, b, others => c)`.
+    Aggregate,
+    /// Attribute `x'attr`.
+    Attr,
+    /// Qualified expression `type'(expr)`.
+    Qualified,
+    /// `others` in aggregates/case.
+    Others,
 }
 
 impl SyntaxKind {
@@ -106,6 +160,7 @@ impl SyntaxKind {
             TokenKind::IntLiteral => SyntaxKind::IntLiteral,
             TokenKind::RealLiteral => SyntaxKind::RealLiteral,
             TokenKind::StrLiteral => SyntaxKind::StrLiteral,
+            TokenKind::CharLiteral => SyntaxKind::CharLiteral,
             TokenKind::SysTask => SyntaxKind::SysTask,
             TokenKind::Directive => SyntaxKind::Directive,
             TokenKind::Punct => SyntaxKind::Punct,
@@ -123,6 +178,7 @@ impl SyntaxKind {
                 | SyntaxKind::IntLiteral
                 | SyntaxKind::RealLiteral
                 | SyntaxKind::StrLiteral
+                | SyntaxKind::CharLiteral
                 | SyntaxKind::SysTask
                 | SyntaxKind::Directive
                 | SyntaxKind::Punct
@@ -172,6 +228,58 @@ impl SyntaxKind {
                 | SyntaxKind::Replicate
                 | SyntaxKind::PartSelect
                 | SyntaxKind::Index
+                | SyntaxKind::ParenExpr
+                | SyntaxKind::Name
+                | SyntaxKind::Literal
+        )
+    }
+    /// Whether this kind is a VHDL node (used by AST views and golden dumps).
+    pub fn is_vhdl_node(self) -> bool {
+        matches!(
+            self,
+            SyntaxKind::LibraryClause
+                | SyntaxKind::UseClause
+                | SyntaxKind::Entity
+                | SyntaxKind::GenericClause
+                | SyntaxKind::PortClause
+                | SyntaxKind::PortDecl
+                | SyntaxKind::GenericDecl
+                | SyntaxKind::Architecture
+                | SyntaxKind::Package
+                | SyntaxKind::SignalDecl
+                | SyntaxKind::ConstantDecl
+                | SyntaxKind::VariableDecl
+                | SyntaxKind::ComponentDecl
+                | SyntaxKind::TypeDecl
+                | SyntaxKind::SubtypeDecl
+                | SyntaxKind::Process
+                | SyntaxKind::ConcAssign
+                | SyntaxKind::SeqAssign
+                | SyntaxKind::VarAssign
+                | SyntaxKind::AssertStmt
+                | SyntaxKind::NullStmt
+                | SyntaxKind::LoopStmt
+                | SyntaxKind::ExitStmt
+                | SyntaxKind::CallStmt
+                | SyntaxKind::ReturnStmt
+                | SyntaxKind::Aggregate
+                | SyntaxKind::Attr
+                | SyntaxKind::Qualified
+                | SyntaxKind::Others
+                | SyntaxKind::Block
+                | SyntaxKind::If
+                | SyntaxKind::Case
+                | SyntaxKind::CaseItem
+                | SyntaxKind::Wait
+                | SyntaxKind::For
+                | SyntaxKind::SensList
+                | SyntaxKind::Inst
+                | SyntaxKind::PortConn
+                | SyntaxKind::BinExpr
+                | SyntaxKind::UnaryExpr
+                | SyntaxKind::Call
+                | SyntaxKind::Index
+                | SyntaxKind::PartSelect
                 | SyntaxKind::ParenExpr
                 | SyntaxKind::Name
                 | SyntaxKind::Literal

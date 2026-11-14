@@ -15,8 +15,11 @@ pub enum TokenKind {
     IntLiteral,
     /// Real literal (`3.14`, `1.0e-3`).
     RealLiteral,
-    /// String literal, quotes included in the text.
+    /// String literal, quotes included in the text. In VHDL also covers bit
+    /// string literals (`x"FF"`, `b"0101"`) — the base letter stays in the text.
     StrLiteral,
+    /// VHDL character literal (`'0'`); quotes included in the text.
+    CharLiteral,
     /// `$name` system task or function.
     SysTask,
     /// `` `name `` compiler directive or macro reference.
