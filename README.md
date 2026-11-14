@@ -55,6 +55,19 @@ Early development. See `docs/plan.md` for the roadmap, `docs/worldclass.md` for
 feature ideas under consideration, and `REVIEWING.md` for the code conventions
 (reviewability + extensibility rules) every contribution follows.
 
+## Install
+
+```
+cargo install --path crates/hdlsim    # from a checkout
+cargo install hdlsim                  # from crates.io (once published)
+```
+
+All six workspace crates (`hdl-syntax`, `hdl-lib`, `hdl-ir`, `hdl-sim`,
+`hdl-wave`, `hdlsim`) are std-only with zero dependencies and published-ready
+(`[workspace.package]` metadata + `repository`/`license` fields), so external
+tools can depend on e.g. `hdl-sim` or `hdl-syntax` directly to reuse the
+kernel or the parsers.
+
 ## Build
 
 ```
@@ -70,10 +83,18 @@ hdlsim check file.v ...                      # parse + lower + resolve, report d
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us
 hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from libraries
+hdlsim run --top tb                           # no files: resolve everything from hdlsim.ini libraries
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
 hdlsim run --top tb tb.v --live              # live wave window in the browser
 hdlsim project --top cpu --format vivado-tcl # export Vivado TCL project files
+hdlsim debug --top tb --dump                 # dump the elaborated design (signals, processes)
+hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
+hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
 ```
+
+The `debug` command (and the `hdl_sim::debug` module: `Watcher`, `fmt_value`,
+`fmt_time`) is also the debugging toolkit for your own tooling built on the
+libraries — attach a `Watcher` observer to any `Simulator`.
 
 ## Examples
 
@@ -87,6 +108,33 @@ hdlsim project --top cpu --format vivado-tcl # export Vivado TCL project files
   ./examples/riscv-vhdl/run_tests.sh                 # uses target/debug/hdlsim
   cargo test -p hdlsim --test riscv                  # same thing as a cargo test
   ```
+
+  The cpu is split across multiple libraries (`rv32i` for the RTL, `work` for
+  the testbenches) to exercise cross-library dependency resolution; the
+  testbenches are run with no file arguments: `hdlsim run --top tb_alu`.
+- `examples/npu-vhdl` — an 8x8 matrix-vector neural-network accelerator in
+  VHDL, memory-mapped at `0x1000` so the RV32I cpu can drive it: a unit test
+  plus a whole-program integration test where the cpu loads weights/inputs,
+  starts a matvec, and reads back the results over MMIO. Its `hdlsim.ini`
+  pulls the cpu in from `../riscv-vhdl/rtl`:
+
+  ```
+  ./examples/npu-vhdl/run_tests.sh                   # tb_npu + tb_cpu_npu
+  cargo test -p hdlsim --test npu
+  ```
+- `examples/fp-vhdl` — hand-written IEEE-754 single-precision `fp_add` /
+  `fp_mul` in pure VHDL (multi-cycle FSMs with start/done handshake; NaN/inf/
+  zero handling), checked by `tb_fp` against expected bit patterns:
+
+  ```
+  ./examples/fp-vhdl/run_tests.sh
+  cargo test -p hdlsim --test fp
+  ```
+
+`crates/hdlsim/tests/corpus/` holds real-world third-party VHDL/Verilog fetched
+from the internet (see `corpus/README.md`), including Xilinx `unisim`-style
+code — every file must lex/parse cleanly and compile through the lowerer
+(`cargo test -p hdlsim --test corpus`).
 
 `hdlsim.ini` (modelsim.ini style) maps logical libraries to directories:
 

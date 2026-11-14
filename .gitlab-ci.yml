@@ -41,3 +41,7 @@ release-smoke:
     - ./target/release/hdlsim run --top tb_counter --max-time 1us examples/counter/counter.v examples/counter/tb_counter.v | grep -q PASS
     # smoke: run all RV32I cpu example testbenches
     - ./examples/riscv-vhdl/run_tests.sh ./target/release/hdlsim
+    # smoke: NPU example (unit + RV32I cpu integration, multi-library)
+    - ./examples/npu-vhdl/run_tests.sh ./target/release/hdlsim
+    # smoke: fp32 add/mul example
+    - ./examples/fp-vhdl/run_tests.sh ./target/release/hdlsim
