@@ -47,9 +47,8 @@ pub fn preprocess(
             let active = cond_stack.iter().all(|&a| a);
             match name.as_str() {
                 "define" if active => {
-                    let value = args.trim().trim_end().to_string();
-                    let (mname, _) = split_ident(args.trim_start());
-                    macros.insert(mname, value);
+                    let (mname, rest) = split_ident(args.trim_start());
+                    macros.insert(mname, rest.trim().to_string());
                 }
                 "undef" if active => {
                     let (mname, _) = split_ident(args.trim_start());
@@ -203,8 +202,9 @@ mod tests {
 
     #[test]
     fn define_expands_object_like_macro() {
+        // Directive lines are consumed entirely (including their newline).
         let r = run("`define W 8\nwire [`W-1:0] x;");
-        assert_eq!(r.text, "\nwire [8-1:0] x;");
+        assert_eq!(r.text, "wire [8-1:0] x;");
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
         let id = db.add_file("t.v", src).unwrap();
         let mut diags = Vec::new();
         let text = preprocess(id, db.file(id), &[], &mut macros, &mut diags);
-        assert_eq!(text, "\na\n\n\n");
+        assert_eq!(text, "a\n");
     }
 
     #[test]

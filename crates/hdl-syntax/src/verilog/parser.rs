@@ -731,6 +731,18 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if text == "case" || text == "casez" || text == "casex" => {
                 self.parse_case();
             }
+            // Module-level constructs are also legal inside generate blocks.
+            TokenKind::Ident
+                if text == "always"
+                    || text == "always_comb"
+                    || text == "always_ff"
+                    || text == "always_latch" =>
+            {
+                self.parse_always();
+            }
+            TokenKind::Ident if text == "initial" => {
+                self.parse_initial();
+            }
             TokenKind::Punct if text == ";" => {
                 self.bump(); // empty statement
             }
@@ -768,11 +780,12 @@ impl<'a> Parser<'a> {
                 // postfix expression only, so `<=` is read as non-blocking
                 // assignment, not as less-than-or-equal.
                 self.builder.start_node(SyntaxKind::StmtAssign);
+                let mark = self.builder.mark();
                 self.parse_postfix();
                 if self.parse_assign_op() {
                     self.parse_expression();
                 } else {
-                    self.parse_binops(1);
+                    self.parse_binops(mark, 1);
                 }
                 self.expect_punct(';', "to end the statement");
                 self.builder.finish_node();
@@ -843,7 +856,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_prec(&mut self, min_prec: u8) {
+        let mark = self.builder.mark();
         self.parse_unary();
+        self.parse_binops(mark, min_prec);
+        // Ternary `?:` is the lowest-precedence operator, right-associative, and
+        // only valid at the top expression level.
+        if min_prec == 1 && self.at_punct('?') {
+            self.builder.start_node_at(mark, SyntaxKind::CondExpr);
+            self.bump(); // ?
+            self.parse_expression();
+            self.expect_punct(':', "in conditional expression");
+            self.parse_expr_prec(1); // else branch, right-assoc
+            self.builder.finish_node();
+        }
+    }
+
+    /// Binary-operator precedence-climbing loop. `mark` points at the start of
+    /// the lhs, so each operator wraps lhs+op+rhs into one BinExpr node.
+    fn parse_binops(&mut self, mut mark: crate::cst::Mark, min_prec: u8) {
         loop {
             let op = if let Some(op) = self.peek_op2() {
                 op
@@ -864,7 +894,7 @@ impl<'a> Parser<'a> {
             if prec < min_prec {
                 break;
             }
-            self.builder.start_node(SyntaxKind::BinExpr);
+            self.builder.start_node_at(mark, SyntaxKind::BinExpr);
             // Consume the operator (one or two punct tokens).
             self.bump();
             if MULTI_OPS.contains(&op.as_str()) {
@@ -873,6 +903,8 @@ impl<'a> Parser<'a> {
             let next_min = if right_assoc { prec } else { prec + 1 };
             self.parse_expr_prec(next_min);
             self.builder.finish_node();
+            // Left-associative chaining: the next operator wraps the whole BinExpr.
+            mark = self.builder.mark();
         }
     }
 
@@ -888,20 +920,8 @@ impl<'a> Parser<'a> {
             }
             self.parse_unary();
             self.builder.finish_node();
-        } else if self.at_punct('?') {
-            // Should not happen here; guarded by ternary handling below.
-            self.parse_primary();
         } else {
             self.parse_postfix();
-        }
-        // Ternary `?:` is the lowest-precedence operator.
-        if self.at_punct('?') {
-            self.builder.start_node(SyntaxKind::CondExpr);
-            self.bump(); // ?
-            self.parse_expression();
-            self.expect_punct(':', "in conditional expression");
-            self.parse_expr_prec(1); // else branch, right-assoc
-            self.builder.finish_node();
         }
     }
 
@@ -1087,9 +1107,15 @@ endmodule
                 .join("\n")
         );
         let sexp = p.root.debug_sexp(&db);
-        assert!(sexp.contains("(Always (SensList"), "{}", sexp);
+        assert!(sexp.contains("(SensList"), "{}", sexp);
         assert!(sexp.contains("(StmtAssign"), "{}", sexp);
         assert!(sexp.contains("(If"), "{}", sexp);
+        // `q <= 8'h00` must be a non-blocking StmtAssign, not a BinExpr comparison.
+        assert!(
+            !sexp.contains("(BinExpr (Name Ident \"q\") Punct \"<\""),
+            "{}",
+            sexp
+        );
     }
 
     #[test]

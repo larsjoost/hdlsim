@@ -168,6 +168,16 @@ impl Iterator for Descendants {
     }
 }
 
+/// A checkpoint into the builder: everything emitted after this mark can be
+/// wrapped into a node with [`TreeBuilder::start_node_at`] (used to build
+/// left-associative expression trees, where the lhs is emitted before the
+/// operator is known).
+#[derive(Clone, Copy, Debug)]
+pub struct Mark {
+    children: usize,
+    offset: u32,
+}
+
 /// Incrementally builds a green tree from parser events. Enforces the invariants:
 /// tokens only inside an open node, spans contiguous, one root at `finish`.
 pub struct TreeBuilder {
@@ -198,6 +208,31 @@ impl TreeBuilder {
             kind,
             start: self.offset,
             children: Vec::new(),
+        });
+    }
+
+    /// Current position as a mark for a later `start_node_at`.
+    pub fn mark(&self) -> Mark {
+        let children = self.stack.last().map_or(0, |t| t.children.len());
+        Mark {
+            children,
+            offset: self.offset,
+        }
+    }
+
+    /// Open a node that wraps everything emitted since `mark`: the children
+    /// already emitted into the current top node after the mark are moved into
+    /// the new node.
+    pub fn start_node_at(&mut self, mark: Mark, kind: SyntaxKind) {
+        let mut children = Vec::new();
+        if let Some(top) = self.stack.last_mut() {
+            let from = mark.children.min(top.children.len());
+            children = top.children.split_off(from);
+        }
+        self.stack.push(OpenNode {
+            kind,
+            start: mark.offset,
+            children,
         });
     }
 
