@@ -997,7 +997,7 @@ impl<'a> Parser<'a> {
 
     /// Binary-operator precedence-climbing loop. `mark` points at the start of
     /// the lhs, so each operator wraps lhs+op+rhs into one BinExpr node.
-    fn parse_binops(&mut self, mut mark: crate::cst::Mark, min_prec: u8) {
+    fn parse_binops(&mut self, mark: crate::cst::Mark, min_prec: u8) {
         loop {
             let op = if let Some(op) = self.peek_op3().or_else(|| self.peek_op2()) {
                 op
@@ -1026,8 +1026,8 @@ impl<'a> Parser<'a> {
             let next_min = if right_assoc { prec } else { prec + 1 };
             self.parse_expr_prec(next_min);
             self.builder.finish_node();
-            // Left-associative chaining: the next operator wraps the whole BinExpr.
-            mark = self.builder.mark();
+            // Keep `mark`: the next operator in the chain wraps the whole
+            // BinExpr just finished (left-associative).
         }
     }
 

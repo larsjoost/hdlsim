@@ -57,7 +57,26 @@ impl Command for Ast {
                     Ok(0)
                 }
             }
-            Language::Vhdl => Err("VHDL front-end not wired yet".to_string()),
+            Language::Vhdl => {
+                let mut db = SourceDb::new();
+                let id = db
+                    .add_file(path.display().to_string(), text)
+                    .map_err(|e| e.to_string())?;
+                let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+                for d in &parsed.diags {
+                    eprint!("{}", d.render(&db));
+                }
+                println!("{}", parsed.root.debug_sexp(&db));
+                if parsed
+                    .diags
+                    .iter()
+                    .any(|d| d.severity == hdl_syntax::diagnostic::Severity::Error)
+                {
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
         }
     }
 }

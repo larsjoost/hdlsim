@@ -89,12 +89,12 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
         Some(l) => l,
         None => return Vec::new(),
     };
-    if lang != Language::Verilog {
-        return Vec::new();
-    }
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    if lang == Language::Vhdl {
+        return vhdl_units_in_file(path, &text);
+    }
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text) else {
         return Vec::new();
@@ -112,5 +112,25 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
         .filter(|c| c.kind() == SyntaxKind::Module)
         .filter_map(|m| m.children().find(|c| c.kind() == SyntaxKind::Name))
         .map(|n| db.span_text(n.span()).trim().to_string())
+        .collect()
+}
+
+/// Entity names defined by a VHDL file.
+fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
+    let mut db = SourceDb::new();
+    let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
+        return Vec::new();
+    };
+    let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+    parsed
+        .root
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::Entity)
+        .filter_map(|e| {
+            e.children()
+                .filter(|c| c.kind() == SyntaxKind::Ident)
+                .nth(1) // [0] is the `entity` keyword
+                .map(|n| db.span_text(n.span()).trim().to_string())
+        })
         .collect()
 }

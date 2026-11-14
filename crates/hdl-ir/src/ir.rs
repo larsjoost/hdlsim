@@ -60,6 +60,9 @@ pub struct SignalIr {
     pub init: Option<Value>,
     /// `Some(depth)` for memories: `reg [7:0] mem [0:255]` → width 8, mem 256.
     pub mem: Option<usize>,
+    /// VHDL `signed` types (and Verilog `signed` regs): arithmetic/comparisons
+    /// sign-extend instead of zero-extend.
+    pub signed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,6 +224,22 @@ pub enum Expr {
         e: Box<Expr>,
         i: Box<Expr>,
     },
+    /// VHDL `rising_edge(sig)` — true when the signal had a 0→1 edge at the
+    /// current simulation time (evaluated against prev/current values).
+    Rising(Box<Expr>),
+    /// VHDL `falling_edge(sig)`.
+    Falling(Box<Expr>),
+    /// VHDL `to_integer(x)` — unsigned numeric value as a 32-bit integer.
+    ToInt(Box<Expr>),
+    /// VHDL `t'image(x)` — decimal string of the value, as ASCII bytes.
+    ToString(Box<Expr>),
+    /// Resize to a fixed width: `to_unsigned(x, n)` / `resize(x, n)`.
+    /// `signed` selects sign-extension (truncation keeps the low bits).
+    Resize {
+        e: Box<Expr>,
+        width: usize,
+        signed: bool,
+    },
 }
 
 impl Expr {
@@ -262,6 +281,10 @@ impl Expr {
                 e.collect_sigs(out);
                 i.collect_sigs(out);
             }
+            Expr::Rising(e) | Expr::Falling(e) | Expr::ToInt(e) | Expr::ToString(e) => {
+                e.collect_sigs(out)
+            }
+            Expr::Resize { e, .. } => e.collect_sigs(out),
         }
     }
 }

@@ -251,11 +251,21 @@ pub fn compile_one(
             design.modules.extend(modules);
         }
         Language::Vhdl => {
-            diags.push(Diagnostic::warning(
-                "W0501",
-                None,
-                format!("VHDL front-end not wired yet; skipping {}", path.display()),
-            ));
+            let raw_id = db
+                .add_file(path.display().to_string(), text)
+                .map_err(|e| e.to_string())?;
+            let parsed = hdl_syntax::vhdl::parser::parse_file(raw_id, db.file(raw_id));
+            diags.extend(parsed.diags);
+            let mut lower_diags = Vec::new();
+            let modules = hdl_ir::vhdl_lower::lower_file(
+                raw_id,
+                &parsed.root,
+                db,
+                &mut lower_diags,
+                1_000_000,
+            );
+            diags.extend(lower_diags);
+            design.modules.extend(modules);
         }
     }
     Ok(())

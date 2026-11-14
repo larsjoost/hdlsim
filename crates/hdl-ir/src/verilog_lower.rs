@@ -214,6 +214,7 @@ impl<'a> Lower<'a> {
                                 kind,
                                 init: None,
                                 mem: None,
+                                signed: false,
                             });
                             module.ports.push(PortIr {
                                 name: n,
@@ -241,6 +242,7 @@ impl<'a> Lower<'a> {
                                     kind: SigKind::Wire,
                                     init: None,
                                     mem: None,
+                                    signed: false,
                                 });
                                 self.names
                                     .insert(module.signals[id as usize].name.clone(), id);
@@ -310,6 +312,7 @@ impl<'a> Lower<'a> {
             kind,
             init: None,
             mem: None,
+            signed: false,
         });
         module.ports.push(PortIr { name, dir, sig: id });
     }
@@ -902,6 +905,7 @@ impl<'a> Lower<'a> {
                         kind: SigKind::Reg,
                         init: None,
                         mem: None,
+                        signed: false,
                     });
                     slots.push((n, width));
                 }
@@ -1165,13 +1169,15 @@ impl<'a> Lower<'a> {
     fn lower_literal(&mut self, l: &SyntaxNode) -> Expr {
         let t = self.text(l);
         if t.starts_with('"') {
-            // String literal: bytes as a value, first char in the low byte.
+            // String literal: first char in the high byte (MSB-first), matching
+            // Value::concat part order and string_of's MSB-first reading.
             let inner = t.trim_matches('"');
             let bytes = inner.as_bytes();
-            let mut bits = vec![V0; bytes.len().max(1) * 8];
+            let n = bytes.len().max(1);
+            let mut bits = vec![V0; n * 8];
             for (bi, &b) in bytes.iter().enumerate() {
                 for j in 0..8 {
-                    bits[bi * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
+                    bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                 }
             }
             return Expr::Lit(Value { bits });
@@ -1333,6 +1339,7 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
     match e {
+        Expr::Rising(_) | Expr::Falling(_) | Expr::ToInt(_) | Expr::ToString(_) => None,
         Expr::Lit(v) => Some(v.clone()),
         Expr::Sig(_) => None,
         Expr::Bin { op, l, r } => Some(const_eval(l, env)?.binop(*op, &const_eval(r, env)?)),
@@ -1363,6 +1370,18 @@ pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
             let v = const_eval(e, env)?;
             let i = const_eval(i, env)?.to_u64()? as usize;
             Some(Value::from_bit(v.bit(i)))
+        }
+        Expr::Resize { e, width, signed } => {
+            let v = const_eval(e, env)?;
+            if *signed && v.width() < *width {
+                let mut bits = vec![if v.bit(v.width() - 1) == V1 { V1 } else { V0 }; *width];
+                for i in 0..v.width() {
+                    bits[i] = v.bit(i);
+                }
+                Some(Value { bits })
+            } else {
+                Some(v.resize(*width))
+            }
         }
         Expr::Call { .. } => None,
     }

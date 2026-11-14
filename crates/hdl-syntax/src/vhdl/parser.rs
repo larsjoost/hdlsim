@@ -1053,6 +1053,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("for") {
             self.parse_expression();
+            // Physical literal unit: `10 ns` — the unit is a bare identifier.
+            if self.peek().kind == TokenKind::Ident {
+                self.bump();
+            }
         }
         self.expect_punct(';', "to end the wait statement");
         self.builder.finish_node();
@@ -1089,7 +1093,7 @@ impl<'a> Parser<'a> {
         self.parse_name();
     }
 
-    fn parse_name_suffixes(&mut self, mut mark: crate::cst::Mark) {
+    fn parse_name_suffixes(&mut self, mark: crate::cst::Mark) {
         loop {
             if self.at_punct('(') {
                 self.bump();
@@ -1110,7 +1114,6 @@ impl<'a> Parser<'a> {
                     self.builder.start_node_at(mark, SyntaxKind::Call);
                     self.builder.finish_node();
                 }
-                mark = self.builder.mark();
             } else if self.at_punct('\'') {
                 self.bump();
                 if self.peek().kind == TokenKind::Ident {
@@ -1120,7 +1123,6 @@ impl<'a> Parser<'a> {
                 } else {
                     self.error_here("expected an attribute name after the tick");
                 }
-                mark = self.builder.mark();
             } else {
                 break;
             }
@@ -1165,7 +1167,7 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn parse_binops(&mut self, mut mark: crate::cst::Mark, min_prec: u8) {
+    fn parse_binops(&mut self, mark: crate::cst::Mark, min_prec: u8) {
         loop {
             let Some(op) = self.current_binop() else {
                 break;
@@ -1187,7 +1189,8 @@ impl<'a> Parser<'a> {
             let next_min = if right_assoc { prec } else { prec + 1 };
             self.parse_expr_prec(next_min);
             self.builder.finish_node();
-            mark = self.builder.mark();
+            // Keep `mark`: the next operator in the chain wraps the whole
+            // BinExpr just finished (left-associative).
         }
     }
 

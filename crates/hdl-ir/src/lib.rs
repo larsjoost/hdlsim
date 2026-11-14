@@ -25,6 +25,7 @@ pub mod elab;
 pub mod ir;
 pub mod value;
 pub mod verilog_lower;
+pub mod vhdl_lower;
 
 pub use ir::*;
 pub use value::{BinOp, UnOp, Value};

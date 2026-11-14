@@ -35,6 +35,8 @@ pub struct FlatSig {
     /// `Some(depth)` for memories.
     pub mem: Option<usize>,
     pub scope: ScopeId,
+    /// Signed arithmetic/comparison (VHDL `signed`, Verilog `signed`).
+    pub signed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +184,7 @@ impl Flat {
         kind: SigKind,
         init: Option<Value>,
         scope: ScopeId,
+        signed: bool,
     ) -> FlatSigId {
         let id = self.signals.len() as FlatSigId;
         self.signals.push(FlatSig {
@@ -190,6 +193,7 @@ impl Flat {
             kind,
             init,
             mem: None,
+            signed,
             scope,
         });
         id
@@ -241,7 +245,7 @@ impl Flat {
             } else {
                 format!("{}.{}", prefix, s.name)
             };
-            let id = self.new_sig(name, s.width, s.kind, s.init.clone(), scope);
+            let id = self.new_sig(name, s.width, s.kind, s.init.clone(), scope, s.signed);
             self.signals[id as usize].mem = s.mem;
             map.push(id);
         }
@@ -270,6 +274,7 @@ impl Flat {
                         port_dir_kind(port.dir),
                         None,
                         scope,
+                        m.signals[port.sig as usize].signed,
                     );
                     map[port.sig as usize] = imp;
                     match port.dir {
@@ -434,6 +439,15 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
             count: Box::new(remap_expr(count, map)),
             e: Box::new(remap_expr(e, map)),
         },
+        Expr::Rising(e) => Expr::Rising(Box::new(remap_expr(e, map))),
+        Expr::Falling(e) => Expr::Falling(Box::new(remap_expr(e, map))),
+        Expr::ToInt(e) => Expr::ToInt(Box::new(remap_expr(e, map))),
+        Expr::ToString(e) => Expr::ToString(Box::new(remap_expr(e, map))),
+        Expr::Resize { e, width, signed } => Expr::Resize {
+            e: Box::new(remap_expr(e, map)),
+            width: *width,
+            signed: *signed,
+        },
         Expr::Sel { e, msb, lsb } => Expr::Sel {
             e: Box::new(remap_expr(e, map)),
             msb: Box::new(remap_expr(msb, map)),
@@ -521,6 +535,7 @@ mod tests {
             kind,
             init: None,
             mem: None,
+            signed: false,
         }
     }
 

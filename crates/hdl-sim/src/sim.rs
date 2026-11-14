@@ -16,7 +16,7 @@
 
 use crate::events::{Observer, SimEvent};
 use hdl_ir::elab::{Flat, FlatSigId};
-use hdl_ir::value::{Value, V0, V1};
+use hdl_ir::value::{Value, V0, V1, VX};
 use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, Stmt};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -537,6 +537,60 @@ impl Simulator {
                     time_fs: self.time,
                 });
             }
+            "assert" => {
+                let ok = args
+                    .first()
+                    .map(|a| truthy(&self.eval_expr(a, None)))
+                    .unwrap_or(true);
+                if !ok {
+                    let msg = args
+                        .get(1)
+                        .map(|a| string_of(&self.eval_expr(a, None)))
+                        .unwrap_or_default();
+                    let severity = args
+                        .get(2)
+                        .map(|a| string_of(&self.eval_expr(a, None)))
+                        .unwrap_or_default();
+                    self.emit(SimEvent::Message {
+                        text: format!("assertion failed at t={}: {}\n", self.time, msg),
+                        time_fs: self.time,
+                    });
+                    if severity == "failure" {
+                        self.emit(SimEvent::Message {
+                            text: format!(
+                                "error: severity failure at t={}; simulation aborted\n",
+                                self.time
+                            ),
+                            time_fs: self.time,
+                        });
+                        self.stopped = true;
+                    }
+                }
+            }
+            "report" => {
+                let msg = args
+                    .first()
+                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .unwrap_or_default();
+                let severity = args
+                    .get(1)
+                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .unwrap_or_default();
+                self.emit(SimEvent::Message {
+                    text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
+                    time_fs: self.time,
+                });
+                if severity == "failure" {
+                    self.emit(SimEvent::Message {
+                        text: format!(
+                            "error: severity failure at t={}; simulation aborted\n",
+                            self.time
+                        ),
+                        time_fs: self.time,
+                    });
+                    self.stopped = true;
+                }
+            }
             "finish" => {
                 self.finished = true;
             }
@@ -810,19 +864,39 @@ impl Simulator {
                 self.set_sig(sig, cur)
             }
             Expr::Concat(parts) => {
-                // Split v across parts, MSB first.
-                let mut changed = false;
-                let mut offset = 0usize;
+                // Split v across parts: parts[0] takes the most-significant
+                // slice, matching Value::concat.
                 let widths: Vec<usize> = parts.iter().map(|p| self.expr_width(p, locals)).collect();
-                let total: usize = widths.iter().sum();
+                let total: usize = widths.iter().sum::<usize>().max(1);
+                let mut changed = false;
+                let mut hi = total; // exclusive upper bound of the remaining slice
                 for (p, w) in parts.iter().zip(widths.iter()) {
-                    let hi = offset + w - 1;
-                    let part_val = v.slice(hi.min(total - 1), offset);
+                    let lo = hi.saturating_sub(*w);
+                    let part_val = v.slice((hi - 1).min(total - 1), lo);
                     changed |= self.assign_to(p, part_val, locals);
-                    offset += w;
+                    hi = lo;
                 }
                 changed
             }
+            _ => false,
+        }
+    }
+
+    /// Whether an expression is a signed-typed value (VHDL `signed`).
+    fn expr_signed(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
+        match e {
+            Expr::Sig(s) => {
+                let i = *s as usize;
+                if let Some(l) = locals {
+                    if i < l.len() {
+                        return false; // function/variable slots are unsigned
+                    }
+                }
+                i < self.flat.signals.len() && self.flat.signals[i].signed
+            }
+            Expr::Bin { l, r, .. } => self.expr_signed(l, locals) && self.expr_signed(r, locals),
+            Expr::Un { e, .. } => self.expr_signed(e, locals),
+            Expr::Resize { e, signed, .. } => *signed || self.expr_signed(e, locals),
             _ => false,
         }
     }
@@ -854,6 +928,10 @@ impl Simulator {
                 .map(|i| self.flat.functions[*i].ret_width)
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
+            Expr::Rising(_) | Expr::Falling(_) => 1,
+            Expr::ToInt(_) => 32,
+            Expr::ToString(_) => 8 * 12, // decimal digits, upper bound
+            Expr::Resize { width, .. } => *width,
         }
     }
 
@@ -878,7 +956,67 @@ impl Simulator {
             Expr::Bin { op, l, r } => {
                 let lv = self.eval_expr(l, locals);
                 let rv = self.eval_expr(r, locals);
+                // VHDL signed operands: sign-extend both to the wider width
+                // before arithmetic/comparison (zero-extend is the default).
+                if self.expr_signed(l, locals) || self.expr_signed(r, locals) {
+                    let w = lv.width().max(rv.width()).max(1);
+                    let l2 = sign_extend(&lv, w);
+                    let r2 = sign_extend(&rv, w);
+                    return l2.binop(*op, &r2);
+                }
                 lv.binop(*op, &rv)
+            }
+            Expr::Rising(e) => {
+                let v = self.eval_expr(e, locals);
+                let i = match &**e {
+                    Expr::Sig(s) => *s as usize,
+                    _ => return Value::x(1),
+                };
+                let cur = v.bit(0);
+                let prev = if i < self.prev.len() {
+                    self.prev[i].bit(0)
+                } else {
+                    VX
+                };
+                Value::from_u64(1, (cur == V1 && prev == V0) as u64)
+            }
+            Expr::Falling(e) => {
+                let v = self.eval_expr(e, locals);
+                let i = match &**e {
+                    Expr::Sig(s) => *s as usize,
+                    _ => return Value::x(1),
+                };
+                let cur = v.bit(0);
+                let prev = if i < self.prev.len() {
+                    self.prev[i].bit(0)
+                } else {
+                    VX
+                };
+                Value::from_u64(1, (cur == V0 && prev == V1) as u64)
+            }
+            Expr::ToInt(e) => {
+                let v = self.eval_expr(e, locals);
+                match v.to_u64() {
+                    Some(n) => Value::from_u64(32, n),
+                    None => Value::x(32),
+                }
+            }
+            Expr::ToString(e) => {
+                let v = self.eval_expr(e, locals);
+                let s = match v.to_u64() {
+                    Some(n) => n.to_string(),
+                    None => "x".to_string(),
+                };
+                // First digit in the high byte, matching string literal packing.
+                let bytes = s.as_bytes();
+                let n = bytes.len().max(1);
+                let mut bits = vec![V0; n * 8];
+                for (bi, &b) in bytes.iter().enumerate() {
+                    for j in 0..8 {
+                        bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
+                    }
+                }
+                Value { bits }
             }
             Expr::Un { op, e } => self.eval_expr(e, locals).unop(*op),
             Expr::Cond { c, t, e } => {
@@ -897,6 +1035,14 @@ impl Simulator {
                 let n = self.eval_expr(count, locals).to_u64().unwrap_or(0) as usize;
                 let v = self.eval_expr(e, locals);
                 Value::concat(&vec![v; n])
+            }
+            Expr::Resize { e, width, signed } => {
+                let v = self.eval_expr(e, locals);
+                if *signed && v.width() < *width {
+                    sign_extend(&v, *width)
+                } else {
+                    v.resize(*width)
+                }
             }
             Expr::Sel { e, msb, lsb } => {
                 let v = self.eval_expr(e, locals);
@@ -1037,6 +1183,26 @@ impl<'a> FnRunner<'a> {
     }
 }
 
+/// Sign-extend `v` to `width` bits (VHDL signed semantics).
+fn sign_extend(v: &Value, width: usize) -> Value {
+    let w = width.max(v.width()).max(1);
+    let mut bits = vec![V0; w];
+    for i in 0..v.width().min(w) {
+        bits[i] = v.bit(i);
+    }
+    let sign = v.bit(v.width().saturating_sub(1));
+    if sign != V0 && sign != V1 {
+        for i in v.width()..w {
+            bits[i] = sign; // X/Z sign-extends as X/Z
+        }
+    } else if sign == V1 {
+        for i in v.width()..w {
+            bits[i] = V1;
+        }
+    }
+    Value { bits }
+}
+
 fn truthy(v: &Value) -> bool {
     v.to_u64().map_or(false, |x| x != 0)
 }
@@ -1053,9 +1219,10 @@ fn lhs_sig(e: &Expr) -> Option<FlatSigId> {
 }
 
 fn string_of(v: &Value) -> String {
-    // Interpret value bits as bytes, LSB-first per byte.
+    // Interpret value bits as bytes, MSB chunk first (first char = high byte,
+    // matching how string literals are packed and Value::concat orders parts).
     let mut s = String::new();
-    for chunk in v.bits.chunks(8) {
+    for chunk in v.bits.chunks(8).rev() {
         let mut byte = 0u8;
         for (j, &b) in chunk.iter().enumerate() {
             if b == V1 {
