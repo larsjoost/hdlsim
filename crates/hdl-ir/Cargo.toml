@@ -1,11 +1,18 @@
 [package]
 name = "hdl-ir"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+rust-version.workspace = true
 description = "Language-neutral elaborated design IR (netlist + processes)"
-license = "MIT"
+keywords = ["vhdl", "verilog", "ir", "netlist", "hdl"]
+categories = ["parser-implementations", "simulation"]
 
 [dependencies]
-hdl-syntax = { path = "../hdl-syntax" }
+hdl-syntax.workspace = true
 # Note: hdl-ir deliberately does NOT depend on hdl-lib (that would be circular).
 # Name resolution is injected via a ResolveCtx trait implemented by hdl-lib users.

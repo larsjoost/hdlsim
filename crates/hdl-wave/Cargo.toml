@@ -1,10 +1,17 @@
 [package]
 name = "hdl-wave"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+rust-version.workspace = true
 description = "Wave sinks and viewers: VCD, self-contained HTML/SVG, live HTTP+SSE, ASCII"
-license = "MIT"
+keywords = ["vcd", "waveform", "viewer", "sse", "hdl"]
+categories = ["simulation", "visualization"]
 
 [dependencies]
-hdl-ir = { path = "../hdl-ir" }
-hdl-sim = { path = "../hdl-sim" }
+hdl-ir.workspace = true
+hdl-sim.workspace = true
