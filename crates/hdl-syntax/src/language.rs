@@ -6,7 +6,7 @@
 //! `DialectFlags` config passed to the same parser, not as forked parsers.
 
 use crate::diagnostic::Diagnostic;
-use crate::source::SourceFile;
+use crate::source::{FileId, SourceFile};
 use crate::token::Token;
 use std::path::Path;
 
@@ -36,7 +36,8 @@ impl Language {
     }
 }
 
-/// Extension seam: implement for a language or dialect, register in [`languages`].
+/// Extension seam: implement for a new language or dialect, register in
+/// [`languages`].
 ///
 /// Implementations must never panic on arbitrary input; all problems are
 /// returned as diagnostics.
@@ -45,7 +46,7 @@ pub trait LanguageFrontend {
 
     /// Lex a whole file into tokens (including whitespace/comment tokens and a
     /// trailing `Eof`), plus any lexing diagnostics.
-    fn lex(&self, file: &SourceFile) -> (Vec<Token>, Vec<Diagnostic>);
+    fn lex(&self, file: FileId, src: &SourceFile) -> (Vec<Token>, Vec<Diagnostic>);
 }
 
 /// Registry of known languages. Add one entry per language/dialect.

@@ -3,3 +3,5 @@
 //!
 //! Dialect differences from SystemVerilog are driven by a `DialectFlags` config,
 //! not by forking this module.
+
+pub mod lexer;
