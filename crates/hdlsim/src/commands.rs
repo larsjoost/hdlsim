@@ -7,6 +7,7 @@
 
 mod ast;
 mod check;
+mod debug;
 mod init;
 mod project;
 mod run;
@@ -147,6 +148,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &ast::Ast,
     &init::Init,
     &project::Project,
+    &debug::Debug,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.

@@ -80,8 +80,10 @@ impl Command for Run {
                 }
             }
         }
-        if files.is_empty() {
-            return Err("no input files".to_string());
+        // Files may be omitted when --top is given: the top (and its
+        // dependencies) are then resolved on demand from the libraries.
+        if files.is_empty() && top.is_none() {
+            return Err("no input files (or pass --top to resolve from libraries)".to_string());
         }
         // Compile the explicit files, then let elaboration pull in any missing
         // design units from the configured libraries on demand.

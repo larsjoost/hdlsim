@@ -183,6 +183,115 @@ impl Simulator {
         self.time
     }
 
+    // ---- introspection (debug API) ---------------------------------------------
+    // These let external tools (and `hdlsim debug`) inspect the running design
+    // without the kernel changing: find signals, read values, dump memories.
+
+    /// Find a signal by id (`"#57"`), full hierarchical name (`tb.dut.q`), or
+    /// leaf name (`q`). Leaf match returns the first hit.
+    pub fn signal_id(&self, name: &str) -> Option<FlatSigId> {
+        if let Some(num) = name.strip_prefix('#') {
+            return num
+                .parse::<FlatSigId>()
+                .ok()
+                .filter(|i| (*i as usize) < self.flat.signals.len());
+        }
+        if let Some(i) = self.flat.signals.iter().position(|s| s.name == name) {
+            return Some(i as FlatSigId);
+        }
+        self.flat
+            .signals
+            .iter()
+            .position(|s| s.name.rsplit('.').next() == Some(name))
+            .map(|i| i as FlatSigId)
+    }
+
+    pub fn signal_name(&self, id: FlatSigId) -> &str {
+        &self.flat.signals[id as usize].name
+    }
+
+    pub fn signal_width(&self, id: FlatSigId) -> usize {
+        self.flat.signals[id as usize].width
+    }
+
+    pub fn signal_value(&self, id: FlatSigId) -> Value {
+        self.vals[id as usize].clone()
+    }
+
+    pub fn signal_is_mem(&self, id: FlatSigId) -> bool {
+        self.is_mem[id as usize]
+    }
+
+    /// Number of words in a memory signal (0 for plain signals).
+    pub fn mem_len(&self, id: FlatSigId) -> usize {
+        if self.is_mem[id as usize] {
+            self.mems[id as usize].len()
+        } else {
+            0
+        }
+    }
+
+    pub fn mem_word(&self, id: FlatSigId, idx: usize) -> Option<Value> {
+        self.mems[id as usize].get(idx).cloned()
+    }
+
+    pub fn proc_count(&self) -> usize {
+        self.flat.procs.len()
+    }
+
+    pub fn proc_origin(&self, id: u32) -> &str {
+        &self.flat.procs[id as usize].origin
+    }
+
+    /// Human-readable listing of the elaborated design: signals (with memory
+    /// depth and init value), processes (with origin and sensitivity), and
+    /// continuous assigns. Useful as a first step when debugging a design.
+    pub fn dump_design(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "design: {} signals, {} processes, {} assigns, {} functions",
+            self.flat.signals.len(),
+            self.flat.procs.len(),
+            self.flat.assigns.len(),
+            self.flat.functions.len()
+        );
+        for (i, s) in self.flat.signals.iter().enumerate() {
+            let mem = match s.mem {
+                Some(d) => format!(" mem[0..{}]", d),
+                None => String::new(),
+            };
+            let init = s
+                .init
+                .as_ref()
+                .map(|v| format!(" init={}", crate::debug::fmt_value(v)))
+                .unwrap_or_default();
+            let sgn = if s.signed { " signed" } else { "" };
+            let _ = writeln!(
+                out,
+                "  sig #{:<3} {:<40} w={:<3}{}{}{}",
+                i, s.name, s.width, mem, sgn, init
+            );
+        }
+        for (i, p) in self.flat.procs.iter().enumerate() {
+            let sens = match &p.sens {
+                Sens::List(es) => es
+                    .iter()
+                    .map(|e| format!("{:?}#{}", e.kind, e.sig))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Sens::All => "all".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "  proc #{:<3} {:?} sens=[{}] ({})",
+                i, p.kind, sens, p.origin
+            );
+        }
+        out
+    }
+
     fn emit(&mut self, ev: SimEvent) {
         for o in &mut self.observers {
             o.on_event(&ev);

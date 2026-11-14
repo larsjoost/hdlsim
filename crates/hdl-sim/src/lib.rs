@@ -10,12 +10,15 @@
 //! # Layout
 //! - [`events`]: the closed `SimEvent` enum + `Observer` trait (extension seam).
 //! - [`sim`]: the `Simulator` (active/NBA/time regions, process frames).
+//! - [`debug`]: debugging helpers — value/time formatting, a signal [`debug::Watcher`],
+//!   and design introspection on the simulator.
 //!
 //! # Invariants
 //! - Deterministic for a fixed design and RNG seed.
 //! - Observers get immutable event snapshots; they cannot corrupt the kernel.
 //! - The kernel never panics on design content; runtime problems are events.
 
+pub mod debug;
 pub mod events;
 pub mod sim;
 
