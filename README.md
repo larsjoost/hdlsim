@@ -95,7 +95,14 @@ hdlsim run --bundle repro.tar --top tb       # reproduce straight from the bundl
 hdlsim debug --top tb --dump                 # dump the elaborated design (signals, processes)
 hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
+hdlsim regress --junit results.xml --list tests.txt  # run many testbenches, JUnit XML report
 ```
+
+`hdlsim regress` runs each test as its own simulation (fresh design per test)
+and exits 1 if any test fails. The `--list` file holds one test per line:
+`name=top [file.v ...]` (`#` starts a comment); plain positional tops also work.
+`--coverage` folds each test's line/branch/toggle coverage into the XML
+`<system-out>`.
 
 The `debug` command (and the `hdl_sim::debug` module: `Watcher`, `fmt_value`,
 `fmt_time`) is also the debugging toolkit for your own tooling built on the

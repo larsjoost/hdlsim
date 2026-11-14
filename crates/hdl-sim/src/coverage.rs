@@ -182,6 +182,16 @@ impl CoverageCollector {
     }
 }
 
+/// Observer adapter over a shared collector, so the caller can keep a handle
+/// and call [`CoverageCollector::report`] after the run.
+pub struct SharedCollector(pub std::rc::Rc<std::cell::RefCell<CoverageCollector>>);
+
+impl Observer for SharedCollector {
+    fn on_event(&mut self, ev: &SimEvent) {
+        self.0.borrow_mut().on_event(ev);
+    }
+}
+
 impl Observer for CoverageCollector {
     fn on_event(&mut self, ev: &SimEvent) {
         match ev {

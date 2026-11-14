@@ -6,15 +6,6 @@ use hdl_ir::Design;
 use hdl_sim::{Observer, SimEvent, Simulator};
 use std::path::PathBuf;
 
-/// Forwards events into a shared [`hdl_sim::coverage::CoverageCollector`].
-struct CovForward(std::rc::Rc<std::cell::RefCell<hdl_sim::coverage::CoverageCollector>>);
-
-impl Observer for CovForward {
-    fn on_event(&mut self, ev: &SimEvent) {
-        self.0.borrow_mut().on_event(ev);
-    }
-}
-
 /// Prints `$display`/`report` messages to stdout, like a simulator transcript.
 struct Transcript;
 
@@ -144,7 +135,7 @@ impl Command for Run {
             let c = std::rc::Rc::new(std::cell::RefCell::new(
                 hdl_sim::coverage::CoverageCollector::new(&design, &widths),
             ));
-            sim.add_observer(Box::new(CovForward(c.clone())));
+            sim.add_observer(Box::new(hdl_sim::coverage::SharedCollector(c.clone())));
             Some(c)
         } else {
             None

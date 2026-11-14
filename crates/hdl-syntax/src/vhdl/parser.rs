@@ -1028,18 +1028,6 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    fn skip_balanced_until_end(&mut self, kw: &str) {
-        // Skip a record body etc.: consume until `end <kw>`.
-        while self.peek().kind != TokenKind::Eof {
-            if self.at_kw("end") {
-                self.bump();
-                self.eat_kw(kw);
-                return;
-            }
-            self.bump();
-        }
-    }
-
     /// A type mark: a (possibly selected) name, e.g. `std_logic_vector`.
     /// No paren suffixes — a following `(7 downto 0)` is a constraint, parsed
     /// separately by the caller.
