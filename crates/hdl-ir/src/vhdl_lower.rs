@@ -1218,21 +1218,33 @@ impl<'a> Lower<'a> {
                         i += 1;
                     }
                     "for" => {
-                        // Physical literal: number + unit ident (e.g. `10 ns`).
-                        // The parser wraps the number token in a Literal node.
+                        // Physical literal: `10 ns`. The parser may merge number
+                        // and unit into one Literal token, or leave the unit as
+                        // a separate Ident sibling.
                         let num = kids.get(i + 1);
-                        let unit = kids.get(i + 2);
                         if let Some(n) = num.filter(|k| k.kind() == SyntaxKind::Literal) {
-                            let v = self
-                                .parse_int_literal(&self.text(n))
-                                .and_then(|v| v.to_u64())
-                                .unwrap_or(0);
-                            let mult = unit
-                                .filter(|k| k.kind() == SyntaxKind::Ident)
-                                .map(|k| time_unit_fs(&self.kw(k)))
-                                .unwrap_or(1_000_000);
+                            let t = self.text(n);
+                            let (v, mult) = match t.split_once(char::is_whitespace) {
+                                Some((a, b)) => (
+                                    self.parse_int_literal(a.trim())
+                                        .and_then(|v| v.to_u64())
+                                        .unwrap_or(0),
+                                    time_unit_fs(b.trim()),
+                                ),
+                                None => {
+                                    let unit =
+                                        kids.get(i + 2).filter(|k| k.kind() == SyntaxKind::Ident);
+                                    (
+                                        self.parse_int_literal(&t)
+                                            .and_then(|v| v.to_u64())
+                                            .unwrap_or(0),
+                                        unit.map(|k| time_unit_fs(&self.kw(k)))
+                                            .unwrap_or(1_000_000),
+                                    )
+                                }
+                            };
                             time_fs = Some(v * mult);
-                            i += 2;
+                            i += 1;
                         }
                     }
                     _ => {}
@@ -1574,6 +1586,20 @@ impl<'a> Lower<'a> {
 
     fn lower_literal(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         let t = self.text(e);
+        // Physical literal: `100 ps` — the parser merges number + unit into
+        // one Literal; the value is femtoseconds.
+        if let Some((num, unit)) = t.split_once(char::is_whitespace) {
+            if matches!(
+                unit.trim().to_ascii_lowercase().as_str(),
+                "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "s" | "min" | "hr"
+            ) {
+                let v = self
+                    .parse_int_literal(num.trim())
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(0);
+                return Expr::Lit(Value::from_u64(32, v * time_unit_fs(unit.trim())));
+            }
+        }
         // Bit string literal: x"FF" / b"01" / o"7".
         if t.len() >= 2
             && matches!(t.as_bytes()[0], b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
@@ -1732,6 +1758,8 @@ fn time_unit_fs(unit: &str) -> u64 {
         "us" | "µs" => 1_000_000_000,
         "ms" => 1_000_000_000_000,
         "sec" | "s" => 1_000_000_000_000_000,
+        "min" => 60_000_000_000_000_000,
+        "hr" => 3_600_000_000_000_000_000,
         _ => 1_000_000,
     }
 }

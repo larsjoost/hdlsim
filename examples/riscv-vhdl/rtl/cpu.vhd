@@ -71,7 +71,7 @@ begin
     end process;
 
     -- ALU input muxes
-    process(rd1, rd2, alu_src, imm_i, imm_s, instr)
+    process(rd1, rd2, alu_src, imm_i, imm_s, imm_u, instr)
     begin
         if instr(6 downto 0) = b"0010111" then
             alu_a <= pc;           -- auipc: pc + imm
@@ -81,6 +81,8 @@ begin
         if alu_src = '1' then
             if instr(6 downto 0) = b"0100011" then
                 alu_b <= imm_s;    -- stores use the S-type immediate
+            elsif instr(6 downto 0) = b"0110111" or instr(6 downto 0) = b"0010111" then
+                alu_b <= imm_u;    -- lui/auipc use the U-type immediate
             else
                 alu_b <= imm_i;
             end if;
