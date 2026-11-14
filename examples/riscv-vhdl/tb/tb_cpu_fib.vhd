@@ -13,6 +13,7 @@
 --  10: sw   x5, 8(x0)     dmem[2] = x5
 --  11: ebreak
 library ieee;
+library rv32i;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -36,15 +37,15 @@ architecture sim of tb_cpu_fib is
     signal tdata : std_logic_vector(31 downto 0);
     signal errors : integer := 0;
 begin
-    u_cpu : entity work.cpu
+    u_cpu : entity rv32i.cpu
         port map (clk => clk, rst => rst, halted => halted,
                   imem_addr => imem_addr, imem_data => imem_data,
                   dmem_addr => dmem_addr, dmem_we => dmem_we,
                   dmem_wdata => dmem_wdata, dmem_rdata => dmem_rdata);
-    u_imem : entity work.imem
+    u_imem : entity rv32i.imem
         port map (clk => clk, we => imem_we, waddr => imem_waddr, wdata => imem_wdata,
                   raddr => imem_addr, rdata => imem_data);
-    u_dmem : entity work.dmem
+    u_dmem : entity rv32i.dmem
         port map (clk => clk, we => dmem_we, waddr => dmem_addr, wdata => dmem_wdata,
                   raddr => dmem_addr, rdata => dmem_rdata, taddr => taddr, tdata => tdata);
 

@@ -1,5 +1,6 @@
 -- Unit testbench for regfile.vhd: write/read several registers, x0 stays 0.
 library ieee;
+library rv32i;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -14,7 +15,7 @@ architecture sim of tb_regfile is
     signal rd1, rd2 : unsigned(31 downto 0);
     signal errors : integer := 0;
 begin
-    dut : entity work.regfile
+    dut : entity rv32i.regfile
         port map (clk => clk, we => we, ra1 => ra1, ra2 => ra2, wa => wa,
                   wd => wd, rd1 => rd1, rd2 => rd2);
 

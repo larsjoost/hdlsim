@@ -1,6 +1,7 @@
 -- Unit testbench for alu.vhd: drives every ALU op with several operand
 -- pairs (including signed edge cases) and checks result + zero flag.
 library ieee;
+library rv32i;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -13,7 +14,7 @@ architecture sim of tb_alu is
     signal zero : std_logic;
     signal errors : integer := 0;
 begin
-    dut : entity work.alu
+    dut : entity rv32i.alu
         port map (a => a, b => b, op => op, result => result, zero => zero);
 
     process

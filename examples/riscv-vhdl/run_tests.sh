@@ -1,12 +1,15 @@
 #!/bin/sh
 # Run all RV32I example testbenches with hdlsim.
+# The example is split into two libraries (see hdlsim.ini: rv32i=rtl, work=tb);
+# no file arguments are needed — hdlsim resolves the top testbench and every
+# dependency (cpu -> alu/decode/regfile/imem/dmem) across the libraries.
 # Usage: ./run_tests.sh [path-to-hdlsim-binary]   (default: ../../target/debug/hdlsim)
 set -u
 cd "$(dirname "$0")"
 HDLSIM="${1:-../../target/debug/hdlsim}"
 fail=0
 for tb in tb_alu tb_decode tb_regfile tb_cpu_fib tb_cpu_sum tb_cpu_jal; do
-    out="$("$HDLSIM" run --top "$tb" --max-time 10us -L work=. ./*.vhd 2>&1)"
+    out="$("$HDLSIM" run --top "$tb" --max-time 10us 2>&1)"
     if printf '%s' "$out" | grep -q PASS && ! printf '%s' "$out" | grep -q FAIL; then
         printf '%s\n' "$out" | grep PASS
     else
@@ -15,7 +18,7 @@ for tb in tb_alu tb_decode tb_regfile tb_cpu_fib tb_cpu_sum tb_cpu_jal; do
     fi
 done
 if [ "$fail" -eq 0 ]; then
-    echo "riscv-vhdl: all testbenches PASS"
+    echo "riscv-vhdl: all testbenches PASS (multi-library resolution via hdlsim.ini)"
 else
     echo "riscv-vhdl: FAILURES" >&2
 fi

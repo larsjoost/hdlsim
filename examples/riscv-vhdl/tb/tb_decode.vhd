@@ -1,6 +1,7 @@
 -- Unit testbench for decode.vhd: feed one instruction per opcode class and
 -- check all control outputs. 31 checks.
 library ieee;
+library rv32i;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -13,7 +14,7 @@ architecture sim of tb_decode is
     signal alu_op : std_logic_vector(3 downto 0);
     signal errors : integer := 0;
 begin
-    dut : entity work.decode
+    dut : entity rv32i.decode
         port map (instr => instr, reg_write => reg_write, alu_src => alu_src,
                   alu_op => alu_op, mem_read => mem_read, mem_write => mem_write,
                   mem_to_reg => mem_to_reg, branch => branch, jump => jump, halt => halt);

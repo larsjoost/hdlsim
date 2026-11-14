@@ -126,6 +126,10 @@ pub fn elaborate_with(
     top: &str,
     resolver: &mut dyn UnitResolver,
 ) -> Result<Flat, ElabError> {
+    // The top itself may live in a library: resolve it before elaborating.
+    if !design.modules.iter().any(|m| m.name == top) {
+        resolver.resolve(design, top).map_err(ElabError::Message)?;
+    }
     let mut tried: Vec<String> = Vec::new();
     loop {
         match try_elaborate(design, top) {
