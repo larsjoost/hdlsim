@@ -22,6 +22,12 @@ the graphical wave display are all implemented here.
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves
   for logs.
+- **rustc-style diagnostics.** Every parse/lower error is rendered like rustc —
+  `error[E..]: message` with the source line, a caret span, and notes.
+- **Project export for other tools.** `hdlsim project --format vivado-tcl
+  --format json manifest` generates Vivado TCL project files (and a JSON manifest)
+  from the same library/compile machinery, through the public `hdlsim::project`
+  API so external tools can reuse it.
 - **One kernel for both languages.** Both front-ends lower to a shared IR, so
   mixed VHDL/Verilog designs simulate natively in one wave window.
 - **Easy to extend.** Closed core data structures, open trait+registry seams at
@@ -64,7 +70,23 @@ hdlsim check file.v ...                      # parse + lower + resolve, report d
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us
 hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from libraries
+hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
+hdlsim run --top tb tb.v --live              # live wave window in the browser
+hdlsim project --top cpu --format vivado-tcl # export Vivado TCL project files
 ```
+
+## Examples
+
+- `examples/counter` — Verilog counter, `examples/vhdl-counter` — the same in VHDL.
+- `examples/riscv-vhdl` — a single-cycle RV32I CPU written in VHDL (alu, decoder,
+  register file, instruction/data memory) with six self-checking testbenches:
+  unit tests for alu/decode/regfile plus whole-program tests (fibonacci, sum of
+  1..10, jal/jalr subroutine call) that check results in data memory. Run them all:
+
+  ```
+  ./examples/riscv-vhdl/run_tests.sh                 # uses target/debug/hdlsim
+  cargo test -p hdlsim --test riscv                  # same thing as a cargo test
+  ```
 
 `hdlsim.ini` (modelsim.ini style) maps logical libraries to directories:
 
