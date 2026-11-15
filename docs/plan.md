@@ -51,9 +51,9 @@ source → tokens → CST → AST → IR (elaborated) → sim events → sinks (
   formatter (`hdlsim fmt`), linter (`hdlsim lint --fix`), driver tracing,
   checkpoint/restore, mini-TCL `do` files, SVA/PSL-lite, `.hwf` viewer, parser
   fuzz harness, `hdlsim doc` HTML docs, `--seed` reproducible $random,
-  `hdlsim doctor` / `hdlsim completions`.
-- Phase 2 (remaining): FST wave format (risky to hand-roll offline - may skip),
-  analog waves (needs real-valued kernel support - big).
+  `hdlsim doctor` / `hdlsim completions`, FST wave format (`--fst`, std-only
+  writer + reader, readable by GTKWave and `hdlsim wave`).
+- Phase 2 (remaining): analog waves (needs real-valued kernel support - big).
 - Phase 3 prove notes: `hdl-sim::sat` is a MiniSat-style CDCL solver (two-watched
   literals, first-UIP learning, VSIDS, Luby restarts); `hdl-sim::bmc` encodes the
   elaborated IR 2-valued (X/Z→0, `rising_edge`≡true per step, div-by-0→0) with
@@ -128,6 +128,7 @@ Merged PRs (main @ 19b5f60, 2026-11-15):
 | #25 | `hdlsim doctor` + `hdlsim completions` (bash/zsh/fish) |
 | #27 | constrained-random stimulus: `$urandom`/`$urandom_range` + `$rand_solve` |
 | #28 | `hdlsim prove` — own CDCL SAT solver + BMC over the elaborated IR |
+| #29 | FST wave format: `run --fst out.fst` (std-only stored-deflate writer) + `hdlsim wave out.fst`; full inflate reader for foreign FST files |
 
-Remaining, in suggested order: FST/analog waves (see phase-2 notes), then
+Remaining, in suggested order: analog waves (see phase-2 notes), then
 SystemVerilog proper / VHDL-2008 / UVM-lite.

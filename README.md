@@ -28,8 +28,9 @@ the graphical wave display are all implemented here.
   compiled at most once regardless.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
-  writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves
-  for logs.
+  writes a self-contained interactive viewer; `--vcd` for interchange; `--fst`
+  writes GTKWave's FST format (std-only writer/reader, no dependencies); ASCII
+  waves for logs.
 - **rustc-style diagnostics.** Every parse/lower error is rendered like rustc —
   `error[E..]: message` with the source line, a caret span, and notes.
 - **Project export for other tools.** `hdlsim project --format vivado-tcl
@@ -98,7 +99,9 @@ hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from librar
 hdlsim run --top tb                           # no files: resolve everything from hdlsim.ini libraries
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
 hdlsim run --top tb tb.v --hwf waves.hwf     # compact binary wave format
+hdlsim run --top tb tb.v --fst waves.fst     # GTKWave FST wave format
 hdlsim wave waves.hwf -o waves.html          # render a .hwf offline (no re-run)
+hdlsim wave waves.fst -o waves.html          # render a .fst (also GTKWave files)
 hdlsim run --top tb tb.v --live              # live wave window in the browser
 hdlsim run --top tb tb.v --max-time 50ns --checkpoint ck.bin   # save state
 hdlsim run --top tb tb.v --restore ck.bin    # resume from a checkpoint
