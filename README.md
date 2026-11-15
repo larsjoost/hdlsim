@@ -108,6 +108,8 @@ hdlsim fmt -w file.vhd                   # rewrite in place
 hdlsim lint file.v ...                   # lint (exit 1 on any finding); --fix applies safe fixes
 hdlsim do run.do --top tb file.v         # mini-Tcl do-file: run/restart/vcd dumpfile/examine
 hdlsim deps --top tb -L work=rtl tb.v    # list all files the top depends on (transitive)
+hdlsim assist "why does tb.v fail"       # local prompt-to-task router (prints $ command; --yes runs it)
+hdlsim explain E0301                     # explain a diagnostic/lint code (no arg lists all)
 ```
 
 `hdlsim regress` runs each test as its own simulation (fresh design per test)

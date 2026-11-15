@@ -177,6 +177,46 @@ fn intern_code(s: &str) -> &'static str {
         .unwrap_or("E0000")
 }
 
+/// Explanations for every code in [`KNOWN_CODES`] plus the lint codes emitted
+/// by [`crate::lint`]. Backs `hdlsim explain <code>`.
+const CODE_EXPLAIN: &[(&str, &str)] = &[
+    ("E0000", "placeholder substituted for an unrecognized code (e.g. from a corrupt cache entry); re-run with HDLSIM_NO_CACHE=1 to see the real code"),
+    ("E0001", "generic error (reserved)"),
+    ("E0002", "generic error (reserved)"),
+    ("E0101", "lexer: unexpected character (a non-ASCII byte in Verilog sources; VHDL uses this code for other invalid characters)"),
+    ("E0102", "unterminated block comment; add `*/` to close it"),
+    ("E0103", "unterminated string literal; add a closing quote"),
+    ("E0104", "`$` must be followed by a system task name (e.g. $display, $finish)"),
+    ("E0105", "backtick must be followed by a compiler directive name (e.g. `define, `include)"),
+    ("E0106", "expected a base specifier after `'` in a based literal (valid bases: 'b 'o 'd 'h, optionally signed: 'sb ...)"),
+    ("E0201", "cannot read a `include file (I/O error); check the path and permissions, and add its directory with -I"),
+    ("E0202", "`include file not found; searched the include dirs (-I) and the including file's directory"),
+    ("E0301", "parser: a token was expected here (commonly `;`); the message names the exact expected token"),
+    ("E0401", "lowering/semantic error, e.g. unknown identifier or port without a name; see the message"),
+    ("E0501", "library manager file I/O error: a source file could not be read; check the path and permissions"),
+    ("W0001", "lint: trailing whitespace (auto-fixable with hdlsim lint --fix)"),
+    ("W0002", "lint: tab character; use spaces instead (auto-fixable with hdlsim lint --fix)"),
+    ("W0003", "lint: line longer than 100 columns"),
+    ("W0101", "lint: case statement without a default arm"),
+    ("W0102", "lint: blocking '=' assignment inside an edge-triggered always block; use '<='"),
+    ("W0201", "lint: VHDL null statement does nothing"),
+    ("W0401", "VHDL lowering warning, e.g. an unsupported construct degraded to a no-op; see the message"),
+];
+
+/// Explain a diagnostic or lint code (`hdlsim explain E0301`). Covers every
+/// code in [`KNOWN_CODES`] plus the lint codes from [`crate::lint`].
+pub fn explain_code(code: &str) -> Option<&'static str> {
+    CODE_EXPLAIN
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, e)| *e)
+}
+
+/// All explainable codes with their texts, in table order.
+pub fn explained_codes() -> impl Iterator<Item = (&'static str, &'static str)> {
+    CODE_EXPLAIN.iter().copied()
+}
+
 /// Serialize a diagnostic list (little-endian, length-prefixed).
 pub fn encode_diags(ds: &[Diagnostic]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -360,6 +400,20 @@ mod tests {
         assert!(!ds.has_errors());
         ds.push(Diagnostic::error("E0001", None, "e"));
         assert!(ds.has_errors());
+    }
+
+    #[test]
+    fn every_known_code_has_an_explanation() {
+        for c in KNOWN_CODES {
+            assert!(explain_code(c).is_some(), "no explanation for {}", c);
+        }
+        // Lint codes live in lint.rs, not KNOWN_CODES, but are explainable too.
+        for c in ["W0002", "W0003", "W0101", "W0102", "W0201"] {
+            assert!(explain_code(c).is_some(), "no explanation for {}", c);
+        }
+        assert!(explain_code("E0301").unwrap().contains("expected"));
+        assert!(explain_code("X9999").is_none());
+        assert_eq!(explained_codes().count(), CODE_EXPLAIN.len());
     }
 }
 
