@@ -46,12 +46,17 @@ source → tokens → CST → AST → IR (elaborated) → sim events → sinks (
   numeric_std subset, processes + sensitivity, concurrent assignments,
   component+port map+generic map, generics, loops, slices, attributes, wait
   until/for in testbenches; assert/report, std.env.stop/finish).
-- Phase 2: coverage (line/branch/toggle/FSM + functional), regression runner with
-  JUnit XML, LSP (`hdlsim lsp`), formatter (`hdlsim fmt`), linter (`hdlsim lint
-  --fix`), driver tracing in wave viewer, checkpoint/restore, mini-TCL `do` files,
-  SVA/PSL-lite, FST, analog waves, `.hwf` streaming viewer.
-- Phase 3: SystemVerilog proper, VHDL-2008, constrained-random, reverse debug,
-  own CDCL + BMC (`hdlsim prove`), UVM-lite.
+- Phase 2 (done): coverage (line/branch/toggle/FSM + functional), regression runner
+  with JUnit XML, LSP (`hdlsim lsp`: diagnostics/hover/definition/completion),
+  formatter (`hdlsim fmt`), linter (`hdlsim lint --fix`), driver tracing,
+  checkpoint/restore, mini-TCL `do` files, SVA/PSL-lite, `.hwf` viewer, parser
+  fuzz harness, `hdlsim doc` HTML docs, `--seed` reproducible $random,
+  `hdlsim doctor` / `hdlsim completions`.
+- Phase 2 (remaining): FST wave format (risky to hand-roll offline - may skip),
+  analog waves (needs real-valued kernel support - big).
+- Phase 3 (done): reverse debug (`back [N]` in do-files).
+- Phase 3 (remaining): SystemVerilog proper, VHDL-2008, constrained-random stimulus,
+  own CDCL + BMC (`hdlsim prove top --bmc N`), UVM-lite.
 
 ## Performance
 Arena-allocated IR, indices not pointers, zero allocation in the event loop; heap
@@ -77,3 +82,43 @@ golden VCDs; wave/live-server tests via std TcpStream; hand-rolled parser fuzz
 
 See also: `docs/extensibility.md` (extension seams), `docs/worldclass.md` (feature
 ideas), `REVIEWING.md` (code conventions).
+
+## Progress log (for continuing in a new session)
+
+All work ships as draft PRs from `vibe/<slug>-d3e0f0` branches, merged manually on
+GitHub. Gate before every push: `cargo fmt --check` + `cargo test --workspace` green.
+`cargo publish` is deferred by the owner until the project is complete (all 6 crate
+names - hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim - verified unique on
+crates.io; publish from the owner's machine with `cargo login` first, in dependency
+order: hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim).
+
+Merged PRs (main @ 19b5f60, 2026-11-15):
+
+| PR | What |
+|---|---|
+| #1 | workspace publish-ready (unique crate names, metadata) |
+| #2 | full Verilog + VHDL syntax in hdl-syntax, unit-tested |
+| #3 | on-disk stdlib `.vhd` files + persistent `.hdlsim-cache/` parse cache |
+| #4 | line/branch/toggle coverage (`run --coverage`) |
+| #5 | `hdlsim regress` with JUnit XML |
+| #6-#9, #17 | LSP slices 1-3: diagnostics, hover, definition, completion |
+| #7, #8 | `hdlsim fmt` (+`--check`, `-w`), `hdlsim lint --fix` |
+| #10 | `hdlsim do` mini-Tcl do-files |
+| #11 | milestone 9: perf gate + golden VCD + loop/break fixes |
+| #12 | `hdlsim deps` (transitive file dependencies of a top) |
+| #13 | `hdlsim assist` (local prompt-to-task router) + `hdlsim explain` |
+| #14 | `hdlsim gen tb` testbench skeleton generator |
+| #15 | `hdlsim analyze` (W0501 undriven / W0502 unread) |
+| #16 | driver tracing (`debug --driver`) + verilog multi-module name-leak fix |
+| #18 | checkpoint/restore (`HDLCKPT1`, `run --checkpoint/--restore`) |
+| #19 | SVA-lite (`assert property`, `|->`/`|=>`, immediate `assert`) |
+| #20 | `.hwf` binary waves + `hdlsim wave` offline viewer |
+| #21 | reverse debug (`back [N]` in do-files) |
+| #22 | deterministic parser fuzz tests + verilog lexer span-overflow fix |
+| #23 | `hdlsim doc` cross-linked HTML docs |
+| #24 | `--seed N` reproducible `$random`; mixed-language co-sim tests |
+| #25 | `hdlsim doctor` + `hdlsim completions` (bash/zsh/fish) |
+
+Remaining, in suggested order: constrained-random stimulus, `hdlsim prove`
+(CDCL + BMC), FST/analog waves (see phase-2 notes), then SystemVerilog proper /
+VHDL-2008 / UVM-lite.
