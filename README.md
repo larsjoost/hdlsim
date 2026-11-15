@@ -89,7 +89,7 @@ cargo test              # unit + integration tests
 hdlsim init                                  # create a starter hdlsim.ini
 hdlsim check file.v ...                      # parse + lower + resolve, report diagnostics
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
-hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us
+hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us --seed 42
 hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from libraries
 hdlsim run --top tb                           # no files: resolve everything from hdlsim.ini libraries
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
@@ -111,7 +111,7 @@ hdlsim fmt file.v                        # print canonically formatted source
 hdlsim fmt --check src/...               # CI gate: exit 1 if any file would change
 hdlsim fmt -w file.vhd                   # rewrite in place
 hdlsim lint file.v ...                   # lint (exit 1 on any finding); --fix applies safe fixes
-hdlsim do run.do --top tb file.v         # mini-Tcl do-file: run/restart/vcd dumpfile/examine/checkpoint/restore/back
+hdlsim do run.do --top tb file.v         # mini-Tcl do-file: run/restart/vcd dumpfile/examine/seed/checkpoint/restore/back
 hdlsim deps --top tb -L work=rtl tb.v    # list all files the top depends on (transitive)
 hdlsim assist "why does tb.v fail"       # local prompt-to-task router (prints $ command; --yes runs it)
 hdlsim explain E0301                     # explain a diagnostic/lint code (no arg lists all)
