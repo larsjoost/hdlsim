@@ -2,7 +2,7 @@
 //! slice: Verilog `real` and VHDL `real` variables, IEEE-754 arithmetic in the
 //! kernel, integer<->real assignment conversion, `%f`/`%g` display formats,
 //! and analog output in the wave sinks (VCD `r` values, HTML polyline data,
-//! `.hwf` real flag).
+//! `.hwf` real flag, FST `FST_VT_VCD_REAL` vars).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -96,7 +96,8 @@ fn real_signals_in_all_wave_formats() {
     let vcd = tmp(&format!("{}_t.vcd", tag));
     let html = tmp(&format!("{}_t.html", tag));
     let hwf = tmp(&format!("{}_t.hwf", tag));
-    for p in [&vcd, &html, &hwf] {
+    let fst = tmp(&format!("{}_t.fst", tag));
+    for p in [&vcd, &html, &hwf, &fst] {
         let _ = std::fs::remove_file(p);
     }
     let out = hdlsim()
@@ -111,6 +112,8 @@ fn real_signals_in_all_wave_formats() {
             html.to_str().unwrap(),
             "--hwf",
             hwf.to_str().unwrap(),
+            "--fst",
+            fst.to_str().unwrap(),
         ])
         .output()
         .expect("runs");
@@ -184,7 +187,50 @@ fn real_signals_in_all_wave_formats() {
     );
     assert!(page2.contains("\"7.5\""));
 
-    for p in [&f, &vcd, &html, &hwf, &html2] {
+    // FST: real signals are FST_VT_VCD_REAL (geom width 0, 8-byte doubles);
+    // read_fst reconstructs SigKind::Real + f64 values, and `wave` renders the
+    // analog trace.
+    let fst_bytes = std::fs::read(&fst).unwrap();
+    let (flat_f, events_f) = hdl_wave::fst::read_fst(&fst_bytes).unwrap();
+    let h = flat_f
+        .signals
+        .iter()
+        .position(|s| s.name.ends_with(".r") || s.name == "r")
+        .expect("r signal");
+    assert_eq!(flat_f.signals[h].kind, hdl_ir::SigKind::Real);
+    // t=0 value lives in the bits array (init); later changes are records.
+    assert_eq!(flat_f.signals[h].init.as_ref().unwrap().to_f64(), Some(1.5));
+    let r_reals: Vec<f64> = events_f
+        .iter()
+        .filter_map(|e| match e {
+            hdl_sim::events::SimEvent::SignalChange { sig, new, .. } if *sig as usize == h => {
+                new.to_f64()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(r_reals, vec![3.75, 7.5], "fst real change stream");
+    let html3 = tmp(&format!("{}_t3.html", tag));
+    let out = hdlsim()
+        .args(["wave", fst.to_str().unwrap(), "-o", html3.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let page3 = std::fs::read_to_string(&html3).unwrap();
+    assert!(
+        page3.contains("\"real\":true"),
+        "real flag after fst replay"
+    );
+    assert!(
+        page3.contains("\"7.5\""),
+        "decimal real value after fst replay"
+    );
+
+    for p in [&f, &vcd, &html, &hwf, &fst, &html2, &html3] {
         let _ = std::fs::remove_file(p);
     }
 }

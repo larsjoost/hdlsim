@@ -179,6 +179,12 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
         .iter()
         .map(|&i| flat.signals[i].width.max(1))
         .collect();
+    // Real signals: FST stores them as FST_VT_VCD_REAL with 8 raw f64 bytes
+    // (geom width 0), not as bit chars.
+    let reals: Vec<bool> = order
+        .iter()
+        .map(|&i| flat.signals[i].kind == hdl_ir::SigKind::Real)
+        .collect();
 
     // Time table: sorted unique event times.
     let mut tindex: BTreeMap<u64, usize> = BTreeMap::new();
@@ -226,7 +232,12 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
     // Bits array: initial values, MSB-first chars per variable.
     let mut bits: Vec<u8> = Vec::new();
     for h in 0..n {
-        bits.extend_from_slice(&fst_chars(&cur[h], widths[h]));
+        if reals[h] {
+            let f = cur[h].to_f64().unwrap_or(f64::NAN);
+            bits.extend_from_slice(&f.to_le_bytes());
+        } else {
+            bits.extend_from_slice(&fst_chars(&cur[h], widths[h]));
+        }
     }
 
     // Record chains.
@@ -234,6 +245,12 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
     for h in 0..n {
         let mut rb = Vec::new();
         for (td, val) in &records[h] {
+            if reals[h] {
+                let f = val.to_f64().unwrap_or(f64::NAN);
+                put_varint(&mut rb, ((*td as u64) << 1) | 1);
+                rb.extend_from_slice(&f.to_le_bytes());
+                continue;
+            }
             let chars = fst_chars(val, widths[h]);
             if widths[h] == 1 {
                 let c = chars[0];
@@ -319,8 +336,9 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
 
     // ---- geometry block ----
     let mut geom_data: Vec<u8> = Vec::new();
-    for w in &widths {
-        put_varint(&mut geom_data, *w as u64);
+    for h in 0..n {
+        // geom encodes reals as a zero-width varint
+        put_varint(&mut geom_data, if reals[h] { 0 } else { widths[h] as u64 });
     }
     let geom_z = zlib_store(&geom_data);
     let mut geom_block = vec![3u8];
@@ -340,6 +358,7 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
         order: &[usize],
         handle_of: &[usize],
         widths: &[usize],
+        reals: &[bool],
         hier: &mut Vec<u8>,
         count: &mut usize,
     ) {
@@ -362,22 +381,24 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
                     .strip_prefix(&format!("{}.", path))
                     .unwrap_or(&sig.name)
             };
-            let (vt, vd) = match sig.kind {
-                hdl_ir::SigKind::Reg => (5u8, 0u8), // FST_VT_VCD_REG, implicit
-                hdl_ir::SigKind::Input => (16, 1),  // wire, input
-                hdl_ir::SigKind::Output => (16, 2), // wire, output
-                hdl_ir::SigKind::Inout => (16, 3),  // wire, inout
-                _ => (16, 0),                       // FST_VT_VCD_WIRE
+            let (vt, vd, len) = match sig.kind {
+                // FST_VT_VCD_REAL: 8 raw f64 bytes, geom width 0
+                hdl_ir::SigKind::Real => (3u8, 0u8, 8u64),
+                hdl_ir::SigKind::Reg => (5u8, 0u8, widths[h] as u64), // FST_VT_VCD_REG
+                hdl_ir::SigKind::Input => (16, 1, widths[h] as u64),
+                hdl_ir::SigKind::Output => (16, 2, widths[h] as u64),
+                hdl_ir::SigKind::Inout => (16, 3, widths[h] as u64),
+                _ => (16, 0, widths[h] as u64), // FST_VT_VCD_WIRE
             };
             hier.push(vt);
             hier.push(vd);
             put_cstr(hier, local);
-            put_varint(hier, widths[h] as u64);
+            put_varint(hier, len);
             put_varint(hier, 0); // no alias: new handle (implicitly h+1 by order)
         }
         for &ch in &children[id] {
             emit_hier(
-                ch, flat, children, scope_path, order, handle_of, widths, hier, count,
+                ch, flat, children, scope_path, order, handle_of, widths, reals, hier, count,
             );
         }
         hier.push(255); // upscope
@@ -391,6 +412,7 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
             &order,
             &handle_of,
             &widths,
+            &reals,
             &mut hier,
             &mut hier_scopes,
         );
@@ -601,6 +623,61 @@ mod tests {
             })
             .collect();
         assert_eq!(advances, vec![0, 5, 15, 25]);
+    }
+
+    #[test]
+    fn fst_real_signal_roundtrip() {
+        use hdl_ir::SigKind;
+        let mut f = flat();
+        f.signals.push(FlatSig {
+            name: "tb.v".to_string(),
+            width: 64,
+            kind: SigKind::Real,
+            init: Some(Value::from_f64(1.5)),
+            mem: None,
+            scope: 0,
+            signed: false,
+        });
+        let vsig = 3u32; // flat index of tb.v
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = FstSink::new(&mut buf, &f);
+        for ev in [
+            SimEvent::TimeAdvance { time_fs: 0 },
+            SimEvent::SignalChange {
+                sig: vsig,
+                old: Value::from_f64(1.5),
+                new: Value::from_f64(2.75),
+                time_fs: 10,
+            },
+            SimEvent::SignalChange {
+                sig: vsig,
+                old: Value::from_f64(2.75),
+                new: Value::from_f64(-0.5),
+                time_fs: 20,
+            },
+        ] {
+            sink.on_event(&ev, &f);
+        }
+        sink.finish(&f);
+
+        let (flat2, events2) = read_fst(&buf).unwrap();
+        assert_eq!(flat2.signals.len(), 4);
+        let h = flat2
+            .signals
+            .iter()
+            .position(|s| s.name == "tb.v")
+            .expect("tb.v present");
+        let v = &flat2.signals[h];
+        assert_eq!(v.kind, SigKind::Real);
+        assert_eq!(v.init.as_ref().unwrap().to_f64(), Some(1.5));
+        let reals: Vec<f64> = events2
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::SignalChange { sig, new, .. } if *sig as usize == h => new.to_f64(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reals, vec![2.75, -0.5]);
     }
 
     #[test]
