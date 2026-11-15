@@ -25,6 +25,75 @@ impl Severity {
     }
 }
 
+/// Terminal color mode for diagnostic rendering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorMode {
+    /// Color when stderr is a terminal; disabled by `NO_COLOR`, overridable
+    /// with `HDLSIM_COLOR=always|never`.
+    Auto,
+    Always,
+    Never,
+}
+
+static COLOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set the global color mode (e.g. from a `--color` CLI flag). Explicitly set
+/// modes win over the `HDLSIM_COLOR`/`NO_COLOR` environment.
+pub fn set_color_mode(mode: ColorMode) {
+    let v = match mode {
+        ColorMode::Auto => 0,
+        ColorMode::Always => 1,
+        ColorMode::Never => 2,
+    };
+    COLOR_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn color_mode() -> ColorMode {
+    match COLOR_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ColorMode::Always,
+        2 => ColorMode::Never,
+        _ => ColorMode::Auto,
+    }
+}
+
+/// Should diagnostics be colorized right now?
+pub fn color_enabled() -> bool {
+    match color_mode() {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => {
+            use std::io::IsTerminal;
+            if std::env::var_os("NO_COLOR").is_some() {
+                return false;
+            }
+            match std::env::var("HDLSIM_COLOR") {
+                Ok(v) if v == "always" || v == "1" || v == "true" => return true,
+                Ok(v) if v == "never" || v == "0" || v == "false" => return false,
+                _ => {}
+            }
+            std::io::stderr().is_terminal()
+        }
+    }
+}
+
+/// Wrap `s` in an ANSI SGR code when color is on.
+pub fn paint(on: bool, code: &str, s: &str) -> String {
+    if on {
+        format!("\x1b[{}m{}\x1b[0m", code, s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// SGR code for a severity: error bold red, warning bold yellow, note bold blue.
+fn sev_code(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Error => "1;31",
+        Severity::Warning => "1;33",
+        Severity::Note => "1;34",
+    }
+}
+
 /// One diagnostic. `span` is `None` for file-level messages.
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
@@ -101,27 +170,27 @@ impl Diagnostic {
     ///    |
     ///    = help: add `;` here
     /// ```
+    /// Render with the global color mode (see [`color_enabled`]).
     pub fn render(&self, db: &SourceDb) -> String {
+        self.render_with(db, color_enabled())
+    }
+
+    /// Render with explicit color on/off.
+    pub fn render_with(&self, db: &SourceDb, color: bool) -> String {
         let mut out = String::new();
+        let head = format!("{}[{}]:", self.severity.name(), self.code);
         let _ = write!(
             out,
-            "{}[{}]: {}",
-            self.severity.name(),
-            self.code,
+            "{} {}",
+            paint(color, sev_code(self.severity), &head),
             self.message
         );
         if let Some(span) = self.span {
             let file = db.file(span.file);
             let (line, col) = file.line_col(span.start);
             let w = line.to_string().len(); // gutter width = line-number digits
-            let _ = write!(
-                out,
-                "\n{}--> {}:{}:{}",
-                " ".repeat(w + 1),
-                file.name(),
-                line,
-                col
-            );
+            let loc = format!("--> {}:{}:{}", file.name(), line, col);
+            let _ = write!(out, "\n{}{}", " ".repeat(w + 1), paint(color, "1", &loc));
             // Source line with tabs expanded (caret column is computed on the
             // expanded text so it stays aligned).
             let raw = db.line_of(span.file, span.start);
@@ -146,11 +215,16 @@ impl Diagnostic {
                 "\n{} | {}{}",
                 " ".repeat(w + 1),
                 " ".repeat(disp_col - 1),
-                "^".repeat(caret_len)
+                paint(color, sev_code(self.severity), &"^".repeat(caret_len))
             );
             let _ = write!(out, "\n{} |", " ".repeat(w + 1));
             if let Some(help) = &self.help {
-                let _ = write!(out, "\n{} = help: {}", " ".repeat(w + 1), help);
+                let _ = write!(
+                    out,
+                    "\n{} {}",
+                    " ".repeat(w + 1),
+                    paint(color, "1;36", &format!("= help: {}", help))
+                );
             }
         }
         out
@@ -320,10 +394,15 @@ impl Diagnostics {
     }
 
     pub fn render_all(&self, db: &SourceDb) -> String {
+        self.render_all_with(db, color_enabled())
+    }
+
+    /// Render all diagnostics with explicit color on/off.
+    pub fn render_all_with(&self, db: &SourceDb, color: bool) -> String {
         let mut out = self
             .items
             .iter()
-            .map(|d| d.render(db))
+            .map(|d| d.render_with(db, color))
             .collect::<Vec<_>>()
             .join("\n\n");
         // rustc-style summary footer.
@@ -339,16 +418,30 @@ impl Diagnostics {
             .count();
         if errors > 0 {
             out.push_str(&format!(
-                "\nerror: could not compile due to {} previous error{}",
-                errors,
-                if errors == 1 { "" } else { "s" }
+                "\n{}",
+                paint(
+                    color,
+                    "1;31",
+                    &format!(
+                        "error: could not compile due to {} previous error{}",
+                        errors,
+                        if errors == 1 { "" } else { "s" }
+                    )
+                )
             ));
         }
         if warnings > 0 {
             out.push_str(&format!(
-                "\nwarning: {} warning{} generated",
-                warnings,
-                if warnings == 1 { "" } else { "s" }
+                "\n{}",
+                paint(
+                    color,
+                    "1;33",
+                    &format!(
+                        "warning: {} warning{} generated",
+                        warnings,
+                        if warnings == 1 { "" } else { "s" }
+                    )
+                )
             ));
         }
         out
@@ -375,6 +468,49 @@ mod tests {
         // Exact rustc layout: header, --> line, gutter, source, carets, help.
         let expected = "error[E0001]: missing semicolon\n  --> t.v:2:4\n   |\n 2 |   wire x\n   |    ^^^\n   |\n   = help: add `;` here";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_colorizes_by_severity_when_enabled() {
+        let mut db = SourceDb::new();
+        db.add_file("t.v", "module m;\n  wire x\nendmodule\n")
+            .unwrap();
+        let mut ds = Diagnostics::new();
+        ds.push(Diagnostic::error(
+            "E0301",
+            Some(crate::source::Span::new(crate::source::FileId(0), 12, 17)),
+            "expected `;`",
+        ));
+        ds.push(Diagnostic::warning("W0001", None, "careful"));
+        // Use the explicit on/off variants so the test does not race on the
+        // global color mode with other tests.
+        let plain = ds.render_all_with(&db, false);
+        assert!(!plain.contains("\x1b["), "{}", plain);
+        let colored = ds.render_all_with(&db, true);
+        assert!(
+            colored.contains("\x1b[1;31merror[E0301]:\x1b[0m"),
+            "{}",
+            colored
+        );
+        assert!(colored.contains("\x1b[1;31m^^^^^\x1b[0m"), "{}", colored);
+        assert!(
+            colored.contains("\x1b[1;33mwarning[W0001]:\x1b[0m"),
+            "{}",
+            colored
+        );
+        assert!(
+            colored.contains("\x1b[1;31merror: could not compile due to 1 previous error\x1b[0m"),
+            "{}",
+            colored
+        );
+        assert!(
+            colored.contains("\x1b[1;33mwarning: 1 warning generated\x1b[0m"),
+            "{}",
+            colored
+        );
+        // Forced off: no escapes.
+        let off = ds.render_all_with(&db, false);
+        assert!(!off.contains("\x1b["), "{}", off);
     }
 
     #[test]

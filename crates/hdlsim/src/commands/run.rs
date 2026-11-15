@@ -11,10 +11,29 @@ pub(crate) struct Transcript;
 
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {
-        if let SimEvent::Message { text, .. } = ev {
-            print!("{}", text);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+        let color = hdl_syntax::diagnostic::color_enabled();
+        match ev {
+            SimEvent::Message { text, .. } => {
+                // Colorize severity-ish message lines ($error/$fatal/assert
+                // failures, warnings); plain $display output stays uncolored.
+                let t = text.trim_start();
+                let painted = if t.starts_with("error")
+                    || t.starts_with("fatal")
+                    || t.contains("assertion failed")
+                {
+                    hdl_syntax::diagnostic::paint(color, "1;31", text)
+                } else if t.starts_with("warning") {
+                    hdl_syntax::diagnostic::paint(color, "1;33", text)
+                } else {
+                    text.clone()
+                };
+                print!("{}", painted);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            // TestFailed is not printed here: its text also arrives as a
+            // Message (colorized above) — printing both would duplicate it.
+            _ => {}
         }
     }
 }
@@ -262,7 +281,14 @@ impl Command for Run {
         // A failed unit test (assert/report severity error|failure, $error/$fatal)
         // makes the whole run fail: exit code 1 so CI/scripts catch it.
         if sim.failures() > 0 {
-            println!("hdlsim: FAILED — {} test failure(s)", sim.failures());
+            println!(
+                "{}",
+                hdl_syntax::diagnostic::paint(
+                    hdl_syntax::diagnostic::color_enabled(),
+                    "1;31",
+                    &format!("hdlsim: FAILED — {} test failure(s)", sim.failures())
+                )
+            );
             return Ok(1);
         }
         if let Some(bus) = &live_bus {

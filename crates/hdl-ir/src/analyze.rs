@@ -24,10 +24,19 @@ pub struct Finding {
 impl Finding {
     /// `warning[W0501] counter.q: never driven`
     pub fn render(&self) -> String {
+        let color = hdl_syntax::diagnostic::color_enabled();
+        let code = match self.severity {
+            Severity::Error => "1;31",
+            Severity::Warning => "1;33",
+            Severity::Note => "1;34",
+        };
         format!(
-            "{}[{}] {}.{}: {}",
-            self.severity.name(),
-            self.code,
+            "{} {}.{}: {}",
+            hdl_syntax::diagnostic::paint(
+                color,
+                code,
+                &format!("{}[{}]", self.severity.name(), self.code)
+            ),
             self.module,
             self.signal,
             self.message

@@ -58,6 +58,14 @@ impl Command for Help {
         println!("              --config FILE  library config (default: ./hdlsim.ini if present)");
         println!("              -I DIR         add an `include search directory");
         println!("              --bundle FILE  read the whole project from a reproducer .tar");
+        println!();
+        println!("  Global flags (before or after the command):");
+        println!("    --color auto|always|never   colorize errors/warnings (default: auto =");
+        println!(
+            "                                 color when stderr is a terminal; env HDLSIM_COLOR,"
+        );
+        println!("                                 NO_COLOR also apply)");
+        println!("    --no-color                   disable color output");
         Ok(0)
     }
 }
@@ -248,6 +256,44 @@ pub const COMMANDS: &[&dyn Command] = &[
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
+/// Pull global color flags (`--color <auto|always|never>`, `--color=<...>`,
+/// `--no-color`) out of `args` and apply them to the diagnostic renderer.
+/// Returns the remaining args. Env fallback: `HDLSIM_COLOR` overrides the
+/// tty auto-detection, `NO_COLOR` disables color entirely.
+pub fn apply_color_args(
+    args: &[String],
+) -> (Vec<String>, Option<hdl_syntax::diagnostic::ColorMode>) {
+    let mut rest = Vec::new();
+    let mut mode = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--no-color" {
+            mode = Some(hdl_syntax::diagnostic::ColorMode::Never);
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--color=") {
+            mode = Some(parse_color_mode(v));
+            i += 1;
+        } else if a == "--color" {
+            let v = args.get(i + 1).map(|s| s.as_str()).unwrap_or("auto");
+            mode = Some(parse_color_mode(v));
+            i += if args.get(i + 1).is_some() { 2 } else { 1 };
+        } else {
+            rest.push(a.clone());
+            i += 1;
+        }
+    }
+    (rest, mode)
+}
+
+fn parse_color_mode(v: &str) -> hdl_syntax::diagnostic::ColorMode {
+    match v {
+        "always" | "yes" | "1" => hdl_syntax::diagnostic::ColorMode::Always,
+        "never" | "no" | "0" => hdl_syntax::diagnostic::ColorMode::Never,
+        _ => hdl_syntax::diagnostic::ColorMode::Auto,
+    }
+}
+
 pub fn dispatch(args: &[String]) -> Result<i32, String> {
     match args.first() {
         None => COMMANDS[0].run(&[]),
