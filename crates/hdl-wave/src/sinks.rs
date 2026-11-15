@@ -34,6 +34,7 @@ impl<S: WaveSink> hdl_sim::Observer for SinkAdapter<S> {
 }
 
 pub mod html;
+pub mod hwf;
 pub mod live;
 pub mod vcd;
 

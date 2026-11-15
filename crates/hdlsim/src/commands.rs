@@ -21,6 +21,7 @@ pub mod lsp;
 mod project;
 mod regress;
 mod run;
+mod wave;
 
 use hdl_lib::LibraryManager;
 use std::path::{Path, PathBuf};
@@ -219,6 +220,7 @@ pub fn parse_time(s: &str) -> Result<u64, String> {
 pub const COMMANDS: &[&dyn Command] = &[
     &Help,
     &run::Run,
+    &wave::Wave,
     &check::Check,
     &ast::Ast,
     &init::Init,
