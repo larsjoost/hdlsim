@@ -168,7 +168,9 @@ impl<'a> Lexer<'a> {
                     );
                     break;
                 }
-                Some(b'\\') => self.pos += 2, // escape: skip the escaped byte
+                // escape: skip the escaped byte, clamped so a trailing `\`
+                // at EOF cannot push pos past the end of the text
+                Some(b'\\') => self.pos = (self.pos + 2).min(self.text.len()),
                 Some(b'"') => {
                     self.pos += 1;
                     break;
@@ -511,6 +513,26 @@ mod tests {
         let (_, diags) = lex_str("\"oops");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("unterminated string"));
+    }
+
+    #[test]
+    fn trailing_backslash_in_string_stays_in_bounds() {
+        // `"\\` — the escape consumes the byte after the backslash even at
+        // EOF; the token span must not run past the end of the source.
+        let src = "\"\\\\";
+        let (tokens, diags) = lex_str(src);
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("unterminated string")));
+        for t in &tokens {
+            assert!(t.span.start as usize <= t.span.end as usize);
+            assert!(t.span.end as usize <= src.len());
+        }
+        let str_tok = tokens
+            .iter()
+            .find(|t| t.kind == TokenKind::StrLiteral)
+            .expect("string token");
+        assert_eq!(str_tok.span.end as usize, src.len());
     }
 
     #[test]
