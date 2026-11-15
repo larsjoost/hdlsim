@@ -15,7 +15,7 @@ use hdl_ir::{BinOp, Edge, EdgeKind, Expr, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -131,6 +131,12 @@ fn w_binop(w: &mut W, op: BinOp) {
         BinOp::BXnor => 21,
         BinOp::LogAnd => 22,
         BinOp::LogOr => 23,
+        BinOp::EqM => 24,
+        BinOp::NeM => 25,
+        BinOp::LtM => 26,
+        BinOp::LeM => 27,
+        BinOp::GtM => 28,
+        BinOp::GeM => 29,
     })
 }
 fn r_binop(r: &mut R) -> Result<BinOp, String> {
@@ -159,6 +165,12 @@ fn r_binop(r: &mut R) -> Result<BinOp, String> {
         21 => BinOp::BXnor,
         22 => BinOp::LogAnd,
         23 => BinOp::LogOr,
+        24 => BinOp::EqM,
+        25 => BinOp::NeM,
+        26 => BinOp::LtM,
+        27 => BinOp::LeM,
+        28 => BinOp::GtM,
+        29 => BinOp::GeM,
         t => return Err(format!("bad BinOp tag {}", t)),
     })
 }
@@ -417,8 +429,10 @@ fn w_stmt(w: &mut W, s: &Stmt) {
             expr,
             items,
             default,
+            matching,
         } => {
             w.u8(2);
+            w.bool(*matching);
             w_expr(w, expr);
             w.u32(items.len() as u32);
             for (pats, body) in items {
@@ -516,6 +530,7 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             Stmt::If { cond, then, els }
         }
         2 => {
+            let matching = r.bool()?;
             let expr = r_expr(r)?;
             let n = r.u32()? as usize;
             if n > (1 << 20) {
@@ -543,6 +558,7 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
                 expr,
                 items,
                 default,
+                matching,
             }
         }
         3 => Stmt::Assign {
@@ -1121,6 +1137,7 @@ mod tests {
                 expr: Expr::Sig(2),
                 items: vec![(vec![Expr::Lit(Value { bits: vec![V1] })], a.clone())],
                 default: Some(Box::new(Stmt::Null)),
+                matching: false,
             },
             a.clone(),
             Stmt::Delay {

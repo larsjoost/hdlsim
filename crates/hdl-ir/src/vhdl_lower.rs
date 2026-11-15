@@ -10,7 +10,7 @@
 //! built in: recognized by name here and lowered to dedicated `Expr` nodes.
 
 use crate::ir::*;
-use crate::value::{BinOp, UnOp, Value, V0, V1, VX, VZ};
+use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VX, VZ};
 use crate::verilog_lower::const_eval;
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
@@ -59,6 +59,13 @@ pub fn lower_file(
         }
     }
     modules
+}
+
+/// Result of lowering a concurrent signal assignment: either a continuous
+/// assign or (for delayed waveforms) a one-shot process.
+pub(crate) enum ConcOut {
+    Assign(AssignIr),
+    Proc(ProcessIr),
 }
 
 pub(crate) fn real_children(n: &SyntaxNode) -> Vec<SyntaxNode> {
@@ -507,8 +514,16 @@ impl<'a> Lower<'a> {
                     proc_idx += 1;
                     module.processes.push(p);
                 }
-                SyntaxKind::ConcAssign => {
-                    if let Some(a) = self.lower_conc_assign(s) {
+                SyntaxKind::ConcAssign => match self.lower_conc_assign(s, proc_idx) {
+                    Some(ConcOut::Assign(a)) => module.assigns.push(a),
+                    Some(ConcOut::Proc(p)) => {
+                        module.processes.push(p);
+                        proc_idx += 1;
+                    }
+                    None => {}
+                },
+                SyntaxKind::SelectedAssign => {
+                    if let Some(a) = self.lower_selected_assign(s) {
                         module.assigns.push(a);
                     }
                 }
@@ -738,6 +753,9 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin,
+            // VHDL processes execute once at t=0 (LRM 11.3), unlike a
+            // Verilog `always @(...)` which waits for the first event.
+            initial: true,
         }
     }
 
@@ -792,6 +810,10 @@ impl<'a> Lower<'a> {
         for c in real_children(s) {
             if c.kind() == SyntaxKind::Name {
                 let name = self.text(&c);
+                // VHDL-2008 `process(all)`: sensitive to every signal read.
+                if name == "all" {
+                    return Sens::All;
+                }
                 if let Some(id) = self.sig_id(&name) {
                     edges.push(Edge {
                         sig: id,
@@ -808,18 +830,234 @@ impl<'a> Lower<'a> {
         Sens::List(edges)
     }
 
-    fn lower_conc_assign(&mut self, s: &SyntaxNode) -> Option<AssignIr> {
+    fn lower_conc_assign(&mut self, s: &SyntaxNode, idx: usize) -> Option<ConcOut> {
         let kids = real_children(s);
-        let lhs = kids.iter().find(|k| {
+        let lhs_pos = kids.iter().position(|k| {
             k.kind() == SyntaxKind::Name
                 || k.kind() == SyntaxKind::Call
                 || k.kind() == SyntaxKind::PartSelect
         })?;
-        let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()))?;
-        Some(AssignIr {
-            lhs: self.lower_expr(lhs, &self.consts.clone()),
-            rhs: self.lower_expr(rhs, &self.consts.clone()),
-        })
+        let lhs = self.lower_expr(&kids[lhs_pos], &self.consts.clone());
+        // Waveform elements: `expr [after t] [when c]`, comma-separated, or the
+        // conditional form `expr when c else expr [when c]... [else expr]`.
+        struct Elem {
+            val: SyntaxNode,
+            delay: Option<SyntaxNode>,
+            cond: Option<SyntaxNode>,
+        }
+        let mut elems: Vec<Elem> = Vec::new();
+        let mut cur: Option<Elem> = None;
+        let mut i = lhs_pos + 1;
+        while i < kids.len() {
+            let k = &kids[i];
+            match self.kw(k).as_str() {
+                "after" | "when" => {
+                    if let Some(e) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
+                        if let Some(c) = cur.as_mut() {
+                            if self.kw(k) == "after" {
+                                c.delay = Some(e.clone());
+                            } else {
+                                c.cond = Some(e.clone());
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "else" => {
+                    if let Some(c) = cur.take() {
+                        elems.push(c);
+                    }
+                    if let Some(e) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
+                        cur = Some(Elem {
+                            val: e.clone(),
+                            delay: None,
+                            cond: None,
+                        });
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ if is_expr_node(k.kind()) => {
+                    if let Some(c) = cur.take() {
+                        elems.push(c);
+                    }
+                    cur = Some(Elem {
+                        val: k.clone(),
+                        delay: None,
+                        cond: None,
+                    });
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        if let Some(c) = cur {
+            elems.push(c);
+        }
+        if elems.is_empty() {
+            return None;
+        }
+        let has_cond = elems.iter().any(|e| e.cond.is_some());
+        let has_delay = elems.iter().any(|e| e.delay.is_some());
+        if has_cond && has_delay {
+            self.err(s.span(), "conditional waveform with `after` is unsupported");
+            return None;
+        }
+        if has_delay {
+            // A delayed concurrent assignment is a one-shot process scheduling
+            // each transaction; VHDL waveform delays are each relative to the
+            // time the statement executes (not cumulative like Verilog).
+            let mut stmts = Vec::new();
+            let mut prev = 0u64;
+            for e in &elems {
+                let mut t = 0u64;
+                if let Some(d) = &e.delay {
+                    let dv = self.lower_expr(d, &self.consts.clone());
+                    match const_eval(&dv, &self.consts.clone()).and_then(|v| v.to_u64()) {
+                        Some(dt) => t = dt,
+                        None => {
+                            self.err(d.span(), "waveform delay must be constant");
+                            return None;
+                        }
+                    }
+                }
+                let val = self.lower_expr(&e.val, &self.consts.clone());
+                let a = Stmt::Assign {
+                    lhs: lhs.clone(),
+                    rhs: val,
+                    nba: false,
+                };
+                stmts.push(if t > prev {
+                    Stmt::Delay {
+                        time_fs: t - prev,
+                        stmt: Box::new(a),
+                    }
+                } else {
+                    a
+                });
+                prev = t;
+            }
+            let body = if stmts.len() == 1 {
+                stmts.pop().unwrap()
+            } else {
+                Stmt::Block(stmts)
+            };
+            return Some(ConcOut::Proc(ProcessIr {
+                kind: ProcKind::Initial,
+                sens: Sens::List(Vec::new()),
+                body,
+                origin: format!("concurrent assign #{}", idx),
+                initial: false,
+            }));
+        }
+        if has_cond {
+            // Conditional waveform → nested ternary, first true condition wins.
+            let mut rhs: Option<Expr> = None;
+            for e in elems.iter().rev() {
+                let v = self.lower_expr(&e.val, &self.consts.clone());
+                rhs = Some(match (&e.cond, rhs) {
+                    (Some(c), Some(r)) => Expr::Cond {
+                        c: Box::new(self.lower_expr(c, &self.consts.clone())),
+                        t: Box::new(v),
+                        e: Box::new(r),
+                    },
+                    (Some(c), None) => Expr::Cond {
+                        c: Box::new(self.lower_expr(c, &self.consts.clone())),
+                        t: Box::new(v),
+                        e: Box::new(Expr::Lit(Value::x(1))),
+                    },
+                    (None, r) => r.unwrap_or(v),
+                });
+            }
+            return Some(ConcOut::Assign(AssignIr { lhs, rhs: rhs? }));
+        }
+        // Plain waveform: the last element at t=0 wins.
+        let rhs = self.lower_expr(&elems.last()?.val, &self.consts.clone());
+        Some(ConcOut::Assign(AssignIr { lhs, rhs }))
+    }
+
+    /// `with sel select target <= w1 when c1, w2 when c2, ...;` → a continuous
+    /// assign of nested ternaries (first matching choice wins, `others` last).
+    fn lower_selected_assign(&mut self, s: &SyntaxNode) -> Option<AssignIr> {
+        let kids = real_children(s);
+        let sel_pos = kids.iter().position(|k| is_expr_node(k.kind()))?;
+        let target_pos = kids[sel_pos + 1..]
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Name)?
+            + sel_pos
+            + 1;
+        let sel = self.lower_expr(&kids[sel_pos], &self.consts.clone());
+        let lhs = self.lower_expr(&kids[target_pos], &self.consts.clone());
+        // Walk `value [after t] when (choice | ... | others) [, ...]` pairs.
+        let mut pairs: Vec<(SyntaxNode, Vec<SyntaxNode>, bool)> = Vec::new();
+        let mut cur_val: Option<SyntaxNode> = None;
+        let mut cur_choices: Vec<SyntaxNode> = Vec::new();
+        let mut cur_others = false;
+        let mut in_choices = false;
+        for k in &kids[target_pos + 1..] {
+            match self.kw(k).as_str() {
+                "when" => in_choices = true,
+                "others" => cur_others = true,
+                _ if k.kind() == SyntaxKind::Punct && self.text(k) == "," => {
+                    if let Some(v) = cur_val.take() {
+                        pairs.push((v, std::mem::take(&mut cur_choices), cur_others));
+                        cur_others = false;
+                    }
+                    in_choices = false;
+                }
+                _ if is_expr_node(k.kind()) => {
+                    if in_choices {
+                        cur_choices.push(k.clone());
+                    } else {
+                        cur_val = Some(k.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(v) = cur_val {
+            pairs.push((v, cur_choices, cur_others));
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        let mut rhs: Option<Expr> = None;
+        for (val, choices, others) in pairs.iter().rev() {
+            let v = self.lower_expr(val, &self.consts.clone());
+            if *others {
+                rhs = Some(rhs.unwrap_or(v));
+                continue;
+            }
+            let mut cond: Option<Expr> = None;
+            for c in choices {
+                let e = Expr::Bin {
+                    op: BinOp::Eq,
+                    l: Box::new(sel.clone()),
+                    r: Box::new(self.lower_expr(c, &self.consts.clone())),
+                };
+                cond = Some(match cond {
+                    None => e,
+                    Some(prev) => Expr::Bin {
+                        op: BinOp::LogOr,
+                        l: Box::new(prev),
+                        r: Box::new(e),
+                    },
+                });
+            }
+            let else_e = rhs.unwrap_or_else(|| Expr::Lit(Value::x(1)));
+            rhs = Some(match cond {
+                Some(c) => Expr::Cond {
+                    c: Box::new(c),
+                    t: Box::new(v),
+                    e: Box::new(else_e),
+                },
+                None => else_e,
+            });
+        }
+        Some(AssignIr { lhs, rhs: rhs? })
     }
 
     fn lower_inst(&mut self, s: &SyntaxNode) -> Option<InstIr> {
@@ -1047,6 +1285,7 @@ impl<'a> Lower<'a> {
 
     fn lower_case(&mut self, s: &SyntaxNode) -> Stmt {
         let kids = real_children(s);
+        let matching = kids.iter().any(|k| k.kind() == SyntaxKind::Matching);
         let expr = kids.iter().find(|k| is_expr_node(k.kind()));
         let expr = expr
             .map(|k| self.lower_expr(k, &self.consts.clone()))
@@ -1072,6 +1311,7 @@ impl<'a> Lower<'a> {
             expr,
             items,
             default,
+            matching,
         }
     }
 
@@ -1691,6 +1931,7 @@ impl<'a> Lower<'a> {
                         b'0' => V0,
                         b'1' => V1,
                         b'z' => VZ,
+                        b'-' | b'?' => VDASH, // don't-care, matched by `case?`
                         _ => VX,
                     };
                 }
@@ -1797,10 +2038,16 @@ fn vhdl_binop(op: &str) -> Option<BinOp> {
         "mod" | "rem" => BinOp::Mod,
         "=" => BinOp::Eq,
         "/=" => BinOp::Ne,
+        "?=" => BinOp::EqM,
+        "?/=" => BinOp::NeM,
         "<" => BinOp::Lt,
         "<=" => BinOp::Le,
         ">" => BinOp::Gt,
         ">=" => BinOp::Ge,
+        "?<" => BinOp::LtM,
+        "?<=" => BinOp::LeM,
+        "?>" => BinOp::GtM,
+        "?>=" => BinOp::GeM,
         "and" => BinOp::BAnd,
         "or" => BinOp::BOr,
         "xor" => BinOp::BXor,

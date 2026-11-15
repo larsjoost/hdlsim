@@ -67,7 +67,9 @@ const MUL_KW_OPS: &[&str] = &[]; // `*`, `/` are punct; mod/rem live at add leve
 fn binop_prec(op: &str) -> Option<(u8, bool)> {
     Some(match op {
         "and" | "or" | "nand" | "nor" | "xor" | "xnor" => (1, false),
-        "=" | "/=" | "<" | "<=" | ">" | ">=" => (2, false),
+        "=" | "/=" | "<" | "<=" | ">" | ">=" | "?=" | "?/=" | "?<" | "?<=" | "?>" | "?>=" => {
+            (2, false)
+        }
         "sll" | "srl" | "sla" | "sra" | "rol" | "ror" => (3, false),
         "+" | "-" | "&" => (4, false),
         "*" | "/" | "mod" | "rem" => (5, false),
@@ -167,7 +169,31 @@ impl<'a> Parser<'a> {
             &self.src.text()[b.span.start as usize..b.span.end as usize]
         );
         match t.as_str() {
-            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" => Some(t),
+            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" | "?=" | "?/=" | "?<" | "?>" => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Three adjacent punct tokens forming a three-char operator (`?<=`, `?>=`).
+    fn peek_op3(&self) -> Option<String> {
+        let i0 = self.skip_trivia_from(self.pos);
+        let i1 = self.skip_trivia_from(i0 + 1);
+        let i2 = self.skip_trivia_from(i1 + 1);
+        if i2 >= self.tokens.len() {
+            return None;
+        }
+        let ts: Vec<&Token> = [i0, i1, i2].iter().map(|&i| &self.tokens[i]).collect();
+        if ts.iter().any(|t| t.kind != TokenKind::Punct) {
+            return None;
+        }
+        let t = format!(
+            "{}{}{}",
+            &self.src.text()[ts[0].span.start as usize..ts[0].span.end as usize],
+            &self.src.text()[ts[1].span.start as usize..ts[1].span.end as usize],
+            &self.src.text()[ts[2].span.start as usize..ts[2].span.end as usize]
+        );
+        match t.as_str() {
+            "?<=" | "?>=" | "?/=" => Some(t),
             _ => None,
         }
     }
@@ -189,7 +215,7 @@ impl<'a> Parser<'a> {
             &self.src.text()[b.span.start as usize..b.span.end as usize]
         );
         match t.as_str() {
-            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" => Some(t),
+            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" | "?=" | "?/=" | "?<" | "?>" => Some(t),
             _ => None,
         }
     }
@@ -1632,6 +1658,8 @@ impl<'a> Parser<'a> {
         self.bump(); // case
         if self.eat_punct('?') {
             // VHDL-2008 matching case: `case? expr is ...`
+            self.start(SyntaxKind::Matching);
+            self.builder.finish_node();
         }
         self.parse_expression();
         self.expect_kw("is", "after the case expression");
@@ -1867,6 +1895,9 @@ impl<'a> Parser<'a> {
     }
 
     fn current_binop(&self) -> Option<String> {
+        if let Some(op) = self.peek_op3() {
+            return binop_prec(&op).map(|_| op);
+        }
         if let Some(op) = self.peek_op2() {
             // A two-char punct sequence that is not a binary operator (e.g.
             // `=>`, `:=`) terminates the expression.
@@ -1906,10 +1937,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.builder.start_node_at(mark, SyntaxKind::BinExpr);
-            // Consume the operator: one punct, two puncts (<=, **, /=), or a keyword.
-            if op.len() == 2 && self.peek().kind == TokenKind::Punct {
-                self.bump();
-                self.bump();
+            // Consume the operator: one to three puncts (<=, **, /=, ?<=), or a keyword.
+            if self.peek().kind == TokenKind::Punct && op.len() > 1 {
+                for _ in 0..op.len() {
+                    self.bump();
+                }
             } else {
                 self.bump();
             }

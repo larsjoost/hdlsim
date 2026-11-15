@@ -219,6 +219,8 @@ pub enum SyntaxKind {
     Qualified,
     /// `others` in aggregates/case.
     Others,
+    /// Marker for the `?` in a VHDL-2008 matching case (`case? ... is`).
+    Matching,
 }
 
 /// All variants in declaration order — index == `kind as u16`.
@@ -353,6 +355,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Attr,
     SyntaxKind::Qualified,
     SyntaxKind::Others,
+    SyntaxKind::Matching,
 ];
 
 impl SyntaxKind {
@@ -542,7 +545,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 116);
+        assert_eq!(ALL.len(), 117);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

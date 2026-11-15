@@ -1308,8 +1308,20 @@ impl<'e, 'a> Exec<'e, 'a> {
                 expr,
                 items,
                 default,
+                matching,
             } => {
                 // Desugar to a priority if-chain: first matching item wins.
+                // BMC is 2-valued: matching-case wildcards ('-') have no SAT
+                // meaning, so reject them here.
+                if *matching {
+                    for (conds, _) in items {
+                        for c in conds {
+                            if expr_has_dash(c) {
+                                return Err("matching case ('-') unsupported in BMC".to_string());
+                            }
+                        }
+                    }
+                }
                 let mut chain: Option<Box<Stmt>> =
                     default.as_ref().map(|d| Box::new((**d).clone()));
                 for (conds, body) in items.iter().rev() {
@@ -1604,6 +1616,14 @@ impl<'e, 'a> Exec<'e, 'a> {
                 let b = &mut self.enc.b;
                 let l2 = extend(b, &lv.bits, w, signed);
                 let r2 = extend(b, &rv.bits, w, signed);
+                // Matching operators have don't-care semantics that are not
+                // 2-valued; reject rather than give a wrong answer.
+                if matches!(
+                    op,
+                    BinOp::EqM | BinOp::NeM | BinOp::LtM | BinOp::LeM | BinOp::GtM | BinOp::GeM
+                ) {
+                    return Err("prove: matching operators (?=, ?/=, ...) unsupported".to_string());
+                }
                 let bits = match op {
                     BinOp::Add => add_bits(b, &l2, &r2, b.false_lit(), w).0,
                     BinOp::Sub => sub_bits(b, &l2, &r2, w),
@@ -1648,6 +1668,10 @@ impl<'e, 'a> Exec<'e, 'a> {
                         let ta = or_bits(b, &l2);
                         let tb = or_bits(b, &r2);
                         vec![b.or_lit(ta, tb)]
+                    }
+                    // Rejected by the guard above.
+                    BinOp::EqM | BinOp::NeM | BinOp::LtM | BinOp::LeM | BinOp::GtM | BinOp::GeM => {
+                        vec![b.false_lit()]
                     }
                 };
                 Ok(Val { bits, signed })
@@ -2112,6 +2136,24 @@ fn sig_root(e: &Expr) -> Result<FlatSigId, String> {
         Expr::Sig(s) => Ok(*s),
         Expr::Idx { e: x, .. } | Expr::Sel { e: x, .. } => sig_root(x),
         _ => Err("prove: unsupported LHS root".to_string()),
+    }
+}
+
+/// Does this expression contain a don't-care ('-') literal bit?
+fn expr_has_dash(e: &Expr) -> bool {
+    match e {
+        Expr::Lit(v) => v.bits.iter().any(|&b| b == hdl_ir::value::VDASH),
+        Expr::Bin { l, r, .. } => expr_has_dash(l) || expr_has_dash(r),
+        Expr::Un { e, .. } => expr_has_dash(e),
+        Expr::Cond { c, t, e } => expr_has_dash(c) || expr_has_dash(t) || expr_has_dash(e),
+        Expr::Call { args, .. } => args.iter().any(expr_has_dash),
+        Expr::Concat(parts) => parts.iter().any(expr_has_dash),
+        Expr::Replicate { count, e } => expr_has_dash(count) || expr_has_dash(e),
+        Expr::Sel { e, msb, lsb } => expr_has_dash(e) || expr_has_dash(msb) || expr_has_dash(lsb),
+        Expr::Idx { e, i } => expr_has_dash(e) || expr_has_dash(i),
+        Expr::Rising(e) | Expr::Falling(e) | Expr::ToInt(e) | Expr::ToString(e) => expr_has_dash(e),
+        Expr::Resize { e, .. } | Expr::Signed(e) => expr_has_dash(e),
+        Expr::Sig(_) | Expr::Real(_) => false,
     }
 }
 

@@ -28,6 +28,34 @@ pub fn is_xz(b: u8) -> bool {
     matches!(b, VX | VZ | VW | VU)
 }
 
+/// Loose equality between a narrow bit vector and a wide byte-packed string of
+/// '0'/'1' characters (chars MSB-first, first char in the high byte — the
+/// string-literal packing): true when the wide value is exactly 8x the narrow
+/// one and each byte is the char of the corresponding bit.
+fn eq_string_loose(a: &Value, b: &Value) -> bool {
+    let (narrow, wide) = if a.width() <= b.width() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let nb = narrow.width();
+    if nb == 0 || wide.width() != nb * 8 || !wide.is_known() || !narrow.is_known() {
+        return false;
+    }
+    let nbytes = wide.width() / 8;
+    (0..nb).all(|i| {
+        // String chars are MSB-first (char 0 = high byte), so bit i is char
+        // `nb - 1 - i`, which sits in byte `nbytes - 1 - (nb - 1 - i)`.
+        let byte_idx = nbytes - nb + i;
+        let byte_bits = &wide.bits[byte_idx * 8..byte_idx * 8 + 8];
+        let byte = byte_bits
+            .iter()
+            .enumerate()
+            .fold(0u8, |acc, (j, &b)| acc | (((b == V1) as u8) << j));
+        byte == if narrow.bits[i] == V1 { b'1' } else { b'0' }
+    })
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Value {
     pub bits: Vec<u8>,
@@ -122,6 +150,19 @@ impl Value {
         Value { bits }
     }
 
+    /// VHDL-2008 matching equality (`?=` / `case?`): choice bits of `VDASH`
+    /// ('-') are wildcards; every other bit must be equal. Both sides are
+    /// extended to the wider width first.
+    pub fn matches_case(&self, choice: &Value) -> bool {
+        let w = self.width().max(choice.width()).max(1);
+        let a = self.resize(w);
+        let b = choice.resize(w);
+        a.bits
+            .iter()
+            .zip(b.bits.iter())
+            .all(|(x, c)| *c == VDASH || x == c)
+    }
+
     /// Concatenate: `parts[0]` is the most significant part (Verilog `{a, b}`).
     pub fn concat(parts: &[Value]) -> Value {
         let total: usize = parts.iter().map(|p| p.width()).sum();
@@ -180,6 +221,11 @@ impl Value {
                 if !strict && any_unknown {
                     return Value::x(1);
                 }
+                if !strict && !all_eq {
+                    // String-aware fallback: `to_bstring(v) = "1010"` compares a
+                    // byte-packed char string against a bit-vector literal.
+                    all_eq = eq_string_loose(self, rhs);
+                }
                 let r = match op {
                     Eq | EqStrict => all_eq,
                     _ => !all_eq,
@@ -198,6 +244,26 @@ impl Value {
                     _ => return Value::x(1),
                 };
                 Value::from_u64(1, ord as u64)
+            }
+            EqM => return Value::from_u64(1, self.matches_case(rhs) as u64),
+            NeM => return Value::from_u64(1, !self.matches_case(rhs) as u64),
+            LtM | LeM | GtM | GeM => {
+                // Matching relational: '-' would need wildcard-aware ordering;
+                // conservatively X when either side has a don't-care bit.
+                if self.bits.iter().any(|&b| b == VDASH) || rhs.bits.iter().any(|&b| b == VDASH) {
+                    return Value::x(1);
+                }
+                let (a, b) = (self.to_u64(), rhs.to_u64());
+                let ord = match (a, b) {
+                    (Some(a), Some(b)) => match op {
+                        LtM => a < b,
+                        LeM => a <= b,
+                        GtM => a > b,
+                        _ => a >= b,
+                    },
+                    _ => return Value::x(1),
+                };
+                return Value::from_u64(1, ord as u64);
             }
             LogAnd | LogOr => {
                 // Logical: X if any operand bit unknown, else 0/1.
@@ -481,6 +547,17 @@ pub enum BinOp {
     Ne,
     EqStrict,
     NeStrict,
+    /// VHDL-2008 matching equality `?=` — '-' bits in either operand are
+    /// wildcards.
+    EqM,
+    /// VHDL-2008 matching inequality `?/= `.
+    NeM,
+    /// VHDL-2008 matching relational operators (`?<`, `?<=`, `?>`, `?>=`).
+    /// Numeric compare when neither side has '-', else X.
+    LtM,
+    LeM,
+    GtM,
+    GeM,
     BAnd,
     BOr,
     BXor,

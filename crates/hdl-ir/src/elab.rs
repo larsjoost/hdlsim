@@ -45,6 +45,8 @@ pub struct FlatProc {
     pub sens: Sens,
     pub body: Stmt,
     pub origin: String,
+    /// Run once at t=0 before waiting on `sens` (VHDL processes).
+    pub initial: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +316,7 @@ impl Flat {
                 sens,
                 body,
                 origin: p.origin.clone(),
+                initial: p.initial,
             });
         }
         for a in &m.assigns {
@@ -482,6 +485,7 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             expr,
             items,
             default,
+            matching,
         } => Stmt::Case {
             expr: remap_expr(expr, map),
             items: items
@@ -494,6 +498,7 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
                 })
                 .collect(),
             default: default.as_ref().map(|d| Box::new(remap_stmt(d, map))),
+            matching: *matching,
         },
         Stmt::Assign { lhs, rhs, nba } => Stmt::Assign {
             lhs: remap_expr(lhs, map),

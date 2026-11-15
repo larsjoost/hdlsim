@@ -19,7 +19,64 @@ use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
 
 mod ckpt;
-use hdl_ir::value::{Value, V0, V1, VX};
+use hdl_ir::value::{Value, V0, V1, VDASH, VX, VZ};
+
+/// Pack a string as a Value: first char in the high byte, MSB-first — the same
+/// layout as VHDL/Verilog string literals.
+fn pack_str_value(s: &str) -> Value {
+    let bytes = s.as_bytes();
+    let n = bytes.len().max(1);
+    let mut bits = vec![V0; n * 8];
+    for (bi, &b) in bytes.iter().enumerate() {
+        for j in 0..8 {
+            bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
+        }
+    }
+    Value { bits }
+}
+
+/// VHDL `to_hstring`/`to_ostring`/`to_bstring` of a value (MSB-first digits).
+fn vhdl_radix_string(v: &Value, radix: u32) -> String {
+    let bits_per = match radix {
+        16 => 4,
+        8 => 3,
+        _ => 1,
+    };
+    let w = v.bits.len();
+    let pad = (bits_per - (w % bits_per)) % bits_per;
+    let mut out = String::new();
+    let mut i = w + pad;
+    while i > 0 {
+        i -= bits_per;
+        let mut digit = 0u32;
+        let mut known = true;
+        for j in 0..bits_per {
+            let idx = i + j;
+            let b = if idx < w { v.bits[idx] } else { V0 };
+            if b == V1 {
+                digit |= 1 << j;
+            } else if b != V0 {
+                known = false;
+            }
+        }
+        if radix == 2 {
+            out.push(if known {
+                if digit == 1 {
+                    '1'
+                } else {
+                    '0'
+                }
+            } else {
+                'X'
+            });
+        } else if known {
+            out.push(char::from_digit(digit, radix).unwrap().to_ascii_uppercase());
+        } else {
+            out.push('X');
+        }
+    }
+    out
+}
 use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -172,9 +229,12 @@ impl Simulator {
             .collect();
         for (i, p) in sim.flat.procs.iter().enumerate() {
             match &p.sens {
-                Sens::List(es) => sim
-                    .proc_sens
-                    .push(es.iter().map(|e| (e.sig, e.kind)).collect()),
+                Sens::List(es) => {
+                    sim.proc_sens
+                        .push(es.iter().map(|e| (e.sig, e.kind)).collect());
+                    // Keep `proc_all` index-aligned with `procs`.
+                    sim.proc_all.push(Vec::new());
+                }
                 Sens::All => {
                     let mut sigs = Vec::new();
                     p.body.collect_sigs(&mut sigs);
@@ -425,7 +485,7 @@ impl Simulator {
                 let start = match (&p.kind, &p.sens) {
                     (ProcKind::Initial, _) => true,
                     (ProcKind::Always, Sens::All) => true,
-                    (ProcKind::Always, Sens::List(es)) => es.is_empty(),
+                    (ProcKind::Always, Sens::List(es)) => es.is_empty() || p.initial,
                 };
                 start.then_some(pid as u32)
             })
@@ -760,6 +820,7 @@ impl Simulator {
                 expr,
                 items,
                 default,
+                matching,
             } => {
                 let v = self.eval_expr(&expr, None);
                 let mut chosen: Option<Stmt> = None;
@@ -768,9 +829,15 @@ impl Simulator {
                         let cv = self.eval_expr(c, None);
                         // Case choices match bit-literally after zero-extending
                         // both sides to the wider width (X in the expression
-                        // matches nothing).
-                        let w = v.width().max(cv.width()).max(1);
-                        if v.resize(w).bits == cv.resize(w).bits {
+                        // matches nothing); in a matching case (`case?`) choice
+                        // bits of '-' are wildcards.
+                        let hit = if matching {
+                            v.matches_case(&cv)
+                        } else {
+                            let w = v.width().max(cv.width()).max(1);
+                            v.resize(w).bits == cv.resize(w).bits
+                        };
+                        if hit {
                             chosen = Some(body.clone());
                             break;
                         }
@@ -1714,16 +1781,7 @@ impl Simulator {
                         None => "x".to_string(),
                     }
                 };
-                // First digit in the high byte, matching string literal packing.
-                let bytes = s.as_bytes();
-                let n = bytes.len().max(1);
-                let mut bits = vec![V0; n * 8];
-                for (bi, &b) in bytes.iter().enumerate() {
-                    for j in 0..8 {
-                        bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
-                    }
-                }
-                Value { bits }
+                pack_str_value(&s)
             }
             Expr::Un { op, e } => {
                 let v = self.eval_expr(e, locals);
@@ -1800,6 +1858,46 @@ impl Simulator {
                 return Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64);
             }
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
+            // VHDL-2008 string functions: to_hstring/to_ostring/to_bstring give
+            // radix digits (uppercase, 'X' for unknown nibbles); to_string of a
+            // 1-bit value is its char, of a byte-multiple value its bytes.
+            "to_hstring" | "to_ostring" | "to_bstring" | "to_string" if !args.is_empty() => {
+                let v = self.eval_expr(&args[0], locals);
+                let s = match name {
+                    "to_hstring" => vhdl_radix_string(&v, 16),
+                    "to_ostring" => vhdl_radix_string(&v, 8),
+                    "to_bstring" => vhdl_radix_string(&v, 2),
+                    _ => {
+                        if v.width() == 1 {
+                            match v.bits[0] {
+                                V0 => "0".to_string(),
+                                V1 => "1".to_string(),
+                                VZ => "Z".to_string(),
+                                VDASH => "-".to_string(),
+                                _ => "X".to_string(),
+                            }
+                        } else if v.width() % 8 == 0 && v.is_known() {
+                            (0..v.width() / 8)
+                                .map(|i| {
+                                    let mut b = 0u8;
+                                    for j in 0..8 {
+                                        if v.bits[i * 8 + j] == V1 {
+                                            b |= 1 << j;
+                                        }
+                                    }
+                                    b as char
+                                })
+                                .collect()
+                        } else {
+                            match v.to_u64() {
+                                Some(n) => n.to_string(),
+                                None => "x".to_string(),
+                            }
+                        }
+                    }
+                };
+                return pack_str_value(&s);
+            }
             "time" | "realtime" => return Value::from_u64(64, self.time),
             "random" | "urandom" => return Value::from_u64(32, self.next_random() as u64),
             "urandom_range" => {
@@ -1923,12 +2021,18 @@ impl<'a> FnRunner<'a> {
                 expr,
                 items,
                 default,
+                matching,
             } => {
                 let v = self.sim.eval_expr(expr, Some(self.locals));
                 for (conds, body) in items {
                     for c in conds {
                         let cv = self.sim.eval_expr(c, Some(self.locals));
-                        if eq_strict(&v, &cv) {
+                        let hit = if *matching {
+                            v.matches_case(&cv)
+                        } else {
+                            eq_strict(&v, &cv)
+                        };
+                        if hit {
                             self.exec(body);
                             return;
                         }

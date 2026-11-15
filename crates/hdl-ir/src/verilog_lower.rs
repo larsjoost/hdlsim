@@ -448,6 +448,7 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin: format!("assert property {}", self.text(prop_node)),
+            initial: false,
         });
     }
 
@@ -634,6 +635,7 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin,
+            initial: false,
         });
     }
 
@@ -983,6 +985,7 @@ impl<'a> Lower<'a> {
             expr,
             items,
             default,
+            matching: false,
         }
     }
 

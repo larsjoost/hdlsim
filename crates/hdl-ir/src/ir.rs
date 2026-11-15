@@ -92,6 +92,9 @@ pub struct ProcessIr {
     pub body: Stmt,
     /// Human-readable origin for debug/wave display, e.g. "always @(posedge clk)".
     pub origin: String,
+    /// Run once at t=0 before waiting on `sens`. VHDL processes always do;
+    /// Verilog `always @(...)` blocks do not.
+    pub initial: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,6 +160,9 @@ pub enum Stmt {
         expr: Expr,
         items: Vec<(Vec<Expr>, Stmt)>,
         default: Option<Box<Stmt>>,
+        /// VHDL-2008 matching case (`case?`): choice bits of `VDASH` ('-')
+        /// are wildcards instead of literal values.
+        matching: bool,
     },
     /// Procedural assignment; `nba` = non-blocking (`<=`).
     Assign {
@@ -333,6 +339,7 @@ impl Stmt {
                 expr,
                 items,
                 default,
+                ..
             } => {
                 expr.collect_sigs(out);
                 for (conds, body) in items {

@@ -76,6 +76,7 @@ fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) 
             expr,
             items,
             default,
+            ..
         } => {
             read(expr, reads);
             for (pats, body) in items {
@@ -255,6 +256,7 @@ mod tests {
                     nba: false,
                 },
                 origin: "always @(posedge clk)".to_string(),
+                initial: false,
             }],
             functions: vec![],
             instances: vec![],
