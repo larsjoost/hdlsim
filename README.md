@@ -117,6 +117,10 @@ hdlsim gen tb --top counter counter.v    # generate a testbench skeleton from th
 hdlsim analyze counter.v                 # static heuristics: undriven (W0501) / unread (W0502) signals
 ```
 
+SVA-lite (Verilog): concurrent `assert property (@(posedge clk) a |-> b)` /
+`|=>` and immediate `assert (e) [else s];` are simulated — a failed assertion
+exits 1. `assume`/`cover` parse with a warning (W0401) but are not simulated.
+
 `hdlsim regress` runs each test as its own simulation (fresh design per test)
 and exits 1 if any test fails. The `--list` file holds one test per line:
 `name=top [file.v ...]` (`#` starts a comment); plain positional tops also work.

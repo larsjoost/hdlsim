@@ -90,6 +90,9 @@ fn is_module_item(k: SyntaxKind) -> bool {
             | SyntaxKind::GenFor
             | SyntaxKind::GenIf
             | SyntaxKind::Inst
+            | SyntaxKind::AssertProperty
+            | SyntaxKind::AssumeProperty
+            | SyntaxKind::CoverProperty
     )
 }
 
@@ -110,6 +113,7 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::BreakStmt
             | SyntaxKind::ContinueStmt
             | SyntaxKind::SysCall
+            | SyntaxKind::SvaStmt
     )
 }
 
@@ -361,6 +365,85 @@ impl<'a> Lower<'a> {
         1
     }
 
+    /// `assert property (@(sens) ante |-> cons);` lowers to an always process:
+    /// `|->` checks `cons` at the same edge, `|=>` waits one more edge; a plain
+    /// property checks its expr at every edge. The check itself is the
+    /// `$assert` system task (kernel turns a false condition into TestFailed).
+    fn lower_assert_property(
+        &mut self,
+        module: &mut ModuleIr,
+        item: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) {
+        let kids = real_children(item);
+        let sens_node = kids.iter().find(|k| k.kind() == SyntaxKind::SensList);
+        let prop_node = kids.iter().find(|k| k.kind() == SyntaxKind::Property);
+        let (Some(sens_node), Some(prop_node)) = (sens_node, prop_node) else {
+            self.err(item.span(), "malformed assert property");
+            return;
+        };
+        let sens = self.lower_sens_list(sens_node, env);
+        let edges = match &sens {
+            Sens::List(es) => es.clone(),
+            Sens::All => {
+                self.err(
+                    prop_node.span(),
+                    "assert property needs an explicit `@(...)` clocking event",
+                );
+                return;
+            }
+        };
+        let pk = real_children(prop_node);
+        let exprs: Vec<&SyntaxNode> = pk.iter().filter(|k| is_expr_node(k.kind())).collect();
+        let op: String = pk
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Punct)
+            .map(|k| self.text(k))
+            .collect();
+        // NB: syscall names are stored without the leading `$`. `sva_assert`
+        // (not `assert`, which is VHDL's severity-gated form) always fails on
+        // a false condition, per SVA.
+        let check = |cons: Expr| Stmt::SysCall {
+            name: "sva_assert".to_string(),
+            args: vec![cons],
+        };
+        let body = match exprs.len() {
+            1 => check(self.lower_expr(exprs[0], env)),
+            2 => {
+                let ante = self.lower_expr(exprs[0], env);
+                let cons = self.lower_expr(exprs[1], env);
+                if op.contains('-') {
+                    // `|->`: overlapping — consequent holds at the same edge.
+                    Stmt::If {
+                        cond: ante,
+                        then: Box::new(check(cons)),
+                        els: None,
+                    }
+                } else {
+                    // `|=>`: consequent holds at the next edge.
+                    Stmt::If {
+                        cond: ante,
+                        then: Box::new(Stmt::Block(vec![Stmt::Wait {
+                            sens: edges,
+                            body: Box::new(check(cons)),
+                        }])),
+                        els: None,
+                    }
+                }
+            }
+            _ => {
+                self.err(prop_node.span(), "malformed property expression");
+                return;
+            }
+        };
+        module.processes.push(ProcessIr {
+            kind: ProcKind::Always,
+            sens,
+            body,
+            origin: format!("assert property {}", self.text(prop_node)),
+        });
+    }
+
     fn lower_module_item(
         &mut self,
         module: &mut ModuleIr,
@@ -368,6 +451,20 @@ impl<'a> Lower<'a> {
         env: &HashMap<String, Value>,
     ) {
         match item.kind() {
+            SyntaxKind::AssertProperty => self.lower_assert_property(module, item, env),
+            SyntaxKind::AssumeProperty | SyntaxKind::CoverProperty => {
+                // SVA-lite: parsed, reported, not simulated.
+                let what = if item.kind() == SyntaxKind::AssumeProperty {
+                    "assume"
+                } else {
+                    "cover"
+                };
+                self.diags.push(Diagnostic::warning(
+                    "W0401",
+                    Some(item.span()),
+                    format!("{} property is parsed but not simulated", what),
+                ));
+            }
             SyntaxKind::Port | SyntaxKind::Decl | SyntaxKind::ParamDecl => {
                 // Already handled in the pre-pass / param pass; re-lowering a Decl
                 // for its init value:
@@ -584,6 +681,54 @@ impl<'a> Lower<'a> {
 
     fn lower_stmt_impl(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
         match s.kind() {
+            SyntaxKind::SvaStmt => {
+                // Statement-level SVA: `assert (e) [else s];` lowers to the
+                // always-failing `sva_assert` check; assume/cover/expect are
+                // parsed but not simulated.
+                let kids = real_children(s);
+                let kw = kids
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| self.text(k))
+                    .unwrap_or_default();
+                if kw != "assert" {
+                    self.diags.push(Diagnostic::warning(
+                        "W0401",
+                        Some(s.span()),
+                        format!("`{}` statement is parsed but not simulated", kw),
+                    ));
+                    return Stmt::Null;
+                }
+                let expr = kids.iter().find(|k| is_expr_node(k.kind()));
+                let els = kids.iter().find(|k| {
+                    !is_expr_node(k.kind())
+                        && !matches!(k.kind(), SyntaxKind::Ident | SyntaxKind::Punct)
+                });
+                match expr {
+                    Some(e) => {
+                        let e = self.lower_expr(e, env);
+                        match els {
+                            // `assert (e) else s;` == `if (!e) s;`
+                            Some(st) => Stmt::If {
+                                cond: Expr::Un {
+                                    op: UnOp::Not,
+                                    e: Box::new(e),
+                                },
+                                then: Box::new(self.lower_stmt(st, env)),
+                                els: None,
+                            },
+                            None => Stmt::SysCall {
+                                name: "sva_assert".to_string(),
+                                args: vec![e],
+                            },
+                        }
+                    }
+                    None => {
+                        self.err(s.span(), "malformed assert statement");
+                        Stmt::Null
+                    }
+                }
+            }
             SyntaxKind::Block => Stmt::Block(
                 real_children(s)
                     .into_iter()
@@ -1529,6 +1674,46 @@ mod tests {
         let b = &modules[1];
         assert_eq!(b.name, "b");
         assert!(b.signals.iter().any(|s| s.name == "x"), "{:?}", b.signals);
+    }
+
+    #[test]
+    fn lowers_sva_lite_assert_property_and_immediate_assert() {
+        let src = "module m (input wire clk, input wire a, output reg b);\n\
+                   always @(posedge clk) b <= a;\n\
+                   assert property (@(posedge clk) a |-> b);\n\
+                   assert property (@(posedge clk) a |=> b);\n\
+                   initial begin assert (a == 1'b0); end\n\
+                   endmodule\n";
+        let (modules, _db, diags) = lower_src(src);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity != hdl_syntax::diagnostic::Severity::Error),
+            "{:?}",
+            diags
+        );
+        let m = &modules[0];
+        // two clocked properties + one always + one initial
+        assert_eq!(
+            m.processes.len(),
+            4,
+            "{:?}",
+            m.processes.iter().map(|p| &p.origin).collect::<Vec<_>>()
+        );
+        let origins: Vec<&str> = m.processes.iter().map(|p| p.origin.as_str()).collect();
+        assert!(
+            origins
+                .iter()
+                .filter(|o| o.starts_with("assert property"))
+                .count()
+                == 2,
+            "{:?}",
+            origins
+        );
+        // the immediate assert lowered to a sva_assert syscall
+        let init = m.processes.iter().find(|p| p.origin == "initial").unwrap();
+        let s = format!("{:?}", init.body);
+        assert!(s.contains("sva_assert"), "{}", s);
     }
 
     #[test]

@@ -499,6 +499,7 @@ impl<'a> Parser<'a> {
                 "defparam" => self.parse_defparam(),
                 "typedef" => self.parse_typedef(),
                 "generate" => self.parse_generate(),
+                "assert" | "assume" | "cover" => self.parse_sva_property(text.as_str()),
                 // `endmodule` here means the enclosing construct was never
                 // closed — report and skip so no loop can spin on it.
                 "endmodule" => {
@@ -539,6 +540,14 @@ impl<'a> Parser<'a> {
 
     fn peek2_text(&self) -> String {
         let t = self.peek2();
+        self.src.text()[t.span.start as usize..t.span.end as usize].to_string()
+    }
+
+    fn peek3_text(&self) -> String {
+        let i = self.skip_trivia_from(self.pos);
+        let j = self.skip_trivia_from(i + 1);
+        let k = self.skip_trivia_from(j + 1);
+        let t = &self.tokens[k.min(self.tokens.len() - 1)];
         self.src.text()[t.span.start as usize..t.span.end as usize].to_string()
     }
 
@@ -705,6 +714,61 @@ impl<'a> Parser<'a> {
             self.parse_sens_list();
         }
         self.parse_statement();
+        self.builder.finish_node();
+    }
+
+    /// `assert|assume|cover property (@(sens) prop);` module item (SVA-lite).
+    fn parse_sva_property(&mut self, kw: &str) {
+        let kind = match kw {
+            "assert" => SyntaxKind::AssertProperty,
+            "assume" => SyntaxKind::AssumeProperty,
+            _ => SyntaxKind::CoverProperty,
+        };
+        self.builder.start_node(kind);
+        self.bump(); // assert/assume/cover
+        if !self.eat_kw("property") {
+            self.error_here("expected `property`");
+        }
+        if !self.eat_punct('(') {
+            self.error_here("expected `(` after `property`");
+        }
+        if self.eat_punct('@') {
+            self.parse_sens_list();
+        } else {
+            self.error_here("SVA-lite property needs a clocking event, e.g. `@(posedge clk)`");
+        }
+        self.parse_property();
+        self.expect_punct(')', "to close the property");
+        self.expect_punct(';', "to end the property declaration");
+        self.builder.finish_node();
+    }
+
+    /// Property expression: `expr`, `expr |-> expr`, or `expr |=> expr`.
+    /// `|->` / `|=>` lex as the single-char puncts `|`, `-`/`=`, `>`, so the
+    /// antecedent/consequent are parsed one precedence level above `|`.
+    fn parse_property(&mut self) {
+        self.builder.start_node(SyntaxKind::Property);
+        let mark = self.builder.mark();
+        self.parse_unary();
+        self.parse_binops(mark, 7);
+        let imp = if self.at_punct('|') && self.peek2_text() == "-" && self.peek3_text() == ">" {
+            Some("|->")
+        } else if self.at_punct('|') && self.peek2_text() == "=" && self.peek3_text() == ">" {
+            Some("|=>")
+        } else {
+            None
+        };
+        if imp.is_some() {
+            self.bump(); // |
+            self.bump(); // - or =
+            self.bump(); // >
+            let mark2 = self.builder.mark();
+            self.parse_unary();
+            self.parse_binops(mark2, 7);
+        } else {
+            // Plain boolean property: allow the remaining top-level `|`.
+            self.parse_binops(mark, 6);
+        }
         self.builder.finish_node();
     }
 
@@ -1983,6 +2047,58 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::source::SourceDb;
+
+    #[test]
+    fn parses_sva_lite_properties_and_immediate_assert() {
+        let src = "module m (input wire clk, input wire a, output reg b);\n\
+                   always @(posedge clk) b <= a;\n\
+                   assert property (@(posedge clk) a |-> b);\n\
+                   assert property (@(posedge clk) a |=> b);\n\
+                   assert property (@(posedge clk) b);\n\
+                   assume property (@(posedge clk) a);\n\
+                   cover property (@(posedge clk) a |-> b);\n\
+                   initial begin assert (a == 1'b0); assert (b) else $display(\"x\"); end\n\
+                   endmodule\n";
+        let (parsed, _db) = parse_str(src);
+        assert!(
+            parsed
+                .diags
+                .iter()
+                .all(|d| d.severity != crate::diagnostic::Severity::Error),
+            "{:?}",
+            parsed.diags
+        );
+        let kinds: Vec<SyntaxKind> = parsed.root.descendants().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == SyntaxKind::AssertProperty)
+                .count(),
+            3
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == SyntaxKind::AssumeProperty)
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == SyntaxKind::CoverProperty)
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| **k == SyntaxKind::Property).count(),
+            5
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| **k == SyntaxKind::SvaStmt).count(),
+            2
+        );
+    }
 
     fn parse_str(src: &str) -> (ParsedFile, SourceDb) {
         let mut db = SourceDb::new();

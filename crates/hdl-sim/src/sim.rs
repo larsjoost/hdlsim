@@ -1008,6 +1008,25 @@ impl Simulator {
                     self.stopped = true;
                 }
             }
+            "sva_assert" => {
+                // SVA-lite assertion check: a false condition is always a
+                // failed test (unlike VHDL's severity-gated `assert` above).
+                let ok = args
+                    .first()
+                    .map(|e| truthy(&self.eval_expr(e, None)))
+                    .unwrap_or(false);
+                if !ok {
+                    let text = match args.first() {
+                        Some(e) => format!("{:?}", e),
+                        None => String::new(),
+                    };
+                    self.emit(SimEvent::Message {
+                        text: format!("assertion failed at t={}: {}\n", self.time, text),
+                        time_fs: self.time,
+                    });
+                    self.fail(format!("sva assertion failed at t={}: {}", self.time, text));
+                }
+            }
             "error" | "fatal" => {
                 // Verilog $error / $fatal — a failed test.
                 let text = self.fmt_args(&args);
