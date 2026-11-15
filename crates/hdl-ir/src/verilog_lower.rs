@@ -51,16 +51,25 @@ pub fn lower_file_with_time(
         sig_is_mem: HashSet::new(),
         extra_base: 0,
         in_function: false,
+        classes: HashMap::new(),
+        class_mems: HashMap::new(),
+        cur_class: None,
     };
+    // Classes first (modules may reference them), then packages, then modules.
+    let children = real_children(root);
+    for child in &children {
+        if child.kind() == SyntaxKind::Class {
+            lx.lower_class(child);
+        }
+    }
     let mut modules = Vec::new();
-    for child in real_children(root) {
+    for child in children {
         match child.kind() {
             SyntaxKind::Module => modules.push(lx.lower_module(&child)),
             SyntaxKind::Package => {
                 let pkg = lx.lower_module(&child);
                 lx.packages.insert(pkg.name.clone(), pkg);
             }
-            SyntaxKind::Class => modules.push(lx.lower_class(&child)),
             _ => {}
         }
     }
@@ -163,6 +172,12 @@ struct Lower<'a> {
     sig_is_mem: HashSet<SigId>,
     /// Inside a function body: `return e;` assigns to slot 0 (function name).
     in_function: bool,
+    /// Lowered SV classes by name.
+    classes: HashMap<String, ClassInfo>,
+    /// Per-module: class name → object-memory signal (one word per object).
+    class_mems: HashMap<String, SigId>,
+    /// Class whose method body is being lowered (for `this`/bare fields).
+    cur_class: Option<String>,
 }
 
 /// A user-defined type (typedef, enum, struct, class).
@@ -182,6 +197,19 @@ enum TypeKind {
     Enum(Vec<(String, u64)>),
     /// Packed struct fields in declaration order: (name, width, lsb offset).
     Struct(Vec<(String, usize, usize)>),
+    /// Class type: instances are 64-bit handles; the class name keys `classes`.
+    Class(String),
+}
+
+/// A lowered SV class: fields (incl. inherited, parent-first) with bit
+/// offsets in the per-class object word, methods, and raw constraint text.
+#[derive(Clone, Debug)]
+struct ClassInfo {
+    name: String,
+    fields: Vec<(String, usize, usize, bool)>, // name, width, lsb, rand
+    width: usize,
+    methods: Vec<FuncIr>,
+    constraint_text: String,
 }
 
 impl<'a> Lower<'a> {
@@ -238,6 +266,9 @@ impl<'a> Lower<'a> {
         self.names.clear();
         self.sig_types.clear();
         self.sig_is_mem.clear();
+        self.class_mems.clear();
+        self.gconsts
+            .insert("null".to_string(), Value::from_u64(64, u64::MAX));
         // First pass: params (so ports and later items can use them in ranges).
         let mut env: HashMap<String, Value> = HashMap::new();
         for item in &item_nodes {
@@ -270,6 +301,13 @@ impl<'a> Lower<'a> {
                 if p.kind() == SyntaxKind::Port {
                     self.lower_port(&mut module, &p, &env_snapshot);
                 }
+            }
+        }
+        // Classes declared inside the module must be registered before the
+        // signal pre-pass so class-typed declarations get their type.
+        for item in &item_nodes {
+            if item.kind() == SyntaxKind::Class {
+                self.lower_class(item);
             }
         }
         // Register all declared signal names up front so items can reference
@@ -380,6 +418,36 @@ impl<'a> Lower<'a> {
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
         self.extra_base = module.signals.len();
+        // Allocate an object memory for each class-typed declaration in this
+        // module, and expose class methods as `Class::method` functions.
+        for item in &item_nodes {
+            if item.kind() == SyntaxKind::Decl {
+                let dk = real_children(item);
+                if let Some(t) = self.decl_type_name(&dk) {
+                    let cn = self.types.get(&t).and_then(|td| match &td.kind {
+                        TypeKind::Class(cn) => Some(cn.clone()),
+                        _ => None,
+                    });
+                    if let Some(cn) = cn {
+                        self.class_mem_sig(&cn);
+                    }
+                }
+            }
+        }
+        let class_methods: Vec<FuncIr> = self
+            .classes
+            .values()
+            .flat_map(|ci| {
+                ci.methods.iter().map(move |m| FuncIr {
+                    name: format!("{}::{}", ci.name, m.name),
+                    ret_width: m.ret_width,
+                    args: m.args.clone(),
+                    locals: m.locals.clone(),
+                    body: m.body.clone(),
+                })
+            })
+            .collect();
+        module.functions.extend(class_methods);
         for item in &item_nodes {
             self.lower_module_item(&mut module, item, &env);
         }
@@ -631,100 +699,245 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Lower a top-level `class` — full class support lands with the
-    /// class/object slice; for now record a stub so `C c;` decls parse.
-    fn lower_class(&mut self, c: &SyntaxNode) -> ModuleIr {
+    /// Lower a top-level `class ... endclass`: register the type, fields
+    /// (inherited fields first), methods (named `Class::method`), and the raw
+    /// constraint-block text used by `randomize()`.
+    fn lower_class(&mut self, c: &SyntaxNode) {
         let kids = real_children(c);
-        let name = kids
-            .iter()
-            .find(|k| k.kind() == SyntaxKind::Name)
-            .map(|k| self.text(k))
-            .unwrap_or_else(|| "<anon_class>".to_string());
-        self.err(
-            c.span(),
-            format!("class '{}' is parsed but not yet supported", name),
+        let mut names = kids.iter().filter(|k| k.kind() == SyntaxKind::Name);
+        let name = names.next().map(|k| self.text(k)).unwrap_or_default();
+        let parent = names.next().map(|k| self.text(k));
+        if name.is_empty() {
+            return;
+        }
+        // Fields: inherited (parent-first) then own declarations.
+        let mut fields: Vec<(String, usize, usize, bool)> = Vec::new();
+        if let Some(p) = &parent {
+            if let Some(pi) = self.classes.get(p) {
+                fields.extend(pi.fields.iter().cloned());
+            }
+        }
+        let mut own: Vec<(String, usize, bool)> = Vec::new();
+        let mut constraint_text = String::new();
+        for k in &kids {
+            match k.kind() {
+                SyntaxKind::Decl => {
+                    let dk = real_children(k);
+                    let width = self.decl_width(&dk, &HashMap::new());
+                    let is_rand = dk.iter().any(|d| {
+                        d.kind() == SyntaxKind::Ident
+                            && matches!(self.text(d).as_str(), "rand" | "randc")
+                    });
+                    for d in &dk {
+                        if d.kind() == SyntaxKind::Name {
+                            own.push((self.text(d), width, is_rand));
+                        }
+                    }
+                }
+                SyntaxKind::Constraint => {
+                    let text = self.db.span_text(k.span());
+                    // Strip the outer braces and the constraint name.
+                    let inner = text
+                        .trim_start_matches(|ch| ch != '{')
+                        .trim_start_matches('{');
+                    let inner = inner.trim_end_matches('}').trim();
+                    if !constraint_text.is_empty() {
+                        constraint_text.push_str(" ; ");
+                    }
+                    constraint_text.push_str(inner);
+                }
+                _ => {}
+            }
+        }
+        let total: usize =
+            fields.iter().map(|f| f.1).sum::<usize>() + own.iter().map(|f| f.1).sum::<usize>();
+        let mut lsb = total;
+        for (n, w, r) in &own {
+            lsb -= w;
+            fields.push((n.clone(), *w, lsb, *r));
+        }
+        // Register the class (fields only) before lowering methods so bare
+        // field references inside methods resolve via `cur_class_field`.
+        self.types.insert(
+            name.clone(),
+            TypeDef {
+                width: 64, // handle
+                signed: false,
+                real: false,
+                kind: TypeKind::Class(name.clone()),
+            },
         );
-        ModuleIr {
-            name,
-            params: Vec::new(),
-            ports: Vec::new(),
-            signals: Vec::new(),
-            assigns: Vec::new(),
-            processes: Vec::new(),
-            functions: Vec::new(),
-            instances: Vec::new(),
-            time_unit_fs: self.time_unit_fs,
+        self.classes.insert(
+            name.clone(),
+            ClassInfo {
+                name: name.clone(),
+                fields,
+                width: total.max(1),
+                methods: Vec::new(),
+                constraint_text,
+            },
+        );
+        // Lower methods with the class context set (this / bare fields).
+        let mut methods = Vec::new();
+        for k in &kids {
+            if k.kind() == SyntaxKind::Function || k.kind() == SyntaxKind::Task {
+                let saved = self.cur_class.replace(name.clone());
+                let f = self.lower_function_ir(k, &HashMap::new());
+                self.cur_class = saved;
+                methods.push(f);
+            }
+        }
+        if let Some(ci) = self.classes.get_mut(&name) {
+            ci.methods = methods;
         }
     }
 
-    /// Lower `'{ a: x, b: y, default: z }` against the struct type of the LHS:
-    /// concat fields in declaration order (first field = MSB).
-    fn lower_pattern(
-        &mut self,
-        pat: &SyntaxNode,
-        lhs: &SyntaxNode,
-        env: &HashMap<String, Value>,
-    ) -> Option<Expr> {
-        let pk = real_children(pat);
-        // (label, expr) pairs in source order.
-        let mut entries: Vec<(Option<String>, Expr)> = Vec::new();
-        let mut i = 0;
-        while i < pk.len() {
-            let label = if pk[i].kind() == SyntaxKind::Name {
-                let l = self.text(&pk[i]);
-                i += 1;
-                Some(l)
-            } else {
-                None
-            };
-            if i < pk.len() && is_expr_node(pk[i].kind()) {
-                let e = self.lower_expr(&pk[i], env);
-                entries.push((label, e));
-                i += 1;
-            } else {
-                i += 1;
+    /// Allocate (once per module) the object-memory signal for class `cn`.
+    fn class_mem_sig(&mut self, cn: &str) -> Option<SigId> {
+        if let Some(id) = self.class_mems.get(cn) {
+            return Some(*id);
+        }
+        let ci = self.classes.get(cn)?.clone();
+        let id = (self.extra_base + self.extra_signals.len()) as SigId;
+        self.extra_signals.push(SignalIr {
+            name: format!("__objmem_{}", cn),
+            width: ci.width,
+            kind: SigKind::Wire,
+            init: None,
+            mem: Some(0), // dynamic: one word per object
+            signed: false,
+        });
+        self.sig_is_mem.insert(id);
+        self.class_mems.insert(cn.to_string(), id);
+        Some(id)
+    }
+
+    /// `obj.field` where obj is a class-typed signal → `$getf::C::field(obj)`.
+    /// Returns None if not a class field access.
+    fn lower_field_read(&mut self, _root: &str, field: &str, root_id: SigId) -> Option<Expr> {
+        let tn = self.sig_types.get(&root_id)?.clone();
+        let cn = match self.types.get(&tn)?.kind {
+            TypeKind::Class(ref cn) => cn.clone(),
+            _ => return None,
+        };
+        if !self
+            .classes
+            .get(&cn)?
+            .fields
+            .iter()
+            .any(|(n, _, _, _)| n == field)
+        {
+            return None;
+        }
+        Some(Expr::Call {
+            name: self
+                .getf_name(&cn, field)
+                .unwrap_or_else(|| format!("$getf::{}::{}", cn, field)),
+            args: vec![Expr::Sig(root_id)],
+        })
+    }
+
+    /// Object expression for `this` / `super` (inherited fields are merged
+    /// into the same word, so both are the current object).
+    fn this_expr(&self) -> Expr {
+        Expr::Call {
+            name: "$this".to_string(),
+            args: vec![],
+        }
+    }
+
+    /// `$getf::C::field@lsb,width` — the field layout is encoded in the call
+    /// name so the simulator can extract field bits without a side table.
+    fn getf_name(&self, cn: &str, field: &str) -> Option<String> {
+        let f = self
+            .classes
+            .get(cn)?
+            .fields
+            .iter()
+            .find(|(n, _, _, _)| n == field)?;
+        Some(format!("$getf::{}::{}@{},{}", cn, field, f.2, f.1))
+    }
+
+    /// `$setf::C::field@lsb,width` — see [`Lower::getf_name`].
+    fn setf_name(&self, cn: &str, field: &str) -> Option<String> {
+        let f = self
+            .classes
+            .get(cn)?
+            .fields
+            .iter()
+            .find(|(n, _, _, _)| n == field)?;
+        Some(format!("$setf::{}::{}@{},{}", cn, field, f.2, f.1))
+    }
+
+    /// `$randomize::C@x=lsb,w;y=lsb,w` — rand-field layout, same order as the
+    /// domains emitted into the constraint spec.
+    fn randomize_name(&self, cn: &str) -> String {
+        let mut lay: Vec<String> = Vec::new();
+        if let Some(ci) = self.classes.get(cn) {
+            for (n, w, lsb, r) in &ci.fields {
+                if *r {
+                    lay.push(format!("{}={},{}", n, lsb, w));
+                }
             }
         }
-        // LHS struct type.
-        let lhs_name = if lhs.kind() == SyntaxKind::Name {
-            self.text(lhs)
+        format!("$randomize::{}@{}", cn, lay.join(";"))
+    }
+
+    /// Is `name` a field of the class whose method is being lowered?
+    fn cur_class_field(&self, name: &str) -> Option<String> {
+        let cn = self.cur_class.as_ref()?;
+        let ci = self.classes.get(cn)?;
+        if ci.fields.iter().any(|(n, _, _, _)| n == name) {
+            Some(cn.clone())
         } else {
-            return None;
-        };
-        let id = self.sig_id(&lhs_name)?;
-        let tn = self.sig_types.get(&id)?.clone();
-        let td = self.types.get(&tn)?.clone();
-        let TypeKind::Struct(fields) = td.kind else {
-            // Non-struct target: positional concat.
-            return Some(Expr::Concat(entries.into_iter().map(|(_, e)| e).collect()));
-        };
-        let default = entries
-            .iter()
-            .find(|(l, _)| l.as_deref() == Some("default"))
-            .map(|(_, e)| e.clone());
-        let mut parts: Vec<Expr> = Vec::new();
-        let mut pos = 0usize;
-        for (fname, fw, _lsb) in &fields {
-            let named = entries
-                .iter()
-                .find(|(l, _)| l.as_deref() == Some(fname.as_str()))
-                .map(|(_, e)| e.clone());
-            let e = named.or_else(|| {
-                let p = entries
-                    .iter()
-                    .enumerate()
-                    .find(|(pi, (l, _))| *pi >= pos && l.is_none());
-                p.map(|(pi, (_, e))| {
-                    pos = pi + 1;
-                    e.clone()
-                })
-            });
-            parts.push(match e {
-                Some(e) => e,
-                None => default.clone().unwrap_or_else(|| Expr::Lit(Value::x(*fw))),
-            });
+            None
         }
-        Some(Expr::Concat(parts))
+    }
+
+    /// If `lhs` is a class field write (`c.x` or bare `x` inside a method),
+    /// return (class, field, object-expr).
+    fn class_field_lhs(&mut self, l: &SyntaxNode) -> Option<(String, String, Expr)> {
+        if l.kind() == SyntaxKind::Name {
+            let name = self.text(l);
+            if let Some(dot) = name.find('.') {
+                let root = &name[..dot];
+                let field = &name[dot + 1..];
+                if let Some(id) = self.sig_id(root) {
+                    if let Some(tn) = self.sig_types.get(&id).cloned() {
+                        if let Some(td) = self.types.get(&tn).cloned() {
+                            if let TypeKind::Class(cn) = &td.kind {
+                                if self.classes.get(cn).map_or(false, |ci| {
+                                    ci.fields.iter().any(|(n, _, _, _)| n == field)
+                                }) {
+                                    return Some((cn.clone(), field.to_string(), Expr::Sig(id)));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(cn) = self.cur_class_field(&name) {
+                return Some((cn, name, self.this_expr()));
+            }
+        }
+        None
+    }
+
+    /// Constraint spec text for `randomize()`: rand field domains plus the
+    /// class's constraint blocks.
+    fn randomize_spec(&self, cn: &str) -> String {
+        let mut spec = String::new();
+        if let Some(ci) = self.classes.get(cn) {
+            for (n, w, _, r) in &ci.fields {
+                if *r {
+                    let hi = if *w >= 64 { i64::MAX } else { (1i64 << w) - 1 };
+                    spec.push_str(&format!("{}: 0..{}; ", n, hi));
+                }
+            }
+            if !ci.constraint_text.is_empty() {
+                spec.push_str(&ci.constraint_text);
+            }
+        }
+        spec
     }
 
     fn lower_port(&mut self, module: &mut ModuleIr, p: &SyntaxNode, env: &HashMap<String, Value>) {
@@ -1057,6 +1270,38 @@ impl<'a> Lower<'a> {
                 // Optional `= expr` after the name.
                 if kids.get(i + 1).map_or(false, |k| self.text(k) == "=") {
                     if let Some(e) = kids.get(i + 2) {
+                        if e.kind() == SyntaxKind::Allocator {
+                            // `C c = new(args);` — runtime constructor: emit a
+                            // one-shot initial process performing the $new call.
+                            let cn = self
+                                .decl_type_name(&kids)
+                                .and_then(|t| self.types.get(&t).cloned())
+                                .and_then(|td| match td.kind {
+                                    TypeKind::Class(cn) => Some(cn),
+                                    _ => None,
+                                });
+                            if let (Some(cn), Some(id)) = (cn, self.sig_id(&name)) {
+                                let mut args = vec![Expr::Sig(id)];
+                                args.extend(
+                                    real_children(e)
+                                        .iter()
+                                        .filter(|k| is_expr_node(k.kind()))
+                                        .map(|k| self.lower_expr(k, env)),
+                                );
+                                module.processes.push(ProcessIr {
+                                    kind: ProcKind::Initial,
+                                    sens: Sens::List(Vec::new()),
+                                    body: Stmt::SysCall {
+                                        name: format!("$new::{}", cn),
+                                        args,
+                                    },
+                                    origin: format!("{} = new(...)", name),
+                                    initial: true,
+                                });
+                            }
+                            i += 3;
+                            continue;
+                        }
                         if is_expr_node(e.kind()) {
                             let expr = self.lower_expr(e, env);
                             if let Some(id) = self.sig_id(&name) {
@@ -1305,6 +1550,65 @@ impl<'a> Lower<'a> {
                         let rhs = body[op + 1..].iter().find(|k| is_expr_node(k.kind()));
                         match (lhs, rhs) {
                             (Some(l), Some(r)) => {
+                                // `obj.field = v` / `this.x = v` → $setf call
+                                // (expression form so it also works inside
+                                // functions, where only &self evaluation runs).
+                                if let Some((cn, field, obj)) = self.class_field_lhs(l) {
+                                    return Stmt::ExprStmt(Expr::Call {
+                                        name: self
+                                            .setf_name(&cn, &field)
+                                            .unwrap_or_else(|| format!("$setf::{}::{}", cn, field)),
+                                        args: vec![obj, self.lower_expr(r, env)],
+                                    });
+                                }
+                                // `c = new C(args)` → $new syscall (alloc + ctor).
+                                if r.kind() == SyntaxKind::Allocator {
+                                    let ak = real_children(r);
+                                    let has_paren = ak.iter().any(|k| {
+                                        k.kind() == SyntaxKind::Punct && self.text(k) == "("
+                                    });
+                                    if has_paren {
+                                        let cn = ak
+                                            .iter()
+                                            .find(|k| k.kind() == SyntaxKind::Name)
+                                            .map(|k| self.text(k))
+                                            .or_else(|| self.cur_class.clone())
+                                            .or_else(|| {
+                                                // `c = new(...)`: class from the LHS type.
+                                                if l.kind() == SyntaxKind::Name {
+                                                    self.sig_id(&self.text(l)).and_then(|id| {
+                                                        self.sig_types.get(&id).and_then(|t| {
+                                                            self.types.get(t).and_then(|td| {
+                                                                match &td.kind {
+                                                                    TypeKind::Class(cn) => {
+                                                                        Some(cn.clone())
+                                                                    }
+                                                                    _ => None,
+                                                                }
+                                                            })
+                                                        })
+                                                    })
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                        if let Some(cn) = cn {
+                                            let mut args = vec![self.lower_expr(l, env)];
+                                            args.extend(
+                                                ak.iter()
+                                                    .filter(|k| {
+                                                        is_expr_node(k.kind())
+                                                            && k.kind() != SyntaxKind::Name
+                                                    })
+                                                    .map(|k| self.lower_expr(k, env)),
+                                            );
+                                            return Stmt::SysCall {
+                                                name: format!("$new::{}", cn),
+                                                args,
+                                            };
+                                        }
+                                    }
+                                }
                                 // `arr = new[n]` — dynamic array allocation.
                                 if r.kind() == SyntaxKind::Allocator
                                     && real_children(r).iter().any(|k| {
@@ -1342,6 +1646,48 @@ impl<'a> Lower<'a> {
                     }
                     None => match body.iter().find(|k| is_expr_node(k.kind())) {
                         Some(e) => {
+                            // Class method call as a statement: `c.randomize();`, `c.do();`
+                            if e.kind() == SyntaxKind::Call {
+                                let ck = real_children(e);
+                                let cname = ck
+                                    .first()
+                                    .map(|k| self.text(k).trim_start_matches('$').to_string())
+                                    .unwrap_or_default();
+                                if let Some(dot) = cname.rfind('.') {
+                                    let base = &cname[..dot];
+                                    let method = &cname[dot + 1..];
+                                    if let Some(id) = self.sig_id(base) {
+                                        if let Some(tn) = self.sig_types.get(&id).cloned() {
+                                            if let Some(td) = self.types.get(&tn).cloned() {
+                                                if let TypeKind::Class(cn) = &td.kind {
+                                                    let mut args = vec![Expr::Sig(id)];
+                                                    args.extend(
+                                                        ck[1..]
+                                                            .iter()
+                                                            .filter(|k| is_expr_node(k.kind()))
+                                                            .map(|k| self.lower_expr(k, env)),
+                                                    );
+                                                    if method == "randomize" {
+                                                        let spec = self.randomize_spec(cn);
+                                                        args.push(Expr::Lit(pack_str(&spec)));
+                                                        return Stmt::ExprStmt(Expr::Call {
+                                                            name: self.randomize_name(cn),
+                                                            args,
+                                                        });
+                                                    }
+                                                    return Stmt::SysCall {
+                                                        name: format!(
+                                                            "$callmethod::{}::{}",
+                                                            cn, method
+                                                        ),
+                                                        args,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Array method call as a statement: `q.push_back(x);`
                             if e.kind() == SyntaxKind::Call {
                                 let ck = real_children(e);
@@ -1651,6 +1997,75 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lower `'{a: x, b: y}` against the LHS struct type: build a concat in
+    /// field order (msb first). Missing fields fall back to positional
+    /// entries, then `default:`, then X.
+    fn lower_pattern(
+        &mut self,
+        pat: &SyntaxNode,
+        lhs: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        if lhs.kind() != SyntaxKind::Name {
+            return None;
+        }
+        let id = self.sig_id(&self.text(lhs))?;
+        let tn = self.sig_types.get(&id)?.clone();
+        let td = self.types.get(&tn)?.clone();
+        let fields = match &td.kind {
+            TypeKind::Struct(f) => f.clone(),
+            _ => return None,
+        };
+        let kids = real_children(pat);
+        let mut named: Vec<(String, Expr)> = Vec::new();
+        let mut positional: Vec<Expr> = Vec::new();
+        let mut default: Option<Expr> = None;
+        let mut i = 0;
+        while i < kids.len() {
+            if kids[i].kind() == SyntaxKind::Name {
+                let n = self.text(&kids[i]);
+                i += 1;
+                if i < kids.len() && is_expr_node(kids[i].kind()) {
+                    let e = self.lower_expr(&kids[i], env);
+                    if n == "default" {
+                        default = Some(e);
+                    } else {
+                        named.push((n, e));
+                    }
+                    i += 1;
+                }
+            } else if is_expr_node(kids[i].kind()) {
+                positional.push(self.lower_expr(&kids[i], env));
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut ordered = fields.clone();
+        ordered.sort_by(|a, b| b.2.cmp(&a.2)); // descending lsb → msb first
+        let mut pos = 0;
+        let mut parts: Vec<Expr> = Vec::new();
+        for (n, w, _) in &ordered {
+            let e = named
+                .iter()
+                .find(|(fn_, _)| fn_ == n)
+                .map(|(_, e)| e.clone())
+                .or_else(|| {
+                    if pos < positional.len() {
+                        let e = positional[pos].clone();
+                        pos += 1;
+                        Some(e)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| default.clone())
+                .unwrap_or_else(|| Expr::Lit(Value::x(*w)));
+            parts.push(e);
+        }
+        Some(Expr::Concat(parts))
+    }
+
     fn lower_case(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
         let kids = real_children(s);
         let expr = kids
@@ -1817,6 +2232,11 @@ impl<'a> Lower<'a> {
         f: &SyntaxNode,
         env: &HashMap<String, Value>,
     ) {
+        let func = self.lower_function_ir(f, env);
+        module.functions.push(func);
+    }
+
+    fn lower_function_ir(&mut self, f: &SyntaxNode, env: &HashMap<String, Value>) -> FuncIr {
         let kids = real_children(f);
         let mut name = String::new();
         let mut ret_width = 1usize;
@@ -1902,13 +2322,13 @@ impl<'a> Lower<'a> {
         let body = Stmt::Block(body_nodes.iter().map(|s| self.lower_stmt(s, env)).collect());
         self.in_function = saved_in_fn;
         self.names = saved_names;
-        module.functions.push(FuncIr {
+        FuncIr {
             name,
             ret_width,
             args,
             locals,
             body,
-        });
+        }
     }
 
     fn lower_inst(
@@ -1999,32 +2419,43 @@ impl<'a> Lower<'a> {
             SyntaxKind::Literal => self.lower_literal(e),
             SyntaxKind::Name => {
                 let name = self.text(e);
+                if name == "this" || name == "super" {
+                    return self.this_expr();
+                }
                 if let Some(v) = env.get(&name).or_else(|| self.gconsts.get(&name)) {
                     return Expr::Lit(v.clone());
                 }
-                // Struct field select: `p.a` where p is a packed-struct signal.
+                // Dotted name: struct field select or class field read.
                 if let Some(dot) = name.find('.') {
                     let root = &name[..dot];
+                    let field = &name[dot + 1..];
                     if let Some(id) = self.sig_id(root) {
                         if let Some(tn) = self.sig_types.get(&id).cloned() {
                             if let Some(td) = self.types.get(&tn).cloned() {
-                                if let TypeKind::Struct(fields) = &td.kind {
-                                    let field = &name[dot + 1..];
-                                    if let Some((_, fw, lsb)) =
-                                        fields.iter().find(|(n, _, _)| n == field)
-                                    {
-                                        return Expr::Sel {
-                                            e: Box::new(Expr::Sig(id)),
-                                            msb: Box::new(Expr::Lit(Value::from_u64(
-                                                32,
-                                                (lsb + fw - 1) as u64,
-                                            ))),
-                                            lsb: Box::new(Expr::Lit(Value::from_u64(
-                                                32,
-                                                *lsb as u64,
-                                            ))),
-                                        };
+                                match &td.kind {
+                                    TypeKind::Struct(fields) => {
+                                        if let Some((_, fw, lsb)) =
+                                            fields.iter().find(|(n, _, _)| n == field)
+                                        {
+                                            return Expr::Sel {
+                                                e: Box::new(Expr::Sig(id)),
+                                                msb: Box::new(Expr::Lit(Value::from_u64(
+                                                    32,
+                                                    (lsb + fw - 1) as u64,
+                                                ))),
+                                                lsb: Box::new(Expr::Lit(Value::from_u64(
+                                                    32,
+                                                    *lsb as u64,
+                                                ))),
+                                            };
+                                        }
                                     }
+                                    TypeKind::Class(_) => {
+                                        if let Some(x) = self.lower_field_read(root, field, id) {
+                                            return x;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -2037,6 +2468,15 @@ impl<'a> Lower<'a> {
                 match self.sig_id(base) {
                     Some(id) => Expr::Sig(id),
                     None => {
+                        // Bare field of the enclosing class method: `x` ≡ `this.x`.
+                        if let Some(cn) = self.cur_class_field(base) {
+                            return Expr::Call {
+                                name: self
+                                    .getf_name(&cn, base)
+                                    .unwrap_or_else(|| format!("$getf::{}::{}", cn, base)),
+                                args: vec![self.this_expr()],
+                            };
+                        }
                         self.err(e.span(), format!("unknown identifier '{}'", base));
                         Expr::Lit(Value::x(1))
                     }
@@ -2118,6 +2558,37 @@ impl<'a> Lower<'a> {
                     .first()
                     .map(|k| self.text(k).trim_start_matches('$').to_string())
                     .unwrap_or_default();
+                // Method call on a class object: `c.get()` → `$method::C::get(c, ...)`.
+                if let Some(dot) = name.rfind('.') {
+                    let (base, method) = (&name[..dot], &name[dot + 1..]);
+                    if let Some(id) = self.sig_id(base) {
+                        if let Some(tn) = self.sig_types.get(&id).cloned() {
+                            if let Some(td) = self.types.get(&tn).cloned() {
+                                if let TypeKind::Class(cn) = &td.kind {
+                                    let mut args = vec![Expr::Sig(id)];
+                                    args.extend(
+                                        kids[1..]
+                                            .iter()
+                                            .filter(|k| is_expr_node(k.kind()))
+                                            .map(|k| self.lower_expr(k, env)),
+                                    );
+                                    if method == "randomize" {
+                                        let spec = self.randomize_spec(cn);
+                                        args.push(Expr::Lit(pack_str(&spec)));
+                                        return Expr::Call {
+                                            name: self.randomize_name(cn),
+                                            args,
+                                        };
+                                    }
+                                    return Expr::Call {
+                                        name: format!("$method::{}::{}", cn, method),
+                                        args,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 // `q.size()` on an array → size query with the array as arg.
                 if let Some(dot) = name.rfind('.') {
                     let (base, method) = (&name[..dot], &name[dot + 1..]);
@@ -2286,6 +2757,20 @@ fn unop_from_str(s: &str) -> Option<UnOp> {
 }
 
 /// Bit width implied by a Verilog type keyword, if any.
+/// Pack a string as a Value (first char in the high byte), matching the
+/// kernel's string-literal packing.
+fn pack_str(s: &str) -> Value {
+    let bytes = s.as_bytes();
+    let n = bytes.len().max(1);
+    let mut bits = vec![V0; n * 8];
+    for (bi, &b) in bytes.iter().enumerate() {
+        for j in 0..8 {
+            bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
+        }
+    }
+    Value { bits }
+}
+
 fn type_kw_width(t: &str) -> Option<usize> {
     Some(match t {
         "integer" | "time" | "int" => 32,

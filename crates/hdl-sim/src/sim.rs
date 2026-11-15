@@ -35,6 +35,22 @@ fn pack_str_value(s: &str) -> Value {
     Value { bits }
 }
 
+/// Inverse of [`pack_str_value`]: bytes of a packed string Value → String.
+fn unpack_str_value(v: &Value) -> String {
+    let n = v.bits.len() / 8;
+    let mut s = String::new();
+    for bi in 0..n {
+        let mut b = 0u8;
+        for j in 0..8 {
+            if v.bits.get((n - 1 - bi) * 8 + j) == Some(&V1) {
+                b |= 1 << j;
+            }
+        }
+        s.push(b as char);
+    }
+    s
+}
+
 /// VHDL `to_hstring`/`to_ostring`/`to_bstring` of a value (MSB-first digits).
 fn vhdl_radix_string(v: &Value, radix: u32) -> String {
     let bits_per = match radix {
@@ -171,6 +187,14 @@ pub struct Simulator {
     waiting: Vec<(u32, Vec<(FlatSigId, EdgeKind)>)>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
     rng: std::cell::Cell<u64>,
+    /// Object memory signal for SV classes: class name → `__objmem_<Class>`
+    /// (used for the object word width).
+    objmem: HashMap<String, FlatSigId>,
+    /// Live class objects: class name → one word per allocated object.
+    /// RefCell so field writes work from &self (function bodies) too.
+    objs: std::cell::RefCell<HashMap<String, Vec<Value>>>,
+    /// Current object handle while executing a class method (`$this`).
+    cur_obj: std::cell::Cell<u64>,
     /// External stop request (e.g. the live wave window's Stop button):
     /// checked once per event-loop iteration in `run`.
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -179,6 +203,13 @@ pub struct Simulator {
 impl Simulator {
     pub fn new(flat: Flat) -> Simulator {
         let n = flat.signals.len();
+        let objmem: HashMap<String, FlatSigId> = flat
+            .signals
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.name.starts_with("__objmem_"))
+            .map(|(i, s)| (s.name["__objmem_".len()..].to_string(), i as FlatSigId))
+            .collect();
         let mut sim = Simulator {
             vals: flat
                 .signals
@@ -213,6 +244,9 @@ impl Simulator {
             finish_notified: false,
             failures: 0,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
+            objmem,
+            objs: std::cell::RefCell::new(HashMap::new()),
+            cur_obj: std::cell::Cell::new(u64::MAX),
             stop_flag: None,
             monitor: Vec::new(),
             monitor_last: Vec::new(),
@@ -1053,6 +1087,46 @@ impl Simulator {
                         let n = self.mems[sig as usize].len();
                         self.vals[sig as usize] = Value::from_u64(32, n as u64);
                     }
+                }
+            }
+            // SV class constructor: `c = new C(args)` — push an object word,
+            // store its handle in `c`, run `C::new` if defined.
+            m if m.starts_with("$new::") => {
+                let cn = &m["$new::".len()..];
+                let w = self
+                    .objmem
+                    .get(cn)
+                    .map(|ms| self.flat.signals[*ms as usize].width.max(1))
+                    .unwrap_or(64);
+                let handle = {
+                    let mut objs = self.objs.borrow_mut();
+                    let words = objs.entry(cn.to_string()).or_default();
+                    words.push(Value::x(w));
+                    (words.len() - 1) as u64
+                };
+                if let Some(Expr::Sig(sig)) = args.first() {
+                    let sig = *sig as FlatSigId;
+                    let sw = self.flat.signals[sig as usize].width.max(1);
+                    self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
+                }
+                let fname = format!("{}::new", cn);
+                if let Some(fi) = self.funcs.get(&fname).copied() {
+                    let saved = self.cur_obj.replace(handle);
+                    self.run_func(fi, &args[1..], None);
+                    self.cur_obj.set(saved);
+                }
+            }
+            // Void method call as a statement: `c.do(args);`
+            m if m.starts_with("$callmethod::") => {
+                let rest = &m["$callmethod::".len()..]; // `C::m`
+                if let Some(fi) = self.funcs.get(rest).copied() {
+                    let obj = args
+                        .first()
+                        .map(|a| self.eval_expr(a, None).to_u64().unwrap_or(u64::MAX))
+                        .unwrap_or(u64::MAX);
+                    let saved = self.cur_obj.replace(obj);
+                    self.run_func(fi, &args[1..], None);
+                    self.cur_obj.set(saved);
                 }
             }
             "display" | "write" => {
@@ -1973,27 +2047,162 @@ impl Simulator {
             }
             _ => {}
         }
+        // SV class support: `$this`, field reads, method calls.
+        if name == "$this" {
+            return Value::from_u64(64, self.cur_obj.get());
+        }
+        // Field write `obj.field = v` (expression form, works in functions too).
+        if let Some(rest) = name.strip_prefix("$setf::") {
+            let (cnf, lw) = rest.split_once('@').unwrap_or((rest, "0,1"));
+            let cn = cnf.split("::").next().unwrap_or("");
+            let mut it = lw.split(',');
+            let lsb = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+            let w = it
+                .next()
+                .and_then(|x| x.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            if args.len() >= 2 {
+                let handle = self
+                    .eval_expr(&args[0], locals)
+                    .to_u64()
+                    .unwrap_or(u64::MAX);
+                let v = self.eval_expr(&args[1], locals).resize(w);
+                self.write_field(cn, handle, lsb, w, &v);
+            }
+            return Value::from_u64(32, 1);
+        }
+        // `c.randomize()` — solve rand-field domains + constraints, write the
+        // object's fields, return 1 on success / 0 on failure.
+        if let Some(rest) = name.strip_prefix("$randomize::") {
+            let (cn, lay) = rest.split_once('@').unwrap_or((rest, ""));
+            let mut layout: HashMap<String, (usize, usize)> = HashMap::new();
+            for ent in lay.split(';') {
+                if let Some((n, lw)) = ent.split_once('=') {
+                    let mut it = lw.split(',');
+                    let lsb = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let w = it
+                        .next()
+                        .and_then(|x| x.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    layout.insert(n.to_string(), (lsb, w));
+                }
+            }
+            if args.len() >= 2 {
+                let handle = self
+                    .eval_expr(&args[0], locals)
+                    .to_u64()
+                    .unwrap_or(u64::MAX);
+                let spec = unpack_str_value(&self.eval_expr(&args[1], locals));
+                let sols = self.with_rng(|r| rand::solve_spec(r, &spec, 4096));
+                match sols {
+                    Ok(sols) => {
+                        for (n, val) in sols {
+                            if let Some(&(lsb, w)) = layout.get(&n) {
+                                let v = Value::from_u64(w, val as u64).resize(w);
+                                self.write_field(cn, handle, lsb, w, &v);
+                            }
+                        }
+                        return Value::from_u64(32, 1);
+                    }
+                    Err(_) => return Value::from_u64(32, 0),
+                }
+            }
+            return Value::from_u64(32, 0);
+        }
+        if let Some(rest) = name.strip_prefix("$getf::") {
+            let (cnf, lw) = rest.split_once('@').unwrap_or((rest, "0,1"));
+            let cn = cnf.split("::").next().unwrap_or("");
+            let mut it = lw.split(',');
+            let lsb = it.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+            let w = it
+                .next()
+                .and_then(|x| x.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let handle = args
+                .first()
+                .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
+                .unwrap_or(u64::MAX);
+            return self.read_field(cn, handle, lsb, w);
+        }
+        if let Some(rest) = name.strip_prefix("$method::") {
+            // `c.m(args)` in expression position; funcs are keyed `C::m`.
+            if let Some(fi) = self.funcs.get(rest).copied() {
+                let obj = args
+                    .first()
+                    .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX);
+                let saved = self.cur_obj.replace(obj);
+                let out = self.run_func(fi, &args[1..], locals);
+                self.cur_obj.set(saved);
+                return out;
+            }
+            return Value::x(32);
+        }
         if let Some(fi) = self.funcs.get(name).copied() {
-            let f = &self.flat.functions[fi];
-            let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
-            lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
-            for (i, a) in args.iter().enumerate() {
-                let w = f.slots.get(i + 1).copied().unwrap_or(1);
-                lvals.push(self.eval_expr(a, locals).resize(w));
-            }
-            while lvals.len() < f.slots.len() {
-                lvals.push(Value::x(f.slots[lvals.len()]));
-            }
-            // Execute the body with locals = lvals. Functions with delays are not
-            // supported (phase 1) — execute recursively.
-            let mut runner = FnRunner {
-                sim: self,
-                locals: &mut lvals,
-            };
-            runner.exec(&f.body);
-            return lvals[0].clone();
+            return self.run_func(fi, args, locals);
         }
         Value::x(32)
+    }
+
+    /// Execute function `fi` with the given argument expressions; returns
+    /// slot 0 (the function-name slot, i.e. the return value). Shared by
+    /// plain calls and class method calls.
+    fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
+        let f = &self.flat.functions[fi];
+        let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
+        lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
+        for (i, a) in args.iter().enumerate() {
+            let w = f.slots.get(i + 1).copied().unwrap_or(1);
+            lvals.push(self.eval_expr(a, locals).resize(w));
+        }
+        while lvals.len() < f.slots.len() {
+            lvals.push(Value::x(f.slots[lvals.len()]));
+        }
+        // Functions with delays are not supported — execute recursively.
+        let mut runner = FnRunner {
+            sim: self,
+            locals: &mut lvals,
+        };
+        runner.exec(&f.body);
+        lvals[0].clone()
+    }
+
+    /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in
+    /// class `cn` (null handle → all X).
+    fn read_field(&self, cn: &str, handle: u64, lsb: usize, w: usize) -> Value {
+        if handle == u64::MAX {
+            return Value::x(w);
+        }
+        let objs = self.objs.borrow();
+        if let Some(word) = objs.get(cn).and_then(|m| m.get(handle as usize)) {
+            let mut bits = vec![VX; w];
+            for (j, b) in bits.iter_mut().enumerate() {
+                if let Some(&v) = word.bits.get(lsb + j) {
+                    *b = v;
+                }
+            }
+            return Value { bits };
+        }
+        Value::x(w)
+    }
+
+    /// Write field bits `[lsb..lsb+w)` of the object word for `handle`.
+    fn write_field(&self, cn: &str, handle: u64, lsb: usize, w: usize, v: &Value) {
+        if handle == u64::MAX {
+            return;
+        }
+        let mut objs = self.objs.borrow_mut();
+        if let Some(word) = objs.get_mut(cn).and_then(|m| m.get_mut(handle as usize)) {
+            while word.bits.len() < lsb + w {
+                word.bits.push(VX);
+            }
+            for j in 0..w {
+                word.bits[lsb + j] = v.bits.get(j).copied().unwrap_or(VX);
+            }
+        }
     }
 
     /// Run `f` with the kernel RNG, persisting the advanced state. The state
@@ -2098,6 +2307,16 @@ impl<'a> FnRunner<'a> {
                 }
                 if let Some(d) = default {
                     self.exec(d);
+                }
+            }
+            Stmt::ExprStmt(e) => {
+                self.sim.eval_expr(e, Some(self.locals));
+            }
+            Stmt::SysCall { name, args } => {
+                // Class field writes / randomize are &self-capable: run them
+                // as calls. Other syscalls need &mut self (process context).
+                if name.starts_with("$setf::") || name.starts_with("$randomize::") {
+                    self.sim.eval_call(name, args, Some(self.locals));
                 }
             }
             _ => {}

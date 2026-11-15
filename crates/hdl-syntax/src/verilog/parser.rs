@@ -498,7 +498,9 @@ impl<'a> Parser<'a> {
     fn parse_package(&mut self) {
         self.builder.start_node(SyntaxKind::Package);
         self.bump(); // package
+        let mut pname = String::new();
         if self.peek().kind == TokenKind::Ident {
+            pname = self.peek_text().to_string();
             self.builder.start_node(SyntaxKind::Name);
             self.bump();
             self.builder.finish_node();
@@ -510,12 +512,13 @@ impl<'a> Parser<'a> {
             self.parse_module_item();
         }
         self.eat_kw("endpackage");
-        // Optional package name — but not the next construct's keyword.
-        if self.peek().kind == TokenKind::Ident
-            && !matches!(
-                self.peek_text(),
-                "module" | "macromodule" | "package" | "class" | "endpackage" | "endclass"
-            )
+        // Optional trailing name — only if it matches the package name AND is
+        // followed by `;`.
+        if !pname.is_empty()
+            && self.peek().kind == TokenKind::Ident
+            && self.peek_text() == pname
+            && self.peek2().kind == TokenKind::Punct
+            && self.peek2_text() == ";"
         {
             self.bump();
         }
@@ -540,7 +543,7 @@ impl<'a> Parser<'a> {
             self.error_here("expected a class name");
         }
         if !cname.is_empty() {
-            self.user_types.insert(cname);
+            self.user_types.insert(cname.clone());
         }
         if self.at_kw("extends") {
             self.bump();
@@ -574,13 +577,15 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat_kw("endclass");
-        if self.peek().kind == TokenKind::Ident
-            && !matches!(
-                self.peek_text(),
-                "module" | "macromodule" | "package" | "class" | "endpackage" | "endclass"
-            )
+        // Optional trailing name — only if it matches the class name AND is
+        // followed by `;`, so a following decl (`endclass\nC c;`) is not eaten.
+        if !cname.is_empty()
+            && self.peek().kind == TokenKind::Ident
+            && self.peek_text() == cname
+            && self.peek2().kind == TokenKind::Punct
+            && self.peek2_text() == ";"
         {
-            self.bump(); // optional class name
+            self.bump();
         }
         self.eat_punct(';'); // optional
         self.builder.finish_node();
@@ -596,13 +601,16 @@ impl<'a> Parser<'a> {
             "constraint" => self.parse_constraint(),
             _ => {
                 self.error_here(format!("unexpected `{}` in class body", text));
+                // Recover: skip to the next `;`.
+                while self.peek().kind != TokenKind::Eof
+                    && !self.at_punct(';')
+                    && !self.at_kw("endclass")
+                {
+                    self.bump();
+                }
+                self.eat_punct(';');
             }
         }
-        // Recover: skip to the next `;`.
-        while self.peek().kind != TokenKind::Eof && !self.at_punct(';') && !self.at_kw("endclass") {
-            self.bump();
-        }
-        self.eat_punct(';');
     }
 
     /// `constraint name { expr; ... }` — parsed structurally, lowered later.

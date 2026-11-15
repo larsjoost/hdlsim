@@ -192,3 +192,96 @@ endmodule
 "#,
     );
 }
+
+#[test]
+fn class_ctor_fields_and_methods() {
+    assert_pass(
+        "class_ctor",
+        r#"
+module tb;
+  class C;
+    int x;
+    int y;
+    function new(int a, int b); x = a; y = b; endfunction
+    function int sum(); return x + y; endfunction
+    task setx(int v); x = v; endtask
+  endclass
+  C c;
+  initial begin
+    c = new C(3, 4);
+    if (c.sum() != 7) $display("FAIL sum %0d", c.sum());
+    c.setx(10);
+    if (c.x != 10 || c.sum() != 14) $display("FAIL %0d %0d", c.x, c.sum());
+    else $display("PASS");
+    $finish;
+  end
+endmodule
+"#,
+    );
+}
+
+#[test]
+fn class_decl_init_new_and_field_read() {
+    assert_pass(
+        "class_decl_init",
+        r#"
+module tb;
+  class C;
+    int x;
+    function new(int v); x = v; endfunction
+    function int get(); return x; endfunction
+  endclass
+  C c = new(42);
+  initial begin
+    if (c.get() == 42 && c.x == 42) $display("PASS"); else $display("FAIL");
+    $finish;
+  end
+endmodule
+"#,
+    );
+}
+
+#[test]
+fn class_randomize_with_constraints() {
+    assert_pass(
+        "class_randomize",
+        r#"
+module tb;
+  class C;
+    rand int x;
+    rand int y;
+    constraint c { x > 10; x < 20; x + y == 30; }
+  endclass
+  C c;
+  initial begin
+    c = new C();
+    if (c.randomize() != 1) $display("FAIL randomize returned 0");
+    if (c.x > 10 && c.x < 20 && c.x + c.y == 30) $display("PASS");
+    else $display("FAIL %0d %0d", c.x, c.y);
+    $finish;
+  end
+endmodule
+"#,
+    );
+}
+
+#[test]
+fn class_randomize_statement_form() {
+    assert_pass(
+        "class_randomize_stmt",
+        r#"
+module tb;
+  class C;
+    rand int x;
+    constraint c { x >= 5; x <= 7; }
+  endclass
+  C c = new();
+  initial begin
+    c.randomize();
+    if (c.x >= 5 && c.x <= 7) $display("PASS"); else $display("FAIL %0d", c.x);
+    $finish;
+  end
+endmodule
+"#,
+    );
+}

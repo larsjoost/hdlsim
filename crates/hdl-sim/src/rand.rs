@@ -612,9 +612,24 @@ impl<'a> Solver<'a> {
                     self.rng.shuffle(&mut v);
                     v
                 } else {
+                    // Large span: random samples first (unconstrained fields
+                    // get uniform values), then boundary values so tight
+                    // constraints near lo/hi (e.g. `x > 10; x < 20` on an
+                    // int) are still reached by backtracking.
                     let mut v = Vec::new();
                     while v.len() < SAMPLE_MAX {
                         let x = self.rng.range(*lo, *hi).unwrap_or(*lo);
+                        if !v.contains(&x) {
+                            v.push(x);
+                        }
+                    }
+                    let edge = 128.min(span as usize);
+                    for x in *lo..(*lo + edge as i64) {
+                        if !v.contains(&x) {
+                            v.push(x);
+                        }
+                    }
+                    for x in (*hi - edge as i64 + 1)..=*hi {
                         if !v.contains(&x) {
                             v.push(x);
                         }
