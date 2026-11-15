@@ -30,6 +30,7 @@ pub fn coverage_universe(design: &Design) -> (HashSet<Span>, HashSet<Span>) {
                 lines.insert(*span);
                 walk(inner, lines, branches);
             }
+            Stmt::Return(_) => {}
             Stmt::Block(ss) => {
                 for s in ss {
                     walk(s, lines, branches);

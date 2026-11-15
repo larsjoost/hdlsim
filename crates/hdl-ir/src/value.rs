@@ -351,33 +351,47 @@ impl Value {
     pub fn unop(&self, op: UnOp) -> Value {
         use UnOp::*;
         match op {
-            Not | BNot | RedNand | RedNor | RedXnor => {
-                let mut bits = vec![VX; self.bits.len().max(1)];
-                for i in 0..bits.len() {
-                    bits[i] = match op {
-                        Not | BNot => bnot1(self.bit(i)),
-                        _ => VX,
-                    };
+            // Logical not: 1-bit result, 1 iff the operand is known zero.
+            Not => {
+                if !self.is_known() {
+                    Value::x(1)
+                } else {
+                    Value::from_bit(if self.to_u64() == Some(0) { V1 } else { V0 })
                 }
-                if matches!(op, RedNand | RedNor | RedXnor) {
-                    // Reduction ops produce 1 bit.
-                    let acc = self.bits.iter().copied().fold(V0, |acc, b| match op {
-                        RedNand => nand1(acc, b),
-                        RedNor => nor1(acc, b),
-                        RedXnor => xnor1(acc, b),
-                        _ => acc,
-                    });
-                    return Value::from_bit(acc);
+            }
+            BNot => {
+                let mut bits = vec![VX; self.bits.len().max(1)];
+                for (j, b) in bits.iter_mut().enumerate() {
+                    *b = bnot1(self.bit(j));
                 }
                 Value { bits }
             }
-            RedAnd | RedOr | RedXor => {
-                let acc = self.bits.iter().copied().fold(V0, |acc, b| match op {
-                    RedAnd => and1(acc, b),
-                    RedOr => or1(acc, b),
-                    _ => xor1(acc, b),
-                });
-                Value::from_bit(acc)
+            // Reductions produce 1 bit; fold with the operator's identity
+            // (AND/XNOR seed 1, OR/XOR seed 0), then invert for the negated
+            // forms.
+            RedAnd | RedNand => {
+                let acc = self.bits.iter().copied().fold(V1, |acc, b| and1(acc, b));
+                Value::from_bit(if matches!(op, RedNand) {
+                    bnot1(acc)
+                } else {
+                    acc
+                })
+            }
+            RedOr | RedNor => {
+                let acc = self.bits.iter().copied().fold(V0, |acc, b| or1(acc, b));
+                Value::from_bit(if matches!(op, RedNor) {
+                    bnot1(acc)
+                } else {
+                    acc
+                })
+            }
+            RedXor | RedXnor => {
+                let acc = self.bits.iter().copied().fold(V0, |acc, b| xor1(acc, b));
+                Value::from_bit(if matches!(op, RedXnor) {
+                    bnot1(acc)
+                } else {
+                    acc
+                })
             }
             Neg | Pos => {
                 if op == Neg && self.is_known() {

@@ -1229,7 +1229,8 @@ impl<'a> Lower<'a> {
                     match k.kind() {
                         SyntaxKind::GenFor => self.lower_gen_for(module, &k, env),
                         SyntaxKind::GenIf => self.lower_gen_if(module, &k, env),
-                        _ => self.lower_module_item(module, &k, env),
+                        _ if is_module_item(k.kind()) => self.lower_module_item(module, &k, env),
+                        _ => {}
                     }
                 }
             }
@@ -1305,7 +1306,9 @@ impl<'a> Lower<'a> {
                         if is_expr_node(e.kind()) {
                             let expr = self.lower_expr(e, env);
                             if let Some(id) = self.sig_id(&name) {
-                                module.signals[id as usize].init = const_eval(&expr, env);
+                                let w = module.signals[id as usize].width.max(1);
+                                module.signals[id as usize].init =
+                                    const_eval(&expr, env).map(|v| v.resize(w));
                             }
                             i += 3;
                             continue;
@@ -1842,17 +1845,14 @@ impl<'a> Lower<'a> {
                     body,
                 }
             }
-            // `return expr;` in a function: assign to the function-name slot 0.
+            // `return expr;` in a function: set the return slot and stop.
             SyntaxKind::ReturnStmt if self.in_function => {
                 let kids = real_children(s);
                 let e = kids.iter().find(|k| is_expr_node(k.kind()));
-                Stmt::Assign {
-                    lhs: Expr::Sig(0),
-                    rhs: e
-                        .map(|e| self.lower_expr(e, env))
+                Stmt::Return(Box::new(
+                    e.map(|e| self.lower_expr(e, env))
                         .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
-                    nba: false,
-                }
+                ))
             }
             SyntaxKind::Delay => {
                 let kids = real_children(s);
@@ -2118,9 +2118,12 @@ impl<'a> Lower<'a> {
             .filter(|k| k.kind() == SyntaxKind::StmtAssign)
             .collect();
         let cond_node = kids.iter().find(|k| is_expr_node(k.kind()));
+        // The body is the last statement node — not one of the header
+        // StmtAssigns (init/step).
         let body = kids
             .iter()
-            .find(|k| is_stmt_node(k.kind()) || k.kind() == SyntaxKind::Block);
+            .rev()
+            .find(|k| k.kind() == SyntaxKind::Block || is_stmt_node(k.kind()));
         if assigns.len() < 2 || cond_node.is_none() || body.is_none() {
             self.err(g.span(), "malformed generate for");
             return;
@@ -2144,13 +2147,6 @@ impl<'a> Lower<'a> {
             return;
         };
         let step = &assigns[1];
-        let step_expr = {
-            let sk = real_children(step);
-            sk.iter()
-                .filter(|k| is_expr_node(k.kind()))
-                .last()
-                .map(|k| self.lower_expr(k, env))
-        };
         let body_node = body.unwrap().clone();
         let mut iter = 0u32;
         loop {
@@ -2161,6 +2157,15 @@ impl<'a> Lower<'a> {
             iter += 1;
             let mut env2 = env.clone();
             env2.insert(var.clone(), Value::from_u64(32, i));
+            // Lower the step against the current iteration value so `i = i + 1`
+            // const-evaluates.
+            let step_expr = {
+                let sk = real_children(step);
+                sk.iter()
+                    .filter(|k| is_expr_node(k.kind()))
+                    .last()
+                    .map(|k| self.lower_expr(k, &env2))
+            };
             let go = cond_node
                 .map(|c| self.lower_expr(c, &env2))
                 .and_then(|e| const_eval(&e, &env2))
@@ -2172,7 +2177,11 @@ impl<'a> Lower<'a> {
             match body_node.kind() {
                 SyntaxKind::Block => {
                     for k in real_children(&body_node) {
-                        if matches!(k.kind(), SyntaxKind::Ident | SyntaxKind::Punct) {
+                        // Skip `begin`/`end` keywords, `:` and the block label.
+                        if matches!(
+                            k.kind(),
+                            SyntaxKind::Ident | SyntaxKind::Punct | SyntaxKind::Name
+                        ) {
                             continue;
                         }
                         self.lower_module_item(module, &k, &env2);
@@ -2220,7 +2229,20 @@ impl<'a> Lower<'a> {
             .collect();
         let chosen = if take { bodies.first() } else { bodies.get(1) };
         if let Some(b) = chosen {
-            self.lower_module_item(module, b, env);
+            if b.kind() == SyntaxKind::Block {
+                for k in real_children(b) {
+                    // Skip `begin`/`end` keywords, `:` and the block label.
+                    if matches!(
+                        k.kind(),
+                        SyntaxKind::Ident | SyntaxKind::Punct | SyntaxKind::Name
+                    ) {
+                        continue;
+                    }
+                    self.lower_module_item(module, &k.clone(), env);
+                }
+            } else {
+                self.lower_module_item(module, b, env);
+            }
         }
     }
 
@@ -2347,9 +2369,24 @@ impl<'a> Lower<'a> {
             module_name = self.text(&kids[0]);
             i = 1;
         }
-        // `#(...)` parameter overrides arrive as ParamAssign nodes.
+        // `#(...)` parameter overrides arrive as ParamAssign nodes inside the
+        // parens — skip the whole `#( ... )` group when looking for the name.
         if i < kids.len() && self.text(&kids[i]) == "#" {
             i += 1; // `#`
+            let mut depth = 0i32;
+            while i < kids.len() {
+                let t = self.text(&kids[i]);
+                if t == "(" {
+                    depth += 1;
+                } else if t == ")" {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
         }
         if i < kids.len() && kids[i].kind() == SyntaxKind::Name {
             inst_name = self.text(&kids[i]);
@@ -2357,9 +2394,13 @@ impl<'a> Lower<'a> {
         }
         for c in &kids[i..] {
             match c.kind() {
-                SyntaxKind::ParamAssign => param_overrides.push(self.lower_param_assign(c, env)),
                 SyntaxKind::PortConn => conns.push(self.lower_conn(c, env)),
                 _ => {}
+            }
+        }
+        for c in &kids[1..] {
+            if c.kind() == SyntaxKind::ParamAssign {
+                param_overrides.push(self.lower_param_assign(c, env));
             }
         }
         if inst_name.is_empty() {
@@ -2826,12 +2867,9 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
     if digits.is_empty() {
         return None;
     }
-    let width =
-        size.map(|s| s as usize)
-            .unwrap_or_else(|| match u128::from_str_radix(&digits, base) {
-                Ok(v) => (128 - v.leading_zeros() as usize).max(1),
-                Err(_) => digits.len() * 4, // has x/z digits; approximate
-            });
+    // Verilog unsized literals (plain decimal or `'b...` without a size) are
+    // at least 32 bits wide; sized literals keep their declared size.
+    let width = size.map(|s| s as usize).unwrap_or(32);
     if !digits
         .chars()
         .any(|c| matches!(c.to_ascii_lowercase(), 'x' | 'z' | '?'))

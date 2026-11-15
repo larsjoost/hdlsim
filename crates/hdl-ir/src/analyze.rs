@@ -60,6 +60,7 @@ fn lhs_roots(e: &Expr, out: &mut HashSet<SigId>) {
 
 fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) {
     match s {
+        Stmt::Return(e) => read(e, reads),
         Stmt::Block(ss) => {
             for s in ss {
                 walk_stmt(s, driven, reads);

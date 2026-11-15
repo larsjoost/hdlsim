@@ -660,6 +660,7 @@ fn stmt_writes(s: &Stmt, out: &mut Vec<FlatSigId>) {
         }
         Stmt::Repeat { body, .. } => stmt_writes(body, out),
         Stmt::SysCall { .. } | Stmt::Break | Stmt::Continue | Stmt::ExprStmt(_) | Stmt::Null => {}
+        Stmt::Return(_) => {}
     }
 }
 
@@ -674,7 +675,7 @@ fn stmt_has_sva(s: &Stmt) -> bool {
             items.iter().any(|(_, b)| stmt_has_sva(b))
                 || default.as_ref().map_or(false, |d| stmt_has_sva(d))
         }
-        Stmt::Assign { .. } => false,
+        Stmt::Assign { .. } | Stmt::Return(_) => false,
         Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
         Stmt::Wait { body, .. } => stmt_has_sva(body),
         Stmt::For {
@@ -1268,6 +1269,8 @@ impl<'e, 'a> Exec<'e, 'a> {
         match s {
             Stmt::Spanned { inner, .. } => self.exec_stmt(inner),
             Stmt::Null => Ok(Ctrl::Done),
+            // Functions aren't executed in BMC; treat return as done.
+            Stmt::Return(_) => Ok(Ctrl::Done),
             Stmt::Block(ss) => {
                 for s in ss {
                     let c = self.exec_stmt(s)?;

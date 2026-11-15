@@ -20,7 +20,7 @@ $dumpvars
 0!
 1"
 bxxxxxxxx #
-0$
+b00000000000000000000000000000000 $
 bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx %
 
 #0

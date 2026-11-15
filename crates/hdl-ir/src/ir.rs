@@ -196,6 +196,10 @@ pub enum Stmt {
         body: Box<Stmt>,
     },
     ExprStmt(Expr),
+    /// `return expr;` inside a function — set the return slot and stop the
+    /// function body (unlike a plain assign to the function-name slot, which
+    /// falls through).
+    Return(Box<Expr>),
     /// `break;` — exit the innermost loop.
     Break,
     /// `continue;` — jump to the innermost loop's step/next iteration.
@@ -323,6 +327,7 @@ impl Stmt {
     pub fn collect_sigs(&self, out: &mut Vec<SigId>) {
         match self {
             Stmt::Spanned { inner, .. } => inner.collect_sigs(out),
+            Stmt::Return(e) => e.collect_sigs(out),
             Stmt::Block(ss) => {
                 for s in ss {
                     s.collect_sigs(out);

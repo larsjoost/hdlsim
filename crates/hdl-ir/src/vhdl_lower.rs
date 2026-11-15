@@ -38,6 +38,8 @@ pub fn lower_file(
         names: HashMap::new(),
         mems: HashMap::new(),
         sig_signed: HashMap::new(),
+        extra_signals: Vec::new(),
+        extra_base: 0,
     };
     lx.register_builtin_types();
     let mut modules: Vec<ModuleIr> = Vec::new();
@@ -125,6 +127,11 @@ struct Lower<'a> {
     mems: HashMap<SigId, usize>,
     /// Signal id → signed flag (for `resize`/`to_signed` context).
     sig_signed: HashMap<SigId, bool>,
+    /// Hidden signals allocated while lowering statements (for-loop vars),
+    /// appended to the module after the process body is lowered.
+    extra_signals: Vec<SignalIr>,
+    /// `module.signals.len()` captured when statement lowering starts.
+    extra_base: usize,
 }
 
 impl<'a> Lower<'a> {
@@ -491,6 +498,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::ComponentDecl => {} // components resolve to entities by name
+                SyntaxKind::Function => self.lower_function_decl(module, d),
                 _ => {}
             }
         }
@@ -708,6 +716,126 @@ impl<'a> Lower<'a> {
 
     // ---- processes and statements ---------------------------------------------------
 
+    /// Lower an architecture-level function declaration to FuncIr. The body is
+    /// lowered in slot space: slot 0 = function name (return value), then
+    /// parameters, then local variables.
+    fn lower_function_decl(&mut self, module: &mut ModuleIr, f: &SyntaxNode) {
+        let kids = real_children(f);
+        let mut name = String::new();
+        let mut ret_mark: Option<SyntaxNode> = None;
+        let mut param_decls: Vec<SyntaxNode> = Vec::new();
+        let mut local_decls: Vec<SyntaxNode> = Vec::new();
+        let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
+        let mut seen_return = false;
+        let mut seen_begin = false;
+        for k in &kids {
+            match k.kind() {
+                SyntaxKind::Ident if self.kw(k) == "return" => seen_return = true,
+                SyntaxKind::Ident if self.kw(k) == "begin" => seen_begin = true,
+                SyntaxKind::Name if !seen_return && name.is_empty() => name = self.text(k),
+                SyntaxKind::Name if seen_return && !seen_begin && ret_mark.is_none() => {
+                    ret_mark = Some(k.clone())
+                }
+                SyntaxKind::PortDecl if !seen_begin => param_decls.push(k.clone()),
+                SyntaxKind::VariableDecl if !seen_begin => local_decls.push(k.clone()),
+                _ if seen_begin && is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            return;
+        }
+        let (ret_width, _, _, _) = match &ret_mark {
+            Some(tm) => self.resolve_type(tm, None, f.span()),
+            None => (32, false, None, false),
+        };
+        // Params: PortDecl `a, b : integer [range]` — names before ':', type after.
+        let mut args: Vec<(String, usize)> = Vec::new();
+        for pd in &param_decls {
+            let pk = real_children(pd);
+            let colon = pk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+            let names: Vec<String> = pk[..colon.unwrap_or(pk.len())]
+                .iter()
+                .filter(|k| k.kind() == SyntaxKind::Name)
+                .map(|k| self.text(k))
+                .collect();
+            let tmark = colon
+                .and_then(|c| pk.get(c + 1))
+                .filter(|k| k.kind() == SyntaxKind::Name);
+            let constraint = colon
+                .and_then(|c| pk.get(c + 2))
+                .filter(|k| k.kind() == SyntaxKind::Range);
+            let (w, _, _, _) = match tmark {
+                Some(tm) => self.resolve_type(tm, constraint, pd.span()),
+                None => (32, false, None, false),
+            };
+            for n in names {
+                args.push((n, w));
+            }
+        }
+        // Local variables.
+        let mut locals: Vec<SignalIr> = Vec::new();
+        for d in &local_decls {
+            let dk = real_children(d);
+            let Some(colon) = dk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+            else {
+                continue;
+            };
+            let names: Vec<String> = dk[..colon]
+                .iter()
+                .filter(|k| k.kind() == SyntaxKind::Name)
+                .map(|k| self.text(k))
+                .collect();
+            let tmark = dk[colon + 1..]
+                .iter()
+                .find(|k| k.kind() == SyntaxKind::Name);
+            let constraint = dk[colon + 1..]
+                .iter()
+                .find(|k| k.kind() == SyntaxKind::Range);
+            let (w, signed, _, real) = match tmark {
+                Some(tm) => self.resolve_type(tm, constraint, d.span()),
+                None => (32, false, None, false),
+            };
+            for n in names {
+                locals.push(SignalIr {
+                    name: n,
+                    width: w,
+                    kind: if real { SigKind::Real } else { SigKind::Wire },
+                    init: None,
+                    mem: None,
+                    signed,
+                });
+            }
+        }
+        // Lower the body in slot space (slot 0 = return value).
+        let saved_names = std::mem::take(&mut self.names);
+        let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
+        slots.extend(args.iter().cloned());
+        slots.extend(locals.iter().map(|l| (l.name.clone(), l.width)));
+        self.names = slots
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i as SigId))
+            .collect();
+        let body = if stmt_nodes.len() == 1 {
+            self.lower_seq_stmt(&stmt_nodes[0])
+        } else {
+            Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
+        };
+        self.names = saved_names;
+        module.functions.push(FuncIr {
+            name,
+            ret_width: ret_width.max(1),
+            args,
+            locals,
+            body,
+        });
+    }
+
     fn lower_process(&mut self, module: &mut ModuleIr, p: &SyntaxNode, idx: usize) -> ProcessIr {
         let kids = real_children(p);
         let mut sens = Sens::List(Vec::new());
@@ -737,11 +865,16 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
+        self.extra_base = module.signals.len();
+        self.extra_signals.clear();
         let body = if stmt_nodes.len() == 1 {
             self.lower_seq_stmt(&stmt_nodes[0])
         } else {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
         };
+        for sig in self.extra_signals.drain(..) {
+            module.signals.push(sig);
+        }
         // VHDL processes always loop: with a sensitivity list they re-run on
         // each event (`always @(sens)`); without one they re-run from the top
         // whenever they reach the end, suspending only at wait statements
@@ -1212,7 +1345,30 @@ impl<'a> Lower<'a> {
                     args: exprs,
                 }
             }
-            SyntaxKind::ExitStmt => Stmt::Null, // loop exit unsupported in IR yet; note it
+            SyntaxKind::ExitStmt => {
+                // `exit;` / `exit when cond;` → break (optionally conditional).
+                let kids = real_children(s);
+                let cond = kids
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|k| self.lower_expr(k, &self.consts.clone()));
+                match cond {
+                    Some(c) => Stmt::If {
+                        cond: c,
+                        then: Box::new(Stmt::Break),
+                        els: None,
+                    },
+                    None => Stmt::Break,
+                }
+            }
+            SyntaxKind::ReturnStmt => {
+                let kids = real_children(s);
+                let e = kids.iter().find(|k| is_expr_node(k.kind()));
+                Stmt::Return(Box::new(
+                    e.map(|e| self.lower_expr(e, &self.consts.clone()))
+                        .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
+                ))
+            }
             SyntaxKind::CallStmt => {
                 let kids = real_children(s);
                 let name = kids
@@ -1335,12 +1491,22 @@ impl<'a> Lower<'a> {
             self.err(s.span(), "malformed for loop");
             return Stmt::Null;
         };
-        let Some(var_id) = self.sig_id(&var) else {
-            self.err(
-                s.span(),
-                format!("for-loop variable '{}' not declared", var),
-            );
-            return Stmt::Null;
+        // VHDL for-loop variables are implicitly declared by the loop.
+        let var_id = match self.sig_id(&var) {
+            Some(id) => id,
+            None => {
+                let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                self.extra_signals.push(SignalIr {
+                    name: format!("__for_{}", var),
+                    width: 32,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: None,
+                    signed: false,
+                });
+                self.names.insert(var.clone(), id);
+                id
+            }
         };
         // Range bounds.
         let (lo, hi, downto) = match range.map(|r| r.kind()) {
@@ -2007,6 +2173,7 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::AssertStmt
             | SyntaxKind::ExitStmt
             | SyntaxKind::CallStmt
+            | SyntaxKind::ReturnStmt
     )
 }
 

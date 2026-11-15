@@ -19,7 +19,7 @@ use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
 
 mod ckpt;
-use hdl_ir::value::{Value, V0, V1, VDASH, VX, VZ};
+use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
 /// layout as VHDL/Verilog string literals.
@@ -834,6 +834,8 @@ impl Simulator {
                 return self.exec_stmt(pid, *inner);
             }
             Stmt::Null => Control::Done,
+            // `return` outside a function body (shouldn't happen) — ignore.
+            Stmt::Return(_) => Control::Done,
             Stmt::Block(ss) => {
                 self.proc_rt[pid as usize].frames.push(Frame::block(ss));
                 Control::Done
@@ -2000,6 +2002,7 @@ impl Simulator {
                     "to_ostring" => vhdl_radix_string(&v, 8),
                     "to_bstring" => vhdl_radix_string(&v, 2),
                     _ => {
+                        // VHDL to_string of a vector: one char per bit.
                         if v.width() == 1 {
                             match v.bits[0] {
                                 V0 => "0".to_string(),
@@ -2008,23 +2011,18 @@ impl Simulator {
                                 VDASH => "-".to_string(),
                                 _ => "X".to_string(),
                             }
-                        } else if v.width() % 8 == 0 && v.is_known() {
-                            (0..v.width() / 8)
-                                .map(|i| {
-                                    let mut b = 0u8;
-                                    for j in 0..8 {
-                                        if v.bits[i * 8 + j] == V1 {
-                                            b |= 1 << j;
-                                        }
-                                    }
-                                    b as char
+                        } else {
+                            v.bits
+                                .iter()
+                                .map(|&b| match b {
+                                    V0 => '0',
+                                    V1 => '1',
+                                    VZ => 'Z',
+                                    VDASH => '-',
+                                    VU => 'U',
+                                    _ => 'X',
                                 })
                                 .collect()
-                        } else {
-                            match v.to_u64() {
-                                Some(n) => n.to_string(),
-                                None => "x".to_string(),
-                            }
                         }
                     }
                 };
@@ -2165,6 +2163,7 @@ impl Simulator {
         let mut runner = FnRunner {
             sim: self,
             locals: &mut lvals,
+            returned: false,
         };
         runner.exec(&f.body);
         lvals[0].clone()
@@ -2255,15 +2254,26 @@ impl Simulator {
 struct FnRunner<'a> {
     sim: &'a Simulator,
     locals: &'a mut Vec<Value>,
+    /// Set when a `return` executed — stops the rest of the function body.
+    returned: bool,
 }
 
 impl<'a> FnRunner<'a> {
     fn exec(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Spanned { inner, .. } => self.exec(inner),
+            Stmt::Return(e) => {
+                let v = self.sim.eval_expr(e, Some(self.locals));
+                let w = self.locals[0].width().max(1);
+                self.locals[0] = v.resize(w);
+                self.returned = true;
+            }
             Stmt::Block(ss) => {
                 for s in ss {
                     self.exec(s);
+                    if self.returned {
+                        return;
+                    }
                 }
             }
             Stmt::If { cond, then, els } => {

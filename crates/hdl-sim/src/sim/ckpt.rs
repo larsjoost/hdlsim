@@ -495,6 +495,10 @@ fn w_stmt(w: &mut W, s: &Stmt) {
             w.u8(9);
             w_expr(w, e);
         }
+        Stmt::Return(e) => {
+            w.u8(14);
+            w_expr(w, e);
+        }
         Stmt::Break => w.u8(10),
         Stmt::Continue => w.u8(11),
         Stmt::Null => w.u8(12),
@@ -605,6 +609,7 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             body: Box::new(r_stmt(r)?),
         },
         9 => Stmt::ExprStmt(r_expr(r)?),
+        14 => Stmt::Return(Box::new(r_expr(r)?)),
         10 => Stmt::Break,
         11 => Stmt::Continue,
         12 => Stmt::Null,

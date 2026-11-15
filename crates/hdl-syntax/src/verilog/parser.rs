@@ -1907,6 +1907,43 @@ impl<'a> Parser<'a> {
                 self.expect_punct(';', "to end the return statement");
                 self.builder.finish_node();
             }
+            // Block-level declaration: `int x = 3;` inside begin/end.
+            TokenKind::Ident
+                if matches!(
+                    text.as_str(),
+                    "wire"
+                        | "reg"
+                        | "logic"
+                        | "integer"
+                        | "real"
+                        | "time"
+                        | "genvar"
+                        | "tri"
+                        | "tri0"
+                        | "tri1"
+                        | "trireg"
+                        | "wand"
+                        | "wor"
+                        | "supply0"
+                        | "supply1"
+                        | "bit"
+                        | "byte"
+                        | "shortint"
+                        | "int"
+                        | "longint"
+                        | "string"
+                        | "chandle"
+                        | "var"
+                        | "const"
+                        | "rand"
+                        | "randc"
+                        | "vectored"
+                        | "scalared"
+                ) || (self.user_types.contains(&text)
+                    && self.peek2().kind == TokenKind::Ident) =>
+            {
+                self.parse_decl();
+            }
             TokenKind::SysTask => {
                 self.builder.start_node(SyntaxKind::SysCall);
                 self.bump();
@@ -2337,17 +2374,20 @@ impl<'a> Parser<'a> {
                 self.builder.finish_node();
             }
             TokenKind::Punct if self.peek_text() == "{" => {
-                self.bump();
-                // Replicate: `{ n { expr } }` vs concat `{ a, b }`.
+                // Replicate `{ n { expr } }` vs concat `{ a, b, ... }`: the
+                // node must wrap from the opening brace, so mark first and
+                // start the node retroactively once the shape is known.
+                let mark = self.builder.mark();
+                self.bump(); // {
                 self.parse_expression();
                 if self.at_punct('{') {
-                    self.builder.start_node(SyntaxKind::Replicate);
-                    self.bump();
+                    self.builder.start_node_at(mark, SyntaxKind::Replicate);
+                    self.bump(); // inner {
                     self.parse_expression();
                     self.expect_punct('}', "to close the replication");
                     self.builder.finish_node();
                 } else {
-                    self.builder.start_node(SyntaxKind::Concat);
+                    self.builder.start_node_at(mark, SyntaxKind::Concat);
                     while self.eat_punct(',') {
                         self.parse_expression();
                     }

@@ -478,6 +478,7 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             inner: Box::new(remap_stmt(inner, map)),
         },
         Stmt::Block(ss) => Stmt::Block(ss.iter().map(|s| remap_stmt(s, map)).collect()),
+        Stmt::Return(e) => Stmt::Return(Box::new(remap_expr(e, map))),
         Stmt::If { cond, then, els } => Stmt::If {
             cond: remap_expr(cond, map),
             then: Box::new(remap_stmt(then, map)),
