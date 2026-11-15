@@ -361,13 +361,19 @@ impl Simulator {
     /// Write the full dynamic simulator state to `path` (own binary format
     /// `HDLCKPT1`) — checkpoint/restore, see [`Simulator::restore_checkpoint`].
     pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.save_checkpoint_bytes())
+    }
+
+    /// In-memory checkpoint (reverse debug history, tests): same format as
+    /// [`Simulator::save_checkpoint`], returned as bytes.
+    pub fn save_checkpoint_bytes(&mut self) -> Vec<u8> {
         // A checkpoint is meant to be resumed: a hard `--max-time` stop sets
         // `stopped`, which would make the restored run exit immediately.
         // (`finished` via $finish is kept — that state is genuinely terminal.)
         self.stopped = false;
         let mut buf = Vec::new();
         ckpt::save(self, &mut buf);
-        std::fs::write(path, &buf)
+        buf
     }
 
     /// Rebuild a simulator from `flat` plus a checkpoint written by
@@ -376,7 +382,12 @@ impl Simulator {
     pub fn restore_checkpoint(flat: Flat, path: &std::path::Path) -> Result<Simulator, String> {
         let bytes =
             std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-        ckpt::load(flat, &bytes)
+        Simulator::restore_checkpoint_bytes(flat, &bytes)
+    }
+
+    /// In-memory restore: see [`Simulator::restore_checkpoint`].
+    pub fn restore_checkpoint_bytes(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
+        ckpt::load(flat, bytes)
     }
 
     /// Run until `$finish`, until `max_time_fs`, or until no events remain.

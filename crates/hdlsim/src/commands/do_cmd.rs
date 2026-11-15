@@ -6,6 +6,7 @@
 //! `hdlsim::tcl`; simulator commands:
 //! - `run [time|-all]` — advance the sim (incremental; `run 100ns` steps)
 //! - `restart` — rebuild the simulation from scratch
+//! - `back [N]` — reverse debug: undo the last N `run` steps (in-memory checkpoints)
 //! - `vcd dumpfile PATH` — attach a VCD sink from this point on
 //! - `examine NAME` — print a signal's current value
 //! - `quit`/`exit [code]` — stop the script (Tcl builtin)
@@ -71,6 +72,7 @@ impl Command for DoCmd {
             max_time_fs,
             sim: None,
             vcd_path: None,
+            history: Vec::new(),
         };
         let mut interp = Interp::new();
         let flow = interp.eval(&text, &mut |_i, args| session.command(args))?;
@@ -96,6 +98,9 @@ struct DoSession {
     max_time_fs: u64,
     sim: Option<Simulator>,
     vcd_path: Option<PathBuf>,
+    /// Reverse-debug history: (time_fs, checkpoint bytes) pushed after each
+    /// `run`; `back` pops and restores.
+    history: Vec<(u64, Vec<u8>)>,
 }
 
 impl DoSession {
@@ -116,6 +121,9 @@ impl DoSession {
         if let Some(p) = &self.vcd_path {
             attach_vcd(&mut sim, p)?;
         }
+        // Seed the reverse-debug history with the t=0 state.
+        let bytes = sim.save_checkpoint_bytes();
+        self.history.push((0, bytes));
         self.sim = Some(sim);
         Ok(())
     }
@@ -126,19 +134,55 @@ impl DoSession {
                 if self.sim.is_none() {
                     self.build_sim()?;
                 }
-                let sim = self.sim.as_mut().unwrap();
-                match args.get(1).map(|s| s.as_str()) {
-                    None | Some("-all") => sim.run_until(self.max_time_fs),
-                    Some(t) => {
-                        let d = parse_time(t)?;
-                        let target = sim.time().saturating_add(d);
-                        sim.run_until(target);
+                let (t, bytes) = {
+                    let sim = self.sim.as_mut().unwrap();
+                    match args.get(1).map(|s| s.as_str()) {
+                        None | Some("-all") => sim.run_until(self.max_time_fs),
+                        Some(t) => {
+                            let d = parse_time(t)?;
+                            let target = sim.time().saturating_add(d);
+                            sim.run_until(target);
+                        }
                     }
+                    (sim.time(), sim.save_checkpoint_bytes())
+                };
+                self.history.push((t, bytes));
+                Ok(Flow::Continue)
+            }
+            Some("back") => {
+                // Reverse debug: undo the last `run` step (or N steps).
+                let n = match args.get(1).map(|s| s.as_str()) {
+                    None => 1usize,
+                    Some(t) => t
+                        .parse::<usize>()
+                        .map_err(|_| format!("back: bad step count '{}'", t))?,
+                };
+                if n == 0 || n >= self.history.len() {
+                    return Err(format!(
+                        "back: only {} step(s) of history",
+                        self.history.len().saturating_sub(1)
+                    ));
                 }
+                self.history.truncate(self.history.len() - n);
+                let (t, bytes) = self.history.last().unwrap().clone();
+                let flat = match &self.sim {
+                    Some(s) => s.flat().clone(),
+                    None => {
+                        return Err("back: simulation not started (use `run` first)".to_string())
+                    }
+                };
+                let mut sim = Simulator::restore_checkpoint_bytes(flat, &bytes)?;
+                sim.add_observer(Box::new(Transcript));
+                if let Some(p) = &self.vcd_path {
+                    attach_vcd(&mut sim, p)?;
+                }
+                self.sim = Some(sim);
+                println!("hdlsim do: back to t={}", hdl_sim::debug::fmt_time(t));
                 Ok(Flow::Continue)
             }
             Some("restart") => {
                 self.sim = None;
+                self.history.clear();
                 self.build_sim()?;
                 Ok(Flow::Continue)
             }
@@ -190,6 +234,7 @@ impl DoSession {
                     attach_vcd(&mut sim, p)?;
                 }
                 self.sim = Some(sim);
+                self.history.clear();
                 println!("hdlsim do: restored checkpoint {}", path);
                 Ok(Flow::Continue)
             }
