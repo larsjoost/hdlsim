@@ -194,6 +194,15 @@ impl LibraryManager {
         )
     }
 
+    /// Canonical paths of all files compiled this session, sorted — the
+    /// transitive dependency closure of everything compiled so far (used by
+    /// `hdlsim deps`).
+    pub fn compiled_files(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.compiled.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// Compile a list of explicit files (e.g. the CLI's file arguments).
     pub fn compile_files(&mut self, design: &mut Design, paths: &[PathBuf]) {
         for p in paths {
