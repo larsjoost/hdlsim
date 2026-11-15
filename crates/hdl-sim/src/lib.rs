@@ -10,6 +10,7 @@
 //! # Layout
 //! - [`events`]: the closed `SimEvent` enum + `Observer` trait (extension seam).
 //! - [`sim`]: the `Simulator` (active/NBA/time regions, process frames).
+//! - [`rand`]: seeded RNG + constraint solver behind `$urandom`/`$rand_solve`.
 //! - [`debug`]: debugging helpers — value/time formatting, a signal [`debug::Watcher`],
 //!   and design introspection on the simulator.
 //!
@@ -21,6 +22,7 @@
 pub mod coverage;
 pub mod debug;
 pub mod events;
+pub mod rand;
 pub mod sim;
 
 pub use events::{NullObserver, Observer, SimEvent};

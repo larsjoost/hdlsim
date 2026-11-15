@@ -15,6 +15,7 @@
 //! - Never panics on design content; runtime errors are Message events.
 
 use crate::events::{Observer, SimEvent};
+use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
 
 mod ckpt;
@@ -1071,6 +1072,54 @@ impl Simulator {
                     }
                 }
             }
+            "rand_solve" => {
+                // $rand_solve("spec", "name", lvalue, ...): solve the spec with
+                // the kernel RNG, then assign each binding to its lvalue.
+                let spec = args
+                    .first()
+                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .unwrap_or_default();
+                match self.rand_solve(&spec, rand::DEFAULT_SOLVE_ATTEMPTS) {
+                    Ok(bindings) => {
+                        let mut i = 1;
+                        while i + 1 < args.len() {
+                            let name = string_of(&self.eval_expr(&args[i], None));
+                            match bindings.iter().find(|(n, _)| *n == name) {
+                                Some((_, v)) => {
+                                    self.assign_to(
+                                        &args[i + 1],
+                                        Value::from_u64(32, *v as u32 as u64),
+                                        None,
+                                    );
+                                }
+                                None => self.emit(SimEvent::Message {
+                                    text: format!(
+                                        "warning: $rand_solve: '{}' is not in the spec at t={}\n",
+                                        name, self.time
+                                    ),
+                                    time_fs: self.time,
+                                }),
+                            }
+                            i += 2;
+                        }
+                        if (args.len().saturating_sub(1)) % 2 != 0 {
+                            self.emit(SimEvent::Message {
+                                text: format!(
+                                    "warning: $rand_solve: dangling argument at t={}\n",
+                                    self.time
+                                ),
+                                time_fs: self.time,
+                            });
+                        }
+                    }
+                    Err(msg) => {
+                        self.emit(SimEvent::Message {
+                            text: format!("warning: $rand_solve at t={}: {}\n", self.time, msg),
+                            time_fs: self.time,
+                        });
+                    }
+                }
+            }
             _ => {
                 self.emit(SimEvent::Message {
                     text: format!(
@@ -1590,13 +1639,19 @@ impl Simulator {
             }
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
             "time" | "realtime" => return Value::from_u64(64, self.time),
-            "random" => {
-                let mut x = self.rng.get();
-                x ^= x >> 12;
-                x ^= x << 25;
-                x ^= x >> 27;
-                self.rng.set(x);
-                return Value::from_u64(32, (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u64);
+            "random" | "urandom" => return Value::from_u64(32, self.next_random() as u64),
+            "urandom_range" => {
+                // $urandom_range(max) -> 0..=max, $urandom_range(min, max).
+                let arg = |i: usize| self.eval_expr(&args[i], locals).to_u64().unwrap_or(0) as i64;
+                let (lo, hi) = match args.len() {
+                    1 => (0, arg(0)),
+                    2 => (arg(0), arg(1)),
+                    _ => return Value::x(32),
+                };
+                return match self.urandom_range(lo, hi) {
+                    Some(v) => Value::from_u64(32, v as u32 as u64),
+                    None => Value::x(32),
+                };
             }
             _ => {}
         }
@@ -1623,14 +1678,37 @@ impl Simulator {
         Value::x(32)
     }
 
-    /// `$random` value (xorshift64*), advancing the seed.
+    /// Run `f` with the kernel RNG, persisting the advanced state. The state
+    /// lives in `self.rng`, which checkpoints serialize, so stimulus drawn
+    /// here stays reproducible across checkpoint/restore.
+    fn with_rng<T>(&self, f: impl FnOnce(&mut Rng) -> T) -> T {
+        let mut r = Rng::from_state(self.rng.get());
+        let out = f(&mut r);
+        self.rng.set(r.state());
+        out
+    }
+
+    /// `$random`/`$urandom` value (xorshift64*), advancing the seed.
     pub fn next_random(&self) -> u32 {
-        let mut x = self.rng.get();
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng.set(x);
-        (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
+        self.with_rng(|r| r.next_u32())
+    }
+
+    /// `$urandom` — same stream and values as `$random`, seeded via `--seed`.
+    pub fn urandom(&self) -> u32 {
+        self.next_random()
+    }
+
+    /// `$urandom_range(lo, hi)` — uniform in the inclusive range (`None` when
+    /// `hi < lo`); rejection-sampled, so no modulo bias.
+    pub fn urandom_range(&self, lo: i64, hi: i64) -> Option<i64> {
+        self.with_rng(|r| r.range(lo, hi))
+    }
+
+    /// Solve a `$rand_solve` constraint spec with the kernel RNG; returns the
+    /// variable bindings in declaration order. Advances the RNG, so a fixed
+    /// `--seed` reproduces the same solution.
+    pub fn rand_solve(&self, spec: &str, max_attempts: u32) -> Result<Vec<(String, i64)>, String> {
+        self.with_rng(|r| rand::solve_spec(r, spec, max_attempts))
     }
 
     /// Current `$random` RNG state.
