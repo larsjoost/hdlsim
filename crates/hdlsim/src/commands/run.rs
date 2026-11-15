@@ -26,7 +26,7 @@ impl Command for Run {
         "run"
     }
     fn about(&self) -> &'static str {
-        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--wave out.html] [--live [--port N]] [--max-time 10us]"
+        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
@@ -42,6 +42,7 @@ impl Command for Run {
         let mut coverage_out: Option<PathBuf> = None;
         let mut checkpoint: Option<PathBuf> = None;
         let mut restore: Option<PathBuf> = None;
+        let mut seed: Option<u64> = None;
         let mut i = 0;
         while i < rest.len() {
             match rest[i].as_str() {
@@ -102,6 +103,15 @@ impl Command for Run {
                     ));
                     i += 2;
                 }
+                "--seed" => {
+                    seed = Some(
+                        rest.get(i + 1)
+                            .ok_or("--seed needs a value")?
+                            .parse()
+                            .map_err(|_| "--seed needs a u64")?,
+                    );
+                    i += 2;
+                }
                 other if other.starts_with("--") => {
                     return Err(format!("unknown flag '{}'", other));
                 }
@@ -149,6 +159,9 @@ impl Command for Run {
             Some(p) => Simulator::restore_checkpoint(flat, p)?,
             None => Simulator::new(flat),
         };
+        if let Some(s) = seed {
+            sim.set_seed(s);
+        }
         sim.add_observer(Box::new(Transcript));
         // Coverage collector, kept behind a shared handle so we can report
         // after the run.

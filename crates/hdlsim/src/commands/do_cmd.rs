@@ -9,6 +9,7 @@
 //! - `back [N]` — reverse debug: undo the last N `run` steps (in-memory checkpoints)
 //! - `vcd dumpfile PATH` — attach a VCD sink from this point on
 //! - `examine NAME` — print a signal's current value
+//! - `seed N` — set the `$random` RNG seed (reproducible stimulus)
 //! - `quit`/`exit [code]` — stop the script (Tcl builtin)
 
 use super::run::Transcript;
@@ -73,6 +74,7 @@ impl Command for DoCmd {
             sim: None,
             vcd_path: None,
             history: Vec::new(),
+            seed: None,
         };
         let mut interp = Interp::new();
         let flow = interp.eval(&text, &mut |_i, args| session.command(args))?;
@@ -101,6 +103,8 @@ struct DoSession {
     /// Reverse-debug history: (time_fs, checkpoint bytes) pushed after each
     /// `run`; `back` pops and restores.
     history: Vec<(u64, Vec<u8>)>,
+    /// `$random` seed from a `seed N` command; applied to (re)built sims.
+    seed: Option<u64>,
 }
 
 impl DoSession {
@@ -117,6 +121,9 @@ impl DoSession {
             return Err(mgr.diags().render_all(mgr.db()));
         }
         let mut sim = Simulator::new(flat);
+        if let Some(s) = self.seed {
+            sim.set_seed(s);
+        }
         sim.add_observer(Box::new(Transcript));
         if let Some(p) = &self.vcd_path {
             attach_vcd(&mut sim, p)?;
@@ -193,6 +200,19 @@ impl DoSession {
                 if let Some(sim) = self.sim.as_mut() {
                     attach_vcd(sim, &p)?;
                 }
+                Ok(Flow::Continue)
+            }
+            Some("seed") => {
+                let s: u64 = args
+                    .get(1)
+                    .ok_or("seed needs a u64 value")?
+                    .parse()
+                    .map_err(|_| "seed needs a u64 value")?;
+                self.seed = Some(s);
+                if let Some(sim) = self.sim.as_ref() {
+                    sim.set_seed(s);
+                }
+                println!("hdlsim do: seed = {}", s);
                 Ok(Flow::Continue)
             }
             Some("examine") => {

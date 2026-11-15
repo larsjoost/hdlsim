@@ -1632,6 +1632,18 @@ impl Simulator {
         self.rng.set(x);
         (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
     }
+
+    /// Current `$random` RNG state.
+    pub fn seed(&self) -> u64 {
+        self.rng.get()
+    }
+
+    /// Override the `$random` RNG seed (0 keeps the built-in default), e.g.
+    /// from `--seed` for reproducible stimulus. Persisted in checkpoints.
+    pub fn set_seed(&self, seed: u64) {
+        self.rng
+            .set(if seed == 0 { 0x243F6A8885A308D3 } else { seed });
+    }
 }
 
 /// Helper: run function bodies (recursive, no delays) with a local slot space.

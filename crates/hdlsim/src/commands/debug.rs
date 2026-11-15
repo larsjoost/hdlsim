@@ -31,7 +31,7 @@ impl Command for Debug {
         "debug"
     }
     fn about(&self) -> &'static str {
-        "debug a design: hdlsim debug --top tb [files] [--dump] [--watch sig]... [--all] [--mem name]... [--max-time 10us]"
+        "debug a design: hdlsim debug --top tb [files] [--dump] [--watch sig]... [--all] [--mem name]... [--max-time 10us] [--seed N]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
@@ -43,6 +43,7 @@ impl Command for Debug {
         let mut all = false;
         let mut dump = false;
         let mut max_time_fs = u64::MAX;
+        let mut seed: Option<u64> = None;
         let mut i = 0;
         while i < rest.len() {
             match rest[i].as_str() {
@@ -75,6 +76,15 @@ impl Command for Debug {
                     max_time_fs = parse_time(v)?;
                     i += 2;
                 }
+                "--seed" => {
+                    seed = Some(
+                        rest.get(i + 1)
+                            .ok_or("--seed needs a value")?
+                            .parse()
+                            .map_err(|_| "--seed needs a u64")?,
+                    );
+                    i += 2;
+                }
                 other if other.starts_with("--") => {
                     return Err(format!("unknown flag '{}'", other));
                 }
@@ -101,6 +111,9 @@ impl Command for Debug {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
         let mut sim = Simulator::new(flat);
+        if let Some(s) = seed {
+            sim.set_seed(s);
+        }
         if dump {
             print!("{}", sim.dump_design());
         }
