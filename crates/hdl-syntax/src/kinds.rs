@@ -221,6 +221,16 @@ pub enum SyntaxKind {
     Others,
     /// Marker for the `?` in a VHDL-2008 matching case (`case? ... is`).
     Matching,
+    /// SystemVerilog `class ... endclass`.
+    Class,
+    /// SystemVerilog `import p::x;` / `export ...`.
+    Import,
+    /// SystemVerilog `foreach (arr[i]) stmt`.
+    Foreach,
+    /// SystemVerilog assignment pattern `'{ a: x, default: y }`.
+    Pattern,
+    /// SystemVerilog `constraint name { ... }` block.
+    Constraint,
 }
 
 /// All variants in declaration order — index == `kind as u16`.
@@ -356,6 +366,11 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Qualified,
     SyntaxKind::Others,
     SyntaxKind::Matching,
+    SyntaxKind::Class,
+    SyntaxKind::Import,
+    SyntaxKind::Foreach,
+    SyntaxKind::Pattern,
+    SyntaxKind::Constraint,
 ];
 
 impl SyntaxKind {
@@ -466,6 +481,13 @@ impl SyntaxKind {
                 | SyntaxKind::ParenExpr
                 | SyntaxKind::Name
                 | SyntaxKind::Literal
+                | SyntaxKind::Class
+                | SyntaxKind::Import
+                | SyntaxKind::Foreach
+                | SyntaxKind::Pattern
+                | SyntaxKind::Constraint
+                | SyntaxKind::Package
+                | SyntaxKind::Allocator
         )
     }
     /// Whether this kind is a VHDL node (used by AST views and golden dumps).
@@ -545,7 +567,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 117);
+        assert_eq!(ALL.len(), 122);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

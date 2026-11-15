@@ -57,8 +57,10 @@ impl<'a> Lexer<'a> {
                 b'/' if self.peek(1) == Some(b'/') => self.line_comment(),
                 b'/' if self.peek(1) == Some(b'*') => self.block_comment(),
                 b'"' => self.string(),
+                b'$' if self.peek(1) == Some(b']') => self.emit(TokenKind::Punct, 1), // `q[$]`
                 b'$' => self.sys_task(),
                 b'`' => self.directive(),
+                b'\'' if self.peek(1) == Some(b'{') => self.emit(TokenKind::Punct, 1), // `'{...}`
                 b'\'' => self.based_literal(),
                 b'\\' => self.escaped_ident(),
                 b'0'..=b'9' => self.number(),

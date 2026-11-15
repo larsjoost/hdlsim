@@ -25,7 +25,7 @@ use crate::diagnostic::Diagnostic;
 use crate::kinds::SyntaxKind;
 use crate::source::{FileId, SourceFile};
 use crate::token::{Token, TokenKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Output of parsing one file.
 pub struct ParsedFile {
@@ -66,6 +66,7 @@ pub fn parse_file(file: FileId, src: &SourceFile) -> ParsedFile {
         builder: TreeBuilder::new(file),
         diags: lex_diags,
         timescale: None,
+        user_types: HashSet::new(),
     };
     p.parse_source_text();
     let root = p.builder.finish();
@@ -97,6 +98,7 @@ pub fn parse_with_preproc(
         builder: TreeBuilder::new(file),
         diags: Vec::new(),
         timescale: None,
+        user_types: HashSet::new(),
     };
     diags.append(&mut lex_diags);
     p.parse_source_text();
@@ -119,6 +121,9 @@ struct Parser<'a> {
     builder: TreeBuilder,
     diags: Vec<Diagnostic>,
     timescale: Option<String>,
+    /// User type names seen so far (typedefs, classes) — lets the parser tell
+    /// `word_t w;` (declaration) apart from `foo bar(...)` (instantiation).
+    user_types: HashSet<String>,
 }
 
 /// Binary operator precedence (higher binds tighter) and associativity.
@@ -301,6 +306,11 @@ impl<'a> Parser<'a> {
                 self.parse_directive();
             } else if self.at_kw("module") || self.at_kw("macromodule") {
                 self.parse_module();
+            } else if self.at_kw("package") {
+                self.parse_package();
+            } else if self.at_kw("class") || (self.at_kw("virtual") && self.peek2_text() == "class")
+            {
+                self.parse_class();
             } else {
                 self.error_here("expected `module` or a compiler directive");
                 self.bump();
@@ -469,13 +479,214 @@ impl<'a> Parser<'a> {
         if self.at_punct('[') {
             self.builder.start_node(SyntaxKind::Range);
             self.bump();
-            self.parse_expression();
-            if self.eat_punct(':') {
+            if self.at_punct(']') {
+                // Unbounded dimension: dynamic array `da[]`.
+            } else if self.peek_text() == "$" && self.peek2_text() == "]" {
+                self.bump(); // `$` of a queue `q[$]` — emitted as a plain punct
+            } else {
                 self.parse_expression();
+                if self.eat_punct(':') {
+                    self.parse_expression();
+                }
             }
             self.expect_punct(']', "to close the range");
             self.builder.finish_node();
         }
+    }
+
+    /// `package name; items... endpackage [name];` — SV package scope.
+    fn parse_package(&mut self) {
+        self.builder.start_node(SyntaxKind::Package);
+        self.bump(); // package
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        } else {
+            self.error_here("expected a package name");
+        }
+        self.expect_punct(';', "after the package name");
+        while !self.at_kw("endpackage") && self.peek().kind != TokenKind::Eof {
+            self.parse_module_item();
+        }
+        self.eat_kw("endpackage");
+        // Optional package name — but not the next construct's keyword.
+        if self.peek().kind == TokenKind::Ident
+            && !matches!(
+                self.peek_text(),
+                "module" | "macromodule" | "package" | "class" | "endpackage" | "endclass"
+            )
+        {
+            self.bump();
+        }
+        self.eat_punct(';'); // optional
+        self.builder.finish_node();
+    }
+
+    /// `class [virtual] name [extends base]; items... endclass [name];`
+    fn parse_class(&mut self) {
+        self.builder.start_node(SyntaxKind::Class);
+        if self.at_kw("virtual") {
+            self.bump();
+        }
+        self.bump(); // class
+        let mut cname = String::new();
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            cname = self.peek_text().to_string();
+            self.bump();
+            self.builder.finish_node();
+        } else {
+            self.error_here("expected a class name");
+        }
+        if !cname.is_empty() {
+            self.user_types.insert(cname);
+        }
+        if self.at_kw("extends") {
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                self.builder.start_node(SyntaxKind::Name);
+                self.bump();
+                self.builder.finish_node();
+            }
+        }
+        self.expect_punct(';', "after the class header");
+        while !self.at_kw("endclass") && self.peek().kind != TokenKind::Eof {
+            let text = self.peek_text().to_string();
+            if text == "function" {
+                self.parse_function();
+            } else if text == "task" {
+                self.parse_task();
+            } else if text == "constraint" {
+                self.parse_constraint();
+            } else if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident {
+                self.parse_decl();
+            } else if text == "static"
+                || text == "protected"
+                || text == "local"
+                || text == "virtual"
+                || text == "pure"
+            {
+                self.bump(); // class item modifier
+                continue;
+            } else {
+                self.parse_decl_or_stmt_class_item();
+            }
+        }
+        self.eat_kw("endclass");
+        if self.peek().kind == TokenKind::Ident
+            && !matches!(
+                self.peek_text(),
+                "module" | "macromodule" | "package" | "class" | "endpackage" | "endclass"
+            )
+        {
+            self.bump(); // optional class name
+        }
+        self.eat_punct(';'); // optional
+        self.builder.finish_node();
+    }
+
+    /// Declaration or constraint inside a class body.
+    fn parse_decl_or_stmt_class_item(&mut self) {
+        let text = self.peek_text().to_string();
+        match text.as_str() {
+            "wire" | "reg" | "logic" | "integer" | "real" | "time" | "bit" | "byte"
+            | "shortint" | "int" | "longint" | "string" | "chandle" | "var" | "const" | "rand"
+            | "randc" | "vectored" | "scalared" => self.parse_decl(),
+            "constraint" => self.parse_constraint(),
+            _ => {
+                self.error_here(format!("unexpected `{}` in class body", text));
+            }
+        }
+        // Recover: skip to the next `;`.
+        while self.peek().kind != TokenKind::Eof && !self.at_punct(';') && !self.at_kw("endclass") {
+            self.bump();
+        }
+        self.eat_punct(';');
+    }
+
+    /// `constraint name { expr; ... }` — parsed structurally, lowered later.
+    fn parse_constraint(&mut self) {
+        self.builder.start_node(SyntaxKind::Constraint);
+        self.bump(); // constraint
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        }
+        self.expect_punct('{', "to open the constraint block");
+        let mut depth = 1;
+        while depth > 0 && self.peek().kind != TokenKind::Eof {
+            if self.at_punct('{') {
+                depth += 1;
+                self.bump();
+            } else if self.at_punct('}') {
+                depth -= 1;
+                self.bump();
+            } else {
+                self.parse_expression();
+                // Constraint expression separators: `;`, `&&`, `->`, `solve ... before`.
+                while self.at_punct(';') || self.at_kw("and") || self.at_kw("solve") {
+                    if self.at_kw("and") || self.at_kw("solve") {
+                        // `a && b` inside a constraint: parse as expressions.
+                        self.bump();
+                        if self.at_kw("before") {
+                            self.bump();
+                        }
+                        continue;
+                    }
+                    self.bump(); // ;
+                    if self.at_punct('}') || self.at_kw("endclass") {
+                        break;
+                    }
+                }
+            }
+        }
+        self.builder.finish_node();
+    }
+
+    /// `import p::*;` / `import p::a, q::b;` / `export p::*;`
+    fn parse_import(&mut self, export: bool) {
+        self.builder.start_node(SyntaxKind::Import);
+        self.bump(); // import / export
+        loop {
+            self.parse_scoped_name();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the import/export");
+        let _ = export;
+        self.builder.finish_node();
+    }
+
+    /// `pkg::item` or `pkg::*` — a scope-qualified name.
+    fn parse_scoped_name(&mut self) {
+        self.builder.start_node(SyntaxKind::Name);
+        if self.peek().kind == TokenKind::Ident {
+            self.bump();
+        }
+        while self.at_punct(':') && self.peek2_text() == ":" {
+            self.bump();
+            self.bump();
+            if self.at_punct('*') {
+                self.bump();
+            } else if self.peek().kind == TokenKind::Ident {
+                self.bump();
+            }
+        }
+        self.builder.finish_node();
+    }
+
+    /// `foreach ( arr[i] ) stmt` / `foreach ( arr[i, j] ) stmt`.
+    fn parse_foreach(&mut self) {
+        self.builder.start_node(SyntaxKind::Foreach);
+        self.bump(); // foreach
+        self.expect_punct('(', "after foreach");
+        self.parse_expression(); // array (possibly with [idx] selects)
+        self.expect_punct(')', "to close the foreach header");
+        self.parse_statement();
+        self.builder.finish_node();
     }
 
     fn parse_module_item(&mut self) {
@@ -498,6 +709,9 @@ impl<'a> Parser<'a> {
                 "event" => self.parse_event_decl(),
                 "defparam" => self.parse_defparam(),
                 "typedef" => self.parse_typedef(),
+                "class" => self.parse_class(),
+                "import" => self.parse_import(false),
+                "export" => self.parse_import(true),
                 "generate" => self.parse_generate(),
                 "assert" | "assume" | "cover" => self.parse_sva_property(text.as_str()),
                 // `endmodule` here means the enclosing construct was never
@@ -520,10 +734,13 @@ impl<'a> Parser<'a> {
                     self.builder.finish_node();
                 }
                 _ => {
-                    // Module instantiation: `modname [#(...)] inst (...) ;`
-                    if self.peek2().kind == TokenKind::Ident
+                    // Declaration with a user type: `word_t w;` / `C obj;`.
+                    if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident {
+                        self.parse_decl();
+                    } else if self.peek2().kind == TokenKind::Ident
                         || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "#")
                     {
+                        // Module instantiation: `modname [#(...)] inst (...) ;`
                         self.parse_instantiation();
                     } else {
                         self.error_here(format!("unexpected `{}` in module body", text));
@@ -617,7 +834,24 @@ impl<'a> Parser<'a> {
         self.bump(); // parameter/localparam
         if self.at_kw("type") {
             self.bump(); // `parameter type T = ...`
-        } else if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
+        } else if self.peek().kind == TokenKind::Ident
+            && matches!(
+                self.peek_text(),
+                "integer"
+                    | "real"
+                    | "time"
+                    | "int"
+                    | "longint"
+                    | "shortint"
+                    | "byte"
+                    | "bit"
+                    | "logic"
+                    | "reg"
+                    | "wire"
+                    | "string"
+                    | "chandle"
+            )
+        {
             self.bump();
         }
         // Optional range: `parameter [7:0] W = 8;`.
@@ -910,6 +1144,11 @@ impl<'a> Parser<'a> {
             | "shortint" | "int" | "longint" | "string" | "chandle" | "var" | "const" | "rand"
             | "randc" | "vectored" | "scalared" => self.parse_decl(),
             "parameter" | "localparam" => self.parse_param_decl(),
+            "import" => self.parse_import(false),
+            "export" => self.parse_import(true),
+            _ if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident => {
+                self.parse_decl()
+            }
             _ => self.parse_statement(),
         }
     }
@@ -1014,8 +1253,10 @@ impl<'a> Parser<'a> {
         }
         if self.peek().kind == TokenKind::Ident {
             self.builder.start_node(SyntaxKind::Name);
+            let n = self.peek_text().to_string();
             self.bump();
             self.builder.finish_node();
+            self.user_types.insert(n);
         } else {
             self.error_here("expected a typedef name");
         }
@@ -1391,6 +1632,9 @@ impl<'a> Parser<'a> {
         match self.peek().kind {
             // `assign` is legal inside generate blocks (module item as statement).
             TokenKind::Ident if text == "assign" => self.parse_assign(),
+            TokenKind::Ident if text == "foreach" => self.parse_foreach(),
+            TokenKind::Ident if text == "import" => self.parse_import(false),
+            TokenKind::Ident if text == "export" => self.parse_import(true),
             // `deassign x;` / `force x = e;` / `release x;` — parse and drop the
             // procedural-assignment part (not simulated).
             TokenKind::Ident if text == "deassign" || text == "release" => {
@@ -1874,6 +2118,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix(&mut self) {
+        // Wrap the primary and every postfix `[...]`/`(...)` into one node:
+        // `a[0]`, `a[7:4]`, `f(x)` produce Index/PartSelect/Call nodes whose
+        // first child is the base expression.
+        let mark = self.builder.mark();
         self.parse_primary();
         loop {
             if self.at_punct('[') {
@@ -1907,7 +2155,7 @@ impl<'a> Parser<'a> {
                 } else {
                     SyntaxKind::Index
                 };
-                self.builder.start_node(kind);
+                self.builder.start_node_at(mark, kind);
                 self.bump(); // [
                 self.parse_expression();
                 if is_part {
@@ -1917,8 +2165,8 @@ impl<'a> Parser<'a> {
                 self.expect_punct(']', "to close the select");
                 self.builder.finish_node();
             } else if self.at_punct('(') {
-                // Function call.
-                self.builder.start_node(SyntaxKind::Call);
+                // Function call — wraps the callee name: Call(Name, args...).
+                self.builder.start_node_at(mark, SyntaxKind::Call);
                 self.bump();
                 if !self.at_punct(')') {
                     loop {
@@ -1994,19 +2242,83 @@ impl<'a> Parser<'a> {
                 }
                 self.builder.finish_node();
             }
+            TokenKind::Ident if self.peek_text() == "new" => {
+                // `new C(42)` / `new(42)` (inside a constructor) / `new[3]`.
+                self.builder.start_node(SyntaxKind::Allocator);
+                self.bump(); // new
+                if self.peek().kind == TokenKind::Ident && !self.at_punct('(') {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    self.builder.finish_node();
+                }
+                if self.eat_punct('[') {
+                    self.parse_expression();
+                    self.expect_punct(']', "to close the new[] size");
+                } else if self.eat_punct('(') {
+                    if !self.at_punct(')') {
+                        loop {
+                            self.parse_expression();
+                            if !self.eat_punct(',') {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_punct(')', "to close the constructor arguments");
+                }
+                self.builder.finish_node();
+            }
             TokenKind::Ident => {
                 self.builder.start_node(SyntaxKind::Name);
                 self.bump();
-                // Hierarchical reference: `a.b.c`.
-                while self.at_punct('.') {
-                    self.bump();
-                    if self.peek().kind == TokenKind::Ident {
+                // Hierarchical / scope-qualified reference: `a.b.c`, `p::x`.
+                loop {
+                    if self.at_punct('.') {
                         self.bump();
+                        if self.peek().kind == TokenKind::Ident {
+                            self.bump();
+                        } else {
+                            self.error_here("expected a name after `.`");
+                            break;
+                        }
+                    } else if self.at_punct(':') && self.peek2_text() == ":" {
+                        self.bump();
+                        self.bump();
+                        if self.at_punct('*') {
+                            self.bump();
+                        } else if self.peek().kind == TokenKind::Ident {
+                            self.bump();
+                        } else {
+                            break;
+                        }
                     } else {
-                        self.error_here("expected a name after `.`");
                         break;
                     }
                 }
+                self.builder.finish_node();
+            }
+            TokenKind::Punct if self.peek_text() == "'" && self.peek2_text() == "{" => {
+                // Assignment pattern: `'{ a: x, b: y, default: z }`.
+                self.builder.start_node(SyntaxKind::Pattern);
+                self.bump(); // '
+                self.bump(); // {
+                loop {
+                    if self.at_punct('}') || self.peek().kind == TokenKind::Eof {
+                        break;
+                    }
+                    if self.peek().kind == TokenKind::Ident
+                        && (self.peek2_text() == ":" || self.peek2_text() == ":=")
+                    {
+                        self.builder.start_node(SyntaxKind::Name);
+                        self.bump();
+                        self.builder.finish_node();
+                        self.bump(); // :
+                    }
+                    self.parse_expression();
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+                self.expect_punct('}', "to close the assignment pattern");
                 self.builder.finish_node();
             }
             TokenKind::Punct if self.peek_text() == "(" => {

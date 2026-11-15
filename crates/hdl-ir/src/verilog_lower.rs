@@ -15,7 +15,7 @@ use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::source::{FileId, SourceDb, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Lower one parsed file into modules plus diagnostics, with the LRM default
 /// time unit of 1 ns.
@@ -43,11 +43,25 @@ pub fn lower_file_with_time(
         diags,
         time_unit_fs,
         names: HashMap::new(),
+        sig_types: HashMap::new(),
+        types: HashMap::new(),
+        gconsts: HashMap::new(),
+        packages: HashMap::new(),
+        extra_signals: Vec::new(),
+        sig_is_mem: HashSet::new(),
+        extra_base: 0,
+        in_function: false,
     };
     let mut modules = Vec::new();
     for child in real_children(root) {
-        if child.kind() == SyntaxKind::Module {
-            modules.push(lx.lower_module(&child));
+        match child.kind() {
+            SyntaxKind::Module => modules.push(lx.lower_module(&child)),
+            SyntaxKind::Package => {
+                let pkg = lx.lower_module(&child);
+                lx.packages.insert(pkg.name.clone(), pkg);
+            }
+            SyntaxKind::Class => modules.push(lx.lower_class(&child)),
+            _ => {}
         }
     }
     modules
@@ -73,6 +87,8 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Replicate
             | SyntaxKind::PartSelect
             | SyntaxKind::Index
+            | SyntaxKind::Pattern
+            | SyntaxKind::Allocator
     )
 }
 
@@ -93,6 +109,10 @@ fn is_module_item(k: SyntaxKind) -> bool {
             | SyntaxKind::AssertProperty
             | SyntaxKind::AssumeProperty
             | SyntaxKind::CoverProperty
+            | SyntaxKind::Typedef
+            | SyntaxKind::Import
+            | SyntaxKind::Class
+            | SyntaxKind::Package
     )
 }
 
@@ -114,6 +134,9 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::ContinueStmt
             | SyntaxKind::SysCall
             | SyntaxKind::SvaStmt
+            | SyntaxKind::Foreach
+            | SyntaxKind::ReturnStmt
+            | SyntaxKind::Decl
     )
 }
 
@@ -123,6 +146,42 @@ struct Lower<'a> {
     time_unit_fs: u64,
     /// Current scope's name → signal id map (module signals, or function slots).
     names: HashMap<String, SigId>,
+    /// Signal id → typedef name (for struct field selects), current module.
+    sig_types: HashMap<SigId, String>,
+    /// User typedefs: name → type info (`pkg::name` entries included).
+    types: HashMap<String, TypeDef>,
+    /// Global constants: enum labels, package params (`pkg::NAME`), imported names.
+    gconsts: HashMap<String, Value>,
+    /// Lowered SV packages by name.
+    packages: HashMap<String, ModuleIr>,
+    /// Signals allocated during statement lowering (e.g. foreach index vars).
+    extra_signals: Vec<SignalIr>,
+    /// module.signals.len() after the registration pre-pass — the id base of
+    /// `extra_signals`.
+    extra_base: usize,
+    /// Signal ids that are memories/arrays.
+    sig_is_mem: HashSet<SigId>,
+    /// Inside a function body: `return e;` assigns to slot 0 (function name).
+    in_function: bool,
+}
+
+/// A user-defined type (typedef, enum, struct, class).
+#[derive(Clone, Debug)]
+struct TypeDef {
+    width: usize,
+    signed: bool,
+    real: bool,
+    kind: TypeKind,
+}
+
+#[derive(Clone, Debug)]
+enum TypeKind {
+    Plain,
+    /// Enum labels in declaration order (label → value).
+    #[allow(dead_code)]
+    Enum(Vec<(String, u64)>),
+    /// Packed struct fields in declaration order: (name, width, lsb offset).
+    Struct(Vec<(String, usize, usize)>),
 }
 
 impl<'a> Lower<'a> {
@@ -177,6 +236,8 @@ impl<'a> Lower<'a> {
         // The name map is per-module: without this, a declaration in the second
         // module of a file would be skipped as "already known" from the first.
         self.names.clear();
+        self.sig_types.clear();
+        self.sig_is_mem.clear();
         // First pass: params (so ports and later items can use them in ranges).
         let mut env: HashMap<String, Value> = HashMap::new();
         for item in &item_nodes {
@@ -184,7 +245,23 @@ impl<'a> Lower<'a> {
                 self.lower_param(&mut module, item, &env);
                 for p in &module.params {
                     env.insert(p.name.clone(), p.default.clone());
+                    self.gconsts
+                        .insert(format!("{}::{}", module.name, p.name), p.default.clone());
                 }
+            }
+        }
+        // Imports and typedefs come before signal registration so user types
+        // are known when declarations are scanned.
+        let pkg_of = if m.kind() == SyntaxKind::Package {
+            Some(module.name.clone())
+        } else {
+            None
+        };
+        for item in &item_nodes {
+            match item.kind() {
+                SyntaxKind::Import => self.lower_import(&mut module, item, &env),
+                SyntaxKind::Typedef => self.lower_typedef(item, &env, pkg_of.as_deref()),
+                _ => {}
             }
         }
         if let Some(pl) = &ports_node {
@@ -246,14 +323,28 @@ impl<'a> Lower<'a> {
                     let width = self.decl_width(&dk, &env);
                     let is_real = dk
                         .iter()
-                        .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "real");
-                    for k in &dk {
+                        .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "real")
+                        || self
+                            .decl_type_name(&dk)
+                            .and_then(|t| self.types.get(&t))
+                            .map_or(false, |t| t.real);
+                    let tname = self.decl_type_name(&dk);
+                    for (i, k) in dk.iter().enumerate() {
                         if k.kind() == SyntaxKind::Name {
                             let n = self.text(k);
                             if self.sig_id(&n).is_none() {
                                 let id = module.signals.len() as SigId;
+                                // Memory dimension after the name: `mem [0:255]`,
+                                // dynamic `da []` / queue `q [$]`.
+                                let mem = dk.get(i + 1).and_then(|r| {
+                                    if r.kind() == SyntaxKind::Range {
+                                        Some(self.range_depth(r, &env))
+                                    } else {
+                                        None
+                                    }
+                                });
                                 module.signals.push(SignalIr {
-                                    name: n,
+                                    name: n.clone(),
                                     width,
                                     kind: if is_real {
                                         SigKind::Real
@@ -261,11 +352,19 @@ impl<'a> Lower<'a> {
                                         SigKind::Wire
                                     },
                                     init: None,
-                                    mem: None,
-                                    signed: false,
+                                    mem,
+                                    signed: tname
+                                        .as_ref()
+                                        .and_then(|t| self.types.get(t))
+                                        .map_or(false, |t| t.signed),
                                 });
-                                self.names
-                                    .insert(module.signals[id as usize].name.clone(), id);
+                                if let Some(t) = &tname {
+                                    self.sig_types.insert(id, t.clone());
+                                }
+                                if mem.is_some() {
+                                    self.sig_is_mem.insert(id);
+                                }
+                                self.names.insert(n, id);
                             }
                         }
                     }
@@ -280,10 +379,352 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
+        self.extra_base = module.signals.len();
         for item in &item_nodes {
             self.lower_module_item(&mut module, item, &env);
         }
+        // Signals allocated while lowering statements (foreach index vars).
+        for sig in self.extra_signals.drain(..) {
+            let id = module.signals.len() as SigId;
+            self.names.insert(sig.name.clone(), id);
+            module.signals.push(sig);
+        }
         module
+    }
+
+    /// Lower a `typedef` into the type table; enum labels also become
+    /// constants. `pkg` prefixes names when the typedef lives in a package.
+    fn lower_typedef(
+        &mut self,
+        item: &SyntaxNode,
+        env: &HashMap<String, Value>,
+        pkg: Option<&str>,
+    ) {
+        let kids = real_children(item);
+        let name = kids
+            .iter()
+            .rev()
+            .find(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k));
+        let Some(name) = name else { return };
+        let key = match pkg {
+            Some(p) => format!("{}::{}", p, name),
+            None => name.clone(),
+        };
+        let body = kids.iter().find(|k| {
+            matches!(k.kind(), SyntaxKind::EnumType | SyntaxKind::StructType)
+                || (k.kind() == SyntaxKind::Ident && self.types.contains_key(&self.text(k)))
+                || matches!(k.kind(), SyntaxKind::Range)
+        });
+        // Determine the type body: EnumType / StructType node, or a base type
+        // ident (+ optional range) for `typedef logic [7:0] word_t;`.
+        let enum_node = kids.iter().find(|k| k.kind() == SyntaxKind::EnumType);
+        let struct_node = kids.iter().find(|k| k.kind() == SyntaxKind::StructType);
+        if let Some(en) = enum_node {
+            let ek = real_children(en);
+            // Optional base type + range.
+            let mut width = 32usize;
+            if let Some(r) = ek.iter().find(|k| k.kind() == SyntaxKind::Range) {
+                width = self.range_width(r, env);
+            } else if ek.iter().any(|k| k.kind() == SyntaxKind::Name) {
+                if let Some(r) = ek.iter().find(|k| k.kind() == SyntaxKind::Range) {
+                    width = self.range_width(r, env);
+                }
+            }
+            let mut vals: Vec<(String, u64)> = Vec::new();
+            let mut next = 0u64;
+            for k in &ek {
+                if k.kind() == SyntaxKind::Name && self.text(k) != "enum" {
+                    // Could be the base type name; enum labels are Names too.
+                    // Distinguish: labels are followed by `=`/`,`/`}`; the base
+                    // type name is the first Name and is a type keyword or typedef.
+                    let t = self.text(k);
+                    if vals.is_empty()
+                        && (type_kw_width(&t).is_some() || self.types.contains_key(&t))
+                    {
+                        continue;
+                    }
+                    let mut v = next;
+                    // Look for `= expr` right after this Name.
+                    if let Some(pos) = ek.iter().position(|x| std::ptr::eq(x, k)) {
+                        if let Some(e) = ek.get(pos + 1).filter(|e| is_expr_node(e.kind())) {
+                            if let Some(cv) = const_eval(&self.lower_expr(e, env), env) {
+                                if let Some(n) = cv.to_u64() {
+                                    v = n;
+                                }
+                            }
+                        }
+                    }
+                    next = v + 1;
+                    vals.push((t, v));
+                }
+            }
+            for (label, v) in &vals {
+                let lv = Value::from_u64(width, *v);
+                self.gconsts.insert(label.clone(), lv.clone());
+                if let Some(p) = pkg {
+                    self.gconsts.insert(format!("{}::{}", p, label), lv);
+                }
+            }
+            self.types.insert(
+                key,
+                TypeDef {
+                    width,
+                    signed: false,
+                    real: false,
+                    kind: TypeKind::Enum(vals),
+                },
+            );
+            return;
+        }
+        if let Some(st) = struct_node {
+            let sk = real_children(st);
+            let mut fields: Vec<(String, usize)> = Vec::new();
+            let mut i = 0;
+            while i < sk.len() {
+                let mut width = 1usize;
+                if sk[i].kind() == SyntaxKind::Ident {
+                    let t = self.text(&sk[i]);
+                    width = type_kw_width(&t)
+                        .or_else(|| self.types.get(&t).map(|td| td.width))
+                        .unwrap_or(1);
+                    i += 1;
+                    if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                        width = self.range_width(&sk[i], env);
+                        i += 1;
+                    }
+                }
+                while i < sk.len() && sk[i].kind() == SyntaxKind::Name {
+                    fields.push((self.text(&sk[i]), width));
+                    i += 1;
+                    if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                        i += 1; // array field dimension
+                    }
+                }
+                // skip `;`
+                i += 1;
+            }
+            let total: usize = fields.iter().map(|f| f.1).sum();
+            let mut lsb = total;
+            let mut with_off: Vec<(String, usize, usize)> = Vec::new();
+            for (n, w) in &fields {
+                lsb -= w;
+                with_off.push((n.clone(), *w, lsb));
+            }
+            let signed = sk
+                .iter()
+                .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "signed");
+            self.types.insert(
+                key,
+                TypeDef {
+                    width: total.max(1),
+                    signed,
+                    real: false,
+                    kind: TypeKind::Struct(with_off),
+                },
+            );
+            return;
+        }
+        let _ = body;
+        // Plain typedef: base type keyword or existing typedef, optional range.
+        let mut width = 1usize;
+        let mut signed = false;
+        let mut real = false;
+        if let Some(r) = kids.iter().find(|k| k.kind() == SyntaxKind::Range) {
+            width = self.range_width(r, env);
+        }
+        for k in &kids {
+            if k.kind() == SyntaxKind::Ident {
+                let t = self.text(k);
+                match t.as_str() {
+                    "signed" => signed = true,
+                    "real" => {
+                        real = true;
+                        width = 64;
+                    }
+                    "typedef" => {}
+                    _ => {
+                        if width == 1 {
+                            if let Some(w) = type_kw_width(&t) {
+                                width = w;
+                            } else if let Some(td) = self.types.get(&t) {
+                                width = td.width;
+                                signed = td.signed;
+                                real = td.real;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.types.insert(
+            key,
+            TypeDef {
+                width,
+                signed,
+                real,
+                kind: TypeKind::Plain,
+            },
+        );
+    }
+
+    /// `import p::*;` / `import p::x;` — merge package scope into the module:
+    /// constants, typedefs, and functions (renamed to `p::f`).
+    fn lower_import(
+        &mut self,
+        module: &mut ModuleIr,
+        item: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) {
+        let _ = env;
+        for name_node in real_children(item)
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+        {
+            let text = self.text(name_node);
+            let parts: Vec<&str> = text.split("::").collect();
+            let (Some(pkg), item_name) = (parts.first(), parts.get(1)) else {
+                continue;
+            };
+            let Some(p) = self.packages.get(*pkg).cloned() else {
+                self.err(
+                    name_node.span(),
+                    format!("unknown package '{}' in import", pkg),
+                );
+                continue;
+            };
+            let star = item_name == Some(&"*");
+            for param in &p.params {
+                self.gconsts
+                    .insert(format!("{}::{}", pkg, param.name), param.default.clone());
+                if star {
+                    self.gconsts
+                        .insert(param.name.clone(), param.default.clone());
+                } else if Some(param.name.as_str()) == item_name.copied() {
+                    self.gconsts
+                        .insert(param.name.clone(), param.default.clone());
+                }
+            }
+            for f in &p.functions {
+                let qualified = format!("{}::{}", pkg, f.name);
+                if star || Some(f.name.as_str()) == item_name.copied() {
+                    let mut f2 = f.clone();
+                    f2.name = qualified.clone();
+                    module.functions.push(f2);
+                }
+            }
+            // Typedefs and enum labels of the package.
+            for (tname, td) in &self.types.clone() {
+                if let Some(rest) = tname.strip_prefix(&format!("{}::", pkg)) {
+                    if star || rest == *item_name.unwrap_or(&"") {
+                        self.types.insert(rest.to_string(), td.clone());
+                    }
+                }
+            }
+            for (cname, cv) in &self.gconsts.clone() {
+                if let Some(rest) = cname.strip_prefix(&format!("{}::", pkg)) {
+                    if star || rest == *item_name.unwrap_or(&"") {
+                        self.gconsts.insert(rest.to_string(), cv.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lower a top-level `class` — full class support lands with the
+    /// class/object slice; for now record a stub so `C c;` decls parse.
+    fn lower_class(&mut self, c: &SyntaxNode) -> ModuleIr {
+        let kids = real_children(c);
+        let name = kids
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))
+            .unwrap_or_else(|| "<anon_class>".to_string());
+        self.err(
+            c.span(),
+            format!("class '{}' is parsed but not yet supported", name),
+        );
+        ModuleIr {
+            name,
+            params: Vec::new(),
+            ports: Vec::new(),
+            signals: Vec::new(),
+            assigns: Vec::new(),
+            processes: Vec::new(),
+            functions: Vec::new(),
+            instances: Vec::new(),
+            time_unit_fs: self.time_unit_fs,
+        }
+    }
+
+    /// Lower `'{ a: x, b: y, default: z }` against the struct type of the LHS:
+    /// concat fields in declaration order (first field = MSB).
+    fn lower_pattern(
+        &mut self,
+        pat: &SyntaxNode,
+        lhs: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let pk = real_children(pat);
+        // (label, expr) pairs in source order.
+        let mut entries: Vec<(Option<String>, Expr)> = Vec::new();
+        let mut i = 0;
+        while i < pk.len() {
+            let label = if pk[i].kind() == SyntaxKind::Name {
+                let l = self.text(&pk[i]);
+                i += 1;
+                Some(l)
+            } else {
+                None
+            };
+            if i < pk.len() && is_expr_node(pk[i].kind()) {
+                let e = self.lower_expr(&pk[i], env);
+                entries.push((label, e));
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        // LHS struct type.
+        let lhs_name = if lhs.kind() == SyntaxKind::Name {
+            self.text(lhs)
+        } else {
+            return None;
+        };
+        let id = self.sig_id(&lhs_name)?;
+        let tn = self.sig_types.get(&id)?.clone();
+        let td = self.types.get(&tn)?.clone();
+        let TypeKind::Struct(fields) = td.kind else {
+            // Non-struct target: positional concat.
+            return Some(Expr::Concat(entries.into_iter().map(|(_, e)| e).collect()));
+        };
+        let default = entries
+            .iter()
+            .find(|(l, _)| l.as_deref() == Some("default"))
+            .map(|(_, e)| e.clone());
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut pos = 0usize;
+        for (fname, fw, _lsb) in &fields {
+            let named = entries
+                .iter()
+                .find(|(l, _)| l.as_deref() == Some(fname.as_str()))
+                .map(|(_, e)| e.clone());
+            let e = named.or_else(|| {
+                let p = entries
+                    .iter()
+                    .enumerate()
+                    .find(|(pi, (l, _))| *pi >= pos && l.is_none());
+                p.map(|(pi, (_, e))| {
+                    pos = pi + 1;
+                    e.clone()
+                })
+            });
+            parts.push(match e {
+                Some(e) => e,
+                None => default.clone().unwrap_or_else(|| Expr::Lit(Value::x(*fw))),
+            });
+        }
+        Some(Expr::Concat(parts))
     }
 
     fn lower_port(&mut self, module: &mut ModuleIr, p: &SyntaxNode, env: &HashMap<String, Value>) {
@@ -340,13 +781,79 @@ impl<'a> Lower<'a> {
     /// Width of a declaration: an explicit `[msb:lsb]` range wins, else the
     /// type keyword (`integer` = 32 bits, …), else 1.
     fn decl_width(&mut self, kids: &[SyntaxNode], env: &HashMap<String, Value>) -> usize {
-        if let Some(r) = kids.iter().find(|k| k.kind() == SyntaxKind::Range) {
+        let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+        if let Some(r) = kids
+            .iter()
+            .enumerate()
+            .find(|(i, k)| k.kind() == SyntaxKind::Range && name_pos.map_or(true, |np| *i < np))
+            .map(|(_, k)| k)
+        {
             return self.range_width(r, env);
+        }
+        if let Some(t) = self.decl_type_name(kids) {
+            if let Some(td) = self.types.get(&t) {
+                return td.width;
+            }
         }
         kids.iter()
             .filter(|k| k.kind() == SyntaxKind::Ident)
             .find_map(|k| type_kw_width(&self.text(k)))
             .unwrap_or(1)
+    }
+
+    /// The declared type name of a Decl node when it is a user type
+    /// (`word_t w;` → `word_t`), else None.
+    fn decl_type_name(&self, kids: &[SyntaxNode]) -> Option<String> {
+        // Skip modifiers (var/const/rand/...), then the first Ident that is a
+        // known user type (a type keyword like `int` is not in `types`).
+        for k in kids {
+            if k.kind() == SyntaxKind::Ident {
+                let t = self.text(k);
+                if self.types.contains_key(&t) {
+                    return Some(t);
+                }
+            }
+            if k.kind() == SyntaxKind::Name {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Memory depth of a dimension after a name: `[0:255]` → 256,
+    /// `[]` / `[$]` (dynamic array / queue) → 0 (grows on demand),
+    /// `[n]` (assoc) → 0 as well (sparse).
+    fn range_depth(&mut self, r: &SyntaxNode, env: &HashMap<String, Value>) -> usize {
+        let kids = real_children(r);
+        // Assoc-array key type (`aa[string]`) or queue `q[$]`: no depth.
+        let nonpunct: Vec<&SyntaxNode> = kids
+            .iter()
+            .filter(|k| k.kind() != SyntaxKind::Punct)
+            .collect();
+        if nonpunct.len() == 1 && nonpunct[0].kind() == SyntaxKind::Name {
+            return 0;
+        }
+        let exprs: Vec<Expr> = kids
+            .into_iter()
+            .filter(|c| is_expr_node(c.kind()))
+            .map(|c| self.lower_expr(&c, env))
+            .collect();
+        if exprs.is_empty() {
+            return 0; // `[]` or `[$]`
+        }
+        if exprs.len() == 1 {
+            if let Some(v) = const_eval(&exprs[0], env).and_then(|v| v.to_u64()) {
+                // `mem [255:0]` style single bound, or assoc `[string]` (non-const).
+                return v as usize + 1;
+            }
+            return 0; // assoc array key type, e.g. `[string]`
+        }
+        if let (Some(a), Some(b)) = (const_eval(&exprs[0], env), const_eval(&exprs[1], env)) {
+            if let (Some(a), Some(b)) = (a.to_u64(), b.to_u64()) {
+                return (a as i64 - b as i64).unsigned_abs() as usize + 1;
+            }
+        }
+        0
     }
 
     fn range_width(&mut self, r: &SyntaxNode, env: &HashMap<String, Value>) -> usize {
@@ -480,6 +987,9 @@ impl<'a> Lower<'a> {
                     self.lower_decl_init(module, item, env);
                 }
             }
+            // Handled in the pre-pass.
+            SyntaxKind::Typedef | SyntaxKind::Import => {}
+            SyntaxKind::Class | SyntaxKind::Package => {}
             SyntaxKind::Assign => {
                 let kids = real_children(item);
                 let eq = kids
@@ -537,7 +1047,7 @@ impl<'a> Lower<'a> {
                     .get(i + 1)
                     .map_or(false, |k| k.kind() == SyntaxKind::Range)
                 {
-                    let depth = self.range_width(&kids[i + 1], env);
+                    let depth = self.range_depth(&kids[i + 1], env);
                     if let Some(id) = self.sig_id(&name) {
                         module.signals[id as usize].mem = Some(depth);
                     }
@@ -794,18 +1304,208 @@ impl<'a> Lower<'a> {
                         let lhs = body[..op].iter().find(|k| is_expr_node(k.kind()));
                         let rhs = body[op + 1..].iter().find(|k| is_expr_node(k.kind()));
                         match (lhs, rhs) {
-                            (Some(l), Some(r)) => Stmt::Assign {
-                                lhs: self.lower_expr(l, env),
-                                rhs: self.lower_expr(r, env),
-                                nba,
-                            },
+                            (Some(l), Some(r)) => {
+                                // `arr = new[n]` — dynamic array allocation.
+                                if r.kind() == SyntaxKind::Allocator
+                                    && real_children(r).iter().any(|k| {
+                                        k.kind() == SyntaxKind::Punct && self.text(k) == "["
+                                    })
+                                {
+                                    let size = real_children(r)
+                                        .into_iter()
+                                        .find(|k| is_expr_node(k.kind()))
+                                        .map(|k| self.lower_expr(&k, env))
+                                        .unwrap_or_else(|| Expr::Lit(Value::from_u64(32, 0)));
+                                    return Stmt::SysCall {
+                                        name: "$array_new".to_string(),
+                                        args: vec![self.lower_expr(l, env), size],
+                                    };
+                                }
+                                // `p = '{a: x, b: y}` — struct assignment pattern.
+                                if r.kind() == SyntaxKind::Pattern {
+                                    if let Some(e) = self.lower_pattern(r, l, env) {
+                                        return Stmt::Assign {
+                                            lhs: self.lower_expr(l, env),
+                                            rhs: e,
+                                            nba,
+                                        };
+                                    }
+                                }
+                                Stmt::Assign {
+                                    lhs: self.lower_expr(l, env),
+                                    rhs: self.lower_expr(r, env),
+                                    nba,
+                                }
+                            }
                             _ => Stmt::Null,
                         }
                     }
                     None => match body.iter().find(|k| is_expr_node(k.kind())) {
-                        Some(e) => Stmt::ExprStmt(self.lower_expr(e, env)),
+                        Some(e) => {
+                            // Array method call as a statement: `q.push_back(x);`
+                            if e.kind() == SyntaxKind::Call {
+                                let ck = real_children(e);
+                                let cname = ck
+                                    .first()
+                                    .map(|k| self.text(k).trim_start_matches('$').to_string())
+                                    .unwrap_or_default();
+                                if let Some(dot) = cname.find('.') {
+                                    let base = &cname[..dot];
+                                    let method = &cname[dot + 1..];
+                                    if let Some(id) = self.sig_id(base) {
+                                        if self.sig_is_mem.contains(&id) {
+                                            let mut args = vec![Expr::Sig(id)];
+                                            args.extend(
+                                                ck[1..]
+                                                    .iter()
+                                                    .filter(|k| is_expr_node(k.kind()))
+                                                    .map(|k| self.lower_expr(k, env)),
+                                            );
+                                            return Stmt::SysCall {
+                                                name: format!("$array_{}", method),
+                                                args,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            Stmt::ExprStmt(self.lower_expr(e, env))
+                        }
                         None => Stmt::Null,
                     },
+                }
+            }
+            // Block-level declaration (`int x = 3;` inside begin/end):
+            // allocate a hidden signal, then lower any init as an assignment.
+            SyntaxKind::Decl => {
+                let dk = real_children(s);
+                let width = self.decl_width(&dk, env);
+                let tname = self.decl_type_name(&dk);
+                let mut inits = Vec::new();
+                for (i, k) in dk.iter().enumerate() {
+                    if k.kind() == SyntaxKind::Name {
+                        let n = self.text(k);
+                        if self.sig_id(&n).is_none() {
+                            let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                            let mem = dk.get(i + 1).and_then(|r| {
+                                if r.kind() == SyntaxKind::Range {
+                                    Some(self.range_depth(r, env))
+                                } else {
+                                    None
+                                }
+                            });
+                            self.extra_signals.push(SignalIr {
+                                name: n.clone(),
+                                width,
+                                kind: SigKind::Wire,
+                                init: None,
+                                mem,
+                                signed: false,
+                            });
+                            if mem.is_some() {
+                                self.sig_is_mem.insert(id);
+                            }
+                            if let Some(t) = &tname {
+                                self.sig_types.insert(id, t.clone());
+                            }
+                            self.names.insert(n, id);
+                        }
+                        // `= expr` init?
+                        if dk.get(i + 1).map_or(false, |k| self.text(k) == "=") {
+                            if let Some(e) = dk.get(i + 2).filter(|e| is_expr_node(e.kind())) {
+                                inits.push(Stmt::Assign {
+                                    lhs: Expr::Sig(self.sig_id(&self.text(k)).unwrap()),
+                                    rhs: self.lower_expr(e, env),
+                                    nba: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                if inits.is_empty() {
+                    Stmt::Null
+                } else if inits.len() == 1 {
+                    inits.pop().unwrap()
+                } else {
+                    Stmt::Block(inits)
+                }
+            }
+            SyntaxKind::Foreach => {
+                // `foreach (arr[i]) body` → for (i = 0; i < arr.size(); i++) body
+                let kids = real_children(s);
+                let hdr = kids.iter().find(|k| is_expr_node(k.kind())).cloned();
+                let body_node = kids.iter().find(|k| is_stmt_node(k.kind())).cloned();
+                let (arr_node, idx_name): (Option<SyntaxNode>, String) = match &hdr {
+                    Some(h) if h.kind() == SyntaxKind::Index => {
+                        let ik = real_children(h);
+                        let exprs: Vec<&SyntaxNode> =
+                            ik.iter().filter(|k| is_expr_node(k.kind())).collect();
+                        let arr = exprs.first().map(|n| (*n).clone());
+                        let idx = exprs
+                            .get(1)
+                            .filter(|n| n.kind() == SyntaxKind::Name)
+                            .map(|n| self.text(n))
+                            .unwrap_or_else(|| "i".to_string());
+                        (arr, idx)
+                    }
+                    Some(h) => (Some(h.clone()), "i".to_string()),
+                    None => (None, "i".to_string()),
+                };
+                let Some(arr_node) = arr_node else {
+                    self.err(s.span(), "foreach needs an array");
+                    return Stmt::Null;
+                };
+                let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                self.extra_signals.push(SignalIr {
+                    name: format!("__foreach_{}", idx_name),
+                    width: 32,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: None,
+                    signed: false,
+                });
+                self.names.insert(idx_name, id);
+                let arr = self.lower_expr(&arr_node, env);
+                let idx = Expr::Sig(id);
+                let body = body_node
+                    .map(|b| Box::new(self.lower_stmt(&b, env)))
+                    .unwrap_or_else(|| Box::new(Stmt::Null));
+                Stmt::For {
+                    init: Box::new(Stmt::Assign {
+                        lhs: idx.clone(),
+                        rhs: Expr::Lit(Value::from_u64(32, 0)),
+                        nba: false,
+                    }),
+                    cond: Expr::Bin {
+                        op: BinOp::Lt,
+                        l: Box::new(idx.clone()),
+                        r: Box::new(Expr::Call {
+                            name: "$array_size".to_string(),
+                            args: vec![arr],
+                        }),
+                    },
+                    step: Box::new(Stmt::Assign {
+                        lhs: idx.clone(),
+                        rhs: Expr::Bin {
+                            op: BinOp::Add,
+                            l: Box::new(idx),
+                            r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                        },
+                        nba: false,
+                    }),
+                    body,
+                }
+            }
+            // `return expr;` in a function: assign to the function-name slot 0.
+            SyntaxKind::ReturnStmt if self.in_function => {
+                let kids = real_children(s);
+                let e = kids.iter().find(|k| is_expr_node(k.kind()));
+                Stmt::Assign {
+                    lhs: Expr::Sig(0),
+                    rhs: e
+                        .map(|e| self.lower_expr(e, env))
+                        .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
+                    nba: false,
                 }
             }
             SyntaxKind::Delay => {
@@ -1127,6 +1827,12 @@ impl<'a> Lower<'a> {
             match k.kind() {
                 SyntaxKind::Name if name.is_empty() => name = self.text(k),
                 SyntaxKind::Range => ret_width = self.range_width(k, env),
+                // Return type keyword (`function int f...`): pick up its width.
+                SyntaxKind::Ident if name.is_empty() => {
+                    if let Some(w) = type_kw_width(&self.text(k)) {
+                        ret_width = w;
+                    }
+                }
                 SyntaxKind::Port => arg_nodes.push(k.clone()),
                 SyntaxKind::Decl => local_nodes.push(k.clone()),
                 _ if is_stmt_node(k.kind()) => body_nodes.push(k.clone()),
@@ -1134,7 +1840,8 @@ impl<'a> Lower<'a> {
             }
         }
         let mut args = Vec::new();
-        let mut slots: Vec<(String, usize)> = Vec::new();
+        // Slot 0 is the function name (the return value); args follow.
+        let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
         for a in &arg_nodes {
             let ak = real_children(a);
             let aname = ak
@@ -1146,6 +1853,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .find(|k| k.kind() == SyntaxKind::Range)
                 .map(|r| self.range_width(r, env))
+                .or_else(|| {
+                    ak.iter()
+                        .filter(|k| k.kind() == SyntaxKind::Ident)
+                        .find_map(|k| type_kw_width(&self.text(k)))
+                })
                 .unwrap_or(1);
             args.push((aname.clone(), aw));
             slots.push((aname, aw));
@@ -1157,6 +1869,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .find(|k| k.kind() == SyntaxKind::Range)
                 .map(|r| self.range_width(r, env))
+                .or_else(|| {
+                    dk.iter()
+                        .filter(|k| k.kind() == SyntaxKind::Ident)
+                        .find_map(|k| type_kw_width(&self.text(k)))
+                })
                 .unwrap_or(1);
             for k in &dk {
                 if k.kind() == SyntaxKind::Name {
@@ -1180,7 +1897,10 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        let saved_in_fn = self.in_function;
+        self.in_function = true;
         let body = Stmt::Block(body_nodes.iter().map(|s| self.lower_stmt(s, env)).collect());
+        self.in_function = saved_in_fn;
         self.names = saved_names;
         module.functions.push(FuncIr {
             name,
@@ -1279,8 +1999,39 @@ impl<'a> Lower<'a> {
             SyntaxKind::Literal => self.lower_literal(e),
             SyntaxKind::Name => {
                 let name = self.text(e);
+                if let Some(v) = env.get(&name).or_else(|| self.gconsts.get(&name)) {
+                    return Expr::Lit(v.clone());
+                }
+                // Struct field select: `p.a` where p is a packed-struct signal.
+                if let Some(dot) = name.find('.') {
+                    let root = &name[..dot];
+                    if let Some(id) = self.sig_id(root) {
+                        if let Some(tn) = self.sig_types.get(&id).cloned() {
+                            if let Some(td) = self.types.get(&tn).cloned() {
+                                if let TypeKind::Struct(fields) = &td.kind {
+                                    let field = &name[dot + 1..];
+                                    if let Some((_, fw, lsb)) =
+                                        fields.iter().find(|(n, _, _)| n == field)
+                                    {
+                                        return Expr::Sel {
+                                            e: Box::new(Expr::Sig(id)),
+                                            msb: Box::new(Expr::Lit(Value::from_u64(
+                                                32,
+                                                (lsb + fw - 1) as u64,
+                                            ))),
+                                            lsb: Box::new(Expr::Lit(Value::from_u64(
+                                                32,
+                                                *lsb as u64,
+                                            ))),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let base = name.rsplit('.').next().unwrap_or(name.as_str());
-                if let Some(v) = env.get(base) {
+                if let Some(v) = env.get(base).or_else(|| self.gconsts.get(base)) {
                     return Expr::Lit(v.clone());
                 }
                 match self.sig_id(base) {
@@ -1367,6 +2118,20 @@ impl<'a> Lower<'a> {
                     .first()
                     .map(|k| self.text(k).trim_start_matches('$').to_string())
                     .unwrap_or_default();
+                // `q.size()` on an array → size query with the array as arg.
+                if let Some(dot) = name.rfind('.') {
+                    let (base, method) = (&name[..dot], &name[dot + 1..]);
+                    if matches!(method, "size" | "num") {
+                        if let Some(id) = self.sig_id(base) {
+                            if self.sig_is_mem.contains(&id) {
+                                return Expr::Call {
+                                    name: "$array_size".to_string(),
+                                    args: vec![Expr::Sig(id)],
+                                };
+                            }
+                        }
+                    }
+                }
                 let args = kids[1..]
                     .iter()
                     .filter(|k| is_expr_node(k.kind()))
@@ -1381,6 +2146,24 @@ impl<'a> Lower<'a> {
                     .map(|k| self.lower_expr(&k, env))
                     .collect(),
             ),
+            // Assignment pattern `'{ a: x, b: y }`: lowered contextually in
+            // assignments (struct field order); here, positional concat.
+            SyntaxKind::Pattern => Expr::Concat(
+                real_children(e)
+                    .into_iter()
+                    .filter(|k| is_expr_node(k.kind()))
+                    .map(|k| self.lower_expr(&k, env))
+                    .collect(),
+            ),
+            // `new[n]` for dynamic arrays: handled in assignment context; as a
+            // bare expression it is an error.
+            SyntaxKind::Allocator => {
+                self.err(
+                    e.span(),
+                    "`new` is only supported as a constructor call or array allocation in an assignment",
+                );
+                Expr::Lit(Value::x(32))
+            }
             SyntaxKind::Replicate => {
                 let kids = real_children(e);
                 let exprs: Vec<&SyntaxNode> =
@@ -1505,11 +2288,12 @@ fn unop_from_str(s: &str) -> Option<UnOp> {
 /// Bit width implied by a Verilog type keyword, if any.
 fn type_kw_width(t: &str) -> Option<usize> {
     Some(match t {
-        "integer" | "time" => 32,
+        "integer" | "time" | "int" => 32,
         "longint" => 64,
         "shortint" => 16,
         "byte" => 8,
         "real" => 64,
+        "bit" | "logic" | "reg" | "wire" => 1,
         _ => return None,
     })
 }

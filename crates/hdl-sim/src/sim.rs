@@ -1007,6 +1007,54 @@ impl Simulator {
 
     fn sys_call(&mut self, name: &str, args: Vec<Expr>) {
         match name {
+            // `arr = new[n]` — resize a dynamic array / queue.
+            "$array_new" => {
+                if let (Some(Expr::Sig(sig)), Some(n)) = (args.first(), args.get(1)) {
+                    let n = self.eval_expr(n, None).to_u64().unwrap_or(0) as usize;
+                    let sig = *sig as FlatSigId;
+                    let w = self.flat.signals[sig as usize].width;
+                    self.mems[sig as usize].resize(n, Value::x(w.max(1)));
+                    self.vals[sig as usize] = Value::from_u64(32, n as u64);
+                }
+            }
+            // Array method statement: `q.push_back(x)` — lowered to
+            // `$array_push_back` with the array as args[0].
+            m if m.starts_with("$array_") && m != "$array_new" => {
+                let method = &m["$array_".len()..];
+                if let Some(Expr::Sig(sig)) = args.first() {
+                    let sig = *sig as FlatSigId;
+                    if self.is_mem[sig as usize] {
+                        let w = self.flat.signals[sig as usize].width.max(1);
+                        let margs: Vec<Value> = args[1..]
+                            .iter()
+                            .map(|a| self.eval_expr(a, None).resize(w))
+                            .collect();
+                        match method {
+                            "push_back" => {
+                                if let Some(v) = margs.first() {
+                                    self.mems[sig as usize].push(v.clone());
+                                }
+                            }
+                            "push_front" => {
+                                if let Some(v) = margs.first() {
+                                    self.mems[sig as usize].insert(0, v.clone());
+                                }
+                            }
+                            "pop_back" => {
+                                self.mems[sig as usize].pop();
+                            }
+                            "pop_front" => {
+                                if !self.mems[sig as usize].is_empty() {
+                                    self.mems[sig as usize].remove(0);
+                                }
+                            }
+                            _ => {}
+                        }
+                        let n = self.mems[sig as usize].len();
+                        self.vals[sig as usize] = Value::from_u64(32, n as u64);
+                    }
+                }
+            }
             "display" | "write" => {
                 let text = self.fmt_args(&args);
                 let text = if name == "display" {
@@ -1858,6 +1906,16 @@ impl Simulator {
                 return Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64);
             }
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
+            // Array size: `$array_size(arr)` (foreach) or `q.size()`.
+            "$array_size" => {
+                if let Some(Expr::Sig(sig)) = args.first() {
+                    let sig = *sig as FlatSigId;
+                    let n = self.mems.get(sig as usize).map_or(0, |m| m.len());
+                    return Value::from_u64(32, n as u64);
+                }
+                return Value::x(32);
+            }
+
             // VHDL-2008 string functions: to_hstring/to_ostring/to_bstring give
             // radix digits (uppercase, 'X' for unknown nibbles); to_string of a
             // 1-bit value is its char, of a byte-multiple value its bytes.

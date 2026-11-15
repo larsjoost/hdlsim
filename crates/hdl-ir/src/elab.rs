@@ -326,7 +326,9 @@ impl Flat {
             });
         }
         for f in &m.functions {
-            let mut slots: Vec<usize> = f.args.iter().map(|(_, w)| *w).collect();
+            // Slot 0 is the function name (return value), then args, then locals.
+            let mut slots: Vec<usize> = vec![f.ret_width.max(1)];
+            slots.extend(f.args.iter().map(|(_, w)| *w));
             let arg_ids: Vec<SigId> = (0..f.args.len() as SigId).collect();
             let local_base = f.args.len() as SigId;
             for l in &f.locals {
