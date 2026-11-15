@@ -1577,6 +1577,9 @@ impl<'e, 'a> Exec<'e, 'a> {
 
     fn eval(&mut self, e: &Expr) -> Result<Val, String> {
         match e {
+            Expr::Real(_) => {
+                Err("prove: real-typed expressions are unsupported in BMC".to_string())
+            }
             Expr::Lit(v) => Ok(Val {
                 // 2-valued: X/Z/… literal bits encode as 0.
                 bits: v
