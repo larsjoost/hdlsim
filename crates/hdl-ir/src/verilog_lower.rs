@@ -103,6 +103,12 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Delay
             | SyntaxKind::Wait
             | SyntaxKind::For
+            | SyntaxKind::While
+            | SyntaxKind::Repeat
+            | SyntaxKind::Forever
+            | SyntaxKind::DoWhile
+            | SyntaxKind::BreakStmt
+            | SyntaxKind::ContinueStmt
             | SyntaxKind::SysCall
     )
 }
@@ -685,6 +691,82 @@ impl<'a> Lower<'a> {
                     Stmt::Null
                 }
             }
+            SyntaxKind::While => {
+                // Desugar `while (c) body` into a For loop with no init/step.
+                let kids = real_children(s);
+                let cond = kids
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|c| self.lower_expr(c, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 1)));
+                let body = kids
+                    .iter()
+                    .find(|k| is_stmt_node(k.kind()))
+                    .map(|b| Box::new(self.lower_stmt(b, env)))
+                    .unwrap_or_else(|| Box::new(Stmt::Null));
+                Stmt::For {
+                    init: Box::new(Stmt::Null),
+                    cond,
+                    step: Box::new(Stmt::Null),
+                    body,
+                }
+            }
+            SyntaxKind::Forever => {
+                let kids = real_children(s);
+                let body = kids
+                    .iter()
+                    .find(|k| is_stmt_node(k.kind()))
+                    .map(|b| Box::new(self.lower_stmt(b, env)))
+                    .unwrap_or_else(|| Box::new(Stmt::Null));
+                Stmt::For {
+                    init: Box::new(Stmt::Null),
+                    cond: Expr::Lit(Value::from_u64(1, 1)),
+                    step: Box::new(Stmt::Null),
+                    body,
+                }
+            }
+            SyntaxKind::DoWhile => {
+                // `do body while (c)` = body; while (c) body;
+                let kids = real_children(s);
+                let stmts: Vec<&SyntaxNode> =
+                    kids.iter().filter(|k| is_stmt_node(k.kind())).collect();
+                let cond = kids
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|c| self.lower_expr(c, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::from_u64(0, 1)));
+                match stmts.first() {
+                    Some(b) => {
+                        let body = self.lower_stmt(b, env);
+                        Stmt::Block(vec![
+                            body.clone(),
+                            Stmt::For {
+                                init: Box::new(Stmt::Null),
+                                cond,
+                                step: Box::new(Stmt::Null),
+                                body: Box::new(body),
+                            },
+                        ])
+                    }
+                    None => Stmt::Null,
+                }
+            }
+            SyntaxKind::Repeat => {
+                let kids = real_children(s);
+                let count = kids
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|c| self.lower_expr(c, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::from_u64(0, 32)));
+                let body = kids
+                    .iter()
+                    .find(|k| is_stmt_node(k.kind()))
+                    .map(|b| Box::new(self.lower_stmt(b, env)))
+                    .unwrap_or_else(|| Box::new(Stmt::Null));
+                Stmt::Repeat { count, body }
+            }
+            SyntaxKind::BreakStmt => Stmt::Break,
+            SyntaxKind::ContinueStmt => Stmt::Continue,
             SyntaxKind::SysCall => {
                 let kids = real_children(s);
                 let name = kids
