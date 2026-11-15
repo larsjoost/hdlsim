@@ -117,6 +117,7 @@ hdlsim assist "why does tb.v fail"       # local prompt-to-task router (prints $
 hdlsim explain E0301                     # explain a diagnostic/lint code (no arg lists all)
 hdlsim gen tb --top counter counter.v    # generate a testbench skeleton from the top's ports
 hdlsim analyze counter.v                 # static heuristics: undriven (W0501) / unread (W0502) signals
+hdlsim doc counter.v tb.v --out html-docs/  # cross-linked HTML docs (index + page per unit, highlighted source)
 ```
 
 SVA-lite (Verilog): concurrent `assert property (@(posedge clk) a |-> b)` /
