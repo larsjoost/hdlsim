@@ -19,10 +19,12 @@
 //! - Observers get immutable event snapshots; they cannot corrupt the kernel.
 //! - The kernel never panics on design content; runtime problems are events.
 
+pub mod bmc;
 pub mod coverage;
 pub mod debug;
 pub mod events;
 pub mod rand;
+pub mod sat;
 pub mod sim;
 
 pub use events::{NullObserver, Observer, SimEvent};

@@ -124,7 +124,16 @@ hdlsim analyze counter.v                 # static heuristics: undriven (W0501) /
 hdlsim doc counter.v tb.v --out html-docs/  # cross-linked HTML docs (index + page per unit, highlighted source)
 hdlsim doctor                              # environment check: stdlib, config, libraries, cache (exit 1 on failure)
 hdlsim completions bash > ~/.local/share/bash-completion/completions/hdlsim  # shell completions (bash|zsh|fish)
+hdlsim prove --top dut --bmc 20 dut.v      # bounded model checking: check `assert property` within N clock edges
 ```
+
+`hdlsim prove` runs bounded model checking with the built-in CDCL SAT solver
+(`hdl_sim::sat` + `hdl_sim::bmc`): it unrolls the design `N` clock edges
+(`--bmc`, default 10), treats the DUT ports as free inputs, and checks every
+`assert property` / VHDL `assert`. Exit **0** = no violation within the bound
+(SAFE, not a proof), **1** = property violated (a counterexample trace is
+printed), **2** = unsupported construct (memories, `#delay`, non-constant
+indices, …).
 
 SVA-lite (Verilog): concurrent `assert property (@(posedge clk) a |-> b)` /
 `|=>` and immediate `assert (e) [else s];` are simulated — a failed assertion

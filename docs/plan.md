@@ -54,9 +54,17 @@ source → tokens → CST → AST → IR (elaborated) → sim events → sinks (
   `hdlsim doctor` / `hdlsim completions`.
 - Phase 2 (remaining): FST wave format (risky to hand-roll offline - may skip),
   analog waves (needs real-valued kernel support - big).
-- Phase 3 (done): reverse debug (`back [N]` in do-files).
-- Phase 3 (remaining): SystemVerilog proper, VHDL-2008, constrained-random stimulus,
-  own CDCL + BMC (`hdlsim prove top --bmc N`), UVM-lite.
+- Phase 3 prove notes: `hdl-sim::sat` is a MiniSat-style CDCL solver (two-watched
+  literals, first-UIP learning, VSIDS, Luby restarts); `hdl-sim::bmc` encodes the
+  elaborated IR 2-valued (X/Z→0, `rising_edge`≡true per step, div-by-0→0) with
+  Tseitin gates and checks `assert property`/`assert` as safety properties.
+  Memories, `#delay`, non-constant indices and dynamic loop bounds are clean
+  errors. UNSAT proofs scale roughly linearly in BMC depth but can hit CDCL
+  search cliffs (8-bit accumulator, depth 30 ≈ 20 s release).
+- Phase 3 (done): reverse debug (`back [N]` in do-files), constrained-random
+  stimulus (`$urandom`/`$urandom_range`/`$rand_solve`), own CDCL + BMC
+  (`hdlsim prove --top dut --bmc N`).
+- Phase 3 (remaining): SystemVerilog proper, VHDL-2008, UVM-lite.
 
 ## Performance
 Arena-allocated IR, indices not pointers, zero allocation in the event loop; heap
@@ -118,7 +126,8 @@ Merged PRs (main @ 19b5f60, 2026-11-15):
 | #23 | `hdlsim doc` cross-linked HTML docs |
 | #24 | `--seed N` reproducible `$random`; mixed-language co-sim tests |
 | #25 | `hdlsim doctor` + `hdlsim completions` (bash/zsh/fish) |
+| #27 | constrained-random stimulus: `$urandom`/`$urandom_range` + `$rand_solve` |
+| #28 | `hdlsim prove` — own CDCL SAT solver + BMC over the elaborated IR |
 
-Remaining, in suggested order: constrained-random stimulus, `hdlsim prove`
-(CDCL + BMC), FST/analog waves (see phase-2 notes), then SystemVerilog proper /
-VHDL-2008 / UVM-lite.
+Remaining, in suggested order: FST/analog waves (see phase-2 notes), then
+SystemVerilog proper / VHDL-2008 / UVM-lite.
