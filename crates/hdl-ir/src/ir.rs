@@ -75,6 +75,8 @@ pub enum SigKind {
     Inout,
     /// Loop variable of a generate-for (elaboration-time constant).
     Genvar,
+    /// Verilog `real` / VHDL `real`: 64-bit, value is the f64 bit pattern.
+    Real,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +206,8 @@ pub enum Stmt {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Lit(Value),
+    /// Real (floating-point) literal, e.g. Verilog `1.5`, VHDL `1.5`.
+    Real(f64),
     Sig(SigId),
     Bin {
         op: BinOp,
@@ -265,7 +269,7 @@ impl Expr {
     /// All signal ids referenced by this expression (for `@*` sensitivity).
     pub fn collect_sigs(&self, out: &mut Vec<SigId>) {
         match self {
-            Expr::Lit(_) => {}
+            Expr::Lit(_) | Expr::Real(_) => {}
             Expr::Sig(s) => out.push(*s),
             Expr::Bin { l, r, .. } => {
                 l.collect_sigs(out);

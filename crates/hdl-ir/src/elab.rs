@@ -419,6 +419,7 @@ fn port_dir_kind(d: Dir) -> SigKind {
 pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
     match e {
         Expr::Lit(v) => Expr::Lit(v.clone()),
+        Expr::Real(x) => Expr::Real(*x),
         Expr::Sig(s) => Expr::Sig(map[*s as usize]),
         Expr::Bin { op, l, r } => Expr::Bin {
             op: *op,

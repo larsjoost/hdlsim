@@ -4,12 +4,14 @@
 //! `.html` file with the trace data embedded as JSON plus inline CSS/JS — no
 //! network, no external assets, works offline in any browser. Features:
 //! signal search + visibility toggles, digital traces for 1-bit signals, hex
-//! buses, time axis, wheel zoom + drag pan, cursor with per-signal readout,
-//! and a transcript pane for `$display`/`report` messages.
+//! buses, analog polylines for `real` signals, time axis, wheel zoom + drag pan,
+//! cursor with per-signal readout, and a transcript pane for `$display`/`report`
+//! messages.
 
 use super::{bits_msb, json_str, WaveSink};
 use hdl_ir::elab::Flat;
 use hdl_ir::value::Value;
+use hdl_ir::SigKind;
 use hdl_sim::events::SimEvent;
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,8 +26,8 @@ struct Rec {
 pub struct HtmlSink {
     file: Option<std::fs::File>,
     path: PathBuf,
-    /// (name, width) per signal, captured from the flat design.
-    sigs: Vec<(String, usize)>,
+    /// (name, width, is_real) per signal, captured from the flat design.
+    sigs: Vec<(String, usize, bool)>,
     /// Initial values at t=0 plus every recorded change.
     recs: Vec<Rec>,
     /// Transcript lines: (time_fs, text).
@@ -36,10 +38,10 @@ pub struct HtmlSink {
 
 impl HtmlSink {
     pub fn new(file: std::fs::File, path: PathBuf, flat: &Flat) -> HtmlSink {
-        let sigs: Vec<(String, usize)> = flat
+        let sigs: Vec<(String, usize, bool)> = flat
             .signals
             .iter()
-            .map(|s| (s.name.clone(), s.width.max(1)))
+            .map(|s| (s.name.clone(), s.width.max(1), s.kind == SigKind::Real))
             .collect();
         let mut sink = HtmlSink {
             file: Some(file),
@@ -56,7 +58,7 @@ impl HtmlSink {
             sink.recs.push(Rec {
                 t: 0,
                 s: i as u32,
-                v: bits_msb(&v),
+                v: fmt_rec(&v, s.kind == SigKind::Real),
             });
         }
         sink
@@ -64,15 +66,16 @@ impl HtmlSink {
 
     fn write_html(&mut self, flat: &Flat) {
         let mut data = String::from("{\"sigs\":[");
-        for (i, (name, width)) in self.sigs.iter().enumerate() {
+        for (i, (name, width, real)) in self.sigs.iter().enumerate() {
             if i > 0 {
                 data.push(',');
             }
             data.push_str(&format!(
-                "{{\"id\":{},\"name\":{},\"w\":{}}}",
+                "{{\"id\":{},\"name\":{},\"w\":{},\"real\":{}}}",
                 i,
                 json_str(name),
-                width
+                width,
+                real
             ));
         }
         data.push_str("],\"events\":[");
@@ -103,7 +106,7 @@ impl HtmlSink {
 }
 
 impl WaveSink for HtmlSink {
-    fn on_event(&mut self, ev: &SimEvent, _flat: &Flat) {
+    fn on_event(&mut self, ev: &SimEvent, flat: &Flat) {
         match ev {
             SimEvent::TimeAdvance { time_fs } => {
                 self.time = *time_fs;
@@ -114,10 +117,15 @@ impl WaveSink for HtmlSink {
             SimEvent::SignalChange {
                 sig, new, time_fs, ..
             } => {
+                let real = flat
+                    .signals
+                    .get(*sig as usize)
+                    .map(|s| s.kind == SigKind::Real)
+                    .unwrap_or(false);
                 self.recs.push(Rec {
                     t: *time_fs,
                     s: *sig,
-                    v: bits_msb(new),
+                    v: fmt_rec(new, real),
                 });
                 if *time_fs > self.max_time {
                     self.max_time = *time_fs;
@@ -132,6 +140,19 @@ impl WaveSink for HtmlSink {
 
     fn finish(&mut self, flat: &Flat) {
         self.write_html(flat);
+    }
+}
+
+/// Recorded value as a string: bit string for digital signals, decimal for
+/// real signals (the JS side parses it with parseFloat when sig.real).
+fn fmt_rec(v: &Value, real: bool) -> String {
+    if real {
+        match v.to_f64() {
+            Some(f) => format!("{}", f),
+            None => "x".to_string(),
+        }
+    } else {
+        bits_msb(v)
     }
 }
 
@@ -173,6 +194,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
   .axis { stroke:var(--line); stroke-width:1; }
   .tlab { fill:var(--dim); font-size:10px; }
   .sig1 { stroke:var(--acc); stroke-width:1.6; fill:none; }
+  .analog { stroke:#5fd38a; stroke-width:1.4; fill:none; }
   .busband { fill:#2a3140; stroke:var(--bus); stroke-width:1; }
   .buslab { fill:var(--bus); font-size:10px; text-anchor:middle; }
   .xlab { fill:var(--x); font-size:10px; text-anchor:middle; }
@@ -282,6 +304,22 @@ function draw() {
   rows.forEach((si, r) => {
     const y = 18 + r * (ROW_H + GAP), s = sigs[si];
     const evs = bySig[si];
+    if (s.real) {
+      // analog trace: polyline, y auto-scaled to the signal's value range
+      let lo = Infinity, hi = -Infinity;
+      for (const [t, v] of evs) { const f = parseFloat(v); if (!isNaN(f)) { if (f < lo) lo = f; if (f > hi) hi = f; } }
+      if (!isFinite(lo)) { lo = 0; hi = 1; }
+      if (hi - lo < 1e-12) { const m = (hi + lo) / 2; lo = m - 0.5; hi = m + 0.5; }
+      const yOf = f => y + (ROW_H - 6) - (f - lo) / (hi - lo) * (ROW_H - 6);
+      let d = '';
+      for (const [t, v] of evs) {
+        const f = parseFloat(v); if (isNaN(f)) continue;
+        d += (d ? ' L' : 'M') + x(t).toFixed(1) + ' ' + yOf(f).toFixed(1);
+      }
+      if (d) d += ' L' + x(view.t0 + view.span).toFixed(1) + ' ' + yOf(parseFloat(valAt(si, view.t0 + view.span))).toFixed(1);
+      if (d) svg.appendChild(el('path', { d, class: 'analog' }));
+      return;
+    }
     if (s.w === 1) {
       let d = '', cur = null;
       for (const [t, v] of evs) {
@@ -316,7 +354,7 @@ function draw() {
   }
   rows.forEach((si, r) => {
     const elv = document.getElementById('val' + si);
-    if (elv) elv.textContent = cursorT === null ? '' : (sigs[si].w === 1 ? valAt(si, cursorT).slice(-1) : jsonBitsToHex(valAt(si, cursorT)));
+    if (elv) elv.textContent = cursorT === null ? '' : (sigs[si].real ? valAt(si, cursorT) : (sigs[si].w === 1 ? valAt(si, cursorT).slice(-1) : jsonBitsToHex(valAt(si, cursorT))));
   });
 }
 function fit() { view = { t0: 0, span: tmax || 1 }; draw(); }

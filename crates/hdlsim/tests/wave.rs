@@ -48,7 +48,7 @@ fn hwf_roundtrip_through_html_viewer() {
     );
     assert!(hwf.is_file());
     let bytes = std::fs::read(&hwf).unwrap();
-    assert_eq!(&bytes[..8], b"HDLHWF01", "hwf magic");
+    assert_eq!(&bytes[..8], b"HDLHWF02", "hwf magic");
     // Binary and much smaller than the equivalent VCD would be for many events.
     assert!(bytes.len() < 4096, "hwf is compact: {} bytes", bytes.len());
 

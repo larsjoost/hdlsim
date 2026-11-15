@@ -2,10 +2,11 @@
 //! reader that replays it into any other sink (e.g. the HTML viewer via
 //! `hdlsim wave file.hwf -o out.html`): simulate once, view offline many times.
 //!
-//! Layout (little-endian): magic `HDLHWF1`, u32 version, then the signal table
-//! (u32 count; per signal: str name, u32 width, u8 is_mem, value init bits),
-//! then a tagged event stream: 0=end, 1=signal change (u64 t, u32 sig, value
-//! bits), 2=message (u64 t, str), 3=time advance (u64 t).
+//! Layout (little-endian): magic `HDLHWF02`, u32 version, then the signal table
+//! (u32 count; per signal: str name, u32 width, u8 flags [bit0=mem, bit1=real],
+//! value init bits), then a tagged event stream: 0=end, 1=signal change (u64 t,
+//! u32 sig, value bits), 2=message (u64 t, str), 3=time advance (u64 t).
+//! v1 files (`HDLHWF01`, one u8 is_mem per signal) are still readable.
 
 use super::WaveSink;
 use hdl_ir::elab::{Flat, FlatSig};
@@ -14,8 +15,11 @@ use hdl_ir::SigKind;
 use hdl_sim::events::SimEvent;
 use std::io::Write;
 
-const MAGIC: &[u8; 8] = b"HDLHWF01";
-const VERSION: u32 = 1;
+const MAGIC: &[u8; 8] = b"HDLHWF02";
+const MAGIC_V1: &[u8; 8] = b"HDLHWF01";
+const VERSION: u32 = 2;
+const FLAG_MEM: u8 = 1;
+const FLAG_REAL: u8 = 2;
 
 fn w_u8(w: &mut impl Write, v: u8) {
     let _ = w.write_all(&[v]);
@@ -49,7 +53,14 @@ impl<W: Write> HwfSink<W> {
         for s in &flat.signals {
             w_str(&mut w, &s.name);
             w_u32(&mut w, s.width.max(1) as u32);
-            w_u8(&mut w, s.mem.is_some() as u8);
+            let mut flags = 0u8;
+            if s.mem.is_some() {
+                flags |= FLAG_MEM;
+            }
+            if s.kind == SigKind::Real {
+                flags |= FLAG_REAL;
+            }
+            w_u8(&mut w, flags);
             w_value(&mut w, s.init.as_ref().unwrap_or(&Value::x(s.width.max(1))));
         }
         HwfSink { w }
@@ -132,12 +143,13 @@ impl<'a> R<'a> {
 /// Read a `.hwf` file back into a minimal `Flat` (signals only) plus the event
 /// stream, ready to replay into any `WaveSink`.
 pub fn read_hwf(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
-    if bytes.get(..8) != Some(MAGIC) {
+    let v1 = bytes.get(..8) == Some(MAGIC_V1);
+    if !v1 && bytes.get(..8) != Some(MAGIC) {
         return Err("not an hdlsim .hwf file (bad magic)".to_string());
     }
     let mut r = R { buf: bytes, pos: 8 };
     let version = r.u32()?;
-    if version != VERSION {
+    if version != VERSION && !(v1 && version == 1) {
         return Err(format!("unsupported .hwf version {}", version));
     }
     let n_sig = r.u32()? as usize;
@@ -148,14 +160,18 @@ pub fn read_hwf(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
     for _ in 0..n_sig {
         let name = r.str()?;
         let width = r.u32()? as usize;
-        let is_mem = r.u8()? != 0;
+        let flags = if v1 { r.u8()? & FLAG_MEM } else { r.u8()? };
         let init = r.value()?;
         signals.push(FlatSig {
             name,
             width,
-            kind: SigKind::Wire,
+            kind: if flags & FLAG_REAL != 0 {
+                SigKind::Real
+            } else {
+                SigKind::Wire
+            },
             init: Some(init),
-            mem: is_mem.then_some(0),
+            mem: (flags & FLAG_MEM != 0).then_some(0),
             scope: 0,
             signed: false,
         });

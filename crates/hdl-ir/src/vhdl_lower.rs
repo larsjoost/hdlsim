@@ -95,6 +95,8 @@ enum TypeInfo {
     Vector { signed: bool },
     /// 32-bit integer (natural/positive unsigned).
     Integer { signed: bool },
+    /// 64-bit IEEE-754 real.
+    Real,
     /// 8-bit char.
     Char,
     /// Enumeration: literals in declaration order.
@@ -169,6 +171,7 @@ impl<'a> Lower<'a> {
             .insert("signed".into(), TypeInfo::Vector { signed: true });
         self.types
             .insert("integer".into(), TypeInfo::Integer { signed: true });
+        self.types.insert("real".into(), TypeInfo::Real);
         self.types
             .insert("natural".into(), TypeInfo::Integer { signed: false });
         self.types
@@ -186,12 +189,12 @@ impl<'a> Lower<'a> {
         mark: &SyntaxNode,
         constraint: Option<&SyntaxNode>,
         span: Span,
-    ) -> (usize, bool, Option<usize>) {
+    ) -> (usize, bool, Option<usize>, bool) {
         let name = self.kw(mark);
         let base = self.types.get(&name).cloned();
         let Some(base) = base else {
             self.err(span, format!("unknown type '{}'", name));
-            return (1, false, None);
+            return (1, false, None, false);
         };
         match base {
             TypeInfo::Vector { signed } => {
@@ -199,16 +202,17 @@ impl<'a> Lower<'a> {
                     .map(|c| self.constraint_width(c))
                     .unwrap_or(1)
                     .max(1);
-                (w, signed, None)
+                (w, signed, None, false)
             }
-            TypeInfo::Integer { signed } => (32, signed, None),
-            TypeInfo::Scalar => (1, false, None),
-            TypeInfo::Char => (8, false, None),
+            TypeInfo::Integer { signed } => (32, signed, None, false),
+            TypeInfo::Real => (64, false, None, true),
+            TypeInfo::Scalar => (1, false, None, false),
+            TypeInfo::Char => (8, false, None, false),
             TypeInfo::Enum(ref lits) => {
                 let w = bits_for(lits.len());
-                (w, false, None)
+                (w, false, None, false)
             }
-            TypeInfo::Array { elem, depth } => (elem, false, Some(depth)),
+            TypeInfo::Array { elem, depth } => (elem, false, Some(depth), false),
         }
     }
 
@@ -317,9 +321,9 @@ impl<'a> Lower<'a> {
                 }
             }
             let span = d.span();
-            let (width, signed, _) = match &type_mark {
+            let (width, signed, _, _) = match &type_mark {
                 Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
-                None => (32, false, None),
+                None => (32, false, None, false),
             };
             let def = default
                 .as_ref()
@@ -387,9 +391,9 @@ impl<'a> Lower<'a> {
                 // ...but the mode keyword was also before ':' and is an Ident, not a Name.
             }
             let span = d.span();
-            let (width, signed, mem) = match &type_mark {
+            let (width, signed, mem, _real) = match &type_mark {
                 Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
-                None => (1, false, None),
+                None => (1, false, None, false),
             };
             let dir = match mode.as_str() {
                 "out" => Dir::Out,
@@ -547,10 +551,11 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let span = d.span();
-        let (width, signed, mem) = match type_mark {
+        let (width, signed, mem, real) = match type_mark {
             Some(tm) => self.resolve_type(tm, constraint, span),
-            None => (1, false, None),
+            None => (1, false, None, false),
         };
+        let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(e, &self.consts.clone());
             const_eval(&ex, &self.consts.clone())
@@ -563,7 +568,7 @@ impl<'a> Lower<'a> {
             module.signals.push(SignalIr {
                 name: n.clone(),
                 width,
-                kind: SigKind::Wire,
+                kind,
                 init: init_v.clone(),
                 mem,
                 signed,
@@ -638,9 +643,9 @@ impl<'a> Lower<'a> {
                     .find(|k| k.kind() == SyntaxKind::Range)
             });
             let depth = range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1);
-            let (ew, _, _) = match elem {
+            let (ew, _, _, _) = match elem {
                 Some(e) => self.resolve_type(&e, elem_constraint, d.span()),
-                None => (8, false, None),
+                None => (8, false, None, false),
             };
             self.types.insert(name, TypeInfo::Array { elem: ew, depth });
             return;
@@ -678,7 +683,7 @@ impl<'a> Lower<'a> {
             .cloned();
         if let Some(base) = base {
             let span = d.span();
-            let (w, signed, mem) = self.resolve_type(&base, constraint.as_ref(), span);
+            let (w, signed, mem, _r) = self.resolve_type(&base, constraint.as_ref(), span);
             let _ = mem;
             // Register as a vector type with the constrained width.
             let _ = w;
@@ -759,9 +764,9 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let span = d.span();
-        let (width, signed, _) = match type_mark {
+        let (width, signed, _, real) = match type_mark {
             Some(tm) => self.resolve_type(tm, constraint, span),
-            None => (32, false, None),
+            None => (32, false, None, false),
         };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(e, &self.consts.clone());
@@ -772,7 +777,7 @@ impl<'a> Lower<'a> {
             module.signals.push(SignalIr {
                 name: format!("__p{}_var_{}", proc_idx, n),
                 width,
-                kind: SigKind::Wire,
+                kind: if real { SigKind::Real } else { SigKind::Wire },
                 init: init_v.clone(),
                 mem: None,
                 signed,
@@ -1560,7 +1565,7 @@ impl<'a> Lower<'a> {
             "signed" if args.len() == 1 => Expr::Signed(Box::new(args.into_iter().next().unwrap())),
             // Other type conversions are bit-identical.
             "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "bit_vector" | "std_logic"
-            | "bit" | "integer" | "natural" | "boolean" | "string" | "char"
+            | "bit" | "integer" | "natural" | "boolean" | "string" | "char" | "real"
                 if args.len() == 1 =>
             {
                 args.into_iter().next().unwrap()
@@ -1707,7 +1712,10 @@ impl<'a> Lower<'a> {
             return Expr::Lit(v);
         }
         if let Ok(v) = t.parse::<f64>() {
-            let _ = v;
+            // VHDL real literal (contains '.' or exponent, no base '#').
+            if t.contains('.') || t.contains('e') || t.contains('E') {
+                return Expr::Real(v);
+            }
             self.warn(e.span(), "real literals unsupported; X");
             return Expr::Lit(Value::x(32));
         }

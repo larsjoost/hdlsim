@@ -319,6 +319,10 @@ fn w_expr(w: &mut W, e: &Expr) {
             w.u8(15);
             w_expr(w, e);
         }
+        Expr::Real(x) => {
+            w.u8(16);
+            w.u64(x.to_bits());
+        }
     }
 }
 
@@ -386,6 +390,7 @@ fn r_expr(r: &mut R) -> Result<Expr, String> {
             signed: r.bool()?,
         },
         15 => Expr::Signed(Box::new(r_expr(r)?)),
+        16 => Expr::Real(f64::from_bits(r.u64()?)),
         t => return Err(format!("bad Expr tag {}", t)),
     })
 }

@@ -58,6 +58,19 @@ impl Value {
         Value { bits: vec![b] }
     }
 
+    /// 64-bit value holding the IEEE-754 bit pattern of `x` (a `real` signal).
+    pub fn from_f64(x: f64) -> Value {
+        Value::from_u64(64, x.to_bits())
+    }
+
+    /// Interpret a 64-bit value as f64 (real signals). None if not 64 known bits.
+    pub fn to_f64(&self) -> Option<f64> {
+        if self.bits.len() != 64 || !self.is_known() {
+            return None;
+        }
+        Some(f64::from_bits(self.to_u64()?))
+    }
+
     pub fn width(&self) -> usize {
         self.bits.len()
     }
@@ -549,6 +562,17 @@ mod tests {
         assert_eq!(c.to_u64(), Some(0xA5));
         let s = c.slice(3, 0);
         assert_eq!(s.to_u64(), Some(0x5));
+    }
+
+    #[test]
+    fn f64_roundtrip() {
+        for f in [0.0, 1.5, -2.25, 7.5, 1e300, 1e-300, 3.141592653589793] {
+            let v = Value::from_f64(f);
+            assert_eq!(v.width(), 64);
+            assert_eq!(v.to_f64(), Some(f));
+        }
+        assert_eq!(Value::x(64).to_f64(), None);
+        assert_eq!(Value::from_u64(32, 5).to_f64(), None);
     }
 
     #[test]
