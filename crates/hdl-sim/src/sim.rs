@@ -83,7 +83,7 @@ pub struct Simulator {
     mems: Vec<Vec<Value>>, // per memory signal: mems[sig] if is_mem
     is_mem: Vec<bool>,
     active: VecDeque<u32>,
-    nba: Vec<(FlatSigId, Value)>,
+    nba: Vec<(FlatSigId, Value, Option<u32>)>,
     time_events: BTreeMap<u64, Vec<Ev>>,
     time: u64,
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
@@ -101,7 +101,12 @@ pub struct Simulator {
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
     /// Deferred NBA writes to non-scalar targets (part-selects, memories).
-    nba_exprs: Vec<(Expr, Value)>,
+    nba_exprs: Vec<(Expr, Value, Option<u32>)>,
+    /// Process currently executing (for driver tracing); `None` outside
+    /// processes, `Some(u32::MAX)` while re-evaluating continuous assigns.
+    cur_proc: Option<u32>,
+    /// Per-signal last driver: (proc, time_fs). proc == u32::MAX = assign.
+    last_driver: Vec<Option<(u32, u64)>>,
     /// Processes parked at `@(...)` event waits: (proc, edges).
     waiting: Vec<(u32, Vec<(FlatSigId, EdgeKind)>)>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
@@ -133,6 +138,8 @@ impl Simulator {
             flat,
             active: VecDeque::new(),
             nba: Vec::new(),
+            cur_proc: None,
+            last_driver: vec![None; n],
             time_events: BTreeMap::new(),
             time: 0,
             proc_sens: Vec::new(),
@@ -229,6 +236,23 @@ impl Simulator {
             .iter()
             .position(|s| s.name.rsplit('.').next() == Some(name))
             .map(|i| i as FlatSigId)
+    }
+
+    /// Last driver of `sig` as `(time_fs, driver label)` — a process origin
+    /// like `always @(posedge clk)`, or `"continuous assign"` for `assign`.
+    /// `None` when the signal never changed value.
+    pub fn driver_of(&self, sig: FlatSigId) -> Option<(u64, &str)> {
+        let (p, t) = self.last_driver.get(sig as usize).copied().flatten()?;
+        let name = if p == u32::MAX {
+            "continuous assign"
+        } else {
+            self.flat
+                .procs
+                .get(p as usize)
+                .map(|pr| pr.origin.as_str())
+                .unwrap_or("<unknown process>")
+        };
+        Some((t, name))
     }
 
     pub fn signal_name(&self, id: FlatSigId) -> &str {
@@ -409,13 +433,16 @@ impl Simulator {
             }
             if !self.nba.is_empty() || !self.nba_exprs.is_empty() {
                 let nba = std::mem::take(&mut self.nba);
-                for (sig, v) in nba {
+                for (sig, v, drv) in nba {
+                    self.cur_proc = drv;
                     self.set_sig(sig, v);
                 }
                 let exprs = std::mem::take(&mut self.nba_exprs);
-                for (lhs, v) in exprs {
+                for (lhs, v, drv) in exprs {
+                    self.cur_proc = drv;
                     self.assign_to(&lhs, v, None);
                 }
+                self.cur_proc = None;
                 continue;
             }
             if self.eval_assigns_fixpoint() {
@@ -485,6 +512,7 @@ impl Simulator {
             active: true,
             time_fs: self.time,
         });
+        self.cur_proc = Some(pid);
         {
             let rt = &mut self.proc_rt[pid as usize];
             if rt.frames.is_empty() {
@@ -530,6 +558,7 @@ impl Simulator {
                 Control::Wait => break, // parked in self.waiting until an edge
             }
         }
+        self.cur_proc = None;
         self.emit(SimEvent::ProcActive {
             proc: pid,
             active: false,
@@ -731,7 +760,7 @@ impl Simulator {
                     if let Some(sig) = lhs_sig(&lhs) {
                         let cur = self.vals[sig as usize].clone();
                         let w = self.flat.signals[sig as usize].width;
-                        self.nba.push((sig, v.resize(w.max(1))));
+                        self.nba.push((sig, v.resize(w.max(1)), self.cur_proc));
                         let _ = cur;
                     } else {
                         // Memory/part write with NBA: capture the target
@@ -866,7 +895,7 @@ impl Simulator {
         // executed in the NBA region via a synthetic process-less path. Phase 1:
         // apply immediately if the target is a plain signal; else defer via a
         // queued closure is not possible — so store as (lhs, v) in a side list.
-        self.nba_exprs.push((lhs, v));
+        self.nba_exprs.push((lhs, v, self.cur_proc));
     }
 
     // ---- system tasks -------------------------------------------------------------
@@ -1107,6 +1136,7 @@ impl Simulator {
     /// changed (which may have scheduled processes).
     fn eval_assigns_fixpoint(&mut self) -> bool {
         let mut any = false;
+        self.cur_proc = Some(u32::MAX);
         for _ in 0..10_000 {
             self.delta_guard += 1;
             let mut changed = false;
@@ -1119,9 +1149,11 @@ impl Simulator {
             }
             any |= changed;
             if !changed {
+                self.cur_proc = None;
                 return any;
             }
         }
+        self.cur_proc = None;
         self.emit(SimEvent::Message {
             text: format!("error: combinational loop detected at t={}", self.time),
             time_fs: self.time,
@@ -1146,6 +1178,16 @@ impl Simulator {
             new: new.clone(),
             time_fs: self.time,
         });
+        if let Some(p) = self.cur_proc {
+            if self.last_driver[sig as usize].map(|(q, _)| q) != Some(p) {
+                self.emit(SimEvent::Driver {
+                    sig,
+                    proc: p,
+                    time_fs: self.time,
+                });
+            }
+            self.last_driver[sig as usize] = Some((p, self.time));
+        }
         self.schedule_sensitive(sig, &self.prev[sig as usize].clone(), &new);
         true
     }

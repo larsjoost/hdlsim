@@ -100,6 +100,7 @@ hdlsim run --bundle repro.tar --top tb       # reproduce straight from the bundl
 hdlsim debug --top tb --dump                 # dump the elaborated design (signals, processes)
 hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
+hdlsim debug --top tb --driver q                     # which process/assign last drove a signal
 hdlsim regress --junit results.xml --list tests.txt  # run many testbenches, JUnit XML report
 hdlsim lsp                                   # LSP server on stdio (diagnostics, hover, go-to-definition)
 hdlsim fmt file.v                        # print canonically formatted source
