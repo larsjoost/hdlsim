@@ -13,3 +13,4 @@ pub mod commands;
 pub mod compile;
 pub mod json;
 pub mod project;
+pub mod tcl;
