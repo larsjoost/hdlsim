@@ -7,7 +7,7 @@ use hdl_sim::{Observer, SimEvent, Simulator};
 use std::path::PathBuf;
 
 /// Prints `$display`/`report` messages to stdout, like a simulator transcript.
-struct Transcript;
+pub(crate) struct Transcript;
 
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {

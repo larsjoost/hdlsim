@@ -9,6 +9,7 @@ mod ast;
 mod bundle;
 mod check;
 mod debug;
+mod do_cmd;
 mod fmt;
 mod init;
 mod lint;
@@ -224,6 +225,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &lsp::Lsp,
     &fmt::Fmt,
     &lint::LintCmd,
+    &do_cmd::DoCmd,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.

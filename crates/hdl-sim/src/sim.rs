@@ -81,6 +81,8 @@ pub struct Simulator {
     observers: Vec<Box<dyn Observer>>,
     finished: bool,
     stopped: bool,
+    started: bool,
+    finish_notified: bool,
     /// Number of test failures seen (severity error/failure, `$error`/`$fatal`).
     failures: u64,
     monitor: Vec<Vec<Expr>>,
@@ -128,6 +130,8 @@ impl Simulator {
             observers: Vec::new(),
             finished: false,
             stopped: false,
+            started: false,
+            finish_notified: false,
             failures: 0,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             stop_flag: None,
@@ -318,6 +322,25 @@ impl Simulator {
 
     /// Run until `$finish`, until `max_time_fs`, or until no events remain.
     pub fn run(&mut self, max_time_fs: u64) {
+        self.ensure_started();
+        self.pump(max_time_fs, false);
+    }
+
+    /// Incremental run: advance until `target_fs`, `$finish`, or no events
+    /// remain — whichever comes first. Safe to call repeatedly (used by
+    /// `hdlsim do` for `run 100ns` steps); reaching the target just pauses,
+    /// it does not stop the simulation.
+    pub fn run_until(&mut self, target_fs: u64) {
+        self.ensure_started();
+        let target = target_fs.max(self.time);
+        self.pump(target, true);
+    }
+
+    fn ensure_started(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
         self.emit(SimEvent::TimeAdvance { time_fs: 0 });
         // Schedule initial processes, plus `always` blocks that wait on no
         // explicit event list: bare `always` (empty list) and `always @*`
@@ -340,6 +363,9 @@ impl Simulator {
             self.activate(pid);
         }
         self.eval_assigns_fixpoint();
+    }
+
+    fn pump(&mut self, max_time_fs: u64, soft: bool) {
         loop {
             if self.finished || self.stopped {
                 break;
@@ -401,6 +427,9 @@ impl Simulator {
                     }
                 }
                 _ => {
+                    if soft {
+                        break; // pause at the target; simulation stays resumable
+                    }
                     self.emit(SimEvent::Stop { time_fs: self.time });
                     self.stopped = true;
                     break;
@@ -410,8 +439,11 @@ impl Simulator {
         if self.finished {
             self.emit(SimEvent::Finish { time_fs: self.time });
         }
-        for o in &mut self.observers {
-            o.on_finish();
+        if (self.finished || self.stopped) && !self.finish_notified {
+            self.finish_notified = true;
+            for o in &mut self.observers {
+                o.on_finish();
+            }
         }
     }
 
