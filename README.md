@@ -105,6 +105,7 @@ hdlsim lsp                                   # LSP server on stdio (live parse d
 hdlsim fmt file.v                        # print canonically formatted source
 hdlsim fmt --check src/...               # CI gate: exit 1 if any file would change
 hdlsim fmt -w file.vhd                   # rewrite in place
+hdlsim lint file.v ...                   # lint (exit 1 on any finding); --fix applies safe fixes
 ```
 
 `hdlsim regress` runs each test as its own simulation (fresh design per test)

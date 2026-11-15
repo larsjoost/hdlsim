@@ -25,6 +25,7 @@ pub mod diagnostic;
 pub mod fmt;
 pub mod kinds;
 pub mod language;
+pub mod lint;
 pub mod source;
 pub mod token;
 pub mod verilog;
