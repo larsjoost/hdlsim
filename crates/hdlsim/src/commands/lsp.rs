@@ -82,6 +82,13 @@ impl Server {
                             ),
                             ("hoverProvider", Json::Bool(true)),
                             ("definitionProvider", Json::Bool(true)),
+                            (
+                                "completionProvider",
+                                Json::obj(vec![(
+                                    "triggerCharacters",
+                                    Json::Arr(vec![Json::str(".")]),
+                                )]),
+                            ),
                         ]),
                     ),
                 ]),
@@ -192,6 +199,49 @@ impl Server {
                             }
                             None => Json::Null,
                         }
+                    }
+                    None => Json::Null,
+                };
+                match id {
+                    Some(id) => vec![response(Some(id), result)],
+                    None => vec![],
+                }
+            }
+            Some("textDocument/completion") => {
+                let uri = msg
+                    .get("params")
+                    .and_then(|p| p.get("textDocument"))
+                    .and_then(|t| t.get("uri"))
+                    .and_then(|u| u.as_str());
+                let line = msg
+                    .get("params")
+                    .and_then(|p| p.get("position"))
+                    .and_then(|p| p.get("line"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as u32;
+                let character = msg
+                    .get("params")
+                    .and_then(|p| p.get("position"))
+                    .and_then(|p| p.get("character"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as u32;
+                let result = match uri.and_then(|u| self.docs.get(u).map(|t| (u, t))) {
+                    Some((uri, text)) => {
+                        let off = position_to_offset(text, line, character)
+                            .unwrap_or(0)
+                            .min(text.len() as u32) as usize;
+                        let prefix = ident_prefix(text, off);
+                        let items = match uri_to_path(uri) {
+                            Some(path) => match Language::from_path(&path) {
+                                Some(lang) => completion_items(lang, &path, text, &prefix),
+                                None => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        };
+                        Json::obj(vec![
+                            ("isIncomplete", Json::Bool(false)),
+                            ("items", Json::Arr(items)),
+                        ])
                     }
                     None => Json::Null,
                 };
@@ -377,6 +427,213 @@ fn parse_doc(path: &std::path::Path, text: &str) -> Vec<Diagnostic> {
         Some((_db, _root, diags)) => diags,
         None => Vec::new(),
     }
+}
+
+/// Identifier characters being typed at `off` (the prefix up to the cursor).
+fn ident_prefix(text: &str, off: usize) -> String {
+    let b = text.as_bytes();
+    let end = off.min(b.len());
+    let mut start = end;
+    while start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+        start -= 1;
+    }
+    text[start..end].to_string()
+}
+
+const VERILOG_KEYWORDS: &[&str] = &[
+    "always",
+    "and",
+    "assign",
+    "begin",
+    "buf",
+    "bufif0",
+    "bufif1",
+    "case",
+    "casex",
+    "casez",
+    "default",
+    "end",
+    "endcase",
+    "endfunction",
+    "endgenerate",
+    "endmodule",
+    "endtask",
+    "else",
+    "for",
+    "forever",
+    "fork",
+    "function",
+    "generate",
+    "genvar",
+    "if",
+    "inout",
+    "input",
+    "integer",
+    "join",
+    "localparam",
+    "module",
+    "nand",
+    "negedge",
+    "nor",
+    "not",
+    "notif0",
+    "notif1",
+    "or",
+    "output",
+    "parameter",
+    "posedge",
+    "pulldown",
+    "pullup",
+    "real",
+    "reg",
+    "repeat",
+    "signed",
+    "supply0",
+    "supply1",
+    "task",
+    "time",
+    "tri",
+    "tri0",
+    "tri1",
+    "unsigned",
+    "wait",
+    "wand",
+    "while",
+    "wire",
+    "wor",
+    "xnor",
+    "xor",
+];
+
+const VHDL_KEYWORDS: &[&str] = &[
+    "abs",
+    "after",
+    "alias",
+    "all",
+    "and",
+    "architecture",
+    "array",
+    "assert",
+    "attribute",
+    "begin",
+    "block",
+    "body",
+    "buffer",
+    "bus",
+    "case",
+    "component",
+    "configuration",
+    "constant",
+    "disconnect",
+    "downto",
+    "else",
+    "elsif",
+    "end",
+    "entity",
+    "exit",
+    "file",
+    "for",
+    "function",
+    "generate",
+    "generic",
+    "group",
+    "guarded",
+    "if",
+    "impure",
+    "in",
+    "inertial",
+    "inout",
+    "is",
+    "label",
+    "library",
+    "linkage",
+    "loop",
+    "map",
+    "mod",
+    "nand",
+    "new",
+    "next",
+    "nor",
+    "not",
+    "null",
+    "of",
+    "on",
+    "open",
+    "or",
+    "others",
+    "out",
+    "package",
+    "port",
+    "postponed",
+    "procedure",
+    "process",
+    "pure",
+    "range",
+    "record",
+    "register",
+    "reject",
+    "rem",
+    "report",
+    "return",
+    "rol",
+    "ror",
+    "select",
+    "severity",
+    "signal",
+    "shared",
+    "sla",
+    "sll",
+    "sra",
+    "srl",
+    "subtype",
+    "then",
+    "to",
+    "transport",
+    "type",
+    "unaffected",
+    "units",
+    "until",
+    "use",
+    "variable",
+    "wait",
+    "when",
+    "while",
+    "with",
+    "xnor",
+    "xor",
+];
+
+/// Build completion items: language keywords (kind 14) plus every identifier
+/// already used in the document (kind 6), filtered by the typed prefix
+/// (case-insensitive), deduped, sorted. Keywords win over identifiers.
+fn completion_items(lang: Language, path: &std::path::Path, text: &str, prefix: &str) -> Vec<Json> {
+    let kws: &[&str] = match lang {
+        Language::Verilog => VERILOG_KEYWORDS,
+        Language::Vhdl => VHDL_KEYWORDS,
+    };
+    let mut kinds: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for k in kws {
+        kinds.insert(k.to_string(), 14); // CompletionItemKind.Keyword
+    }
+    if let Some((db, root, _)) = parse_root(path, text) {
+        for d in root.descendants() {
+            if d.kind() == SyntaxKind::Ident {
+                kinds.entry(d.text(&db).to_string()).or_insert(6); // Variable
+            }
+        }
+    }
+    let pfx = prefix.to_ascii_lowercase();
+    let mut items: Vec<(String, i64)> = kinds
+        .into_iter()
+        .filter(|(label, _)| pfx.is_empty() || label.to_ascii_lowercase().starts_with(&pfx))
+        .collect();
+    items.sort();
+    items
+        .into_iter()
+        .map(|(label, kind)| {
+            Json::obj(vec![("label", Json::str(label)), ("kind", Json::num(kind))])
+        })
+        .collect()
 }
 
 /// Parse a document and return the db, CST root, and diagnostics.
@@ -845,6 +1102,110 @@ mod tests {
                 .and_then(|u| u.as_str()),
             Some(uri)
         );
+    }
+
+    #[test]
+    fn initialize_advertises_completion() {
+        let mut srv = Server::new();
+        let out = srv.handle(&msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        let caps = out[0].get("result").unwrap().get("capabilities").unwrap();
+        let cp = caps.get("completionProvider").unwrap();
+        assert_eq!(
+            cp.get("triggerCharacters").unwrap().as_arr().unwrap()[0],
+            Json::str(".")
+        );
+    }
+
+    #[test]
+    fn completion_offers_keywords_and_doc_idents_filtered_by_prefix() {
+        let mut srv = Server::new();
+        let uri = "file:///tmp/tb.v";
+        let open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{}","text":"module tb;\n  wire count_sig;\n  al\nendmodule\n"}}}}}}"#,
+            uri
+        );
+        srv.handle(&msg(&open));
+        // Cursor right after "al" on line 2 (0-based): prefix "al".
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":2,"character":4}}}}}}"#,
+            uri
+        );
+        let out = srv.handle(&msg(&req));
+        let items = out[0]
+            .get("result")
+            .unwrap()
+            .get("items")
+            .unwrap()
+            .as_arr()
+            .unwrap()
+            .clone();
+        let labels: Vec<&str> = items
+            .iter()
+            .map(|i| i.get("label").unwrap().as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"always"), "{:?}", labels);
+        assert!(!labels.contains(&"module"), "prefix filter: {:?}", labels);
+        // Empty prefix returns everything, keywords + doc idents, deduped.
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":0,"character":0}}}}}}"#,
+            uri
+        );
+        let out = srv.handle(&msg(&req));
+        let items = out[0]
+            .get("result")
+            .unwrap()
+            .get("items")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let labels: Vec<&str> = items
+            .iter()
+            .map(|i| i.get("label").unwrap().as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"module"), "{:?}", labels);
+        assert!(labels.contains(&"count_sig"), "{:?}", labels);
+        assert!(labels.contains(&"tb"), "{:?}", labels);
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted.to_vec(), "items sorted");
+        let mut dedup = labels.clone();
+        dedup.dedup();
+        assert_eq!(labels.len(), dedup.len(), "no duplicates: {:?}", labels);
+    }
+
+    #[test]
+    fn completion_is_case_insensitive_for_vhdl() {
+        let mut srv = Server::new();
+        let uri = "file:///tmp/tb.vhd";
+        let open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{}","text":"entity tb is\nend entity;\nSIG\n"}}}}}}"#,
+            uri
+        );
+        srv.handle(&msg(&open));
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":2,"character":3}}}}}}"#,
+            uri
+        );
+        let out = srv.handle(&msg(&req));
+        let items = out[0]
+            .get("result")
+            .unwrap()
+            .get("items")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let labels: Vec<&str> = items
+            .iter()
+            .map(|i| i.get("label").unwrap().as_str().unwrap())
+            .collect();
+        assert!(
+            labels.contains(&"signal"),
+            "prefix SIG matches signal: {:?}",
+            labels
+        );
+        assert!(!labels.contains(&"entity"), "prefix filter: {:?}", labels);
     }
 
     #[test]

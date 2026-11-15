@@ -23,6 +23,62 @@ fn bodies(out: &[u8]) -> Vec<Json> {
 }
 
 #[test]
+fn lsp_completion_over_framed_session() {
+    let uri = "file:///tmp/lsp_comp.vhd";
+    let mut input = Vec::new();
+    for m in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{}","languageId":"vhdl","version":1,"text":"entity tb is\nend entity;\nproc\n"}}}}}}"#,
+            uri
+        ),
+        // Ask for completions after "proc" (line 2, character 4).
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":2,"character":4}}}}}}"#,
+            uri
+        ),
+        r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ] {
+        input.extend_from_slice(&frame(m));
+    }
+    let mut cur = Cursor::new(input);
+    let mut out = Vec::new();
+    let code = serve(&mut cur, &mut out);
+    assert_eq!(code, 0);
+    let msgs = bodies(&out);
+    let comp = msgs
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_i64()) == Some(2))
+        .expect("completion response");
+    let items = comp
+        .get("result")
+        .unwrap()
+        .get("items")
+        .unwrap()
+        .as_arr()
+        .unwrap();
+    let labels: Vec<&str> = items
+        .iter()
+        .map(|i| i.get("label").unwrap().as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"process"), "{:?}", labels);
+    assert!(labels.contains(&"procedure"), "{:?}", labels);
+    assert!(!labels.contains(&"entity"), "prefix filter: {:?}", labels);
+    let init = msgs
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_i64()) == Some(1))
+        .unwrap();
+    assert!(init
+        .get("result")
+        .unwrap()
+        .get("capabilities")
+        .unwrap()
+        .get("completionProvider")
+        .is_some());
+}
+
+#[test]
 fn lsp_session_serves_diagnostics_and_exits_zero() {
     let uri = "file:///tmp/lsp_tb.v";
     let mut input = Vec::new();

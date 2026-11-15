@@ -102,7 +102,7 @@ hdlsim debug --top tb --watch sig --all      # watch signal changes live during 
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
 hdlsim debug --top tb --driver q                     # which process/assign last drove a signal
 hdlsim regress --junit results.xml --list tests.txt  # run many testbenches, JUnit XML report
-hdlsim lsp                                   # LSP server on stdio (diagnostics, hover, go-to-definition)
+hdlsim lsp                                   # LSP server on stdio (diagnostics, hover, definition, completion)
 hdlsim fmt file.v                        # print canonically formatted source
 hdlsim fmt --check src/...               # CI gate: exit 1 if any file would change
 hdlsim fmt -w file.vhd                   # rewrite in place
