@@ -468,6 +468,7 @@ pub fn gzip_decompress(d: &[u8]) -> Result<Vec<u8>, String> {
 
 /// FST var types we care about (GTKWave `fstVarType`).
 const VT_REG: u8 = 5;
+const VT_REAL: u8 = 3;
 const VT_PORT: u8 = 18;
 
 /// FST value-change codes for non-0/1 single-bit values, indexed by `(rcv >> 1) & 7`.
@@ -635,18 +636,41 @@ fn parse_hier(data: &[u8]) -> Result<(Vec<Scope>, Vec<HierVar>), String> {
     Ok((scopes, vars))
 }
 
-/// One decoded value-change record: time-table index delta + MSB-first chars.
+/// One decoded value-change record: time-table index delta + value.
 struct Rec {
     tdelta: u64,
-    chars: Vec<u8>,
+    val: Value,
 }
 
-/// Decode one variable's record chain.
-fn decode_records(data: &[u8], width: usize) -> Result<Vec<Rec>, String> {
+/// Decode one variable's record chain. `real` selects the FST_VT_VCD_REAL
+/// encoding: varint(tdelta<<1 | 1) + 8 raw f64 bytes (endianness `double_le`).
+fn decode_records(
+    data: &[u8],
+    width: usize,
+    real: bool,
+    double_le: bool,
+) -> Result<Vec<Rec>, String> {
     let mut c = Cur::new(data);
     let mut recs = Vec::new();
     while c.p < data.len() {
         let vli = c.varint()?;
+        if real {
+            if vli & 1 == 0 {
+                return Err("fst: packed-binary real record unsupported".to_string());
+            }
+            let tdelta = vli >> 1;
+            let b = c.take(8)?;
+            let f = if double_le {
+                f64::from_le_bytes(b.try_into().map_err(|_| "fst: bad real")?)
+            } else {
+                f64::from_be_bytes(b.try_into().map_err(|_| "fst: bad real")?)
+            };
+            recs.push(Rec {
+                tdelta,
+                val: Value::from_f64(f),
+            });
+            continue;
+        }
         let tdelta = if width == 1 {
             if vli & 1 == 0 {
                 vli >> 2
@@ -673,7 +697,10 @@ fn decode_records(data: &[u8], width: usize) -> Result<Vec<Rec>, String> {
         } else {
             c.take(width)?.to_vec()
         };
-        recs.push(Rec { tdelta, chars });
+        recs.push(Rec {
+            tdelta,
+            val: value_from_chars(&chars),
+        });
     }
     Ok(recs)
 }
@@ -691,7 +718,14 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
     }
     let _start_time = c.u64be()?;
     let end_time = c.u64be()?;
-    let _endian = c.take(8)?;
+    // Endian test: the 8 bytes of the f64 constant e = 2.718... in native
+    // order; we read doubles little-endian iff the file wrote them so.
+    let endian = c.take(8)?;
+    let double_le = endian == 2.7182818284590452354f64.to_le_bytes();
+    let double_be = endian == 2.7182818284590452354f64.to_be_bytes();
+    if !double_le && !double_be {
+        return Err("fst: bad endian test word".to_string());
+    }
     let _mem = c.u64be()?;
     let _num_scopes = c.u64be()?;
     let _num_hier_vars = c.u64be()?;
@@ -706,6 +740,7 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
     // Walk the remaining blocks; collect hier, geom and VC payload slices.
     let mut hier_raw: Option<Vec<u8>> = None;
     let mut geom_widths: Option<Vec<usize>> = None;
+    let mut geom_reals: Option<Vec<bool>> = None;
     let mut vc_blocks: Vec<(usize, usize)> = Vec::new(); // (payload start, seclen)
     while c.p < bytes.len() {
         let tag = c.u8()?;
@@ -729,10 +764,12 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
                 };
                 let mut gc = Cur::new(&raw);
                 let mut widths = Vec::with_capacity(count);
+                let mut reals = Vec::with_capacity(count);
                 for _ in 0..count {
                     let v = gc.varint()?;
+                    reals.push(v == 0); // geom encodes reals as zero width
                     widths.push(if v == 0 {
-                        8 // real
+                        8 // real: 8 raw f64 bytes
                     } else if v == 0xFFFF_FFFF {
                         0
                     } else {
@@ -740,6 +777,7 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
                     });
                 }
                 geom_widths = Some(widths);
+                geom_reals = Some(reals);
             }
             4 => {
                 // hierarchy: u64 uclen, gzip data
@@ -787,6 +825,18 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
             })
             .unwrap_or(1)
             .max(1)
+    };
+    // A handle is real if geom says zero-width or the hier var is VT_REAL.
+    let real_of = |h: usize| -> bool {
+        geom_reals
+            .as_ref()
+            .and_then(|r| r.get(h))
+            .copied()
+            .unwrap_or(false)
+            || by_handle
+                .get(h)
+                .and_then(|v| v.map(|v| v.vartype == VT_REAL))
+                .unwrap_or(false)
     };
 
     // Events + per-handle changes from the VC blocks.
@@ -897,12 +947,25 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
             lengths[prev_pos_idx] = records_end - chain[prev_pos_idx];
         }
 
-        // Initial values from the bits array, split per handle by width.
+        // Initial values from the bits array, split per handle (real = 8 raw
+        // f64 bytes).
         let mut bc = Cur::new(&bits);
         for h in 0..frame_count {
-            let w = width_of(h);
-            if let (Ok(chars), Some(slot)) = (bc.take(w), inits.get_mut(h)) {
-                *slot = Some(value_from_chars(chars));
+            let slot = inits.get_mut(h);
+            if real_of(h) {
+                if let (Ok(b), Some(slot)) = (bc.take(8), slot) {
+                    let f = if double_le {
+                        f64::from_le_bytes(b.try_into().map_err(|_| "fst: bad real")?)
+                    } else {
+                        f64::from_be_bytes(b.try_into().map_err(|_| "fst: bad real")?)
+                    };
+                    *slot = Some(Value::from_f64(f));
+                }
+            } else {
+                let w = width_of(h);
+                if let (Ok(chars), Some(slot)) = (bc.take(w), slot) {
+                    *slot = Some(value_from_chars(chars));
+                }
             }
         }
 
@@ -927,14 +990,14 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
                 zlib_decompress(body)?
             };
             let w = width_of(h);
-            let recs = decode_records(&recs_raw, w)?;
+            let recs = decode_records(&recs_raw, w, real_of(h), double_le)?;
             let mut ti = 0u64;
             for rec in recs {
                 ti += rec.tdelta;
                 let time = blk_times
                     .get(ti as usize)
                     .ok_or("fst: record time index out of range")?;
-                changes[h].push((*time, value_from_chars(&rec.chars)));
+                changes[h].push((*time, rec.val));
             }
         }
     }
@@ -957,6 +1020,7 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
         let (name, scope, kind) = match v {
             Some(v) => {
                 let kind = match (v.vartype, v.dir) {
+                    (VT_REAL, _) => SigKind::Real,
                     (VT_REG, _) => SigKind::Reg,
                     (VT_PORT, 1) => SigKind::Input,
                     (VT_PORT, 2) => SigKind::Output,
