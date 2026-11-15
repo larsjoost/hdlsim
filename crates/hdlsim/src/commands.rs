@@ -5,6 +5,7 @@
 //! registry. Shared flags (`-L`, `--config`, `-I`) are parsed once in
 //! [`extract_common`] and turned into a `LibraryManager` by [`build_manager`].
 
+mod analyze;
 mod assist;
 mod ast;
 mod bundle;
@@ -233,6 +234,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &assist::Assist,
     &assist::Explain,
     &gen::Gen,
+    &analyze::Analyze,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
