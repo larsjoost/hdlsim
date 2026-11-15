@@ -13,6 +13,7 @@ mod debug;
 mod deps;
 mod do_cmd;
 mod fmt;
+mod gen;
 mod init;
 mod lint;
 pub mod lsp;
@@ -231,6 +232,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &deps::Deps,
     &assist::Assist,
     &assist::Explain,
+    &gen::Gen,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
