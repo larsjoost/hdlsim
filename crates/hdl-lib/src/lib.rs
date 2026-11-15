@@ -24,6 +24,7 @@
 pub mod builtin;
 pub mod bundle;
 pub mod cache;
+pub mod doctor;
 pub mod providers;
 
 use hdl_ir::elab::UnitResolver;

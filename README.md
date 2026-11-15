@@ -118,6 +118,8 @@ hdlsim explain E0301                     # explain a diagnostic/lint code (no ar
 hdlsim gen tb --top counter counter.v    # generate a testbench skeleton from the top's ports
 hdlsim analyze counter.v                 # static heuristics: undriven (W0501) / unread (W0502) signals
 hdlsim doc counter.v tb.v --out html-docs/  # cross-linked HTML docs (index + page per unit, highlighted source)
+hdlsim doctor                              # environment check: stdlib, config, libraries, cache (exit 1 on failure)
+hdlsim completions bash > ~/.local/share/bash-completion/completions/hdlsim  # shell completions (bash|zsh|fish)
 ```
 
 SVA-lite (Verilog): concurrent `assert property (@(posedge clk) a |-> b)` /
