@@ -94,6 +94,8 @@ hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from librar
 hdlsim run --top tb                           # no files: resolve everything from hdlsim.ini libraries
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
 hdlsim run --top tb tb.v --live              # live wave window in the browser
+hdlsim run --top tb tb.v --max-time 50ns --checkpoint ck.bin   # save state
+hdlsim run --top tb tb.v --restore ck.bin    # resume from a checkpoint
 hdlsim project --top cpu --format vivado-tcl # export Vivado TCL project files
 hdlsim bundle --out repro.tar --top tb [files]  # pack the project into one .tar reproducer
 hdlsim run --bundle repro.tar --top tb       # reproduce straight from the bundle

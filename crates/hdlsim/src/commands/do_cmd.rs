@@ -11,11 +11,10 @@
 //! - `quit`/`exit [code]` — stop the script (Tcl builtin)
 
 use super::run::Transcript;
-use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command, CommonOpts};
 use crate::tcl::{Flow, Interp};
 use hdl_ir::elab;
 use hdl_ir::Design;
-use hdl_lib::LibraryManager;
 use hdl_sim::Simulator;
 use std::path::PathBuf;
 
@@ -62,11 +61,11 @@ impl Command for DoCmd {
         let top = top.ok_or("--top is required")?;
         let text = std::fs::read_to_string(&script)
             .map_err(|e| format!("cannot read {}: {}", script.display(), e))?;
-        let (mgr, root) = build_manager(&opts)?;
+        let (_mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
 
         let mut session = DoSession {
-            mgr,
+            opts,
             files,
             top,
             max_time_fs,
@@ -89,7 +88,9 @@ impl Command for DoCmd {
 }
 
 struct DoSession {
-    mgr: LibraryManager,
+    /// Kept so `restart` can build a fresh LibraryManager — the compiled-file
+    /// set of a used manager would skip the files and leave the new design empty.
+    opts: CommonOpts,
     files: Vec<PathBuf>,
     top: String,
     max_time_fs: u64,
@@ -99,15 +100,16 @@ struct DoSession {
 
 impl DoSession {
     fn build_sim(&mut self) -> Result<(), String> {
+        let (mut mgr, _root) = build_manager(&self.opts)?;
         let mut design = Design::default();
-        self.mgr.compile_files(&mut design, &self.files);
-        if self.mgr.diags().has_errors() {
-            return Err(self.mgr.diags().render_all(self.mgr.db()));
+        mgr.compile_files(&mut design, &self.files);
+        if mgr.diags().has_errors() {
+            return Err(mgr.diags().render_all(mgr.db()));
         }
-        let flat = elab::elaborate_with(&mut design, &self.top, &mut self.mgr)
+        let flat = elab::elaborate_with(&mut design, &self.top, &mut mgr)
             .map_err(|e| format!("elaboration error: {}", e))?;
-        if self.mgr.diags().has_errors() {
-            return Err(self.mgr.diags().render_all(self.mgr.db()));
+        if mgr.diags().has_errors() {
+            return Err(mgr.diags().render_all(mgr.db()));
         }
         let mut sim = Simulator::new(flat);
         sim.add_observer(Box::new(Transcript));
@@ -163,6 +165,32 @@ impl DoSession {
                     ),
                     None => return Err(format!("examine: no signal '{}'", name)),
                 }
+                Ok(Flow::Continue)
+            }
+            Some("checkpoint") => {
+                let path = args.get(1).ok_or("checkpoint needs a path")?;
+                let sim = self
+                    .sim
+                    .as_mut()
+                    .ok_or("checkpoint: simulation not started (use `run` first)")?;
+                sim.save_checkpoint(std::path::Path::new(path))
+                    .map_err(|e| format!("checkpoint: {}", e))?;
+                println!("hdlsim do: checkpoint written to {}", path);
+                Ok(Flow::Continue)
+            }
+            Some("restore") => {
+                let path = args.get(1).ok_or("restore needs a path")?;
+                if self.sim.is_none() {
+                    self.build_sim()?;
+                }
+                let flat = self.sim.as_ref().unwrap().flat().clone();
+                let mut sim = Simulator::restore_checkpoint(flat, std::path::Path::new(path))?;
+                sim.add_observer(Box::new(Transcript));
+                if let Some(p) = &self.vcd_path {
+                    attach_vcd(&mut sim, p)?;
+                }
+                self.sim = Some(sim);
+                println!("hdlsim do: restored checkpoint {}", path);
                 Ok(Flow::Continue)
             }
             Some(other) => Err(format!("unknown do-file command '{}'", other)),
