@@ -38,6 +38,10 @@ the graphical wave display are all implemented here.
   API so external tools can reuse it.
 - **One kernel for both languages.** Both front-ends lower to a shared IR, so
   mixed VHDL/Verilog designs simulate natively in one wave window.
+- **Reproducible constrained-random stimulus.** `$urandom`,
+  `$urandom_range(min, max)`, and `$rand_solve("a: 0..255; len: 1..16; a + len <= 260", "a", a, "len", len)`
+  — a small deterministic constraint solver over the seeded RNG. `--seed N`
+  (or do-file `seed N`) makes the whole stimulus sequence reproducible.
 - **Easy to extend.** Closed core data structures, open trait+registry seams at
   every pipeline edge — adding a language, system task, wave format, lint rule, or
   CLI command is a new module plus one registration line. See
