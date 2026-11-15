@@ -9,7 +9,9 @@
 
 use super::Command;
 use crate::json::Json;
+use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
+use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::language::Language;
 use hdl_syntax::source::{SourceDb, Span};
 use std::collections::HashMap;
@@ -69,14 +71,18 @@ impl Server {
                     ),
                     (
                         "capabilities",
-                        Json::obj(vec![(
-                            "textDocumentSync",
-                            Json::obj(vec![
-                                ("openClose", Json::Bool(true)),
-                                // 1 = TextDocumentSyncKind.Full
-                                ("change", Json::num(1)),
-                            ]),
-                        )]),
+                        Json::obj(vec![
+                            (
+                                "textDocumentSync",
+                                Json::obj(vec![
+                                    ("openClose", Json::Bool(true)),
+                                    // 1 = TextDocumentSyncKind.Full
+                                    ("change", Json::num(1)),
+                                ]),
+                            ),
+                            ("hoverProvider", Json::Bool(true)),
+                            ("definitionProvider", Json::Bool(true)),
+                        ]),
                     ),
                 ]),
             )],
@@ -137,6 +143,60 @@ impl Server {
                         // Clear the squiggles in the editor.
                         vec![publish_diagnostics(uri, Vec::new())]
                     }
+                    None => vec![],
+                }
+            }
+            Some("textDocument/hover") | Some("textDocument/definition") => {
+                let is_hover = method == Some("textDocument/hover");
+                let uri = msg
+                    .get("params")
+                    .and_then(|p| p.get("textDocument"))
+                    .and_then(|t| t.get("uri"))
+                    .and_then(|u| u.as_str());
+                let line = msg
+                    .get("params")
+                    .and_then(|p| p.get("position"))
+                    .and_then(|p| p.get("line"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as u32;
+                let character = msg
+                    .get("params")
+                    .and_then(|p| p.get("position"))
+                    .and_then(|p| p.get("character"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as u32;
+                let result = match uri.and_then(|u| self.docs.get(u).map(|t| (u, t))) {
+                    Some((uri, text)) => {
+                        let off = position_to_offset(&text, line, character)
+                            .unwrap_or(0)
+                            .min(text.len().saturating_sub(1) as u32);
+                        match uri_to_path(uri).and_then(|p| parse_root(&p, &text)) {
+                            Some((db, root, _diags)) => {
+                                if is_hover {
+                                    match hover_at(&db, &root, off) {
+                                        Some(v) => Json::obj(vec![(
+                                            "contents",
+                                            Json::obj(vec![
+                                                ("kind", Json::str("markdown")),
+                                                ("value", Json::str(v)),
+                                            ]),
+                                        )]),
+                                        None => Json::Null,
+                                    }
+                                } else {
+                                    match definition_at(&db, &root, off) {
+                                        Some(span) => location_json(uri, &text, span),
+                                        None => Json::Null,
+                                    }
+                                }
+                            }
+                            None => Json::Null,
+                        }
+                    }
+                    None => Json::Null,
+                };
+                match id {
+                    Some(id) => vec![response(Some(id), result)],
                     None => vec![],
                 }
             }
@@ -313,15 +373,30 @@ fn percent_decode(s: &str) -> String {
 
 /// Lex + parse one document (raw text, so spans align with the editor buffer).
 fn parse_doc(path: &std::path::Path, text: &str) -> Vec<Diagnostic> {
-    let mut db = SourceDb::new();
-    let Ok(id) = db.add_file(path.display().to_string(), text) else {
-        return Vec::new();
-    };
-    match Language::from_path(path) {
-        Some(Language::Verilog) => hdl_syntax::verilog::parser::parse_file(id, db.file(id)).diags,
-        Some(Language::Vhdl) => hdl_syntax::vhdl::parser::parse_file(id, db.file(id)).diags,
+    match parse_root(path, text) {
+        Some((_db, _root, diags)) => diags,
         None => Vec::new(),
     }
+}
+
+/// Parse a document and return the db, CST root, and diagnostics.
+fn parse_root(
+    path: &std::path::Path,
+    text: &str,
+) -> Option<(SourceDb, SyntaxNode, Vec<Diagnostic>)> {
+    let mut db = SourceDb::new();
+    let id = db.add_file(path.display().to_string(), text).ok()?;
+    let (root, diags) = match Language::from_path(path)? {
+        Language::Verilog => {
+            let p = hdl_syntax::verilog::parser::parse_file(id, db.file(id));
+            (p.root, p.diags)
+        }
+        Language::Vhdl => {
+            let p = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+            (p.root, p.diags)
+        }
+    };
+    Some((db, root, diags))
 }
 
 /// LSP position: 0-based line, 0-based UTF-16 code-unit column.
@@ -371,6 +446,165 @@ fn to_lsp_diag(text: &str, d: &Diagnostic) -> Json {
         ("code", Json::str(d.code)),
         ("source", Json::str("hdlsim")),
         ("message", Json::str(d.message.clone())),
+    ])
+}
+
+/// LSP `Position` (0-based line, UTF-16 column) -> byte offset. Inverse of
+/// [`offset_to_position`].
+pub fn position_to_offset(text: &str, line: u32, character: u32) -> Option<u32> {
+    let mut cur = 0u32;
+    let mut start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            if cur == line {
+                break;
+            }
+            cur += 1;
+            start = i + 1;
+        }
+    }
+    if cur != line {
+        return None;
+    }
+    let mut col = 0u32;
+    for (j, c) in text[start..].char_indices() {
+        if col >= character {
+            return Some((start + j) as u32);
+        }
+        col += c.len_utf16() as u32;
+    }
+    Some(text.len() as u32)
+}
+
+/// Deepest non-trivia leaf token containing byte offset `off`.
+fn leaf_at(root: &SyntaxNode, off: u32) -> Option<SyntaxNode> {
+    for d in root.descendants() {
+        if d.children().next().is_some() {
+            continue; // not a leaf
+        }
+        match d.kind() {
+            SyntaxKind::Whitespace | SyntaxKind::Comment | SyntaxKind::Eof => continue,
+            _ => {}
+        }
+        let sp = d.span();
+        if sp.start > off {
+            break;
+        }
+        if sp.start <= off && off < sp.end {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Hover text (markdown) for the token at byte offset `off`.
+fn hover_at(db: &SourceDb, root: &SyntaxNode, off: u32) -> Option<String> {
+    let leaf = leaf_at(root, off)?;
+    let tok = leaf.text(db);
+    // Nearest non-root ancestor gives the syntactic context.
+    let mut ctx = leaf.parent();
+    let mut ctx_kind = SyntaxKind::Root;
+    let mut snippet = String::new();
+    while let Some(n) = ctx {
+        if n.kind() == SyntaxKind::Root || n.kind() == SyntaxKind::Name {
+            ctx = n.parent();
+            continue;
+        }
+        ctx_kind = n.kind();
+        let t = n.text(db);
+        let first = t.lines().next().unwrap_or("").trim();
+        snippet = if first.len() > 80 {
+            format!("{}...", &first[..80])
+        } else {
+            first.to_string()
+        };
+        break;
+    }
+    Some(format!(
+        "`{}` — `{:?}`\n\n```\n{}\n```",
+        tok, ctx_kind, snippet
+    ))
+}
+
+/// Keywords after which an identifier is a declaration name.
+const DECL_KEYWORDS: &[&str] = &[
+    "module",
+    "macromodule",
+    "entity",
+    "architecture",
+    "process",
+    "function",
+    "task",
+    "procedure",
+    "package",
+    "signal",
+    "variable",
+    "constant",
+    "generic",
+    "port",
+    "type",
+    "subtype",
+    "component",
+    "wire",
+    "reg",
+    "logic",
+    "integer",
+    "real",
+    "genvar",
+    "input",
+    "output",
+    "inout",
+    "parameter",
+    "localparam",
+];
+
+/// Go-to-definition: if the token at `off` is an identifier, find its
+/// declaration in the same document (an `Ident` leaf preceded by a declaration
+/// keyword). Returns the declaration span.
+fn definition_at(db: &SourceDb, root: &SyntaxNode, off: u32) -> Option<Span> {
+    let leaf = leaf_at(root, off)?;
+    if leaf.kind() != SyntaxKind::Ident {
+        return None;
+    }
+    let name = leaf.text(db);
+    if DECL_KEYWORDS.contains(&name.to_ascii_lowercase().as_str()) {
+        return Some(leaf.span()); // cursor on the keyword itself
+    }
+    let mut prev: Option<String> = None;
+    for d in root.descendants() {
+        if d.children().next().is_some() {
+            continue;
+        }
+        match d.kind() {
+            SyntaxKind::Whitespace | SyntaxKind::Comment | SyntaxKind::Eof => continue,
+            _ => {}
+        }
+        if d.kind() == SyntaxKind::Ident && d.text(db) == name {
+            if let Some(p) = &prev {
+                if DECL_KEYWORDS.contains(&p.to_ascii_lowercase().as_str()) {
+                    return Some(d.span());
+                }
+            }
+        }
+        prev = Some(d.text(db).to_string());
+    }
+    None
+}
+
+fn location_json(uri: &str, text: &str, span: Span) -> Json {
+    let pos = |off: u32| {
+        let (l, c) = offset_to_position(text, off);
+        Json::obj(vec![("line", Json::num(l)), ("character", Json::num(c))])
+    };
+    Json::obj(vec![
+        ("uri", Json::str(uri)),
+        (
+            "range",
+            Json::obj(vec![
+                ("start", pos(span.start)),
+                ("end", pos(span.end.max(span.start))),
+            ]),
+        ),
     ])
 }
 
@@ -527,8 +761,7 @@ mod tests {
             .get("diagnostics")
             .unwrap()
             .as_arr()
-            .unwrap()
-            .clone();
+            .unwrap();
         assert!(!diags.is_empty());
     }
 
@@ -541,12 +774,88 @@ mod tests {
         srv.handle(&msg(r#"{"jsonrpc":"2.0","method":"exit"}"#));
         assert!(srv.exit_requested);
         let out = srv.handle(&msg(
-            r#"{"jsonrpc":"2.0","id":9,"method":"textDocument/hover"}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"textDocument/semanticTokens"}"#,
         ));
         assert_eq!(
             out[0].get("error").unwrap().get("code"),
             Some(&Json::num(-32601))
         );
+    }
+
+    #[test]
+    fn position_offset_roundtrip_utf16() {
+        let text = "ab\n\u{1f600}x\nlast";
+        for off in [0usize, 1, 2, 3, 7, 8, 9, 12, 13] {
+            let (l, c) = offset_to_position(text, off as u32);
+            assert_eq!(
+                position_to_offset(text, l, c),
+                Some(off as u32),
+                "off {}",
+                off
+            );
+        }
+        assert_eq!(position_to_offset(text, 2, 0), Some(9));
+        assert_eq!(position_to_offset(text, 99, 0), None);
+    }
+
+    #[test]
+    fn hover_and_definition_requests() {
+        let mut srv = Server::new();
+        let uri = "file:///tmp/def.v";
+        let text = "module m;\nwire d;\nwire q;\ninitial q = d;\nendmodule\n";
+        let open = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{}","text":"{}"}}}}}}"#,
+            uri,
+            text.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        );
+        srv.handle(&msg(&open));
+        // hover over `m` in `module m;` (line 0, char 7)
+        let hov = format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":0,"character":7}}}}}}"#,
+            uri
+        );
+        let out = srv.handle(&msg(&hov));
+        let value = out[0]
+            .get("result")
+            .and_then(|r| r.get("contents"))
+            .and_then(|c| c.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(value.contains("`m`"), "{}", value);
+        assert!(value.contains("Module"), "{}", value);
+        // definition of `d` used at line 3, char 12 -> declared at line 1, char 5
+        let def = format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":3,"character":12}}}}}}"#,
+            uri
+        );
+        let out = srv.handle(&msg(&def));
+        let range = out[0].get("result").and_then(|r| r.get("range")).unwrap();
+        assert_eq!(range.get("start").unwrap().get("line"), Some(&Json::num(1)));
+        assert_eq!(
+            range.get("start").unwrap().get("character"),
+            Some(&Json::num(5))
+        );
+        assert_eq!(
+            out[0]
+                .get("result")
+                .unwrap()
+                .get("uri")
+                .and_then(|u| u.as_str()),
+            Some(uri)
+        );
+    }
+
+    #[test]
+    fn initialize_advertises_hover_and_definition() {
+        let mut srv = Server::new();
+        let out = srv.handle(&msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        let caps = out[0].get("result").unwrap().get("capabilities").unwrap();
+        assert_eq!(caps.get("hoverProvider"), Some(&Json::Bool(true)));
+        assert_eq!(caps.get("definitionProvider"), Some(&Json::Bool(true)));
     }
 
     #[test]
