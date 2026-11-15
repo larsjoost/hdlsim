@@ -170,6 +170,9 @@ impl<'a> Lower<'a> {
             instances: Vec::new(),
             time_unit_fs: self.time_unit_fs,
         };
+        // The name map is per-module: without this, a declaration in the second
+        // module of a file would be skipped as "already known" from the first.
+        self.names.clear();
         // First pass: params (so ports and later items can use them in ranges).
         let mut env: HashMap<String, Value> = HashMap::new();
         for item in &item_nodes {
@@ -502,7 +505,11 @@ impl<'a> Lower<'a> {
             match k.kind() {
                 SyntaxKind::SensList => {
                     sens = self.lower_sens_list(k, env);
-                    origin = self.text(k);
+                    let kw = match kind {
+                        ProcKind::Initial => "initial",
+                        ProcKind::Always => "always",
+                    };
+                    origin = format!("{} @{}", kw, self.text(k));
                 }
                 SyntaxKind::Ident | SyntaxKind::Punct => {}
                 _ => body = Some(k.clone()),
@@ -512,6 +519,12 @@ impl<'a> Lower<'a> {
             Some(b) => self.lower_stmt(&b, env),
             None => Stmt::Null,
         };
+        if origin.is_empty() {
+            origin = match kind {
+                ProcKind::Initial => "initial".to_string(),
+                ProcKind::Always => "always".to_string(),
+            };
+        }
         module.processes.push(ProcessIr {
             kind,
             sens,
@@ -1495,6 +1508,27 @@ mod tests {
         let mut diags = parsed.diags;
         let modules = lower_file(id, &parsed.root, &db, &mut diags);
         (modules, db, diags)
+    }
+
+    #[test]
+    fn two_modules_in_one_file_do_not_share_names() {
+        // Regression: the per-module name map used to leak from the first
+        // module into the second, so a same-named decl in module 2 was
+        // skipped and later references failed with "unknown identifier".
+        let src = "module a (input wire x); endmodule\n\
+                   module b;\n    reg x;\n    initial begin x = 1'b0; end\nendmodule\n";
+        let (modules, _db, diags) = lower_src(src);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity != hdl_syntax::diagnostic::Severity::Error),
+            "{:?}",
+            diags
+        );
+        assert_eq!(modules.len(), 2);
+        let b = &modules[1];
+        assert_eq!(b.name, "b");
+        assert!(b.signals.iter().any(|s| s.name == "x"), "{:?}", b.signals);
     }
 
     #[test]

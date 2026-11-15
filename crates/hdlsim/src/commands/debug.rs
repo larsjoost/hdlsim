@@ -38,6 +38,7 @@ impl Command for Debug {
         let mut files: Vec<PathBuf> = Vec::new();
         let mut top: Option<String> = None;
         let mut watches: Vec<String> = Vec::new();
+        let mut drivers: Vec<String> = Vec::new();
         let mut mems: Vec<String> = Vec::new();
         let mut all = false;
         let mut dump = false;
@@ -51,6 +52,10 @@ impl Command for Debug {
                 }
                 "--watch" => {
                     watches.push(rest.get(i + 1).ok_or("--watch needs a value")?.clone());
+                    i += 2;
+                }
+                "--driver" => {
+                    drivers.push(rest.get(i + 1).ok_or("--driver needs a value")?.clone());
                     i += 2;
                 }
                 "--mem" => {
@@ -113,6 +118,21 @@ impl Command for Debug {
         if sim.failures() > 0 {
             println!("hdlsim debug: FAILED — {} test failure(s)", sim.failures());
             return Ok(1);
+        }
+        for d in &drivers {
+            let Some(id) = sim.signal_id(d) else {
+                eprintln!("hdlsim debug: no signal named '{}'", d);
+                continue;
+            };
+            match sim.driver_of(id) {
+                Some((t, origin)) => println!(
+                    "driver of {}: {} (last write at t={})",
+                    sim.signal_name(id),
+                    origin,
+                    fmt_time(t)
+                ),
+                None => println!("driver of {}: never driven", sim.signal_name(id)),
+            }
         }
         for m in &mems {
             let Some(id) = sim.signal_id(m) else {

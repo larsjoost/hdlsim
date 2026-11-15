@@ -24,6 +24,10 @@ pub enum SimEvent {
         new: Value,
         time_fs: u64,
     },
+    /// The driver of `sig` changed (a different process, or a process vs. a
+    /// continuous assign, wrote it last) — wave-viewer driver tracing.
+    /// `proc == u32::MAX` means a continuous `assign`.
+    Driver { sig: u32, proc: u32, time_fs: u64 },
     /// A process started (`true`) / finished (`false`) executing.
     ProcActive {
         proc: u32,
