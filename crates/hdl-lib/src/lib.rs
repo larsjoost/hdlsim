@@ -173,6 +173,12 @@ impl LibraryManager {
         self.indexed = true;
     }
 
+    /// The file that defines `unit` according to the library index, if any.
+    pub fn unit_file(&mut self, unit: &str) -> Option<PathBuf> {
+        self.ensure_index();
+        self.index.get(unit).and_then(|v| v.first().cloned())
+    }
+
     /// Compile one source file into `design` (at most once per session).
     pub fn compile_file(&mut self, design: &mut Design, path: &Path) -> Result<(), String> {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
