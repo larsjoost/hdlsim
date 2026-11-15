@@ -51,9 +51,9 @@ source → tokens → CST → AST → IR (elaborated) → sim events → sinks (
   formatter (`hdlsim fmt`), linter (`hdlsim lint --fix`), driver tracing,
   checkpoint/restore, mini-TCL `do` files, SVA/PSL-lite, `.hwf` viewer, parser
   fuzz harness, `hdlsim doc` HTML docs, `--seed` reproducible $random,
-  `hdlsim doctor` / `hdlsim completions`.
-- Phase 2 (remaining): FST wave format (risky to hand-roll offline - may skip),
-  analog waves (needs real-valued kernel support - big).
+  `hdlsim doctor` / `hdlsim completions`, FST wave format (`--fst`, std-only
+  writer + reader, readable by GTKWave and `hdlsim wave`).
+- Phase 2 (remaining): analog waves (needs real-valued kernel support - big).
 - Phase 3 (done): reverse debug (`back [N]` in do-files).
 - Phase 3 (remaining): SystemVerilog proper, VHDL-2008, constrained-random stimulus,
   own CDCL + BMC (`hdlsim prove top --bmc N`), UVM-lite.
@@ -118,7 +118,7 @@ Merged PRs (main @ 19b5f60, 2026-11-15):
 | #23 | `hdlsim doc` cross-linked HTML docs |
 | #24 | `--seed N` reproducible `$random`; mixed-language co-sim tests |
 | #25 | `hdlsim doctor` + `hdlsim completions` (bash/zsh/fish) |
+| #29 | FST wave format: `run --fst out.fst` (std-only stored-deflate writer) + `hdlsim wave out.fst`; full inflate reader for foreign FST files |
 
-Remaining, in suggested order: constrained-random stimulus, `hdlsim prove`
-(CDCL + BMC), FST/analog waves (see phase-2 notes), then SystemVerilog proper /
-VHDL-2008 / UVM-lite.
+Remaining, in suggested order: `hdlsim prove` (CDCL + BMC, draft PR #28), analog
+waves (see phase-2 notes), then SystemVerilog proper / VHDL-2008 / UVM-lite.

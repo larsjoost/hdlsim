@@ -1,5 +1,6 @@
-//! `hdlsim wave` — render a `.hwf` wave file (written by `run --hwf`) into
-//! the self-contained HTML viewer, without re-running the simulation:
+//! `hdlsim wave` — render a wave file (`.hwf` from `run --hwf`, or `.fst` from
+//! `run --fst` / any GTKWave-produced FST file) into the self-contained HTML
+//! viewer, without re-running the simulation:
 //! `hdlsim wave waves.hwf [-o out.html]`. Default output: same name, `.html`.
 
 use super::Command;
@@ -13,7 +14,7 @@ impl Command for Wave {
         "wave"
     }
     fn about(&self) -> &'static str {
-        "render a .hwf wave file to the HTML viewer: hdlsim wave file.hwf [-o out.html]"
+        "render a .hwf/.fst wave file to the HTML viewer: hdlsim wave file.hwf [-o out.html]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let mut input: Option<PathBuf> = None;
@@ -34,14 +35,17 @@ impl Command for Wave {
                 }
             }
         }
-        let input = input.ok_or("usage: hdlsim wave <file.hwf> [-o out.html]")?;
+        let input = input.ok_or("usage: hdlsim wave <file.hwf|file.fst> [-o out.html]")?;
         let out = match out {
             Some(p) => p,
             None => input.with_extension("html"),
         };
         let bytes =
             std::fs::read(&input).map_err(|e| format!("cannot read {}: {}", input.display(), e))?;
-        let (flat, events) = hdl_wave::sinks::hwf::read_hwf(&bytes)?;
+        let (flat, events) = match input.extension().and_then(|e| e.to_str()) {
+            Some("fst") => hdl_wave::fst::read_fst(&bytes)?,
+            _ => hdl_wave::sinks::hwf::read_hwf(&bytes)?,
+        };
         let file = std::fs::File::create(&out)
             .map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
         let mut sink = hdl_wave::sinks::html::HtmlSink::new(file, out.clone(), &flat);

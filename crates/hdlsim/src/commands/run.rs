@@ -26,7 +26,7 @@ impl Command for Run {
         "run"
     }
     fn about(&self) -> &'static str {
-        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
+        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--hwf out.hwf] [--fst out.fst] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
@@ -34,6 +34,7 @@ impl Command for Run {
         let mut top: Option<String> = None;
         let mut vcd: Option<PathBuf> = None;
         let mut hwf: Option<PathBuf> = None;
+        let mut fst: Option<PathBuf> = None;
         let mut wave: Option<PathBuf> = None;
         let mut live = false;
         let mut port: u16 = 8085;
@@ -56,6 +57,10 @@ impl Command for Run {
                 }
                 "--hwf" => {
                     hwf = Some(PathBuf::from(rest.get(i + 1).ok_or("--hwf needs a value")?));
+                    i += 2;
+                }
+                "--fst" => {
+                    fst = Some(PathBuf::from(rest.get(i + 1).ok_or("--fst needs a value")?));
                     i += 2;
                 }
                 "--wave" => {
@@ -193,6 +198,16 @@ impl Command for Run {
                 flat: sim.flat().clone(),
             }));
             println!("hdlsim: .hwf waves will be written to {}", path.display());
+        }
+        if let Some(path) = fst {
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+            let sink = hdl_wave::sinks::fst::FstSink::new(file, sim.flat());
+            sim.add_observer(Box::new(hdl_wave::SinkAdapter {
+                sink,
+                flat: sim.flat().clone(),
+            }));
+            println!("hdlsim: .fst waves will be written to {}", path.display());
         }
         if let Some(path) = wave {
             let file = std::fs::File::create(&path)

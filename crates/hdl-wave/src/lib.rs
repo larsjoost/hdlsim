@@ -17,6 +17,7 @@
 //! Invariant: sinks handle arbitrary signal widths; the HTML pages never need
 //! the network (all assets embedded).
 
+pub mod fst;
 pub mod sinks;
 
 pub use sinks::html::HtmlSink;
