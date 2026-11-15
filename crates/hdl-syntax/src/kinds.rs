@@ -102,6 +102,10 @@ pub enum SyntaxKind {
     Repeat,
     Forever,
     DoWhile,
+    /// `break;`
+    BreakStmt,
+    /// `continue;`
+    ContinueStmt,
     /// `disable name;`
     Disable,
     /// `fork ... join` / `join_any` / `join_none`.
@@ -209,6 +213,20 @@ pub enum SyntaxKind {
 }
 
 /// All variants in declaration order — index == `kind as u16`.
+/// Fingerprint of the kind table (FNV-1a over the variant names). Cache
+/// entries that embed kind indices (e.g. the `.hdlsim-cache/` parse cache)
+/// compare against this, so any change to the table invalidates them.
+pub fn fingerprint() -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for k in ALL {
+        for b in format!("{:?}", k).as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
 pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Ident,
     SyntaxKind::IntLiteral,
@@ -265,6 +283,8 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Repeat,
     SyntaxKind::Forever,
     SyntaxKind::DoWhile,
+    SyntaxKind::BreakStmt,
+    SyntaxKind::ContinueStmt,
     SyntaxKind::Disable,
     SyntaxKind::ForkJoin,
     SyntaxKind::Trigger,
@@ -404,6 +424,8 @@ impl SyntaxKind {
                 | SyntaxKind::Repeat
                 | SyntaxKind::Forever
                 | SyntaxKind::DoWhile
+                | SyntaxKind::BreakStmt
+                | SyntaxKind::ContinueStmt
                 | SyntaxKind::Disable
                 | SyntaxKind::ForkJoin
                 | SyntaxKind::Trigger
@@ -503,7 +525,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 110);
+        assert_eq!(ALL.len(), 112);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

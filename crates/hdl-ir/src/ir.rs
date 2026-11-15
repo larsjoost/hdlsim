@@ -182,7 +182,16 @@ pub enum Stmt {
         step: Box<Stmt>,
         body: Box<Stmt>,
     },
+    /// `repeat (count) body` — count is evaluated once when the loop is entered.
+    Repeat {
+        count: Expr,
+        body: Box<Stmt>,
+    },
     ExprStmt(Expr),
+    /// `break;` — exit the innermost loop.
+    Break,
+    /// `continue;` — jump to the innermost loop's step/next iteration.
+    Continue,
     Null,
     /// Source-span wrapper attached by the lowerers to every statement — used
     /// for line/branch coverage, never changes semantics.
@@ -359,6 +368,11 @@ impl Stmt {
                 step.collect_sigs(out);
                 body.collect_sigs(out);
             }
+            Stmt::Repeat { count, body } => {
+                count.collect_sigs(out);
+                body.collect_sigs(out);
+            }
+            Stmt::Break | Stmt::Continue => {}
             Stmt::ExprStmt(e) => e.collect_sigs(out),
             Stmt::Null => {}
         }

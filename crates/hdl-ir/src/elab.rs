@@ -528,6 +528,12 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             step: Box::new(remap_stmt(step, map)),
             body: Box::new(remap_stmt(body, map)),
         },
+        Stmt::Repeat { count, body } => Stmt::Repeat {
+            count: remap_expr(count, map),
+            body: Box::new(remap_stmt(body, map)),
+        },
+        Stmt::Break => Stmt::Break,
+        Stmt::Continue => Stmt::Continue,
         Stmt::ExprStmt(e) => Stmt::ExprStmt(remap_expr(e, map)),
         Stmt::Null => Stmt::Null,
     }

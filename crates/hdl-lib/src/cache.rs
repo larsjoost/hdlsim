@@ -2,7 +2,9 @@
 //!
 //! One cache file per source file, named by the hash of its canonical path.
 //! File format (little-endian):
-//! `magic "HDLCST1\0" | u32 format_version | u64 source_hash | payload`.
+//! `magic "HDLCST1\0" | u32 format_version | u64 kinds_fingerprint | u64 source_hash | payload`.
+//! The kinds fingerprint (`hdl_syntax::kinds::fingerprint`) invalidates entries
+//! whenever the SyntaxKind table changes (CST payloads embed kind indices).
 //! The payload itself is composed by the caller (hdl-lib): an optional
 //! timescale string, the encoded CST, and the encoded diagnostics — see
 //! `LibraryManager`. A hit therefore skips lexing+parsing entirely; lowering
@@ -75,6 +77,9 @@ impl Cache {
         if r.u32()? != FORMAT_VERSION {
             return None;
         }
+        if r.u64()? != hdl_syntax::kinds::fingerprint() {
+            return None;
+        }
         if r.u64()? != source_hash {
             return None;
         }
@@ -84,9 +89,10 @@ impl Cache {
     /// Store a payload (atomic via tmp+rename; failures are silently ignored —
     /// the cache is an optimization, never a correctness requirement).
     pub fn put(&self, file: &Path, source_hash: u64, payload: &[u8]) {
-        let mut out = Vec::with_capacity(payload.len() + 24);
+        let mut out = Vec::with_capacity(payload.len() + 32);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&hdl_syntax::kinds::fingerprint().to_le_bytes());
         out.extend_from_slice(&source_hash.to_le_bytes());
         out.extend_from_slice(payload);
         let entry = self.entry(file);

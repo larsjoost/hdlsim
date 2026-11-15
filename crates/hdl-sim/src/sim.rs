@@ -44,6 +44,13 @@ enum Frame {
         body: Box<Stmt>,
         after_body: bool,
     },
+    /// Repeat-loop marker (`repeat (n) body`): `remaining` is the count
+    /// evaluated once at loop entry. Same protocol as `ForIter`.
+    RepeatIter {
+        remaining: i64,
+        body: Box<Stmt>,
+        after_body: bool,
+    },
 }
 
 impl Frame {
@@ -62,6 +69,11 @@ enum Control {
     Suspend(u64),
     /// Park the process until one of the listed signal edges occurs.
     Wait,
+    /// `break;`: pop frames up to and including the innermost loop marker.
+    Break,
+    /// `continue;`: pop frames above the innermost loop marker and run its
+    /// step / next iteration.
+    Continue,
 }
 
 pub struct Simulator {
@@ -484,7 +496,9 @@ impl Simulator {
         }
         loop {
             match self.exec_frames(pid) {
-                Control::Done => {
+                // Break/Continue are consumed inside exec_frames; if one ever
+                // escapes (no enclosing loop), treat it as process end.
+                Control::Done | Control::Break | Control::Continue => {
                     if self.flat.procs[pid as usize].kind == ProcKind::Always {
                         // `always @(sens) stmt` ≡ `forever begin @(sens); stmt end`:
                         // after the body completes, park until the next event.
@@ -530,6 +544,7 @@ impl Simulator {
             Exec(Stmt),
             ForStep,
             ForTest,
+            RepeatTest,
         }
         loop {
             let n = self.proc_rt[pid as usize].frames.len();
@@ -556,6 +571,17 @@ impl Simulator {
                             Act::ForTest
                         }
                     }
+                    Frame::RepeatIter {
+                        remaining,
+                        after_body,
+                        ..
+                    } => {
+                        if *after_body {
+                            *remaining -= 1;
+                            *after_body = false;
+                        }
+                        Act::RepeatTest
+                    }
                 }
             };
             match action {
@@ -563,6 +589,35 @@ impl Simulator {
                     Control::Done => continue,
                     Control::Suspend(at) => return Control::Suspend(at),
                     Control::Wait => return Control::Wait,
+                    Control::Break => {
+                        let rt = &mut self.proc_rt[pid as usize];
+                        while let Some(f) = rt.frames.last() {
+                            let is_loop =
+                                matches!(f, Frame::ForIter { .. } | Frame::RepeatIter { .. });
+                            rt.frames.pop();
+                            if is_loop {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    Control::Continue => {
+                        let rt = &mut self.proc_rt[pid as usize];
+                        let mut i = rt.frames.len();
+                        while i > 0 {
+                            i -= 1;
+                            match &mut rt.frames[i] {
+                                Frame::ForIter { after_body, .. }
+                                | Frame::RepeatIter { after_body, .. } => {
+                                    *after_body = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        rt.frames.truncate(i + 1);
+                        continue;
+                    }
                 },
                 Act::ForStep => {
                     // Run the loop step in its own block frame above the marker.
@@ -573,6 +628,23 @@ impl Simulator {
                     self.proc_rt[pid as usize]
                         .frames
                         .push(Frame::block(vec![step]));
+                }
+                Act::RepeatTest => {
+                    let (remaining, body) = match &self.proc_rt[pid as usize].frames[n - 1] {
+                        Frame::RepeatIter {
+                            remaining, body, ..
+                        } => (*remaining, (**body).clone()),
+                        _ => unreachable!(),
+                    };
+                    let rt = &mut self.proc_rt[pid as usize];
+                    if remaining > 0 {
+                        if let Frame::RepeatIter { after_body, .. } = &mut rt.frames[n - 1] {
+                            *after_body = true;
+                        }
+                        rt.frames.push(Frame::block(vec![body]));
+                    } else {
+                        rt.frames.pop();
+                    }
                 }
                 Act::ForTest => {
                     let (cond, body) = match &self.proc_rt[pid as usize].frames[n - 1] {
@@ -704,6 +776,18 @@ impl Simulator {
                 });
                 self.exec_stmt(pid, *init)
             }
+            Stmt::Repeat { count, body } => {
+                let v = self.eval_expr(&count, None);
+                let remaining = v.to_u64().map(|u| u as i64).unwrap_or(0);
+                self.proc_rt[pid as usize].frames.push(Frame::RepeatIter {
+                    remaining,
+                    body,
+                    after_body: false,
+                });
+                Control::Done
+            }
+            Stmt::Break => Control::Break,
+            Stmt::Continue => Control::Continue,
             Stmt::ExprStmt(e) => {
                 self.eval_expr(&e, None);
                 Control::Done

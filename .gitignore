@@ -2,3 +2,4 @@
 .hdlsim-cache/
 *.vcd
 *.hwf
+!crates/hdlsim/tests/fixtures/counter_golden.vcd

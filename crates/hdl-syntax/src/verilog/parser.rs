@@ -1394,6 +1394,18 @@ impl<'a> Parser<'a> {
                 self.parse_statement();
                 self.builder.finish_node();
             }
+            TokenKind::Ident if text == "break" => {
+                self.builder.start_node(SyntaxKind::BreakStmt);
+                self.bump();
+                self.eat_punct(';');
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "continue" => {
+                self.builder.start_node(SyntaxKind::ContinueStmt);
+                self.bump();
+                self.eat_punct(';');
+                self.builder.finish_node();
+            }
             TokenKind::Ident if text == "repeat" => {
                 self.builder.start_node(SyntaxKind::Repeat);
                 self.bump();
@@ -1883,6 +1895,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) {
+        // Consume pending trivia into the *parent* node first, so a `Name`
+        // started below does not absorb a preceding comment into its text.
+        while self.pos < self.tokens.len() {
+            let t = &self.tokens[self.pos];
+            if matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment) {
+                self.builder
+                    .token(SyntaxKind::from_token(t.kind), t.span.len());
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
         let t = self.peek().clone();
         match t.kind {
             TokenKind::IntLiteral | TokenKind::RealLiteral | TokenKind::StrLiteral => {
@@ -2154,6 +2178,9 @@ endmodule
         for node in ["(While", "(Repeat", "(Forever", "(DoWhile"] {
             assert!(sexp.contains(node), "{} missing in {}", node, sexp);
         }
+        // A comment before a statement must not leak into the statement's Name.
+        let sexp = ok("module m;\ninitial begin\n  // note\n  x = 1;\nend\nendmodule\n");
+        assert!(sexp.contains(r#"(Name Ident "x")"#), "{}", sexp);
     }
 
     #[test]

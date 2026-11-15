@@ -71,6 +71,8 @@ pub fn coverage_universe(design: &Design) -> (HashSet<Span>, HashSet<Span>) {
                 walk(step, lines, branches);
                 walk(body, lines, branches);
             }
+            Stmt::Repeat { body, .. } => walk(body, lines, branches),
+            Stmt::Break | Stmt::Continue => {}
             Stmt::Assign { .. } | Stmt::ExprStmt(_) | Stmt::Null | Stmt::SysCall { .. } => {}
         }
     }
