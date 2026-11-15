@@ -16,6 +16,8 @@
 
 use crate::events::{Observer, SimEvent};
 use hdl_ir::elab::{Flat, FlatSigId};
+
+mod ckpt;
 use hdl_ir::value::{Value, V0, V1, VX};
 use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, Stmt};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -355,6 +357,27 @@ impl Simulator {
     }
 
     // ---- main loop ------------------------------------------------------------
+
+    /// Write the full dynamic simulator state to `path` (own binary format
+    /// `HDLCKPT1`) — checkpoint/restore, see [`Simulator::restore_checkpoint`].
+    pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        // A checkpoint is meant to be resumed: a hard `--max-time` stop sets
+        // `stopped`, which would make the restored run exit immediately.
+        // (`finished` via $finish is kept — that state is genuinely terminal.)
+        self.stopped = false;
+        let mut buf = Vec::new();
+        ckpt::save(self, &mut buf);
+        std::fs::write(path, &buf)
+    }
+
+    /// Rebuild a simulator from `flat` plus a checkpoint written by
+    /// [`Simulator::save_checkpoint`]. The re-elaborated design must match the
+    /// checkpointed one (fingerprint check) or this returns an error.
+    pub fn restore_checkpoint(flat: Flat, path: &std::path::Path) -> Result<Simulator, String> {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        ckpt::load(flat, &bytes)
+    }
 
     /// Run until `$finish`, until `max_time_fs`, or until no events remain.
     pub fn run(&mut self, max_time_fs: u64) {

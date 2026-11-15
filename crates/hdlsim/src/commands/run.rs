@@ -39,6 +39,8 @@ impl Command for Run {
         let mut max_time_fs = u64::MAX;
         let mut coverage = false;
         let mut coverage_out: Option<PathBuf> = None;
+        let mut checkpoint: Option<PathBuf> = None;
+        let mut restore: Option<PathBuf> = None;
         let mut i = 0;
         while i < rest.len() {
             match rest[i].as_str() {
@@ -71,6 +73,18 @@ impl Command for Run {
                 "--max-time" => {
                     let v = rest.get(i + 1).ok_or("--max-time needs a value")?;
                     max_time_fs = parse_time(v)?;
+                    i += 2;
+                }
+                "--checkpoint" => {
+                    checkpoint = Some(PathBuf::from(
+                        rest.get(i + 1).ok_or("--checkpoint needs a value")?,
+                    ));
+                    i += 2;
+                }
+                "--restore" => {
+                    restore = Some(PathBuf::from(
+                        rest.get(i + 1).ok_or("--restore needs a value")?,
+                    ));
                     i += 2;
                 }
                 "--coverage" => {
@@ -126,7 +140,10 @@ impl Command for Run {
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
-        let mut sim = Simulator::new(flat);
+        let mut sim = match &restore {
+            Some(p) => Simulator::restore_checkpoint(flat, p)?,
+            None => Simulator::new(flat),
+        };
         sim.add_observer(Box::new(Transcript));
         // Coverage collector, kept behind a shared handle so we can report
         // after the run.
@@ -183,6 +200,11 @@ impl Command for Run {
             sim.flat().signals.len(),
             sim.flat().procs.len()
         );
+        if let Some(p) = &checkpoint {
+            sim.save_checkpoint(p)
+                .map_err(|e| format!("cannot write checkpoint {}: {}", p.display(), e))?;
+            println!("hdlsim: checkpoint written to {}", p.display());
+        }
         if let Some(cov) = &cov {
             let report = cov.borrow().report(mgr.db());
             match &coverage_out {
