@@ -11,6 +11,7 @@ mod check;
 mod debug;
 mod fmt;
 mod init;
+mod lint;
 pub mod lsp;
 mod project;
 mod regress;
@@ -222,6 +223,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &regress::Regress,
     &lsp::Lsp,
     &fmt::Fmt,
+    &lint::LintCmd,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
