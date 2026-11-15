@@ -9,6 +9,7 @@ mod ast;
 mod bundle;
 mod check;
 mod debug;
+mod fmt;
 mod init;
 pub mod lsp;
 mod project;
@@ -220,6 +221,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &bundle::Bundle,
     &regress::Regress,
     &lsp::Lsp,
+    &fmt::Fmt,
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.

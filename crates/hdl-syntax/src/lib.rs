@@ -22,6 +22,7 @@
 
 pub mod cst;
 pub mod diagnostic;
+pub mod fmt;
 pub mod kinds;
 pub mod language;
 pub mod source;
