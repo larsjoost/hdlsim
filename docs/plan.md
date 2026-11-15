@@ -59,6 +59,19 @@ source → tokens → CST → AST → IR (elaborated) → sim events → sinks (
   (`.hwf` v2 carries a real flag; FST carries reals as `FST_VT_VCD_REAL`).
 - Phase 2 (remaining): full analog kernel support (continuous `wreal`/
   VHDL-AMS is out of scope).
+- Phase 4 (done): SystemVerilog subset and VHDL-2008 on top of phase 1:
+  SV packages + `import` + `pkg::` refs, typedefs (plain/enum/packed
+  struct), `'{...}` assignment patterns, dynamic arrays/queues/assoc
+  arrays (`new[]`, `push_back`/`pop_back`/`size()`), `foreach`, classes
+  (`new`/ctor, fields, methods, tasks, `randomize()` with `rand` fields +
+  `constraint` blocks solved by the built-in solver), `unique`/`priority`
+  case, block-level declarations, 32-bit unsized literals. VHDL-2008:
+  `process(all)`, matching `case?`/`?=`/`?<=` operators with `'-'`
+  don't-care, `to_hstring`/`to_ostring`/`to_bstring`/`to_string`, delayed +
+  conditional (`when/else`) + selected (`with/select`) concurrent
+  assignments, architecture-level functions, implicit for-loop variables,
+  `exit when`. Every feature is locked in by a self-checking PASS design in
+  `examples/features/` (run by `crates/hdlsim/tests/examples.rs`).
 - Phase 3 prove notes: `hdl-sim::sat` is a MiniSat-style CDCL solver (two-watched
   literals, first-UIP learning, VSIDS, Luby restarts); `hdl-sim::bmc` encodes the
   elaborated IR 2-valued (X/Z→0, `rising_edge`≡true per step, div-by-0→0) with
@@ -105,7 +118,7 @@ names - hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim - verified unique
 crates.io; publish from the owner's machine with `cargo login` first, in dependency
 order: hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim).
 
-Merged PRs (main @ 19b5f60, 2026-11-15):
+Merged PRs (main @ c7feea8, 2026-11-16):
 
 | PR | What |
 |---|---|
@@ -136,5 +149,9 @@ Merged PRs (main @ 19b5f60, 2026-11-15):
 | #29 | FST wave format: `run --fst out.fst` (std-only stored-deflate writer) + `hdlsim wave out.fst`; full inflate reader for foreign FST files |
 | #30 | analog waves v1: `real` signals (Verilog/VHDL) as IEEE-754 doubles in the kernel + analog traces in HTML/live viewers, VCD `r` values, `.hwf` v2 real flag |
 | #31 | FST real vars: `FST_VT_VCD_REAL` (geom width 0, 8-byte doubles) in the writer, decoded by `read_fst` — GTKWave analog display |
+| (direct) | VHDL-2008 slice: `process(all)`, matching case/operators, `to_xstring`, delayed+conditional+selected assigns, t=0 process start |
+| (direct) | SV: packages, typedefs (enum/struct), `'{...}'` patterns, dynamic/queue/assoc arrays, `foreach`; postfix-parse + function-slot fixes |
+| (direct) | SV classes: `new`/ctor, fields, methods, tasks, `randomize()` + constraints; class-body/endclass parser fixes |
+| (direct) | `examples/features/`: 22 self-checking PASS designs (14 SV, 8 VHDL) wired into `tests/examples.rs`; fixes they exposed (32-bit unsized literals, concat/replicate parse, logical-not/reduction ops, `Stmt::Return`, `#(...)` instancing, generate blocks, block decls, VHDL functions/returns/exit-when/for-var, solver boundary values) |
 
-Remaining, in suggested order: SystemVerilog proper / VHDL-2008 / UVM-lite.
+Remaining, in suggested order: UVM-lite / broader SV coverage (interfaces, clocking blocks, covergroups), VHDL packages & configurations, synthesis-oriented subsets.

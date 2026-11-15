@@ -66,9 +66,15 @@ Pipeline: `source → tokens → CST → AST → IR → sim events → sinks`.
 
 ## Status
 
-Early development. See `docs/plan.md` for the roadmap, `docs/worldclass.md` for
-feature ideas under consideration, and `REVIEWING.md` for the code conventions
-(reviewability + extensibility rules) every contribution follows.
+Early development. Verilog-2005, a SystemVerilog subset (packages, typedefs,
+structs/enums, arrays/queues, classes with `randomize()` + constraints,
+generate, `unique case`), and VHDL incl. VHDL-2008 (`process(all)`, matching
+case/operators, `to_xstring`, conditional/selected assigns) are supported and
+locked in by self-checking examples in `examples/features/` (each prints
+`PASS`; run via `cargo test -p hdlsim --test examples`). See `docs/plan.md`
+for the roadmap, `docs/worldclass.md` for feature ideas under consideration,
+and `REVIEWING.md` for the code conventions (reviewability + extensibility
+rules) every contribution follows.
 
 ## Install
 
