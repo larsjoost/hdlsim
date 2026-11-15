@@ -58,6 +58,15 @@ pub enum SyntaxKind {
     Specify,
     /// Module instantiation (`foo bar (...)`) or gate primitive (`and (o,a,b)`).
     Inst,
+    /// `assert property (@(clk) a |-> b);` concurrent assertion (SVA-lite).
+    AssertProperty,
+    /// `assume property (...);` — parsed, not simulated (SVA-lite stub).
+    AssumeProperty,
+    /// `cover property (...);` — parsed, not simulated (SVA-lite stub).
+    CoverProperty,
+    /// Property expression inside assert/assume/cover: `ante |-> cons`,
+    /// `ante |=> cons`, or a plain boolean expr.
+    Property,
     /// One port connection in an instantiation (`.name(expr)` or positional).
     PortConn,
     /// One `#(...)` parameter override: `.name(expr)` or positional expr.
@@ -259,6 +268,10 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::GenBlock,
     SyntaxKind::Specify,
     SyntaxKind::Inst,
+    SyntaxKind::AssertProperty,
+    SyntaxKind::AssumeProperty,
+    SyntaxKind::CoverProperty,
+    SyntaxKind::Property,
     SyntaxKind::PortConn,
     SyntaxKind::ParamAssign,
     SyntaxKind::Task,
@@ -506,6 +519,10 @@ impl SyntaxKind {
                 | SyntaxKind::For
                 | SyntaxKind::SensList
                 | SyntaxKind::Inst
+                | SyntaxKind::AssertProperty
+                | SyntaxKind::AssumeProperty
+                | SyntaxKind::CoverProperty
+                | SyntaxKind::Property
                 | SyntaxKind::PortConn
                 | SyntaxKind::BinExpr
                 | SyntaxKind::UnaryExpr
@@ -525,7 +542,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 112);
+        assert_eq!(ALL.len(), 116);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));
