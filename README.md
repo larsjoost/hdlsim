@@ -107,6 +107,7 @@ hdlsim fmt --check src/...               # CI gate: exit 1 if any file would cha
 hdlsim fmt -w file.vhd                   # rewrite in place
 hdlsim lint file.v ...                   # lint (exit 1 on any finding); --fix applies safe fixes
 hdlsim do run.do --top tb file.v         # mini-Tcl do-file: run/restart/vcd dumpfile/examine
+hdlsim deps --top tb -L work=rtl tb.v    # list all files the top depends on (transitive)
 ```
 
 `hdlsim regress` runs each test as its own simulation (fresh design per test)
