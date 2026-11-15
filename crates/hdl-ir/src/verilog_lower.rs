@@ -244,6 +244,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::Decl => {
                     let dk = real_children(item);
                     let width = self.decl_width(&dk, &env);
+                    let is_real = dk
+                        .iter()
+                        .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "real");
                     for k in &dk {
                         if k.kind() == SyntaxKind::Name {
                             let n = self.text(k);
@@ -252,7 +255,11 @@ impl<'a> Lower<'a> {
                                 module.signals.push(SignalIr {
                                     name: n,
                                     width,
-                                    kind: SigKind::Wire,
+                                    kind: if is_real {
+                                        SigKind::Real
+                                    } else {
+                                        SigKind::Wire
+                                    },
                                     init: None,
                                     mem: None,
                                     signed: false,
@@ -1434,6 +1441,9 @@ impl<'a> Lower<'a> {
             }
             return Expr::Lit(Value { bits });
         }
+        if let Some(f) = parse_real_literal(&t) {
+            return Expr::Real(f);
+        }
         match parse_int_literal(&t) {
             Some(v) => Expr::Lit(v),
             None => {
@@ -1503,6 +1513,20 @@ fn type_kw_width(t: &str) -> Option<usize> {
 
 /// Parse a Verilog integer literal (`42`, `8'hFF`, `'b1010`, `4'd3`) into a
 /// Value with per-bit X/Z for x/z/? digits. Returns None for non-integers.
+/// Parse a Verilog real literal (`1.5`, `1e3`, `.5`, `2.0E-2`). Base-specified
+/// literals (`8'hFF`) and plain integers are not real literals.
+pub fn parse_real_literal(t: &str) -> Option<f64> {
+    let t = t.trim();
+    if t.contains('\'') {
+        return None;
+    }
+    if !(t.contains('.') || t.contains('e') || t.contains('E')) {
+        return None;
+    }
+    let c: String = t.chars().filter(|&c| c != '_').collect();
+    c.parse::<f64>().ok()
+}
+
 pub fn parse_int_literal(t: &str) -> Option<Value> {
     let t = t.trim();
     let (size, rest) = match t.find('\'') {
@@ -1593,6 +1617,7 @@ pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
     match e {
         Expr::Rising(_) | Expr::Falling(_) | Expr::ToInt(_) | Expr::ToString(_) => None,
         Expr::Lit(v) => Some(v.clone()),
+        Expr::Real(x) => Some(Value::from_f64(*x)),
         Expr::Sig(_) => None,
         Expr::Bin { op, l, r } => Some(const_eval(l, env)?.binop(*op, &const_eval(r, env)?)),
         Expr::Un { op, e } => Some(const_eval(e, env)?.unop(*op)),
@@ -1763,6 +1788,17 @@ endmodule
     }
 
     #[test]
+    fn parse_real_literals() {
+        assert_eq!(parse_real_literal("1.5"), Some(1.5));
+        assert_eq!(parse_real_literal("2.0E-2"), Some(0.02));
+        assert_eq!(parse_real_literal("1e3"), Some(1000.0));
+        assert_eq!(parse_real_literal(".5"), Some(0.5));
+        assert_eq!(parse_real_literal("42"), None); // plain integer
+        assert_eq!(parse_real_literal("8'hFF"), None); // based literal
+        assert_eq!(parse_real_literal("8'h1E"), None); // 'E' inside based literal
+        assert_eq!(parse_real_literal("1_000.5"), Some(1000.5));
+    }
+
     fn parse_int_literals() {
         assert_eq!(parse_int_literal("42").unwrap().to_u64(), Some(42));
         assert_eq!(parse_int_literal("8'hFF").unwrap().to_u64(), Some(255));

@@ -20,7 +20,7 @@ use hdl_ir::elab::{Flat, FlatSigId};
 
 mod ckpt;
 use hdl_ir::value::{Value, V0, V1, VX};
-use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, Stmt};
+use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Scheduled future event.
@@ -795,6 +795,7 @@ impl Simulator {
                     if let Some(sig) = lhs_sig(&lhs) {
                         let cur = self.vals[sig as usize].clone();
                         let w = self.flat.signals[sig as usize].width;
+                        let v = self.convert_for_target(&lhs, &rhs, v, None);
                         self.nba.push((sig, v.resize(w.max(1)), self.cur_proc));
                         let _ = cur;
                     } else {
@@ -804,6 +805,7 @@ impl Simulator {
                         self.nba_apply_later(lhs, v);
                     }
                 } else {
+                    let v = self.convert_for_target(&lhs, &rhs, v, None);
                     self.assign_to(&lhs, v, None);
                 }
                 Control::Done
@@ -870,6 +872,7 @@ impl Simulator {
     fn concretize_target(&mut self, lhs: &Expr) -> Expr {
         match lhs {
             Expr::Lit(v) => Expr::Lit(v.clone()),
+            Expr::Real(x) => Expr::Real(*x),
             Expr::Sig(s) => Expr::Sig(*s),
             Expr::Idx { e, i } => {
                 let a = self.eval_expr(i, None);
@@ -1198,6 +1201,24 @@ impl Simulator {
                             }
                         }
                     }
+                    'f' | 'e' | 'g' => {
+                        if argi < args.len() {
+                            let e = &args[argi];
+                            let v = self.eval_expr(e, None);
+                            argi += 1;
+                            let f = if self.expr_real(e, None) {
+                                v.to_f64()
+                            } else {
+                                v.to_u64().map(|n| n as f64)
+                            };
+                            match (spec, f) {
+                                ('f', Some(x)) => out.push_str(&format!("{:.6}", x)),
+                                ('e', Some(x)) => out.push_str(&format!("{:e}", x)),
+                                ('g', Some(x)) => out.push_str(&format!("{}", x)),
+                                _ => out.push('x'),
+                            }
+                        }
+                    }
                     'm' => out.push_str("<hier>"),
                     _ => {
                         out.push('%');
@@ -1245,6 +1266,7 @@ impl Simulator {
             for ai in 0..self.flat.assigns.len() {
                 let a = self.flat.assigns[ai].clone();
                 let rhs = self.eval_expr(&a.rhs, None);
+                let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
                 if self.assign_to(&a.lhs, rhs, None) {
                     changed = true;
                 }
@@ -1427,6 +1449,7 @@ impl Simulator {
     fn expr_width(&self, e: &Expr, locals: Option<&Vec<Value>>) -> usize {
         match e {
             Expr::Lit(v) => v.width(),
+            Expr::Real(_) => 64,
             Expr::Sig(s) => {
                 if let Some(l) = locals {
                     if (*s as usize) < l.len() {
@@ -1461,9 +1484,127 @@ impl Simulator {
 
     // ---- expression evaluation -----------------------------------------------------------
 
+    /// Whether an expression is real-typed (Verilog/VHDL `real`).
+    fn expr_real(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
+        match e {
+            Expr::Real(_) => true,
+            Expr::Sig(s) => {
+                let i = *s as usize;
+                if let Some(l) = locals {
+                    if i < l.len() {
+                        return false; // function/variable slots are not real
+                    }
+                }
+                i < self.flat.signals.len() && self.flat.signals[i].kind == SigKind::Real
+            }
+            // Only arithmetic propagates realness; comparisons/logical ops
+            // yield 1-bit results even on real operands.
+            Expr::Bin { op, l, r } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    self.expr_real(l, locals) || self.expr_real(r, locals)
+                }
+                _ => false,
+            },
+            Expr::Un { op, e } => match op {
+                UnOp::Neg | UnOp::Pos => self.expr_real(e, locals),
+                _ => false,
+            },
+            Expr::Resize { e, .. } | Expr::Signed(e) => self.expr_real(e, locals),
+            Expr::Cond { c, t, e } => {
+                self.expr_real(c, locals) || self.expr_real(t, locals) || self.expr_real(e, locals)
+            }
+            _ => false,
+        }
+    }
+
+    /// One operand of a real-typed binop as f64: real operands decode their
+    /// bit pattern, integer operands convert their integer value.
+    fn operand_f64(&self, e: &Expr, v: &Value, locals: Option<&Vec<Value>>) -> Option<f64> {
+        if self.expr_real(e, locals) {
+            v.to_f64()
+        } else {
+            v.to_u64().map(|n| n as f64)
+        }
+    }
+
+    /// IEEE-754 arithmetic/comparison for real-typed binops.
+    fn eval_bin_real(
+        &self,
+        op: BinOp,
+        l: &Expr,
+        r: &Expr,
+        lv: &Value,
+        rv: &Value,
+        locals: Option<&Vec<Value>>,
+    ) -> Value {
+        let a = self.operand_f64(l, lv, locals);
+        let b = self.operand_f64(r, rv, locals);
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => match (a, b) {
+                (Some(x), Some(y)) => Value::from_f64(match op {
+                    BinOp::Add => x + y,
+                    BinOp::Sub => x - y,
+                    BinOp::Mul => x * y,
+                    BinOp::Div => x / y,
+                    _ => x % y,
+                }),
+                _ => Value::x(64),
+            },
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => match (a, b) {
+                (Some(x), Some(y)) => Value::from_u64(
+                    1,
+                    match op {
+                        BinOp::Lt => x < y,
+                        BinOp::Le => x <= y,
+                        BinOp::Gt => x > y,
+                        BinOp::Ge => x >= y,
+                        BinOp::Eq => x == y,
+                        _ => x != y,
+                    } as u64,
+                ),
+                _ => Value::x(1),
+            },
+            _ => Value::x(64), // bitwise/shift ops on reals: undefined
+        }
+    }
+
+    /// Convert an assigned value to the target signal's type: integer -> real
+    /// (value becomes f64), real -> integer (round to nearest, per Verilog).
+    fn convert_for_target(
+        &self,
+        lhs: &Expr,
+        rhs: &Expr,
+        v: Value,
+        locals: Option<&Vec<Value>>,
+    ) -> Value {
+        if let Expr::Sig(s) = lhs {
+            let i = *s as usize;
+            if i < self.flat.signals.len() {
+                let sig = &self.flat.signals[i];
+                let target_real = sig.kind == SigKind::Real;
+                let src_real = self.expr_real(rhs, locals);
+                if target_real && !src_real {
+                    return match v.to_u64() {
+                        Some(n) => Value::from_f64(n as f64),
+                        None => Value::x(64),
+                    };
+                }
+                if !target_real && src_real {
+                    let w = sig.width.max(1);
+                    return match v.to_f64() {
+                        Some(f) => Value::from_u64(w, (f.round() as i64) as u64),
+                        None => Value::x(w),
+                    };
+                }
+            }
+        }
+        v
+    }
+
     fn eval_expr(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Value {
         match e {
             Expr::Lit(v) => v.clone(),
+            Expr::Real(x) => Value::from_f64(*x),
             Expr::Sig(s) => {
                 let i = *s as usize;
                 if let Some(l) = locals {
@@ -1480,6 +1621,10 @@ impl Simulator {
             Expr::Bin { op, l, r } => {
                 let lv = self.eval_expr(l, locals);
                 let rv = self.eval_expr(r, locals);
+                // Real-typed expression: IEEE-754 arithmetic on f64 operands.
+                if self.expr_real(l, locals) || self.expr_real(r, locals) {
+                    return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
+                }
                 // VHDL signed operands: sign-extend both to the wider width
                 // before arithmetic/comparison (zero-extend is the default).
                 if self.expr_signed(l, locals) || self.expr_signed(r, locals) {
@@ -1558,9 +1703,16 @@ impl Simulator {
             }
             Expr::ToString(e) => {
                 let v = self.eval_expr(e, locals);
-                let s = match v.to_u64() {
-                    Some(n) => n.to_string(),
-                    None => "x".to_string(),
+                let s = if self.expr_real(e, locals) {
+                    match v.to_f64() {
+                        Some(f) => format!("{}", f),
+                        None => "x".to_string(),
+                    }
+                } else {
+                    match v.to_u64() {
+                        Some(n) => n.to_string(),
+                        None => "x".to_string(),
+                    }
                 };
                 // First digit in the high byte, matching string literal packing.
                 let bytes = s.as_bytes();
@@ -1573,7 +1725,17 @@ impl Simulator {
                 }
                 Value { bits }
             }
-            Expr::Un { op, e } => self.eval_expr(e, locals).unop(*op),
+            Expr::Un { op, e } => {
+                let v = self.eval_expr(e, locals);
+                if self.expr_real(e, locals) {
+                    return match (op, v.to_f64()) {
+                        (UnOp::Neg, Some(x)) => Value::from_f64(-x),
+                        (UnOp::Pos, Some(x)) => Value::from_f64(x),
+                        _ => Value::x(64),
+                    };
+                }
+                v.unop(*op)
+            }
             Expr::Cond { c, t, e } => {
                 let cv = self.eval_expr(c, locals);
                 if truthy(&cv) {

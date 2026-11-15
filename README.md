@@ -29,7 +29,8 @@ the graphical wave display are all implemented here.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; ASCII waves
-  for logs.
+  for logs. Verilog `real` / VHDL `real` signals simulate as IEEE-754 doubles and
+  render as analog traces (VCD `r` values, HTML/live polylines).
 - **rustc-style diagnostics.** Every parse/lower error is rendered like rustc —
   `error[E..]: message` with the source line, a caret span, and notes.
 - **Project export for other tools.** `hdlsim project --format vivado-tcl

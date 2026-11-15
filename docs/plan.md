@@ -119,6 +119,5 @@ Merged PRs (main @ 19b5f60, 2026-11-15):
 | #24 | `--seed N` reproducible `$random`; mixed-language co-sim tests |
 | #25 | `hdlsim doctor` + `hdlsim completions` (bash/zsh/fish) |
 
-Remaining, in suggested order: constrained-random stimulus, `hdlsim prove`
-(CDCL + BMC), FST/analog waves (see phase-2 notes), then SystemVerilog proper /
+Remaining, in suggested order: FST real vars, then SystemVerilog proper /
 VHDL-2008 / UVM-lite.

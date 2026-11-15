@@ -12,6 +12,7 @@
 
 use super::{bits_msb, json_str, WaveSink};
 use hdl_ir::elab::Flat;
+use hdl_ir::SigKind;
 use hdl_sim::events::SimEvent;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -43,10 +44,11 @@ impl LiveBus {
                 sigs.push(',');
             }
             sigs.push_str(&format!(
-                "{{\"id\":{},\"name\":{},\"w\":{}}}",
+                "{{\"id\":{},\"name\":{},\"w\":{},\"real\":{}}}",
                 i,
                 json_str(&s.name),
-                s.width.max(1)
+                s.width.max(1),
+                s.kind == SigKind::Real
             ));
         }
         sigs.push(']');
@@ -98,17 +100,32 @@ impl LiveSink {
 }
 
 impl WaveSink for LiveSink {
-    fn on_event(&mut self, ev: &SimEvent, _flat: &Flat) {
+    fn on_event(&mut self, ev: &SimEvent, flat: &Flat) {
         let line = match ev {
             SimEvent::TimeAdvance { time_fs } => format!("{{\"e\":\"t\",\"t\":{}}}", time_fs),
             SimEvent::SignalChange {
                 sig, new, time_fs, ..
-            } => format!(
-                "{{\"e\":\"s\",\"t\":{},\"s\":{},\"v\":{}}}",
-                time_fs,
-                sig,
-                json_str(&bits_msb(new))
-            ),
+            } => {
+                let real = flat
+                    .signals
+                    .get(*sig as usize)
+                    .map(|s| s.kind == SigKind::Real)
+                    .unwrap_or(false);
+                let v = if real {
+                    match new.to_f64() {
+                        Some(f) => format!("{}", f),
+                        None => "x".to_string(),
+                    }
+                } else {
+                    bits_msb(new)
+                };
+                format!(
+                    "{{\"e\":\"s\",\"t\":{},\"s\":{},\"v\":{}}}",
+                    time_fs,
+                    sig,
+                    json_str(&v)
+                )
+            }
             SimEvent::Message { text, time_fs } => format!(
                 "{{\"e\":\"m\",\"t\":{},\"m\":{}}}",
                 time_fs,
@@ -334,7 +351,24 @@ function draw() {
   sigs.forEach((s, i) => {
     const y = 6 + i * (ROW + GAP); if (y > H) return;
     const evs = bySig[i];
-    if (s.w === 1) {
+    if (s.real) {
+      let lo = Infinity, hi = -Infinity;
+      for (const [t, v] of evs) { const f = parseFloat(v); if (!isNaN(f)) { if (f<lo) lo=f; if (f>hi) hi=f; } }
+      if (!isFinite(lo)) { lo = 0; hi = 1; }
+      if (hi - lo < 1e-12) { const m=(hi+lo)/2; lo=m-0.5; hi=m+0.5; }
+      const yOf = f => y + (ROW-5) - (f-lo)/(hi-lo)*(ROW-5);
+      ctx.strokeStyle = '#5fd38a'; ctx.lineWidth = 1.4; ctx.beginPath();
+      let started = false;
+      for (const [t, v] of evs) {
+        const f = parseFloat(v); if (isNaN(f)) continue;
+        if (t < t0) continue;
+        if (t > t0 + span) break;
+        const xx = x(t);
+        if (!started) { ctx.moveTo(xx, yOf(f)); started = true; } else ctx.lineTo(xx, yOf(f));
+      }
+      if (started) ctx.lineTo(x(t0+span), yOf(parseFloat(valAt(i, t0+span))));
+      ctx.stroke();
+    } else if (s.w === 1) {
       ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 1.5; ctx.beginPath();
       let cur = null;
       for (const [t, v] of evs) {
@@ -359,7 +393,7 @@ function draw() {
       flush(t0 + span);
     }
     const el = document.getElementById('v'+i);
-    if (el) el.textContent = s.w === 1 ? valAt(i, latest).slice(-1) : hex(valAt(i, latest));
+    if (el) el.textContent = s.real ? valAt(i, latest) : (s.w === 1 ? valAt(i, latest).slice(-1) : hex(valAt(i, latest)));
   });
 }
 function fit() { t0 = 0; span = tmax || 1; draw(); }

@@ -2,11 +2,13 @@
 //!
 //! Written incrementally as events arrive: `$scope`/`$var` header from the
 //! elaborated hierarchy, `#<time>` on time advance, value changes on signal
-//! events. One-bit signals use the `0!` short form, wider ones `b<bits> !`.
+//! events. One-bit signals use the `0!` short form, wider ones `b<bits> !`,
+//! real signals (Verilog `real` / VHDL `real`) use `$var real` + `r<value>`.
 
 use super::WaveSink;
 use hdl_ir::elab::Flat;
 use hdl_ir::value::{Value, V1, VZ};
+use hdl_ir::SigKind;
 use hdl_sim::events::SimEvent;
 use std::io::Write;
 
@@ -79,7 +81,11 @@ impl<W: Write> VcdSink<W> {
         for (i, sig) in flat.signals.iter().enumerate() {
             let name = sig.name.rsplit('.').next().unwrap_or(&sig.name);
             let w = sig.width.max(1);
-            let _ = writeln!(self.w, "$var wire {} {} {} $end", w, self.ids[i], name);
+            if sig.kind == SigKind::Real {
+                let _ = writeln!(self.w, "$var real {} {} {} $end", w, self.ids[i], name);
+            } else {
+                let _ = writeln!(self.w, "$var wire {} {} {} $end", w, self.ids[i], name);
+            }
         }
         let _ = writeln!(self.w, "$enddefinitions $end");
         let _ = writeln!(self.w, "$dumpvars");
@@ -92,7 +98,8 @@ impl<W: Write> VcdSink<W> {
                     &sig.init
                         .clone()
                         .unwrap_or_else(|| Value::x(sig.width.max(1))),
-                    &self.ids[i]
+                    &self.ids[i],
+                    sig.kind == SigKind::Real
                 )
             );
         }
@@ -126,7 +133,12 @@ impl<W: Write> WaveSink for VcdSink<W> {
             } => {
                 self.ensure_header(flat);
                 self.time_line(*time_fs);
-                let _ = write!(self.w, "{}", fmt_value(new, &self.ids[*sig as usize]));
+                let is_real = flat.signals[*sig as usize].kind == SigKind::Real;
+                let _ = write!(
+                    self.w,
+                    "{}",
+                    fmt_value(new, &self.ids[*sig as usize], is_real)
+                );
             }
             SimEvent::Finish { time_fs } | SimEvent::Stop { time_fs } => {
                 self.time_line(*time_fs);
@@ -136,7 +148,13 @@ impl<W: Write> WaveSink for VcdSink<W> {
     }
 }
 
-fn fmt_value(v: &Value, id: &str) -> String {
+fn fmt_value(v: &Value, id: &str, is_real: bool) -> String {
+    if is_real {
+        return match v.to_f64() {
+            Some(f) => format!("r{} {}\n", fmt_f64(f), id),
+            None => format!("rx {}\n", id),
+        };
+    }
     if v.width() == 1 {
         let c = match v.bit(0) {
             V1 => '1',
@@ -158,5 +176,23 @@ fn fmt_value(v: &Value, id: &str) -> String {
             })
             .collect();
         format!("b{} {}\n", s, id)
+    }
+}
+
+/// Format an f64 for VCD `r` values: shortest round-trip decimal; non-finite
+/// values fall back to a large placeholder (VCD has no inf/nan syntax).
+fn fmt_f64(f: f64) -> String {
+    if f.is_finite() {
+        let mut s = format!("{}", f);
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            s.push_str(".0");
+        }
+        s
+    } else if f.is_nan() {
+        "NaN".to_string()
+    } else if f > 0.0 {
+        "1e308".to_string()
+    } else {
+        "-1e308".to_string()
     }
 }
