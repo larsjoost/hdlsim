@@ -22,6 +22,7 @@ mod init;
 mod lint;
 pub mod lsp;
 mod project;
+mod prove;
 mod regress;
 mod run;
 mod wave;
@@ -228,6 +229,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &ast::Ast,
     &init::Init,
     &project::Project,
+    &prove::Prove,
     &debug::Debug,
     &bundle::Bundle,
     &regress::Regress,
