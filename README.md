@@ -111,6 +111,7 @@ hdlsim deps --top tb -L work=rtl tb.v    # list all files the top depends on (tr
 hdlsim assist "why does tb.v fail"       # local prompt-to-task router (prints $ command; --yes runs it)
 hdlsim explain E0301                     # explain a diagnostic/lint code (no arg lists all)
 hdlsim gen tb --top counter counter.v    # generate a testbench skeleton from the top's ports
+hdlsim analyze counter.v                 # static heuristics: undriven (W0501) / unread (W0502) signals
 ```
 
 `hdlsim regress` runs each test as its own simulation (fresh design per test)

@@ -21,6 +21,7 @@
 //! - All ids (`SigId`, `ProcId`, …) are arena indices, never pointers.
 //! - After elaboration, every `Expr::Sig` refers to the flat signal space.
 
+pub mod analyze;
 pub mod elab;
 pub mod gen;
 pub mod ir;

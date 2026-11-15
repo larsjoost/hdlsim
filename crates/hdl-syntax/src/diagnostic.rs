@@ -201,6 +201,8 @@ const CODE_EXPLAIN: &[(&str, &str)] = &[
     ("W0102", "lint: blocking '=' assignment inside an edge-triggered always block; use '<='"),
     ("W0201", "lint: VHDL null statement does nothing"),
     ("W0401", "VHDL lowering warning, e.g. an unsupported construct degraded to a no-op; see the message"),
+    ("W0501", "analyze: signal is never driven anywhere in its module, so it stays X; check for a missing assignment or port connection"),
+    ("W0502", "analyze: signal is never read (dead logic); remove it or wire it to an output/port"),
 ];
 
 /// Explain a diagnostic or lint code (`hdlsim explain E0301`). Covers every
@@ -407,8 +409,10 @@ mod tests {
         for c in KNOWN_CODES {
             assert!(explain_code(c).is_some(), "no explanation for {}", c);
         }
-        // Lint codes live in lint.rs, not KNOWN_CODES, but are explainable too.
-        for c in ["W0002", "W0003", "W0101", "W0102", "W0201"] {
+        // Lint/analyze codes live outside KNOWN_CODES, but are explainable too.
+        for c in [
+            "W0002", "W0003", "W0101", "W0102", "W0201", "W0501", "W0502",
+        ] {
             assert!(explain_code(c).is_some(), "no explanation for {}", c);
         }
         assert!(explain_code("E0301").unwrap().contains("expected"));
