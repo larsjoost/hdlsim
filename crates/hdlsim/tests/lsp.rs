@@ -130,3 +130,63 @@ fn lsp_malformed_json_gets_parse_error() {
         .and_then(|c| c.as_i64())
         == Some(-32700)));
 }
+
+#[test]
+fn lsp_hover_and_definition_session() {
+    let uri = "file:///tmp/lsp_def.v";
+    let text = "module m;\nwire d;\nwire q;\ninitial q = d;\nendmodule\n";
+    let mut input = Vec::new();
+    for m in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{}","text":"module m;\nwire d;\nwire q;\ninitial q = d;\nendmodule\n"}}}}}}"#,
+            uri
+        ),
+        // hover over `m` (line 0, char 7)
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":0,"character":7}}}}}}"#,
+            uri
+        ),
+        // definition of `d` used at line 3, char 12
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{}"}},"position":{{"line":3,"character":12}}}}}}"#,
+            uri
+        ),
+        r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ] {
+        let mut v = Vec::new();
+        write_message(&mut v, m).unwrap();
+        input.extend_from_slice(&v);
+    }
+    let _ = text;
+    let mut cur = Cursor::new(input);
+    let mut out = Vec::new();
+    assert_eq!(serve(&mut cur, &mut out), 0);
+    let msgs = bodies(&out);
+    let hov = msgs
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_i64()) == Some(10))
+        .unwrap();
+    let value = hov
+        .get("result")
+        .and_then(|r| r.get("contents"))
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert!(
+        value.contains("`m`") && value.contains("Module"),
+        "{}",
+        value
+    );
+    let def = msgs
+        .iter()
+        .find(|m| m.get("id").and_then(|i| i.as_i64()) == Some(11))
+        .unwrap();
+    let range = def.get("result").and_then(|r| r.get("range")).unwrap();
+    assert_eq!(range.get("start").unwrap().get("line"), Some(&Json::num(1)));
+    assert_eq!(
+        range.get("start").unwrap().get("character"),
+        Some(&Json::num(5))
+    );
+}
