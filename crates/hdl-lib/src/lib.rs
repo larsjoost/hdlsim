@@ -437,6 +437,8 @@ pub fn compile_one(
             };
             diags.extend(parse_diags);
             let mut lower_diags = Vec::new();
+            let known_entities: Vec<String> =
+                design.modules.iter().map(|m| m.name.clone()).collect();
             let lowered = hdl_ir::vhdl_lower::lower_file(
                 id,
                 &root,
@@ -444,6 +446,7 @@ pub fn compile_one(
                 &mut lower_diags,
                 1_000_000,
                 &design.packages,
+                &known_entities,
             );
             diags.extend(lower_diags);
             design.modules.extend(lowered.modules);

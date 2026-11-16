@@ -69,6 +69,9 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
     out
 }
 
+/// `known_entities` are the entity names already lowered into the design
+/// (from previously compiled files); they are only used for "did you mean"
+/// suggestions when an architecture names an unknown entity.
 pub fn lower_file(
     file: FileId,
     root: &SyntaxNode,
@@ -76,6 +79,7 @@ pub fn lower_file(
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
     pkgs: &HashMap<String, PackageIr>,
+    known_entities: &[String],
 ) -> Lowered {
     let _ = file;
     let mut lx = Lower {
@@ -125,11 +129,17 @@ pub fn lower_file(
             modules.push(m);
         }
     }
+    // Entities known design-wide (this file's + previously compiled files'),
+    // for "did you mean" suggestions on unknown-entity errors.
+    let mut candidates: Vec<String> = known_entities.to_vec();
+    candidates.extend(entities.keys().cloned());
     // Pass 2: packages (constants/types into scope) and architectures (bodies).
     for child in real_children(root) {
         match child.kind() {
             SyntaxKind::Package => packages.push(lx.lower_package(&child)),
-            SyntaxKind::Architecture => lx.lower_architecture(&child, &mut modules, &entities),
+            SyntaxKind::Architecture => {
+                lx.lower_architecture(&child, &mut modules, &entities, &candidates)
+            }
             _ => {}
         }
     }
@@ -602,6 +612,7 @@ impl<'a> Lower<'a> {
         a: &SyntaxNode,
         modules: &mut Vec<ModuleIr>,
         entities: &HashMap<String, usize>,
+        candidates: &[String],
     ) {
         let kids = real_children(a);
         // `architecture NAME of ENTITY is ...`
@@ -610,12 +621,21 @@ impl<'a> Lower<'a> {
             .filter(|k| k.kind() == SyntaxKind::Ident)
             .collect();
         // idents: [architecture, name, of, entity, is, begin/end...]
-        let entity_name = idents.get(3).map(|k| self.text(k)).unwrap_or_default();
+        let entity_node = idents.get(3);
+        let entity_name = entity_node.map(|k| self.text(k)).unwrap_or_default();
         let Some(&midx) = entities.get(&entity_name) else {
-            self.err(
-                a.span(),
-                format!("architecture for unknown entity '{}'", entity_name),
-            );
+            // Point at the entity name itself (not the whole architecture
+            // node) and suggest a similarly named known entity, if any.
+            let span = entity_node.map(|k| k.span()).unwrap_or_else(|| a.span());
+            let help = did_you_mean(&entity_name, candidates.iter())
+                .map(|s| format!("did you mean '{s}'?"));
+            self.diags.push(Diagnostic {
+                code: "E0401",
+                severity: Severity::Error,
+                span: Some(span),
+                message: format!("architecture for unknown entity '{entity_name}'"),
+                help,
+            });
             return;
         };
         let module = &mut modules[midx];
@@ -2328,6 +2348,54 @@ fn bits_for(n: usize) -> usize {
     (usize::BITS - (n.max(1) - 1).leading_zeros()).max(1) as usize
 }
 
+/// Case-insensitive "did you mean" suggestion over known unit names: prefers
+/// prefix overlap (`edge_detector` → `edge_detector_entity`), then a small
+/// edit distance. Exact (case-insensitive) matches are never suggested.
+fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) -> Option<&'c str> {
+    if name.is_empty() {
+        return None;
+    }
+    let n = name.to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for c in candidates {
+        let cl = c.to_ascii_lowercase();
+        if cl == n {
+            continue;
+        }
+        let prefix = cl.starts_with(&n) || n.starts_with(&cl);
+        let d = if prefix {
+            cl.len().abs_diff(n.len())
+        } else {
+            levenshtein(&n, &cl)
+        };
+        if prefix || d <= (n.len() / 3).max(3) {
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, c.as_str()));
+            }
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// Levenshtein edit distance, counted in chars.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = Vec::with_capacity(b.len() + 1);
+        cur.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            cur.push(
+                (prev[j] + usize::from(ca != *cb))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1),
+            );
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// VHDL time unit → femtoseconds.
 fn time_unit_fs(unit: &str) -> u64 {
     match unit {
@@ -2442,4 +2510,33 @@ fn value_from_u128(width: usize, v: u128) -> Value {
         bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
     }
     Value { bits }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn did_you_mean_prefers_close_names() {
+        let cands = vec!["edge_detector_entity".to_string(), "fifo".to_string()];
+        // Prefix overlap: `edge_detector` is a prefix of `edge_detector_entity`.
+        assert_eq!(
+            did_you_mean("edge_detector", cands.iter()),
+            Some("edge_detector_entity")
+        );
+        // Small edit distance.
+        assert_eq!(did_you_mean("fifo2", cands.iter()), Some("fifo"));
+        // Case-insensitive exact match is not suggested.
+        assert_eq!(did_you_mean("FIFO", cands.iter()), None);
+        // No close candidate at all.
+        assert_eq!(did_you_mean("zzzzzz", cands.iter()), None);
+        assert_eq!(did_you_mean("", cands.iter()), None);
+    }
+
+    #[test]
+    fn levenshtein_distance_counts_chars() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("", "ab"), 2);
+    }
 }
