@@ -105,19 +105,31 @@ pub fn lower_file(
             modules.push(m);
         }
     }
-    // Pass 2: packages (constants/types into scope) and architectures (bodies).
-    // An architecture whose entity is not declared in this file is deferred
-    // (`pending`): the entity may live in a file compiled later, so binding
-    // happens design-wide in `lower_pending_architectures`.
+    // Pass 2: packages (constants/types into scope), configurations (default
+    // architecture bindings) and architectures (bodies). An architecture whose
+    // entity is not declared in this file is deferred (`pending`): the entity
+    // may live in a file compiled later, so binding happens design-wide in
+    // `lower_pending_architectures`.
+    let mut last_arch: HashMap<String, String> = HashMap::new();
+    let mut config_defaults: HashMap<String, String> = HashMap::new();
     for child in real_children(root) {
         match child.kind() {
             SyntaxKind::Package => packages.push(lx.lower_package(&child)),
+            SyntaxKind::ConfigDecl => {
+                if let Some((ent, arch)) = config_default(&child, db) {
+                    config_defaults.insert(ent, arch);
+                }
+            }
             SyntaxKind::Architecture => {
                 let known = arch_entity(&child, db)
                     .map(|(_, name)| entities.contains_key(&name))
                     .unwrap_or(false);
                 if known {
-                    lx.lower_architecture(&child, &mut modules, &entities);
+                    if let Some((ent, arch)) =
+                        lx.lower_architecture(&child, &mut modules, &entities)
+                    {
+                        last_arch.insert(ent, arch);
+                    }
                 } else {
                     pending.push(PendingArch {
                         root: root.clone(),
@@ -128,10 +140,58 @@ pub fn lower_file(
             _ => {}
         }
     }
+    apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults);
     Lowered {
         modules,
         packages,
         pending,
+    }
+}
+
+/// `configuration cfg of ENT is for ARCH ... end for;` → (entity, arch).
+fn config_default(c: &SyntaxNode, db: &SourceDb) -> Option<(String, String)> {
+    let kids = real_children(c);
+    let ent = kids
+        .iter()
+        .skip_while(|k| db.span_text(k.span()).trim().to_ascii_lowercase() != "of")
+        .nth(1)
+        .filter(|k| k.kind() == SyntaxKind::Name)
+        .map(|k| db.span_text(k.span()).trim().to_string())?;
+    let ent = ent.rsplit('.').next().unwrap_or("").to_string();
+    let fs = kids.iter().find(|k| k.kind() == SyntaxKind::ForSpec)?;
+    let arch = real_children(fs)
+        .iter()
+        .filter(|k| k.kind() == SyntaxKind::Ident)
+        .map(|k| db.span_text(k.span()).trim().to_ascii_lowercase())
+        .find(|w| {
+            !matches!(
+                w.as_str(),
+                "for" | "end" | "use" | "entity" | "configuration"
+            )
+        })?;
+    Some((ent, arch))
+}
+
+/// Give each plain entity module the body of its default architecture:
+/// the one named by a configuration declaration if any, else the last one
+/// analyzed (IEEE default binding rule). Bodies live in `entity/arch`
+/// variant modules produced by `lower_architecture`.
+fn apply_default_archs(
+    modules: &mut Vec<ModuleIr>,
+    entities: &HashMap<String, usize>,
+    last_arch: &HashMap<String, String>,
+    config_defaults: &HashMap<String, String>,
+) {
+    for (ent, &base) in entities {
+        let Some(ch) = config_defaults.get(ent).or_else(|| last_arch.get(ent)) else {
+            continue;
+        };
+        let vname = format!("{ent}/{ch}");
+        if let Some(vpos) = modules.iter().position(|m| m.name == vname) {
+            let mut v = modules[vpos].clone();
+            v.name = ent.clone();
+            modules[base] = v;
+        }
     }
 }
 
@@ -159,18 +219,25 @@ pub fn lower_pending_architectures(
         .collect();
     let candidates: Vec<String> = entities.keys().cloned().collect();
     let mut still_pending = Vec::new();
+    let mut last_arch: HashMap<String, String> = HashMap::new();
     for p in pending {
         let mut lx = Lower::new(db, diags);
         lx.register_builtin_types();
         lx.apply_context_clauses(&p.root, pkgs);
-        if !lx.lower_architecture(&p.arch, modules, &entities) {
-            if emit_errors {
-                lx.err_unknown_entity(&p.arch, &candidates);
-            } else {
-                still_pending.push(p);
+        match lx.lower_architecture(&p.arch, modules, &entities) {
+            Some((ent, arch)) => {
+                last_arch.insert(ent, arch);
+            }
+            None => {
+                if emit_errors {
+                    lx.err_unknown_entity(&p.arch, &candidates);
+                } else {
+                    still_pending.push(p);
+                }
             }
         }
     }
+    apply_default_archs(modules, &entities, &last_arch, &HashMap::new());
     still_pending
 }
 
@@ -807,12 +874,17 @@ impl<'a> Lower<'a> {
     /// (without emitting a diagnostic) when the entity is not in `entities` —
     /// the caller either defers the architecture or reports E0401 via
     /// [`Lower::err_unknown_entity`].
+    /// Lower an architecture body. On success the body is attached to a
+    /// per-architecture variant module `entity/arch` (pushed to `modules`)
+    /// and the function returns `(entity, arch)`; the plain entity module gets
+    /// the default architecture's body afterwards (see `apply_default_archs`).
+    /// Returns None when the entity is unknown (caller defers or errors).
     fn lower_architecture(
         &mut self,
         a: &SyntaxNode,
         modules: &mut Vec<ModuleIr>,
         entities: &HashMap<String, usize>,
-    ) -> bool {
+    ) -> Option<(String, String)> {
         let kids = real_children(a);
         let arch_ent = arch_entity(a, self.db);
         let entity_name = arch_ent
@@ -820,9 +892,19 @@ impl<'a> Lower<'a> {
             .map(|(_, s)| s.clone())
             .unwrap_or_default();
         let Some(&midx) = entities.get(&entity_name) else {
-            return false;
+            return None;
         };
-        let module = &mut modules[midx];
+        let idents: Vec<&SyntaxNode> = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .collect();
+        let arch_name = idents
+            .get(1)
+            .map(|k| self.text(k).to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut module_owned = modules[midx].clone();
+        module_owned.name = format!("{entity_name}/{arch_name}");
+        let module = &mut module_owned;
         self.names = module
             .signals
             .iter()
@@ -897,7 +979,8 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
-        true
+        modules.push(module_owned);
+        Some((entity_name, arch_name))
     }
 
     /// E0401 for an architecture naming an entity that is unknown design-wide:
@@ -1676,13 +1759,38 @@ impl<'a> Lower<'a> {
 
     fn lower_inst(&mut self, s: &SyntaxNode) -> Option<InstIr> {
         let kids = real_children(s);
-        let name = kids
-            .iter()
-            .find(|k| k.kind() == SyntaxKind::Name)
-            .map(|k| self.text(k))?;
+        // `entity lib.unit(arch)` parses as Call(Name "lib.unit", "(", Name
+        // "arch", ")"); without an arch it is a plain Name child.
+        let (unit_text, arch) = match kids.iter().find(|k| k.kind() == SyntaxKind::Call) {
+            Some(call) => {
+                let ck = real_children(call);
+                let un = ck
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k))?;
+                let arch = ck
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "(")
+                    .and_then(|p| ck.get(p + 1))
+                    .filter(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k).to_ascii_lowercase());
+                (un, arch)
+            }
+            None => (
+                kids.iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k))?,
+                None,
+            ),
+        };
         // `entity work.counter` — drop the library prefix; the unit name is
-        // the last selected component.
-        let name = name.rsplit('.').next().unwrap_or(name.as_str()).to_string();
+        // the last selected component. With `(arch)`, select the `unit/arch`
+        // variant module (see lower_architecture).
+        let unit = unit_text.rsplit('.').next().unwrap_or("").to_string();
+        let name = match arch {
+            Some(a) => format!("{unit}/{a}"),
+            None => unit,
+        };
         let mut param_overrides = Vec::new();
         let mut conns = Vec::new();
         let mut in_generic = false;
