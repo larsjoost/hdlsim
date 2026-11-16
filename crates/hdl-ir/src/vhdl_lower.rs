@@ -11,7 +11,7 @@
 
 use crate::ir::*;
 use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VX, VZ};
-use crate::verilog_lower::const_eval;
+use crate::verilog_lower::const_eval_f;
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
@@ -48,6 +48,9 @@ pub struct PackageIr {
     pub name: String,
     pub types: Vec<(String, TypeInfo)>,
     pub consts: Vec<(String, Value)>,
+    /// Function bodies declared in the package — lets constant initializers
+    /// const-eval calls like `sel_natural_f(cond, a, b)`.
+    pub functions: Vec<FuncIr>,
 }
 
 /// Unit names referenced by the context clauses (`use lib.pkg...;`,
@@ -342,6 +345,9 @@ struct Lower<'a> {
     diags: &'a mut Vec<Diagnostic>,
     /// Compile-time constants in scope (enum literals, constants, generics).
     consts: HashMap<String, Value>,
+    /// User function bodies in scope (package functions via `use`), for
+    /// const-evaluating calls in constant initializers.
+    funcs: HashMap<String, FuncIr>,
     /// Type marks in scope (built-ins + user type/subtype decls).
     types: HashMap<String, TypeInfo>,
     /// Signal/variable name → signal id in the current module.
@@ -372,6 +378,7 @@ impl<'a> Lower<'a> {
             db,
             diags,
             consts: HashMap::new(),
+            funcs: HashMap::new(),
             types: HashMap::new(),
             names: HashMap::new(),
             mems: HashMap::new(),
@@ -580,8 +587,8 @@ impl<'a> Lower<'a> {
             .collect();
         if exprs.len() >= 2 {
             if let (Some(a), Some(b)) = (
-                const_eval(&exprs[0], &HashMap::new()),
-                const_eval(&exprs[1], &HashMap::new()),
+                self.ce_env(&exprs[0], &HashMap::new()),
+                self.ce_env(&exprs[1], &HashMap::new()),
             ) {
                 if let (Some(a), Some(b)) = (a.to_u64(), b.to_u64()) {
                     return (a as i64 - b as i64).unsigned_abs() as usize + 1;
@@ -589,7 +596,7 @@ impl<'a> Lower<'a> {
             }
             1
         } else if exprs.len() == 1 {
-            const_eval(&exprs[0], &HashMap::new())
+            self.ce_env(&exprs[0], &HashMap::new())
                 .and_then(|v| v.to_u64())
                 .map(|n| n as usize)
                 .unwrap_or(1)
@@ -637,8 +644,12 @@ impl<'a> Lower<'a> {
                 .map(|k| self.lower_expr(k, &HashMap::new()))
                 .collect();
             if exprs.len() >= 2 {
-                let a = const_eval(&exprs[0], &HashMap::new()).and_then(|v| v.to_u64());
-                let b = const_eval(&exprs[1], &HashMap::new()).and_then(|v| v.to_u64());
+                let a = self
+                    .ce_env(&exprs[0], &HashMap::new())
+                    .and_then(|v| v.to_u64());
+                let b = self
+                    .ce_env(&exprs[1], &HashMap::new())
+                    .and_then(|v| v.to_u64());
                 if let (Some(a), Some(b)) = (a, b) {
                     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                     dims.push((lo as i64, (hi - lo + 1) as usize));
@@ -646,7 +657,8 @@ impl<'a> Lower<'a> {
                     dims.push((0, 1));
                 }
             } else if exprs.len() == 1 {
-                let n = const_eval(&exprs[0], &HashMap::new())
+                let n = self
+                    .ce_env(&exprs[0], &HashMap::new())
                     .and_then(|v| v.to_u64())
                     .unwrap_or(1);
                 dims.push((0, n as usize));
@@ -659,6 +671,18 @@ impl<'a> Lower<'a> {
 
     fn sig_id(&self, name: &str) -> Option<SigId> {
         self.names.get(name).copied()
+    }
+
+    /// Const-eval in the lowerer's constant scope, with visible package
+    /// function bodies (for calls in constant initializers).
+    fn ce(&self, e: &Expr) -> Option<Value> {
+        const_eval_f(e, &self.consts, &self.funcs)
+    }
+
+    /// Const-eval against an explicit env (loop vars, generics) plus package
+    /// function bodies.
+    fn ce_env(&self, e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+        const_eval_f(e, env, &self.funcs)
     }
 
     // ---- entities / architectures ---------------------------------------------
@@ -738,7 +762,7 @@ impl<'a> Lower<'a> {
                 .as_ref()
                 .map(|e| {
                     let ex = self.lower_expr(e, &HashMap::new());
-                    const_eval(&ex, &HashMap::new())
+                    self.ce_env(&ex, &HashMap::new())
                 })
                 .flatten()
                 .unwrap_or(Value::x(width.max(1)));
@@ -860,26 +884,58 @@ impl<'a> Lower<'a> {
                     .or_insert_with(|| cval.clone());
             }
         }
+        for f in &p.functions {
+            if item.is_none_or(|i| i == &f.name.to_ascii_lowercase()) {
+                // Last wins: the package body (with real bodies) follows the
+                // declaration (signature-only) in the merged package.
+                self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
+            }
+        }
     }
 
     fn lower_package(&mut self, p: &SyntaxNode) -> PackageIr {
-        // Package name: `package NAME is ...` — the second ident.
+        // Package name: the first ident that is not a keyword — `package NAME
+        // is …` and `package body NAME is …` both yield NAME (a naive nth(1)
+        // would return "body" for package bodies).
         let kids = real_children(p);
         let name = kids
             .iter()
             .filter(|k| k.kind() == SyntaxKind::Ident)
-            .nth(1)
             .map(|k| self.kw(k))
+            .find(|w| !matches!(w.as_str(), "package" | "body" | "is" | "end"))
             .unwrap_or_default();
-        // Package declarations: constants and types become visible in this file.
+        // Package declarations: constants, types, and function bodies become
+        // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
         let consts_before: std::collections::HashSet<String> =
             self.consts.keys().cloned().collect();
+        let mut functions: Vec<FuncIr> = Vec::new();
         for d in real_children(p) {
             match d.kind() {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
+                SyntaxKind::Function => {
+                    if self.function_locals_use_params(&d) {
+                        // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
+                        // — the width depends on a call argument, which is not
+                        // known at lower time; skip registering the function.
+                        let name = real_children(&d)
+                            .iter()
+                            .find(|k| k.kind() == SyntaxKind::Name)
+                            .map(|k| self.text(k))
+                            .unwrap_or_default();
+                        self.warn(
+                            d.span(),
+                            format!(
+                                "function '{name}' has parameter-dependent local declarations; not registered for constant evaluation"
+                            ),
+                        );
+                    } else if let Some(f) = self.lower_function_node(&d) {
+                        self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
+                        functions.push(f);
+                    }
+                }
                 _ => {}
             }
         }
@@ -904,6 +960,7 @@ impl<'a> Lower<'a> {
             name,
             types,
             consts,
+            functions,
         }
     }
 
@@ -1115,7 +1172,7 @@ impl<'a> Lower<'a> {
         if exprs.len() < 2 {
             return;
         }
-        let ev = |e: &Expr| const_eval(e, &env).and_then(|v| v.to_u64());
+        let ev = |e: &Expr| self.ce_env(e, &env).and_then(|v| v.to_u64());
         let (Some(lo), Some(hi)) = (ev(&exprs[0]), ev(&exprs[1])) else {
             self.warn(s.span(), "generate range is not constant; skipped");
             return;
@@ -1202,7 +1259,7 @@ impl<'a> Lower<'a> {
                     .map(|c| {
                         let env = self.consts.clone();
                         let e = self.lower_expr(&c, &env);
-                        const_eval(&e, &env)
+                        self.ce_env(&e, &env)
                             .and_then(|v| v.to_u64())
                             .map(|n| n != 0)
                             .unwrap_or(false)
@@ -1229,7 +1286,7 @@ impl<'a> Lower<'a> {
             .position(|k| is_expr_node(k.kind()))
             .unwrap_or(kids.len());
         let sel = self.lower_expr(&kids[sel_pos], &env);
-        let sel_v = const_eval(&sel, &env).and_then(|v| v.to_u64());
+        let sel_v = self.ce_env(&sel, &env).and_then(|v| v.to_u64());
         let items: Vec<&SyntaxNode> = kids
             .iter()
             .filter(|k| k.kind() == SyntaxKind::CaseItem)
@@ -1257,7 +1314,7 @@ impl<'a> Lower<'a> {
                 || sel_v
                     .map(|sv| {
                         choices.iter().any(|c| {
-                            const_eval(c, &env)
+                            self.ce_env(c, &env)
                                 .and_then(|v| v.to_u64())
                                 .map(|cv| cv == sv)
                                 .unwrap_or(false)
@@ -1352,7 +1409,7 @@ impl<'a> Lower<'a> {
         let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(e, &self.consts.clone());
-            const_eval(&ex, &self.consts.clone())
+            self.ce(&ex)
         });
         for n in &names {
             if self.sig_id(n).is_some() {
@@ -1412,6 +1469,9 @@ impl<'a> Lower<'a> {
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let Some(init) = init else { return };
         let env = self.consts.clone();
+        let width = type_mark
+            .map(|tm| self.resolve_type(tm, None, d.span()).0)
+            .unwrap_or(32);
         // Record-typed constant: order named aggregate fields by the record.
         let ex = match type_mark {
             Some(tm)
@@ -1427,12 +1487,25 @@ impl<'a> Lower<'a> {
             }
             _ => self.lower_expr(init, &env),
         };
-        if let Some(v) = const_eval(&ex, &env) {
-            for n in &names {
-                self.consts.insert(n.to_ascii_lowercase(), v.clone());
+        match self.ce_env(&ex, &env) {
+            Some(v) => {
+                for n in &names {
+                    self.consts.insert(n.to_ascii_lowercase(), v.clone());
+                }
             }
-        } else {
-            self.warn(d.span(), "constant initializer is not constant; ignored");
+            None => {
+                // Keep the name bound to X (e.g. a generic with no default is
+                // not constant at analysis time) so uses resolve instead of
+                // cascading into unknown-identifier errors.
+                self.warn(
+                    d.span(),
+                    "constant initializer is not constant; treated as X",
+                );
+                for n in &names {
+                    self.consts
+                        .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
+                }
+            }
         }
     }
 
@@ -1568,6 +1641,49 @@ impl<'a> Lower<'a> {
     /// lowered in slot space: slot 0 = function name (return value), then
     /// parameters, then local variables.
     fn lower_function_decl(&mut self, module: &mut ModuleIr, f: &SyntaxNode) {
+        if let Some(fi) = self.lower_function_node(f) {
+            module.functions.push(fi);
+        }
+    }
+
+    /// True when a function's local variable declarations constrain their
+    /// width with a parameter (`variable v : std_ulogic_vector(n-1 downto 0)`),
+    /// which cannot be lowered without knowing the call argument.
+    fn function_locals_use_params(&self, f: &SyntaxNode) -> bool {
+        let kids = real_children(f);
+        let mut params: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_begin = false;
+        for k in &kids {
+            if k.kind() == SyntaxKind::Ident && self.kw(k) == "begin" {
+                seen_begin = true;
+            }
+            if !seen_begin && k.kind() == SyntaxKind::PortDecl {
+                let pk = real_children(k);
+                if let Some(colon) = pk
+                    .iter()
+                    .position(|c| c.kind() == SyntaxKind::Punct && self.text(c) == ":")
+                {
+                    for c in &pk[..colon] {
+                        if c.kind() == SyntaxKind::Name {
+                            params.insert(self.text(c).to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        if params.is_empty() {
+            return false;
+        }
+        kids.iter()
+            .filter(|k| k.kind() == SyntaxKind::VariableDecl)
+            .any(|d| {
+                d.descendants()
+                    .filter(|k| k.kind() == SyntaxKind::Name)
+                    .any(|k| params.contains(&self.text(&k).to_ascii_lowercase()))
+            })
+    }
+
+    fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let kids = real_children(f);
         let mut name = String::new();
         let mut ret_mark: Option<SyntaxNode> = None;
@@ -1591,7 +1707,7 @@ impl<'a> Lower<'a> {
             }
         }
         if name.is_empty() {
-            return;
+            return None;
         }
         let (ret_width, _, _, _) = match &ret_mark {
             Some(tm) => self.resolve_type(tm, None, f.span()),
@@ -1675,13 +1791,13 @@ impl<'a> Lower<'a> {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
         };
         self.names = saved_names;
-        module.functions.push(FuncIr {
+        Some(FuncIr {
             name,
             ret_width: ret_width.max(1),
             args,
             locals,
             body,
-        });
+        })
     }
 
     fn lower_process(&mut self, module: &mut ModuleIr, p: &SyntaxNode, idx: usize) -> ProcessIr {
@@ -1769,7 +1885,7 @@ impl<'a> Lower<'a> {
         };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(e, &self.consts.clone());
-            const_eval(&ex, &self.consts.clone())
+            self.ce(&ex)
         });
         for n in &names {
             let id = module.signals.len() as SigId;
@@ -1924,7 +2040,7 @@ impl<'a> Lower<'a> {
                 let mut t = 0u64;
                 if let Some(d) = &e.delay {
                     let dv = self.lower_expr(d, &self.consts.clone());
-                    match const_eval(&dv, &self.consts.clone()).and_then(|v| v.to_u64()) {
+                    match self.ce(&dv).and_then(|v| v.to_u64()) {
                         Some(dt) => t = dt,
                         None => {
                             self.err(d.span(), "waveform delay must be constant");
@@ -2988,7 +3104,8 @@ impl<'a> Lower<'a> {
                 Expr::ToInt(Box::new(args.into_iter().next().unwrap()))
             }
             "to_unsigned" | "conv_unsigned" | "conv_std_logic_vector" if args.len() == 2 => {
-                let w = const_eval(&args[1], env)
+                let w = self
+                    .ce_env(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
                 Expr::Resize {
@@ -2998,7 +3115,8 @@ impl<'a> Lower<'a> {
                 }
             }
             "to_signed" | "conv_signed" if args.len() == 2 => {
-                let w = const_eval(&args[1], env)
+                let w = self
+                    .ce_env(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
                 Expr::Resize {
@@ -3008,7 +3126,8 @@ impl<'a> Lower<'a> {
                 }
             }
             "resize" if args.len() == 2 => {
-                let w = const_eval(&args[1], env)
+                let w = self
+                    .ce_env(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
                 let inner = &args[0];
