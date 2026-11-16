@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/larsjoost/hdlsim/actions/workflows/ci.yml/badge.svg)](https://github.com/larsjoost/hdlsim/actions/workflows/ci.yml)
 
-A self-contained VHDL + Verilog simulator written in std-only Rust — no external
-crates, and no wrapping of GHDL, Icarus Verilog, Verilator, or any other existing
+A self-contained VHDL + Verilog simulator written in Rust with only a small,
+vetted set of common external crates (declared in `[workspace.dependencies]`),
+and no wrapping of GHDL, Icarus Verilog, Verilator, or any other existing
 simulator. Lexers, parsers, library manager, elaboration, simulation kernel, and
 the graphical wave display are all implemented here.
 
@@ -84,7 +85,8 @@ cargo install hdlsim                  # from crates.io (once published)
 ```
 
 All six workspace crates (`hdl-syntax`, `hdl-lib`, `hdl-ir`, `hdl-sim`,
-`hdl-wave`, `hdlsim`) are std-only with zero dependencies and published-ready
+`hdl-wave`, `hdlsim`) depend only on the vetted common crates from
+`[workspace.dependencies]` and are published-ready
 (`[workspace.package]` metadata + `repository`/`license` fields), so external
 tools can depend on e.g. `hdl-sim` or `hdl-syntax` directly to reuse the
 kernel or the parsers.
@@ -92,7 +94,7 @@ kernel or the parsers.
 ## Build
 
 ```
-cargo build --release   # std-only, no dependencies to fetch
+cargo build --release   # fetches only the vetted workspace crates
 cargo test              # unit + integration tests
 ```
 

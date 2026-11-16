@@ -79,26 +79,15 @@ pub struct Flat {
 /// applied per-instance during instantiation by the lowerer).
 /// Elaboration errors. `UnknownUnit` is retryable: a [`UnitResolver`] may load
 /// the missing unit and elaboration restarts.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ElabError {
     /// A design unit referenced by an instantiation is not compiled yet.
+    #[error("{where_}: unknown design unit '{name}'")]
     UnknownUnit { name: String, where_: String },
     /// Any other elaboration failure.
+    #[error("{0}")]
     Message(String),
 }
-
-impl std::fmt::Display for ElabError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ElabError::UnknownUnit { name, where_ } => {
-                write!(f, "{}: unknown design unit '{}'", where_, name)
-            }
-            ElabError::Message(m) => write!(f, "{}", m),
-        }
-    }
-}
-
-impl std::error::Error for ElabError {}
 
 /// Resolution seam: when elaboration meets a design unit that is not in the
 /// `Design` yet, it asks the resolver to compile/load it into `design`
