@@ -19,6 +19,54 @@ pub trait UnitProvider {
     /// Scan the provider once; returns `(unit name, source file)` pairs.
     /// Called at most once per provider (the manager caches the result).
     fn scan(&self) -> Vec<(String, PathBuf)>;
+    /// Read a unit's source text. Default: read the file `scan` reported.
+    /// In-memory providers (e.g. the embedded stdlib) override this; their
+    /// `scan` paths are labels, not real files.
+    fn read(&self, unit: &str, file: &Path) -> Option<String> {
+        let _ = unit;
+        std::fs::read_to_string(file).ok()
+    }
+}
+
+/// A library whose sources are embedded in the binary (`include_str!`).
+pub struct EmbeddedProvider {
+    name: String,
+    /// `(unit name, source text)` pairs.
+    units: &'static [(&'static str, &'static str)],
+}
+
+impl EmbeddedProvider {
+    pub fn new(name: &str, units: &'static [(&'static str, &'static str)]) -> EmbeddedProvider {
+        EmbeddedProvider {
+            name: name.to_string(),
+            units,
+        }
+    }
+}
+
+impl UnitProvider for EmbeddedProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn scan(&self) -> Vec<(String, PathBuf)> {
+        self.units
+            .iter()
+            .map(|(u, _)| {
+                (
+                    u.to_string(),
+                    PathBuf::from(format!("<builtin {}>/{}.vhd", self.name, u)),
+                )
+            })
+            .collect()
+    }
+
+    fn read(&self, unit: &str, _file: &Path) -> Option<String> {
+        self.units
+            .iter()
+            .find(|(u, _)| *u == unit)
+            .map(|(_, s)| (*s).to_string())
+    }
 }
 
 /// A filesystem directory searched recursively for source files.

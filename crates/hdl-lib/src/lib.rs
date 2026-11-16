@@ -47,8 +47,9 @@ pub struct LibraryManager {
     incdirs: Vec<PathBuf>,
     db: SourceDb,
     diags: Diagnostics,
-    /// unit name → candidate source files, in provider/search order.
-    index: HashMap<String, Vec<PathBuf>>,
+    /// unit name → (provider index, source file) candidates, in search order.
+    /// The index counts into `providers` then `builtins` (see `all_providers`).
+    index: HashMap<String, Vec<(usize, PathBuf)>>,
     indexed: bool,
     /// Canonical paths already compiled this session.
     compiled: HashSet<PathBuf>,
@@ -160,16 +161,24 @@ impl LibraryManager {
             .collect()
     }
 
-    /// Build the unit-name → files index by scanning all providers (once):
-    /// user providers first, built-ins last.
+    /// All providers in search order: user providers first, built-ins last.
+    fn all_providers(&self) -> impl Iterator<Item = &Box<dyn UnitProvider>> {
+        self.providers.iter().chain(self.builtins.iter())
+    }
+
+    /// Build the unit-name → (provider, file) index by scanning all providers
+    /// (once): user providers first, built-ins last.
     pub fn ensure_index(&mut self) {
         if self.indexed {
             return;
         }
-        for p in self.providers.iter().chain(self.builtins.iter()) {
-            for (unit, file) in p.scan() {
-                self.index.entry(unit).or_default().push(file);
-            }
+        let scanned: Vec<(usize, String, PathBuf)> = self
+            .all_providers()
+            .enumerate()
+            .flat_map(|(i, p)| p.scan().into_iter().map(move |(u, f)| (i, u, f)))
+            .collect();
+        for (i, unit, file) in scanned {
+            self.index.entry(unit).or_default().push((i, file));
         }
         self.indexed = true;
     }
@@ -177,21 +186,33 @@ impl LibraryManager {
     /// The file that defines `unit` according to the library index, if any.
     pub fn unit_file(&mut self, unit: &str) -> Option<PathBuf> {
         self.ensure_index();
-        self.index.get(unit).and_then(|v| v.first().cloned())
+        self.index
+            .get(unit)
+            .and_then(|v| v.first().map(|(_, p)| p.clone()))
     }
 
     /// Compile one source file into `design` (at most once per session).
     pub fn compile_file(&mut self, design: &mut Design, path: &Path) -> Result<(), String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        self.compile_text(design, path, &text)
+    }
+
+    /// Compile source text already in memory (e.g. from an embedded provider).
+    pub fn compile_text(
+        &mut self,
+        design: &mut Design,
+        path: &Path,
+        text: &str,
+    ) -> Result<(), String> {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !self.compiled.insert(canon) {
             return Ok(()); // already compiled this session
         }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
         let cache = self.cache.as_ref();
         compile_one(
             path,
-            &text,
+            text,
             &self.incdirs,
             &mut self.db,
             &mut self.diags,
@@ -243,8 +264,15 @@ impl UnitResolver for LibraryManager {
                 }
             ));
         };
-        for path in candidates {
-            self.compile_file(design, &path)?;
+        for (pi, path) in candidates {
+            let text = self
+                .all_providers()
+                .nth(pi)
+                .and_then(|p| p.read(name, &path));
+            let Some(text) = text else {
+                continue;
+            };
+            self.compile_text(design, &path, &text)?;
             if design.modules.iter().any(|m| m.name == name) {
                 return Ok(true);
             }
@@ -469,16 +497,15 @@ mod tests {
         // User providers come before the built-ins in search order.
         let names = mgr.library_names();
         assert_eq!(&names[..1], &["work"]);
-        // The stdlib tree indexes package units, and they compile cleanly
-        // through the real parse+lower pipeline.
-        let dir = builtin::stdlib_dir().expect("stdlib dir in checkout");
+        // The (embedded) stdlib indexes package units, and they resolve +
+        // compile cleanly through the real parse+lower pipeline — no disk
+        // tree needed.
         let mut design = Design::default();
-        mgr.compile_file(&mut design, &dir.join("std/standard.vhd"))
-            .unwrap();
-        mgr.compile_file(&mut design, &dir.join("ieee/std_logic_1164.vhd"))
-            .unwrap();
-        mgr.compile_file(&mut design, &dir.join("ieee/numeric_std.vhd"))
-            .unwrap();
+        for unit in ["standard", "std_logic_1164", "numeric_std"] {
+            // Packages compile but produce no module, so resolve may return
+            // Ok(false); what matters is that compilation is error-free.
+            assert!(mgr.resolve(&mut design, unit).is_ok(), "{}", unit);
+        }
         assert!(
             !mgr.diags().has_errors(),
             "{}",
