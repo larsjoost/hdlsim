@@ -8,7 +8,7 @@
 //! Positions are 0-based line + UTF-16 code-unit column (LSP default).
 
 use super::Command;
-use crate::json::Json;
+use crate::json::{Json, JsonCtor};
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
@@ -86,7 +86,7 @@ impl Server {
                                 "completionProvider",
                                 Json::obj(vec![(
                                     "triggerCharacters",
-                                    Json::Arr(vec![Json::str(".")]),
+                                    Json::Array(vec![Json::str(".")]),
                                 )]),
                             ),
                         ]),
@@ -126,7 +126,7 @@ impl Server {
                 let text = msg
                     .get("params")
                     .and_then(|p| p.get("contentChanges"))
-                    .and_then(|c| c.as_arr())
+                    .and_then(|c| c.as_array())
                     .and_then(|a| a.last())
                     .and_then(|c| c.get("text"))
                     .and_then(|t| t.as_str());
@@ -240,7 +240,7 @@ impl Server {
                         };
                         Json::obj(vec![
                             ("isIncomplete", Json::Bool(false)),
-                            ("items", Json::Arr(items)),
+                            ("items", Json::Array(items)),
                         ])
                     }
                     None => Json::Null,
@@ -380,7 +380,7 @@ fn publish_diagnostics(uri: &str, diags: Vec<Json>) -> Json {
             "params",
             Json::obj(vec![
                 ("uri", Json::str(uri)),
-                ("diagnostics", Json::Arr(diags)),
+                ("diagnostics", Json::Array(diags)),
             ]),
         ),
     ])
@@ -950,7 +950,7 @@ mod tests {
             .unwrap()
             .get("diagnostics")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap();
         assert!(!diags.is_empty(), "expected a parse error");
         assert_eq!(diags[0].get("severity"), Some(&Json::num(1)));
@@ -982,7 +982,7 @@ mod tests {
             .unwrap()
             .get("diagnostics")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap();
         assert!(diags.is_empty());
 
@@ -997,7 +997,7 @@ mod tests {
             .unwrap()
             .get("diagnostics")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap()
             .is_empty());
         assert!(!srv.docs.contains_key(uri));
@@ -1017,7 +1017,7 @@ mod tests {
             .unwrap()
             .get("diagnostics")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap();
         assert!(!diags.is_empty());
     }
@@ -1113,7 +1113,7 @@ mod tests {
         let caps = out[0].get("result").unwrap().get("capabilities").unwrap();
         let cp = caps.get("completionProvider").unwrap();
         assert_eq!(
-            cp.get("triggerCharacters").unwrap().as_arr().unwrap()[0],
+            cp.get("triggerCharacters").unwrap().as_array().unwrap()[0],
             Json::str(".")
         );
     }
@@ -1138,7 +1138,7 @@ mod tests {
             .unwrap()
             .get("items")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap()
             .clone();
         let labels: Vec<&str> = items
@@ -1158,7 +1158,7 @@ mod tests {
             .unwrap()
             .get("items")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap();
         let labels: Vec<&str> = items
             .iter()
@@ -1194,7 +1194,7 @@ mod tests {
             .unwrap()
             .get("items")
             .unwrap()
-            .as_arr()
+            .as_array()
             .unwrap();
         let labels: Vec<&str> = items
             .iter()
