@@ -13,12 +13,32 @@
 //! - `quit`/`exit [code]` — stop the script (Tcl builtin)
 
 use super::run::Transcript;
-use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command, CommonOpts};
+use super::{
+    build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command, CommonOpts,
+};
 use crate::tcl::{Flow, Interp};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::Simulator;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "run a mini-Tcl do-file: hdlsim do <script.do> --top <tb> [--max-time 10us] [files...]"
+)]
+struct DoArgs {
+    /// Do-file script.
+    script: PathBuf,
+    /// Top-level unit.
+    #[arg(long)]
+    top: Option<String>,
+    /// Stop time (e.g. 10us).
+    #[arg(long)]
+    max_time: Option<String>,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct DoCmd;
 
@@ -31,36 +51,17 @@ impl Command for DoCmd {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut script: Option<PathBuf> = None;
-        let mut top: Option<String> = None;
-        let mut max_time_fs = u64::MAX;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--max-time" => {
-                    max_time_fs = parse_time(rest.get(i + 1).ok_or("--max-time needs a value")?)?;
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    if script.is_none() {
-                        script = Some(PathBuf::from(f));
-                    } else {
-                        files.push(PathBuf::from(f));
-                    }
-                    i += 1;
-                }
-            }
-        }
-        let script = script.ok_or("usage: hdlsim do <script.do> --top <tb> [files...]")?;
-        let top = top.ok_or("--top is required")?;
+        let a = match parse_with::<DoArgs>("do", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let script = a.script;
+        let top = a.top.ok_or("--top is required")?;
+        let max_time_fs = match &a.max_time {
+            Some(v) => parse_time(v)?,
+            None => u64::MAX,
+        };
+        let files: Vec<PathBuf> = a.files;
         let text = std::fs::read_to_string(&script)
             .map_err(|e| format!("cannot read {}: {}", script.display(), e))?;
         let (_mgr, root) = build_manager(&opts)?;

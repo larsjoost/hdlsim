@@ -2,9 +2,33 @@
 //! JSON manifest) from sources + library mappings. Thin wrapper over
 //! [`crate::project::generate`].
 
-use super::{build_manager, extract_common, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
 use crate::project::{generate, ProjectFormat, ProjectSpec};
+use clap::Parser;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
+)]
+struct ProjectArgs {
+    /// Output format (vivado-tcl|json).
+    #[arg(long, short = 'f')]
+    format: Option<String>,
+    /// Output file (default: stdout).
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+    #[arg(long, short = 'n')]
+    name: Option<String>,
+    #[arg(long)]
+    top: Option<String>,
+    #[arg(long)]
+    sim_top: Option<String>,
+    #[arg(long)]
+    part: Option<String>,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct Project;
 
@@ -17,49 +41,22 @@ impl Command for Project {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut format: Option<ProjectFormat> = None;
-        let mut out: Option<PathBuf> = None;
+        let a = match parse_with::<ProjectArgs>("project", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let format = ProjectFormat::from_str(
+            a.format
+                .as_deref()
+                .ok_or("missing --format (vivado|json)")?,
+        )?;
+        let out = a.out;
         let mut spec = ProjectSpec::default();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--format" | "-f" => {
-                    format = Some(ProjectFormat::from_str(
-                        rest.get(i + 1)
-                            .ok_or("--format needs a value (vivado|json)")?,
-                    )?);
-                    i += 2;
-                }
-                "--out" | "-o" => {
-                    out = Some(PathBuf::from(rest.get(i + 1).ok_or("--out needs a value")?));
-                    i += 2;
-                }
-                "--name" | "-n" => {
-                    spec.name = rest.get(i + 1).ok_or("--name needs a value")?.clone();
-                    i += 2;
-                }
-                "--top" => {
-                    spec.top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--sim-top" => {
-                    spec.sim_top = Some(rest.get(i + 1).ok_or("--sim-top needs a value")?.clone());
-                    i += 2;
-                }
-                "--part" => {
-                    spec.part = Some(rest.get(i + 1).ok_or("--part needs a value")?.clone());
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    spec.files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let format = format.ok_or("missing --format (vivado|json)")?;
+        spec.name = a.name.unwrap_or_default();
+        spec.top = a.top;
+        spec.sim_top = a.sim_top;
+        spec.part = a.part;
+        spec.files = a.files;
         if spec.files.is_empty() {
             return Err("no input files".to_string());
         }
