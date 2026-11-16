@@ -118,6 +118,14 @@ names - hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim - verified unique
 crates.io; publish from the owner's machine with `cargo login` first, in dependency
 order: hdl-syntax, hdl-ir, hdl-lib, hdl-sim, hdl-wave, hdlsim).
 
+Release prep 0.2.0 (main @ d80e1e2): 0.1.0 is the only version on crates.io, so the
+workspace bumped 0.1.0 -> 0.2.0; version strings in `--help`, bundle manifest JSON,
+VCD `$version` and FST writer headers now read `env!("CARGO_PKG_VERSION")`; the golden
+VCD test normalizes the version header so bumps don't invalidate the fixture. Gates
+green: `cargo fmt --check`, `cargo test --workspace`, `cargo publish --dry-run` (all 6
+crates package + verify at 0.2.0, no index conflicts). Actual upload remains
+owner-side: `cargo login`, then `cargo publish` from the workspace root.
+
 Merged PRs (main @ c7feea8, 2026-11-16):
 
 | PR | What |
