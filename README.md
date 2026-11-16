@@ -172,6 +172,12 @@ exit 2. So CI and `run_tests.sh` scripts can rely on the exit code alone.
 
 ## Reporting bugs — reproducer bundles
 
+Whenever hdlsim exits non-zero, it prints a short `note:` hint on stderr with
+the bundle command and the issue link, so the report path is always one
+copy-paste away. To include in an issue: the full error output (diagnostic
+codes like `E0301` can be explained with `hdlsim explain E0301`), the
+`hdlsim doctor` output (first line has the version), and a reproducer bundle.
+
 If hdlsim fails on your project (compile error, wrong simulation result), pack
 it into a single file and attach it to an issue:
 
