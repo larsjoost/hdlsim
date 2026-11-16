@@ -16,6 +16,17 @@ impl log::Log for StderrLogger {
 
 static LOGGER: StderrLogger = StderrLogger;
 
+/// Printed on every non-zero exit, so users know how to report the failure:
+/// pack a reproducer bundle, then open an issue with the error output.
+fn report_hint() {
+    eprintln!(
+        "note: hdlsim {} — to report this, attach a reproducer and open an issue:",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!("        hdlsim bundle --out hdlsim-repro.tar --top <top> [files...]");
+    eprintln!("      https://github.com/larsjoost/hdlsim/issues/new");
+}
+
 fn main() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
@@ -26,10 +37,16 @@ fn main() {
         hdl_syntax::diagnostic::set_color_mode(mode);
     }
     match hdlsim::commands::dispatch(&args) {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            if code != 0 {
+                report_hint();
+            }
+            std::process::exit(code)
+        }
         Err(e) => {
             eprintln!("hdlsim: {:#}", e);
             eprintln!("try 'hdlsim --help'");
+            report_hint();
             std::process::exit(2);
         }
     }

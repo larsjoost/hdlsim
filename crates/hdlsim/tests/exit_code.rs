@@ -57,3 +57,24 @@ fn failing_tests_exit_nonzero() {
         assert!(stdout.contains(needle), "{}: {}", f, stdout);
     }
 }
+
+#[test]
+fn failures_print_report_hint() {
+    // Usage error (exit 2): hint with the bundle command and the issue link.
+    let out = hdlsim().args(["frobnicate"]).output().expect("runs");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("hdlsim bundle"), "{}", err);
+    assert!(err.contains("issues/new"), "{}", err);
+
+    // Failing simulation (exit 1): hint as well.
+    let out = run("tb_fail_err", "tests/fixtures/tb_fail_err.vhd");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("issues/new"), "{}", err);
+
+    // Passing run: no hint.
+    let out = run("tb_pass", "tests/fixtures/tb_pass.vhd");
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("issues/new"));
+}
