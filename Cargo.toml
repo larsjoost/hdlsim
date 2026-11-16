@@ -23,6 +23,15 @@ hdl-sim = { path = "crates/hdl-sim", version = "0.2.0" }
 hdl-wave = { path = "crates/hdl-wave", version = "0.2.0" }
 hdlsim = { path = "crates/hdlsim", version = "0.2.0" }
 
+# Vetted set of common external crates (see REVIEWING.md). Prefer std when it is
+# a reasonable fit; a crate opts in to one of these with `x.workspace = true`.
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
 [profile.release]
 opt-level = 3
 lto = true

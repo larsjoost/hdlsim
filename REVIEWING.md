@@ -8,7 +8,11 @@
 - Errors are values (`Result<T, Diagnostic>`), never panics on user input. Panics
   only for violated internal invariants, with the invariant named. No
   `unwrap()`/`expect()` on anything derived from source files.
-- No `unsafe`. No build.rs, no proc macros, no external crates.
+- No `unsafe`. No build.rs, no proc macros. External crates are limited to the vetted
+  common set declared in `[workspace.dependencies]` (thiserror, anyhow, clap, serde,
+  serde_json, log); a crate opts in with `x.workspace = true`. Prefer std when it is
+  a reasonable fit; anything outside the vetted set needs a justification in the PR
+  description.
 - One grammar production / one idea per function, typically < 60 lines. Parsers
   mirror the IEEE 1364 / 1076 grammar so reviewers can diff against the standard.
 - No magic numbers; enums instead of boolean flags at call sites.
