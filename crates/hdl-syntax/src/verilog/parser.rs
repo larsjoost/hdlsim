@@ -2376,7 +2376,9 @@ impl<'a> Parser<'a> {
             TokenKind::Punct if self.peek_text() == "{" => {
                 // Replicate `{ n { expr } }` vs concat `{ a, b, ... }`: the
                 // node must wrap from the opening brace, so mark first and
-                // start the node retroactively once the shape is known.
+                // start the node retroactively once the shape is known. Both
+                // closing braces belong to the node — a trailing `}` left as
+                // a sibling corrupts the parent BinExpr's operator text.
                 let mark = self.builder.mark();
                 self.bump(); // {
                 self.parse_expression();
@@ -2385,15 +2387,16 @@ impl<'a> Parser<'a> {
                     self.bump(); // inner {
                     self.parse_expression();
                     self.expect_punct('}', "to close the replication");
+                    self.expect_punct('}', "to close the replication");
                     self.builder.finish_node();
                 } else {
                     self.builder.start_node_at(mark, SyntaxKind::Concat);
                     while self.eat_punct(',') {
                         self.parse_expression();
                     }
+                    self.expect_punct('}', "to close the concatenation");
                     self.builder.finish_node();
                 }
-                self.expect_punct('}', "to close the concatenation");
             }
             _ => {
                 self.error_here("expected an expression");
@@ -2836,5 +2839,18 @@ endmodule
     fn parses_escaped_identifiers() {
         let sexp = ok("module m; wire \\a+b ; assign \\a+b = 1'b0; endmodule\n");
         assert!(sexp.contains("\\a+b"), "{}", sexp);
+    }
+    #[test]
+    fn replicate_node_owns_both_closing_braces() {
+        // `{4{b}}` as a binary operand must parse as BinExpr(Name, "^",
+        // Replicate) with NO stray '}' punct sibling — a leftover '}' used
+        // to corrupt the parent operator text ("^}").
+        let sexp = ok(
+            "module m(input [3:0] a, input b, output [3:0] y); assign y = a ^ {4{b}}; endmodule\n",
+        );
+        let bin = sexp.split("(BinExpr").nth(1).unwrap_or("");
+        let bin = &bin[..bin.find("Punct \";\"").unwrap_or(bin.len())];
+        assert!(bin.contains("Punct \"^\" (Replicate"), "{}", bin);
+        assert_eq!(bin.matches("Punct \"}\"").count(), 2, "{}", bin);
     }
 }

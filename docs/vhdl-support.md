@@ -15,7 +15,7 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 
 | Package | Status | Notes | Test |
 |---|---|---|---|
-| `std.standard` | ✅ | boolean/bit/character/integer/… types; `true`/`false` | `tests/vhdl_std_ulogic.rs`, corpus |
+| `std.standard` | ✅ | boolean/bit/character/integer/… types; `true`/`false`; `severity_level` literals `note`/`warning`/`error`/`failure` | `tests/vhdl_std_ulogic.rs`, `tests/vhdl_severity.rs`, corpus |
 | `std.env` | ✅ | `finish`/`stop` are simulator builtins | `tests/fixtures/tb_pass.vhd`, `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_1164` | ✅ | 9-value logic as 1-bit scalar, vectors, logic ops, `rising_edge`/`falling_edge`, `to_x01` | `tests/vhdl_std_ulogic.rs`, examples |
 | `ieee.numeric_std` | ✅ | `unsigned`/`signed` arithmetic, comparisons, `resize`, `to_integer`, `to_unsigned`/`to_signed` | `tests/vhdl_signed.rs`, `tests/vhdl_std_arith.rs` |
