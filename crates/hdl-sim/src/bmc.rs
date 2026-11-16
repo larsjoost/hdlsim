@@ -1646,6 +1646,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                         let sign = if w > 0 { Some(l2[w - 1]) } else { None };
                         shift_bits(b, &l2, &m, w, ShiftDir::Right, sign)
                     }
+                    BinOp::Rol | BinOp::Ror => {
+                        return Err("prove: rotate operators (rol/ror) unsupported".to_string());
+                    }
                     BinOp::Lt => vec![lt_bits(b, &l2, &r2, w, signed)],
                     BinOp::Le => {
                         let lt = lt_bits(b, &l2, &r2, w, signed);

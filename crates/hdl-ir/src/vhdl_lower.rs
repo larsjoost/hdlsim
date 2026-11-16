@@ -2479,6 +2479,32 @@ impl<'a> Lower<'a> {
                 }
                 Expr::Call { name: fname, args }
             }
+            // Shift/rotate function forms from std_logic_arith & co.
+            "shift_left" | "sll" | "sla" if args.len() == 2 => Expr::Bin {
+                op: BinOp::Shl,
+                l: Box::new(args[0].clone()),
+                r: Box::new(args[1].clone()),
+            },
+            "shift_right" | "srl" if args.len() == 2 => Expr::Bin {
+                op: BinOp::Shr,
+                l: Box::new(args[0].clone()),
+                r: Box::new(args[1].clone()),
+            },
+            "sra" if args.len() == 2 => Expr::Bin {
+                op: BinOp::Sar,
+                l: Box::new(args[0].clone()),
+                r: Box::new(args[1].clone()),
+            },
+            "rotate_left" | "rol" if args.len() == 2 => Expr::Bin {
+                op: BinOp::Rol,
+                l: Box::new(args[0].clone()),
+                r: Box::new(args[1].clone()),
+            },
+            "rotate_right" | "ror" if args.len() == 2 => Expr::Bin {
+                op: BinOp::Ror,
+                l: Box::new(args[0].clone()),
+                r: Box::new(args[1].clone()),
+            },
             "rising_edge" if args.len() == 1 => {
                 Expr::Rising(Box::new(args.into_iter().next().unwrap()))
             }
@@ -2947,10 +2973,11 @@ fn vhdl_binop(op: &str) -> Option<BinOp> {
         "nand" => BinOp::BNand,
         "nor" => BinOp::BNor,
         "xnor" => BinOp::BXnor,
-        "sll" | "rol" => BinOp::Shl,
-        "srl" | "ror" => BinOp::Shr,
+        "sll" | "sla" => BinOp::Shl,
+        "srl" => BinOp::Shr,
         "sra" => BinOp::Sar,
-        "sla" => BinOp::Shl,
+        "rol" => BinOp::Rol,
+        "ror" => BinOp::Ror,
         _ => return None,
     })
 }

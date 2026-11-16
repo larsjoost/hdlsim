@@ -190,7 +190,13 @@ impl Value {
     /// X/Z literally and never produce X.
     pub fn binop(&self, op: BinOp, rhs: &Value) -> Value {
         use BinOp::*;
-        let w = self.bits.len().max(rhs.bits.len()).max(1);
+        // Shift/rotate results have the left operand's width — the shift
+        // amount must not widen the result.
+        let w = if matches!(op, Shl | Shr | Sar | Rol | Ror) {
+            self.bits.len().max(1)
+        } else {
+            self.bits.len().max(rhs.bits.len()).max(1)
+        };
         match op {
             Eq | Ne | EqStrict | NeStrict => {
                 let strict = matches!(op, EqStrict | NeStrict);
@@ -292,7 +298,7 @@ impl Value {
                 }
                 // Arithmetic needs full-width evaluation, not per-bit.
                 match op {
-                    Add | Sub | Mul | Div | Mod | Shl | Shr | Sar => {
+                    Add | Sub | Mul | Div | Mod | Shl | Shr | Sar | Rol | Ror => {
                         return self.arith(op, rhs, w);
                     }
                     _ => {}
@@ -326,6 +332,26 @@ impl Value {
                     }
                     Shl => a.wrapping_shl(b as u32),
                     Shr => a.wrapping_shr(b as u32),
+                    Rol | Ror => {
+                        let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        let a = a & m;
+                        if w >= 64 {
+                            if matches!(op, Rol) {
+                                a.rotate_left((b as u32) % 64)
+                            } else {
+                                a.rotate_right((b as u32) % 64)
+                            }
+                        } else {
+                            let sh = (b as u32) % (w as u32);
+                            if sh == 0 {
+                                a
+                            } else if matches!(op, Rol) {
+                                ((a << sh) | (a >> (w as u32 - sh))) & m
+                            } else {
+                                ((a >> sh) | (a << (w as u32 - sh))) & m
+                            }
+                        }
+                    }
                     // Arithmetic: sign-extend to i64, shift, keep low w bits.
                     Sar => {
                         let sh = (b as u32) % 64;
@@ -553,6 +579,10 @@ pub enum BinOp {
     Shr,
     /// Arithmetic shift right (sign-preserving) — VHDL `sra`.
     Sar,
+    /// Rotate left within the operand width — VHDL `rol`.
+    Rol,
+    /// Rotate right within the operand width — VHDL `ror`.
+    Ror,
     Lt,
     Le,
     Gt,
@@ -682,5 +712,21 @@ mod tests {
         assert_eq!(a.binop(BinOp::Shl, &b).to_u64(), Some(8));
         let c = Value::from_u64(8, 8);
         assert_eq!(c.binop(BinOp::Shr, &b).to_u64(), Some(1));
+    }
+
+    #[test]
+    fn rotates_stay_within_operand_width() {
+        let v = Value::from_u64(8, 0x0F);
+        let n = Value::from_u64(32, 4); // wide amount must not widen the result
+        let rol = v.binop(BinOp::Rol, &n);
+        let ror = v.binop(BinOp::Ror, &n);
+        assert_eq!(rol.width(), 8);
+        assert_eq!(rol.to_u64(), Some(0xF0));
+        assert_eq!(ror.to_u64(), Some(0xF0));
+        let one = Value::from_u64(32, 1);
+        assert_eq!(v.binop(BinOp::Ror, &one).to_u64(), Some(0x87));
+        // Arithmetic shift right sign-extends within the width.
+        let s = Value::from_u64(8, 0xF0);
+        assert_eq!(s.binop(BinOp::Sar, &one).to_u64(), Some(0xF8));
     }
 }
