@@ -2189,6 +2189,7 @@ mod tests {
         Design {
             modules,
             top: Some(top.to_string()),
+            packages: Default::default(),
         }
     }
 

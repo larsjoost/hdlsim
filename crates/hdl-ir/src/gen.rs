@@ -265,6 +265,7 @@ mod tests {
         Design {
             modules: vec![m],
             top: None,
+            packages: Default::default(),
         }
     }
 

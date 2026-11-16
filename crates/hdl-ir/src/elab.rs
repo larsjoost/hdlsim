@@ -592,6 +592,7 @@ mod tests {
         Design {
             modules: vec![top, child],
             top: Some("top".into()),
+            packages: Default::default(),
         }
     }
 

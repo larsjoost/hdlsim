@@ -209,6 +209,20 @@ impl LibraryManager {
         if !self.compiled.insert(canon) {
             return Ok(()); // already compiled this session
         }
+        // VHDL: resolve the units named in context clauses (`use lib.pkg.all;`)
+        // first, so their packages are on the design and visible while lowering.
+        if Language::from_path(path) == Some(Language::Vhdl) {
+            let id = self
+                .db
+                .add_file(path.display().to_string(), text.to_string())
+                .map_err(|e| e.to_string())?;
+            let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
+            for unit in hdl_ir::vhdl_lower::context_units(&self.db, &parsed.root) {
+                if !design.packages.contains_key(&unit) {
+                    let _ = self.resolve(design, &unit);
+                }
+            }
+        }
         let cache = self.cache.as_ref();
         compile_one(
             path,
@@ -423,10 +437,19 @@ pub fn compile_one(
             };
             diags.extend(parse_diags);
             let mut lower_diags = Vec::new();
-            let modules =
-                hdl_ir::vhdl_lower::lower_file(id, &root, db, &mut lower_diags, 1_000_000);
+            let lowered = hdl_ir::vhdl_lower::lower_file(
+                id,
+                &root,
+                db,
+                &mut lower_diags,
+                1_000_000,
+                &design.packages,
+            );
             diags.extend(lower_diags);
-            design.modules.extend(modules);
+            design.modules.extend(lowered.modules);
+            for p in lowered.packages {
+                design.packages.insert(p.name.clone(), p);
+            }
         }
     }
     Ok(())

@@ -7,6 +7,7 @@
 
 use crate::value::{BinOp, UnOp, Value};
 use hdl_syntax::source::Span;
+use std::collections::HashMap;
 
 pub type SigId = u32;
 pub type ModId = u32;
@@ -16,6 +17,10 @@ pub struct Design {
     pub modules: Vec<ModuleIr>,
     /// Name of the top module to elaborate, if chosen.
     pub top: Option<String>,
+    /// Lowered packages by unit name (`std_logic_1164`, ...), so other files
+    /// can make them visible with `use lib.pkg.all;` (see
+    /// [`crate::vhdl_lower`]).
+    pub packages: HashMap<String, crate::vhdl_lower::PackageIr>,
 }
 
 #[derive(Clone, Debug)]
