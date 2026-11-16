@@ -519,8 +519,9 @@ impl<'a> Parser<'a> {
             self.parse_concurrent_stmt();
         }
         self.expect_kw("end", "to close the architecture");
+        self.eat_kw("architecture"); // `end [architecture] [name];`
         if self.peek().kind == TokenKind::Ident {
-            self.bump(); // architecture name
+            self.bump(); // optional architecture name
         }
         self.expect_punct(';', "to end the architecture");
         self.builder.finish_node();
@@ -2158,6 +2159,22 @@ end architecture;
         assert!(sexp.contains("(ConcAssign"), "{}", sexp);
         assert!(sexp.contains("(If"), "{}", sexp);
         assert!(sexp.contains("(Call"), "{}", sexp); // rising_edge(...)
+    }
+
+    #[test]
+    fn parses_all_end_architecture_forms() {
+        // `end [architecture] [name];` — all four forms are valid VHDL.
+        for tail in [
+            "end;",
+            "end rtl;",
+            "end architecture;",
+            "end architecture rtl;",
+            "END ARCHITECTURE behavior;",
+        ] {
+            let src = format!("architecture rtl of m is\nbegin\n{}\n", tail);
+            let sexp = ok(&src);
+            assert!(sexp.contains("(Architecture"), "{}: {}", tail, sexp);
+        }
     }
 
     #[test]
