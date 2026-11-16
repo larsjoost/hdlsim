@@ -9,7 +9,7 @@
 //! Consume it with `hdlsim run --bundle repro.tar --top tb` (also `check`,
 //! `debug`, `project`) or plain `tar -xf`.
 
-use super::{extract_common, parse_with, Command};
+use super::{parse_with, Command, CommonArgs};
 use clap::Parser;
 use hdl_lib::bundle::{write_tar, BundleEntry};
 use hdl_lib::parse_library_config;
@@ -24,6 +24,8 @@ const SIZE_CAP: u64 = 256 * 1024 * 1024;
     about = "pack a project into a single .tar reproducer: hdlsim bundle [--out repro.tar] [--top tb] [--label text] [files...]"
 )]
 struct BundleArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Output tar file (default: hdlsim-repro.tar).
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
@@ -46,11 +48,11 @@ impl Command for Bundle {
         "pack the project into one .tar reproducer for a bug report: hdlsim bundle --out repro.tar [--top tb] [files]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<BundleArgs>("bundle", &rest) {
+        let a = match parse_with::<BundleArgs>("bundle", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let out = a.out.unwrap_or_else(|| PathBuf::from("hdlsim-repro.tar"));
         let top = a.top;
         let label = a.label;

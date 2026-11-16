@@ -1,6 +1,6 @@
 //! `hdlsim run` — compile (with libraries) and simulate one design.
 
-use super::{build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -12,6 +12,8 @@ use std::path::PathBuf;
     about = "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--live] [--max-time 10us] [--seed N]"
 )]
 struct RunArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Top-level unit (default: the single compiled module).
     #[arg(long)]
     top: Option<String>,
@@ -87,11 +89,11 @@ impl Command for Run {
         "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--hwf out.hwf] [--fst out.fst] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<RunArgs>("run", &rest) {
+        let a = match parse_with::<RunArgs>("run", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let top = a.top;
         let vcd = a.vcd;
         let hwf = a.hwf;

@@ -1,7 +1,7 @@
 //! `hdlsim check` — compile only (parse + lower + resolve), print diagnostics,
 //! no simulation. Like `vlog -lint` / `ghdl -a`.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -10,6 +10,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about = "compile files and report diagnostics without simulating")]
 struct CheckArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Source files to compile.
     files: Vec<PathBuf>,
 }
@@ -24,11 +26,11 @@ impl Command for Check {
         "compile files and report diagnostics without simulating"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<CheckArgs>("check", &rest) {
+        let a = match parse_with::<CheckArgs>("check", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         if a.files.is_empty() {
             return Err("no input files".to_string());
         }

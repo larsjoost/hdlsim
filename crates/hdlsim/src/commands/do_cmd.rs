@@ -14,7 +14,7 @@
 
 use super::run::Transcript;
 use super::{
-    build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command, CommonOpts,
+    build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs, CommonOpts,
 };
 use crate::tcl::{Flow, Interp};
 use clap::Parser;
@@ -28,6 +28,8 @@ use std::path::PathBuf;
     about = "run a mini-Tcl do-file: hdlsim do <script.do> --top <tb> [--max-time 10us] [files...]"
 )]
 struct DoArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Do-file script.
     script: PathBuf,
     /// Top-level unit.
@@ -50,11 +52,11 @@ impl Command for DoCmd {
         "run a mini-Tcl do-file: hdlsim do script.do --top tb [files]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<DoArgs>("do", &rest) {
+        let a = match parse_with::<DoArgs>("do", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let script = a.script;
         let top = a.top.ok_or("--top is required")?;
         let max_time_fs = match &a.max_time {

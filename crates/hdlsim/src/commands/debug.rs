@@ -4,7 +4,7 @@
 //! Also usable as a library: `hdl_sim::debug::Watcher` is an `Observer` you can
 //! attach to any `Simulator` in your own tooling.
 
-use super::{build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -30,6 +30,8 @@ impl Observer for Transcript {
     about = "inspect the simulated design: hdlsim debug --top tb [--watch sig]... [--driver d]... [--mem m]... [--all] [--dump] [--max-time T] [--seed N] [files...]"
 )]
 struct DebugArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Top-level unit.
     #[arg(long)]
     top: Option<String>,
@@ -68,11 +70,11 @@ impl Command for Debug {
         "debug a design: hdlsim debug --top tb [files] [--dump] [--watch sig]... [--all] [--mem name]... [--max-time 10us] [--seed N]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<DebugArgs>("debug", &rest) {
+        let a = match parse_with::<DebugArgs>("debug", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let top = a.top.ok_or(
             "debug needs --top TB (file arguments may be omitted when libraries are configured)",
         )?;

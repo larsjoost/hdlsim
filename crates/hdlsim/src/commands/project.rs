@@ -2,7 +2,7 @@
 //! JSON manifest) from sources + library mappings. Thin wrapper over
 //! [`crate::project::generate`].
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use crate::project::{generate, ProjectFormat, ProjectSpec};
 use clap::Parser;
 use std::path::PathBuf;
@@ -12,6 +12,8 @@ use std::path::PathBuf;
     about = "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
 )]
 struct ProjectArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Output format (vivado-tcl|json).
     #[arg(long, short = 'f')]
     format: Option<String>,
@@ -40,11 +42,11 @@ impl Command for Project {
         "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<ProjectArgs>("project", &rest) {
+        let a = match parse_with::<ProjectArgs>("project", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let format = ProjectFormat::from_str(
             a.format
                 .as_deref()
