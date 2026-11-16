@@ -27,6 +27,18 @@ use std::collections::HashMap;
 pub struct Lowered {
     pub modules: Vec<ModuleIr>,
     pub packages: Vec<PackageIr>,
+    /// Architectures whose entity was not declared in the same file; bound
+    /// design-wide later via [`lower_pending_architectures`].
+    pub pending: Vec<PendingArch>,
+}
+
+/// An architecture deferred until its entity is known design-wide (the entity
+/// may be declared in a file compiled later). Holds the file root so the
+/// context clauses can be re-applied when the architecture is lowered.
+#[derive(Clone, Debug)]
+pub struct PendingArch {
+    pub root: SyntaxNode,
+    pub arch: SyntaxNode,
 }
 
 /// A lowered package's declarative items, keyed by unit name on the `Design`,
@@ -69,9 +81,6 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
     out
 }
 
-/// `known_entities` are the entity names already lowered into the design
-/// (from previously compiled files); they are only used for "did you mean"
-/// suggestions when an architecture names an unknown entity.
 pub fn lower_file(
     file: FileId,
     root: &SyntaxNode,
@@ -79,48 +88,15 @@ pub fn lower_file(
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
     pkgs: &HashMap<String, PackageIr>,
-    known_entities: &[String],
 ) -> Lowered {
     let _ = file;
-    let mut lx = Lower {
-        db,
-        diags,
-        consts: HashMap::new(),
-        types: HashMap::new(),
-        names: HashMap::new(),
-        mems: HashMap::new(),
-        sig_signed: HashMap::new(),
-        extra_signals: Vec::new(),
-        extra_base: 0,
-    };
+    let mut lx = Lower::new(db, diags);
     lx.register_builtin_types();
-    // Context clauses: make the referenced packages' items visible
-    // (`use lib.pkg.all;` merges everything, `use lib.pkg.item;` just that item).
-    for child in real_children(root) {
-        if matches!(
-            child.kind(),
-            SyntaxKind::ContextClause | SyntaxKind::UseClause
-        ) {
-            for n in real_children(&child) {
-                if n.kind() == SyntaxKind::Name {
-                    let text = db.span_text(n.span()).trim();
-                    let parts: Vec<&str> = text.split('.').collect();
-                    let (unit, item) = match parts.len() {
-                        n if n >= 3 => (parts[n - 2], parts[n - 1]),
-                        2 => (parts[0], parts[1]),
-                        _ => continue,
-                    };
-                    if let Some(p) = pkgs.get(&unit.to_ascii_lowercase()) {
-                        let item = item.to_ascii_lowercase();
-                        lx.merge_package(p, if item == "all" { None } else { Some(&item) });
-                    }
-                }
-            }
-        }
-    }
+    lx.apply_context_clauses(root, pkgs);
     let mut modules: Vec<ModuleIr> = Vec::new();
     let mut entities: HashMap<String, usize> = HashMap::new();
     let mut packages: Vec<PackageIr> = Vec::new();
+    let mut pending: Vec<PendingArch> = Vec::new();
     // Pass 1: entities (interfaces).
     for child in real_children(root) {
         if child.kind() == SyntaxKind::Entity {
@@ -129,21 +105,87 @@ pub fn lower_file(
             modules.push(m);
         }
     }
-    // Entities known design-wide (this file's + previously compiled files'),
-    // for "did you mean" suggestions on unknown-entity errors.
-    let mut candidates: Vec<String> = known_entities.to_vec();
-    candidates.extend(entities.keys().cloned());
     // Pass 2: packages (constants/types into scope) and architectures (bodies).
+    // An architecture whose entity is not declared in this file is deferred
+    // (`pending`): the entity may live in a file compiled later, so binding
+    // happens design-wide in `lower_pending_architectures`.
     for child in real_children(root) {
         match child.kind() {
             SyntaxKind::Package => packages.push(lx.lower_package(&child)),
             SyntaxKind::Architecture => {
-                lx.lower_architecture(&child, &mut modules, &entities, &candidates)
+                let known = arch_entity(&child, db)
+                    .map(|(_, name)| entities.contains_key(&name))
+                    .unwrap_or(false);
+                if known {
+                    lx.lower_architecture(&child, &mut modules, &entities);
+                } else {
+                    pending.push(PendingArch {
+                        root: root.clone(),
+                        arch: child.clone(),
+                    });
+                }
             }
             _ => {}
         }
     }
-    Lowered { modules, packages }
+    Lowered {
+        modules,
+        packages,
+        pending,
+    }
+}
+
+/// Re-lower architectures deferred by [`lower_file`] because their entity was
+/// not known when their file was compiled. `modules` is the design-wide module
+/// list, so cross-file entity/architecture binding works regardless of file
+/// order. Returns the architectures still unresolved; with `emit_errors`,
+/// those produce E0401 (caret on the entity name, did-you-mean help over all
+/// known entity names).
+pub fn lower_pending_architectures(
+    db: &SourceDb,
+    diags: &mut Vec<Diagnostic>,
+    pkgs: &HashMap<String, PackageIr>,
+    modules: &mut Vec<ModuleIr>,
+    pending: Vec<PendingArch>,
+    emit_errors: bool,
+) -> Vec<PendingArch> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let entities: HashMap<String, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.clone(), i))
+        .collect();
+    let candidates: Vec<String> = entities.keys().cloned().collect();
+    let mut still_pending = Vec::new();
+    for p in pending {
+        let mut lx = Lower::new(db, diags);
+        lx.register_builtin_types();
+        lx.apply_context_clauses(&p.root, pkgs);
+        if !lx.lower_architecture(&p.arch, modules, &entities) {
+            if emit_errors {
+                lx.err_unknown_entity(&p.arch, &candidates);
+            } else {
+                still_pending.push(p);
+            }
+        }
+    }
+    still_pending
+}
+
+/// The entity an architecture belongs to (`architecture NAME of ENTITY is ...`)
+/// → (entity ident node, entity name).
+fn arch_entity(a: &SyntaxNode, db: &SourceDb) -> Option<(SyntaxNode, String)> {
+    let kids = real_children(a);
+    // idents: [architecture, name, of, entity, is, begin/end...]
+    let idents: Vec<&SyntaxNode> = kids
+        .iter()
+        .filter(|k| k.kind() == SyntaxKind::Ident)
+        .collect();
+    idents
+        .get(3)
+        .map(|k| ((*k).clone(), db.span_text(k.span()).trim().to_string()))
 }
 
 /// Result of lowering a concurrent signal assignment: either a continuous
@@ -218,6 +260,47 @@ struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
+    fn new(db: &'a SourceDb, diags: &'a mut Vec<Diagnostic>) -> Lower<'a> {
+        Lower {
+            db,
+            diags,
+            consts: HashMap::new(),
+            types: HashMap::new(),
+            names: HashMap::new(),
+            mems: HashMap::new(),
+            sig_signed: HashMap::new(),
+            extra_signals: Vec::new(),
+            extra_base: 0,
+        }
+    }
+
+    /// Merge the packages named in the file's context clauses into scope
+    /// (`use lib.pkg.all;` merges everything, `use lib.pkg.item;` just that item).
+    fn apply_context_clauses(&mut self, root: &SyntaxNode, pkgs: &HashMap<String, PackageIr>) {
+        for child in real_children(root) {
+            if matches!(
+                child.kind(),
+                SyntaxKind::ContextClause | SyntaxKind::UseClause
+            ) {
+                for n in real_children(&child) {
+                    if n.kind() == SyntaxKind::Name {
+                        let text = self.db.span_text(n.span()).trim();
+                        let parts: Vec<&str> = text.split('.').collect();
+                        let (unit, item) = match parts.len() {
+                            n if n >= 3 => (parts[n - 2], parts[n - 1]),
+                            2 => (parts[0], parts[1]),
+                            _ => continue,
+                        };
+                        if let Some(p) = pkgs.get(&unit.to_ascii_lowercase()) {
+                            let item = item.to_ascii_lowercase();
+                            self.merge_package(p, if item == "all" { None } else { Some(&item) });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn err(&mut self, span: Span, msg: impl Into<String>) {
         self.diags.push(Diagnostic {
             code: "E0401",
@@ -607,36 +690,24 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lower an architecture body onto its entity's module. Returns false
+    /// (without emitting a diagnostic) when the entity is not in `entities` —
+    /// the caller either defers the architecture or reports E0401 via
+    /// [`Lower::err_unknown_entity`].
     fn lower_architecture(
         &mut self,
         a: &SyntaxNode,
         modules: &mut Vec<ModuleIr>,
         entities: &HashMap<String, usize>,
-        candidates: &[String],
-    ) {
+    ) -> bool {
         let kids = real_children(a);
-        // `architecture NAME of ENTITY is ...`
-        let idents: Vec<&SyntaxNode> = kids
-            .iter()
-            .filter(|k| k.kind() == SyntaxKind::Ident)
-            .collect();
-        // idents: [architecture, name, of, entity, is, begin/end...]
-        let entity_node = idents.get(3);
-        let entity_name = entity_node.map(|k| self.text(k)).unwrap_or_default();
+        let arch_ent = arch_entity(a, self.db);
+        let entity_name = arch_ent
+            .as_ref()
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
         let Some(&midx) = entities.get(&entity_name) else {
-            // Point at the entity name itself (not the whole architecture
-            // node) and suggest a similarly named known entity, if any.
-            let span = entity_node.map(|k| k.span()).unwrap_or_else(|| a.span());
-            let help = did_you_mean(&entity_name, candidates.iter())
-                .map(|s| format!("did you mean '{s}'?"));
-            self.diags.push(Diagnostic {
-                code: "E0401",
-                severity: Severity::Error,
-                span: Some(span),
-                message: format!("architecture for unknown entity '{entity_name}'"),
-                help,
-            });
-            return;
+            return false;
         };
         let module = &mut modules[midx];
         self.names = module
@@ -709,6 +780,31 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
+        true
+    }
+
+    /// E0401 for an architecture naming an entity that is unknown design-wide:
+    /// the caret points at the entity name itself (not the whole architecture
+    /// node), with a did-you-mean help when a known entity name is close.
+    fn err_unknown_entity(&mut self, a: &SyntaxNode, candidates: &[String]) {
+        let arch_ent = arch_entity(a, self.db);
+        let entity_name = arch_ent
+            .as_ref()
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        let span = arch_ent
+            .as_ref()
+            .map(|(n, _)| n.span())
+            .unwrap_or_else(|| a.span());
+        let help =
+            did_you_mean(&entity_name, candidates.iter()).map(|s| format!("did you mean '{s}'?"));
+        self.diags.push(Diagnostic {
+            code: "E0401",
+            severity: Severity::Error,
+            span: Some(span),
+            message: format!("architecture for unknown entity '{entity_name}'"),
+            help,
+        });
     }
 
     // ---- declarations ------------------------------------------------------------
