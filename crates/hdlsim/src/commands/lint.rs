@@ -4,12 +4,23 @@
 //! `--fix`: apply the safe automatic fixes (trailing whitespace, tabs) in
 //! place, then report whatever remains.
 
-use super::Command;
+use super::{parse_with, Command};
+use clap::Parser;
 use hdl_syntax::diagnostic::Diagnostic;
 use hdl_syntax::language::Language;
 use hdl_syntax::lint::{apply_fixes, lint_source, Lint};
 use hdl_syntax::source::SourceDb;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(about = "run the source linter: hdlsim lint [--fix] <file.v|file.vhd> ...")]
+struct LintArgs {
+    /// Apply safe automatic fixes in place.
+    #[arg(long)]
+    fix: bool,
+    /// Files to lint.
+    files: Vec<PathBuf>,
+}
 
 pub struct LintCmd;
 
@@ -21,23 +32,17 @@ impl Command for LintCmd {
         "lint sources: hdlsim lint [--fix] file.v ... (exit 1 if any finding)"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let mut fix = false;
-        let mut files: Vec<PathBuf> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "--fix" => fix = true,
-                other if other.starts_with('-') => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => files.push(PathBuf::from(f)),
-            }
-        }
-        if files.is_empty() {
+        let a = match parse_with::<LintArgs>("lint", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let fix = a.fix;
+        if a.files.is_empty() {
             return Err("usage: hdlsim lint [--fix] <file.v|file.vhd> ...".to_string());
         }
         let mut total = 0;
         let mut files_with_issues = 0;
-        for f in &files {
+        for f in &a.files {
             let text = std::fs::read_to_string(f)
                 .map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
             let lang = Language::from_path(f)

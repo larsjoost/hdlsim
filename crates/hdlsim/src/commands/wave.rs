@@ -3,9 +3,22 @@
 //! viewer, without re-running the simulation:
 //! `hdlsim wave waves.hwf [-o out.html]`. Default output: same name, `.html`.
 
-use super::Command;
+use super::{parse_with, Command};
+use clap::Parser;
 use hdl_wave::sinks::WaveSink;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "render a wave file (.hwf/.fst) into the HTML viewer: hdlsim wave <file> [-o out.html]"
+)]
+struct WaveArgs {
+    /// Input wave file (.hwf or .fst).
+    input: PathBuf,
+    /// Output HTML file (default: input name with .html extension).
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+}
 
 pub struct Wave;
 
@@ -17,27 +30,13 @@ impl Command for Wave {
         "render a .hwf/.fst wave file to the HTML viewer: hdlsim wave file.hwf [-o out.html]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let mut input: Option<PathBuf> = None;
-        let mut out: Option<PathBuf> = None;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-o" | "--out" => {
-                    out = Some(PathBuf::from(args.get(i + 1).ok_or("-o needs a value")?));
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    input = Some(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let input = input.ok_or("usage: hdlsim wave <file.hwf|file.fst> [-o out.html]")?;
-        let out = match out {
-            Some(p) => p,
+        let a = match parse_with::<WaveArgs>("wave", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let input = &a.input;
+        let out = match &a.out {
+            Some(p) => p.clone(),
             None => input.with_extension("html"),
         };
         let bytes =

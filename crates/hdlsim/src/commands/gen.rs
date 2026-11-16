@@ -4,12 +4,33 @@
 //! that defines the top (`--lang verilog|vhdl` overrides). Output goes to
 //! stdout, or to `-o FILE`.
 
-use super::{build_manager, extract_common, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::elab::UnitResolver;
 use hdl_ir::gen;
 use hdl_ir::Design;
 use hdl_syntax::language::Language;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
+)]
+struct GenArgs {
+    /// What to generate ("tb").
+    what: String,
+    /// Top-level unit.
+    #[arg(long)]
+    top: Option<String>,
+    /// Output file (default: stdout).
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+    /// Output language override (verilog|vhdl).
+    #[arg(long)]
+    lang: Option<String>,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct Gen;
 
@@ -22,47 +43,27 @@ impl Command for Gen {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        if rest.first().map(|s| s.as_str()) != Some("tb") {
+        let a = match parse_with::<GenArgs>("gen", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        if a.what != "tb" {
             return Err(
                 "usage: hdlsim gen tb --top <unit> [-o out.v] [--lang verilog|vhdl] [files...]"
                     .to_string(),
             );
         }
-        let rest = &rest[1..];
-        let mut top: Option<String> = None;
-        let mut out: Option<PathBuf> = None;
-        let mut lang: Option<Language> = None;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "-o" | "--out" => {
-                    out = Some(PathBuf::from(rest.get(i + 1).ok_or("-o needs a value")?));
-                    i += 2;
-                }
-                "--lang" => {
-                    let v = rest.get(i + 1).ok_or("--lang needs a value")?;
-                    lang = Some(match v.to_ascii_lowercase().as_str() {
-                        "verilog" | "v" | "sv" => Language::Verilog,
-                        "vhdl" | "vhd" => Language::Vhdl,
-                        other => return Err(format!("unknown language '{}'", other)),
-                    });
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let top = top.ok_or("--top is required")?;
+        let lang = match a.lang.as_deref().map(str::to_ascii_lowercase) {
+            Some(v) => match v.as_str() {
+                "verilog" | "v" | "sv" => Some(Language::Verilog),
+                "vhdl" | "vhd" => Some(Language::Vhdl),
+                other => return Err(format!("unknown language '{}'", other)),
+            },
+            None => None,
+        };
+        let top = a.top.ok_or("--top is required")?;
+        let out = a.out;
+        let files: Vec<PathBuf> = a.files;
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();

@@ -6,10 +6,24 @@
 //! `--check` lists files that would change and exits 1 (CI gate); `-w` writes
 //! in place.
 
-use super::Command;
+use super::{parse_with, Command};
+use clap::Parser;
 use hdl_syntax::diagnostic::Severity;
 use hdl_syntax::language::Language;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(about = "format Verilog/VHDL sources: hdlsim fmt [--check] [-w] <file>...")]
+struct FmtArgs {
+    /// List files that would change and exit 1 (CI gate).
+    #[arg(long)]
+    check: bool,
+    /// Rewrite files in place.
+    #[arg(long, short = 'w')]
+    write: bool,
+    /// Files to format.
+    files: Vec<PathBuf>,
+}
 
 pub struct Fmt;
 
@@ -21,32 +35,25 @@ impl Command for Fmt {
         "format sources: hdlsim fmt [--check] [-w] file.v ... (default: print to stdout)"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let mut check = false;
-        let mut write = false;
-        let mut files: Vec<PathBuf> = Vec::new();
-        for a in args {
-            match a.as_str() {
-                "--check" => check = true,
-                "-w" | "--write" => write = true,
-                other if other.starts_with('-') => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => files.push(PathBuf::from(f)),
-            }
-        }
-        if files.is_empty() {
+        let a = match parse_with::<FmtArgs>("fmt", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let check = a.check;
+        let write = a.write;
+        if a.files.is_empty() {
             return Err("usage: hdlsim fmt [--check] [-w] <file.v|file.vhd> ...".to_string());
         }
         if check && write {
             return Err("--check and -w are mutually exclusive".to_string());
         }
-        if !check && !write && files.len() > 1 {
+        if !check && !write && a.files.len() > 1 {
             return Err(
                 "multiple files need --check or -w (default prints one file to stdout)".to_string(),
             );
         }
         let mut unformatted = 0;
-        for f in &files {
+        for f in &a.files {
             let text = std::fs::read_to_string(f)
                 .map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
             let lang = Language::from_path(f)

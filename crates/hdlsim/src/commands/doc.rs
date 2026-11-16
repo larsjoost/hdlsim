@@ -3,10 +3,23 @@
 //! module/entity with parameter/port/instance tables and syntax-highlighted
 //! source. Instances link to the page of the instantiated unit.
 
-use super::{build_manager, extract_common, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::doc::generate_docs;
 use hdl_ir::Design;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
+)]
+struct DocArgs {
+    /// Output directory (default: html-docs/).
+    #[arg(long, short = 'o', default_value = "html-docs")]
+    out: PathBuf,
+    /// Source files to document.
+    files: Vec<PathBuf>,
+}
 
 pub struct Doc;
 
@@ -19,24 +32,20 @@ impl Command for Doc {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut out = PathBuf::from("html-docs");
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--out" | "-o" => {
-                    i += 1;
-                    out = PathBuf::from(rest.get(i).ok_or("--out needs a directory argument")?);
-                }
-                other => files.push(PathBuf::from(other)),
-            }
-            i += 1;
-        }
+        let a = match parse_with::<DocArgs>("doc", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let out = a.out;
         let (mut mgr, root) = build_manager(&opts)?;
-        if files.is_empty() {
+        if a.files.is_empty() {
             return Err("no input files (or pass files to document)".to_string());
         }
-        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
+        let files: Vec<PathBuf> = a
+            .files
+            .iter()
+            .map(|f| remap_into_bundle(f, &root))
+            .collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {
