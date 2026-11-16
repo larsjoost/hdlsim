@@ -235,8 +235,13 @@ pub enum TypeInfo {
     Char,
     /// Enumeration: literals in declaration order.
     Enum(Vec<String>),
-    /// Array type: element width + depth (memories).
-    Array { elem: usize, depth: usize },
+    /// Array type: element width + total depth (memories) + per-index
+    /// dimensions [(low, size), …] for multi-dimensional flat indexing.
+    Array {
+        elem: usize,
+        depth: usize,
+        dims: Vec<(i64, usize)>,
+    },
     /// Record type: fields as (name, width, signed) in declaration order.
     /// Lowered as one flat vector; the first declared field is the MSB.
     Record { fields: Vec<(String, usize, bool)> },
@@ -257,6 +262,10 @@ struct Lower<'a> {
     sig_signed: HashMap<SigId, bool>,
     /// Signal id → record type name (for `sig.field` selects), if record-typed.
     sig_rec: HashMap<SigId, String>,
+    /// Signal id → width in bits (for `'length`/`'high`/… attributes).
+    sig_width: HashMap<SigId, usize>,
+    /// Signal id → array dimensions [(low, size), …] (for `m(i, j)` flat index).
+    sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
     /// Hidden signals allocated while lowering statements (for-loop vars),
     /// appended to the module after the process body is lowered.
     extra_signals: Vec<SignalIr>,
@@ -275,6 +284,8 @@ impl<'a> Lower<'a> {
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
             sig_rec: HashMap::new(),
+            sig_width: HashMap::new(),
+            sig_dims: HashMap::new(),
             extra_signals: Vec::new(),
             extra_base: 0,
         }
@@ -414,7 +425,7 @@ impl<'a> Lower<'a> {
                 let w = bits_for(lits.len());
                 (w, false, None, false)
             }
-            TypeInfo::Array { elem, depth } => (elem, false, Some(depth), false),
+            TypeInfo::Array { elem, depth, .. } => (elem, false, Some(depth), false),
             TypeInfo::Record { fields } => (
                 fields.iter().map(|f| f.1).sum::<usize>().max(1),
                 false,
@@ -424,18 +435,36 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Width from a `(msb downto lsb)` / `(msb to lsb)` / `(n)` constraint.
+    /// Width from a constraint: `(msb downto lsb)` / `(msb to lsb)` / `(n)`,
+    /// or multi-dimensional `(r1, r2, ...)` → product of the dimension widths.
     fn constraint_width(&mut self, c: &SyntaxNode) -> usize {
+        let kids = real_children(c);
+        let subs: Vec<SyntaxNode> = kids
+            .into_iter()
+            .filter(|k| k.kind() == SyntaxKind::Range)
+            .collect();
+        if !subs.is_empty() {
+            return subs
+                .iter()
+                .map(|s| self.range_width(s))
+                .fold(1usize, |a, b| a * b.max(1))
+                .max(1);
+        }
+        self.range_width(c)
+    }
+
+    /// Width of a single range: `a to/downto b`, `(n)`, box `<>`, or an
+    /// index given as a type mark (`array (enum_t) of ...` → literal count).
+    fn range_width(&mut self, r: &SyntaxNode) -> usize {
         // Box constraint `type range <>` — genuinely unconstrained; do not try
         // to evaluate the index type name (it would report "unknown identifier").
-        if self.text(c).contains("<>") {
+        if self.text(r).contains("<>") {
             return 1;
         }
-        let kids = real_children(c);
-        // Index given as a type mark (`array (device_under_test_t) of ...`):
-        // the depth is the enum's literal count. Integer/other type marks are
-        // unconstrained here — fall back to 1. A name that is a *constant*
-        // (not a type) still goes through the expression path below.
+        let kids = real_children(r);
+        // Index given as a type mark: the depth is the enum's literal count.
+        // A name that is a *constant* (not a type) still goes through the
+        // expression path below.
         if let Some(n) = kids.iter().find(|k| k.kind() == SyntaxKind::Name) {
             let tn = self.text(n).to_ascii_lowercase();
             match self.types.get(&tn) {
@@ -445,9 +474,9 @@ impl<'a> Lower<'a> {
             }
         }
         let exprs: Vec<Expr> = kids
-            .into_iter()
+            .iter()
             .filter(|k| is_expr_node(k.kind()))
-            .map(|k| self.lower_expr(&k, &HashMap::new()))
+            .map(|k| self.lower_expr(k, &HashMap::new()))
             .collect();
         if exprs.len() >= 2 {
             if let (Some(a), Some(b)) = (
@@ -467,6 +496,65 @@ impl<'a> Lower<'a> {
         } else {
             1
         }
+    }
+
+    /// Dimensions of an array constraint: [(low, size), …] per index range.
+    fn constraint_dims(&mut self, c: &SyntaxNode) -> Vec<(i64, usize)> {
+        let kids = real_children(c);
+        let subs: Vec<SyntaxNode> = kids
+            .into_iter()
+            .filter(|k| k.kind() == SyntaxKind::Range)
+            .collect();
+        let ranges: Vec<SyntaxNode> = if subs.is_empty() {
+            vec![c.clone()]
+        } else {
+            subs
+        };
+        let mut dims = Vec::new();
+        for r in ranges {
+            if self.text(&r).contains("<>") {
+                dims.push((0, 1));
+                continue;
+            }
+            let rk = real_children(&r);
+            if let Some(n) = rk.iter().find(|k| k.kind() == SyntaxKind::Name) {
+                let tn = self.text(n).to_ascii_lowercase();
+                match self.types.get(&tn) {
+                    Some(TypeInfo::Enum(lits)) => {
+                        dims.push((0, lits.len()));
+                        continue;
+                    }
+                    Some(_) => {
+                        dims.push((0, 1));
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            let exprs: Vec<Expr> = rk
+                .iter()
+                .filter(|k| is_expr_node(k.kind()))
+                .map(|k| self.lower_expr(k, &HashMap::new()))
+                .collect();
+            if exprs.len() >= 2 {
+                let a = const_eval(&exprs[0], &HashMap::new()).and_then(|v| v.to_u64());
+                let b = const_eval(&exprs[1], &HashMap::new()).and_then(|v| v.to_u64());
+                if let (Some(a), Some(b)) = (a, b) {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    dims.push((lo as i64, (hi - lo + 1) as usize));
+                } else {
+                    dims.push((0, 1));
+                }
+            } else if exprs.len() == 1 {
+                let n = const_eval(&exprs[0], &HashMap::new())
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(1);
+                dims.push((0, n as usize));
+            } else {
+                dims.push((0, 1));
+            }
+        }
+        dims
     }
 
     fn sig_id(&self, name: &str) -> Option<SigId> {
@@ -800,7 +888,11 @@ impl<'a> Lower<'a> {
                     }
                 }
                 SyntaxKind::AssertStmt => {
-                    self.warn(s.span(), "concurrent assert not lowered yet");
+                    // Concurrent assert → always-process sensitive to the
+                    // condition's signals; body is the sequential assert.
+                    let p = self.lower_conc_assert(s, proc_idx);
+                    proc_idx += 1;
+                    module.processes.push(p);
                 }
                 _ => {}
             }
@@ -885,9 +977,22 @@ impl<'a> Lower<'a> {
                 self.mems.insert(id, d);
             }
             self.sig_signed.insert(id, signed);
+            self.sig_width.insert(id, width);
             if let Some(tn) = &type_name {
-                if matches!(self.types.get(tn), Some(TypeInfo::Record { .. })) {
-                    self.sig_rec.insert(id, tn.clone());
+                match self.types.get(tn) {
+                    Some(TypeInfo::Record { .. }) => {
+                        self.sig_rec.insert(id, tn.clone());
+                    }
+                    // Array dims come from the signal's own constraint if
+                    // present, else from the array type declaration.
+                    Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
+                        let d = match constraint {
+                            Some(c) => self.constraint_dims(c),
+                            None => dims.clone(),
+                        };
+                        self.sig_dims.insert(id, d);
+                    }
+                    _ => {}
                 }
             }
             self.names.insert(n.clone(), id);
@@ -1002,12 +1107,24 @@ impl<'a> Lower<'a> {
                     .skip(i + 1)
                     .find(|k| k.kind() == SyntaxKind::Range)
             });
-            let depth = range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1);
+            let dims = range.map(|r| self.constraint_dims(r)).unwrap_or_default();
+            let depth = if dims.is_empty() {
+                range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1)
+            } else {
+                dims.iter().map(|d| d.1).product::<usize>().max(1)
+            };
             let (ew, _, _, _) = match elem {
                 Some(e) => self.resolve_type(&e, elem_constraint, d.span()),
                 None => (8, false, None, false),
             };
-            self.types.insert(name, TypeInfo::Array { elem: ew, depth });
+            self.types.insert(
+                name,
+                TypeInfo::Array {
+                    elem: ew,
+                    depth,
+                    dims,
+                },
+            );
             return;
         }
         // Range type: `type t is range 0 to 10;` → integer
@@ -1298,6 +1415,33 @@ impl<'a> Lower<'a> {
             }
         }
         Sens::List(edges)
+    }
+
+    /// Concurrent `assert cond report msg severity lvl;` → an always-process
+    /// sensitive to the condition's signals, with the sequential assert as
+    /// body. Runs once at t=0 like any VHDL process.
+    fn lower_conc_assert(&mut self, s: &SyntaxNode, idx: usize) -> ProcessIr {
+        let body = self.lower_seq_stmt_impl(s);
+        let mut sigs = Vec::new();
+        if let Stmt::SysCall { args, .. } = &body {
+            for a in args.iter().take(1) {
+                a.collect_sigs(&mut sigs);
+            }
+        }
+        ProcessIr {
+            kind: ProcKind::Always,
+            sens: Sens::List(
+                sigs.into_iter()
+                    .map(|sig| Edge {
+                        sig,
+                        kind: EdgeKind::Any,
+                    })
+                    .collect(),
+            ),
+            body,
+            origin: format!("concurrent assert #{idx}"),
+            initial: true,
+        }
     }
 
     fn lower_conc_assign(&mut self, s: &SyntaxNode, idx: usize) -> Option<ConcOut> {
@@ -2220,12 +2364,23 @@ impl<'a> Lower<'a> {
                 let bn = self.text(b);
                 match attr.as_str() {
                     "length" | "high" | "low" | "left" | "right" => {
+                        // Statically known for signals: arrays → element count
+                        // (mem depth), vectors → bit width.
                         if let Some(id) = self.sig_id(&bn) {
-                            let w = 1; // width known only in module context; approximate below
-                            let _ = id;
-                            let _ = w;
+                            let n = self
+                                .mems
+                                .get(&id)
+                                .copied()
+                                .or_else(|| self.sig_width.get(&id).copied())
+                                .unwrap_or(1);
+                            let v = match attr.as_str() {
+                                "length" => n,
+                                "high" | "left" => n.saturating_sub(1),
+                                _ => 0, // low | right
+                            };
+                            return Expr::Lit(Value::from_u64(32, v as u64));
                         }
-                        Expr::Lit(Value::x(32)) // refined by caller when static
+                        Expr::Lit(Value::x(32))
                     }
                     _ => {
                         self.warn(
@@ -2284,13 +2439,45 @@ impl<'a> Lower<'a> {
             .map(|(_, k)| self.lower_expr(k, env))
             .collect();
         match fname.as_str() {
-            // Indexed write/read of a signal: v(i) → Idx.
-            _ if self.sig_id(&name).is_some() && args.len() == 1 => {
+            // Indexed write/read of a signal: v(i) → Idx; multi-dimensional
+            // v(i, j, …) → flat index ((i-lo0)*n1 + (j-lo1))*… via sig_dims.
+            _ if self.sig_id(&name).is_some() && !args.is_empty() => {
                 let base = self.sig_id(&name).unwrap();
-                Expr::Idx {
-                    e: Box::new(Expr::Sig(base)),
-                    i: Box::new(args.into_iter().next().unwrap()),
+                if let Some(dims) = self.sig_dims.get(&base).cloned() {
+                    if dims.len() == args.len() {
+                        let mut flat: Option<Expr> = None;
+                        for (arg, (lo, n)) in args.iter().zip(dims.iter()) {
+                            let a = Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(arg.clone()),
+                                r: Box::new(Expr::Lit(Value::from_u64(32, *lo as u64))),
+                            };
+                            flat = Some(match flat {
+                                None => a,
+                                Some(f) => Expr::Bin {
+                                    op: BinOp::Add,
+                                    l: Box::new(Expr::Bin {
+                                        op: BinOp::Mul,
+                                        l: Box::new(f),
+                                        r: Box::new(Expr::Lit(Value::from_u64(32, *n as u64))),
+                                    }),
+                                    r: Box::new(a),
+                                },
+                            });
+                        }
+                        return Expr::Idx {
+                            e: Box::new(Expr::Sig(base)),
+                            i: Box::new(flat.unwrap()),
+                        };
+                    }
                 }
+                if args.len() == 1 {
+                    return Expr::Idx {
+                        e: Box::new(Expr::Sig(base)),
+                        i: Box::new(args.into_iter().next().unwrap()),
+                    };
+                }
+                Expr::Call { name: fname, args }
             }
             "rising_edge" if args.len() == 1 => {
                 Expr::Rising(Box::new(args.into_iter().next().unwrap()))

@@ -1080,9 +1080,18 @@ impl<'a> Parser<'a> {
 
     /// `(expr to|downto expr)` / `(expr)` / `range ...` — an index/range constraint.
     fn parse_constraint(&mut self) {
+        // `(r)` or multi-dimensional `(r1, r2, ...)` — each sub-range is its
+        // own Range child of the outer constraint node.
         self.start(SyntaxKind::Range);
         self.expect_punct('(', "to open the constraint");
-        self.parse_range();
+        loop {
+            self.start(SyntaxKind::Range);
+            self.parse_range();
+            self.builder.finish_node();
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
         self.expect_punct(')', "to close the constraint");
         self.builder.finish_node();
     }
