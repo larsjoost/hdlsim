@@ -2,9 +2,10 @@
 //!
 //! One cache file per source file, named by the hash of its canonical path.
 //! File format (little-endian):
-//! `magic "HDLCST1\0" | u32 format_version | u64 kinds_fingerprint | u64 source_hash | payload`.
-//! The kinds fingerprint (`hdl_syntax::kinds::fingerprint`) invalidates entries
-//! whenever the SyntaxKind table changes (CST payloads embed kind indices).
+//! `magic "HDLCST1\0" | u32 format_version | u64 payload_fingerprint | u64 source_hash | payload`.
+//! The payload fingerprint mixes the SyntaxKind table (`hdl_syntax::kinds::fingerprint`,
+//! since CST payloads embed kind indices) with the crate version, so parser changes
+//! also invalidate entries on upgrade.
 //! The payload itself is composed by the caller (hdl-lib): an optional
 //! timescale string, the encoded CST, and the encoded diagnostics — see
 //! `LibraryManager`. A hit therefore skips lexing+parsing entirely; lowering
@@ -22,7 +23,19 @@
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"HDLCST1\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// Fingerprint of everything a cached payload depends on: the SyntaxKind table
+/// plus the crate version (parser fixes that do not touch the kind table must
+/// still invalidate old entries once a new version ships).
+fn payload_fingerprint() -> u64 {
+    let mut h = hdl_syntax::kinds::fingerprint();
+    for b in concat!("v", env!("CARGO_PKG_VERSION"), "\0").as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// FNV-1a 64-bit hash of the text — the cache key for a file's contents.
 pub fn hash64(text: &str) -> u64 {
@@ -77,7 +90,7 @@ impl Cache {
         if r.u32()? != FORMAT_VERSION {
             return None;
         }
-        if r.u64()? != hdl_syntax::kinds::fingerprint() {
+        if r.u64()? != payload_fingerprint() {
             return None;
         }
         if r.u64()? != source_hash {
@@ -92,7 +105,7 @@ impl Cache {
         let mut out = Vec::with_capacity(payload.len() + 32);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&hdl_syntax::kinds::fingerprint().to_le_bytes());
+        out.extend_from_slice(&payload_fingerprint().to_le_bytes());
         out.extend_from_slice(&source_hash.to_le_bytes());
         out.extend_from_slice(payload);
         let entry = self.entry(file);
@@ -193,6 +206,21 @@ mod tests {
         // Truncated file → None, no panic.
         let bytes = std::fs::read(&entry).unwrap();
         std::fs::write(&entry, &bytes[..5]).unwrap();
+        assert_eq!(cache.get(f, hash64("x")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_with_stale_fingerprint_are_rejected() {
+        let dir = temp_dir("stale");
+        let cache = Cache::open(dir.clone()).unwrap();
+        let f = Path::new("a.vhd");
+        cache.put(f, hash64("x"), b"payload");
+        // Corrupt the fingerprint field (layout: magic 8 | version 4 | fp 8 | hash 8).
+        let entry = cache.entry(f);
+        let mut bytes = std::fs::read(&entry).unwrap();
+        bytes[12] ^= 0xff;
+        std::fs::write(&entry, &bytes).unwrap();
         assert_eq!(cache.get(f, hash64("x")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
