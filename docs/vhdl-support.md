@@ -60,7 +60,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 |---|---|---|
 | concurrent: process (sensitivity list / `all`), assigns, conditional (`when/else`), selected (`with/select`) | ✅ (no `after` delays) | examples, `tests/loops.rs` |
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
-| sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until rising_edge(…)` etc.) | `tests/loops.rs`, `tests/vhdl2008.rs` |
+| sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs` |
 | `assert … report … severity …` (sequential and concurrent) | ✅ concurrent → always-process on the condition's signals; severity drives exit codes | `tests/exit_code.rs`, `tests/vhdl_gaps.rs` |
 | generate (for/if/case), blocks | ◐ parsed | parser tests |
 | instantiation `label : entity lib.name(arch)` | ✅ | user repro, corpus |
@@ -72,7 +72,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | arithmetic/relational operators, `mod`/`rem`, `abs`/`not` | ✅ | `tests/vhdl_counter.rs`, `vhdl_signed.rs` |
 | logical `and/or/xor/…` on std_logic/vectors | ✅ (via 1164 operator functions) | examples |
 | concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
-| attributes | ◐ `'length`/`'high`/`'low`/`'left`/`'right` static on signals, `'range` in for-loops, `'image`; others → X with diagnostic | `tests/vhdl_gaps.rs`, `tests/loops.rs` |
+| attributes | ◐ `'event` on scalar signals (= rising or falling), `'length`/`'high`/`'low`/`'left`/`'right` static, `'range` in for-loops, `'image`; others → X with diagnostic | `tests/vhdl_event.rs`, `tests/vhdl_gaps.rs`, `tests/loops.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
 | shifts/rotates `sll`/`srl`/`sla`/`sra`/`rol`/`ror` + function forms `shift_left`/`shift_right`/`rotate_left`/`rotate_right` | ✅ (signed `sra`/`to_integer` decode signed; rotates keep operand width; not in `prove`/BMC) | `tests/vhdl_shifts.rs`, value unit tests |
 
