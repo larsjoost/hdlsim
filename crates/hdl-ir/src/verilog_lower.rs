@@ -2759,6 +2759,7 @@ fn binop_from_str(s: &str) -> Option<BinOp> {
         "*" => BinOp::Mul,
         "/" => BinOp::Div,
         "%" => BinOp::Mod,
+        "**" => BinOp::Pow,
         "<<" => BinOp::Shl,
         ">>" => BinOp::Shr,
         "<" => BinOp::Lt,

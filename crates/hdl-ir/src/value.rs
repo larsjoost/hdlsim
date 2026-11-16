@@ -298,7 +298,7 @@ impl Value {
                 }
                 // Arithmetic needs full-width evaluation, not per-bit.
                 match op {
-                    Add | Sub | Mul | Div | Mod | Shl | Shr | Sar | Rol | Ror => {
+                    Add | Sub | Mul | Div | Mod | Pow | Shl | Shr | Sar | Rol | Ror => {
                         return self.arith(op, rhs, w);
                     }
                     _ => {}
@@ -329,6 +329,13 @@ impl Value {
                             return Value::x(w);
                         }
                         a % b
+                    }
+                    Pow => {
+                        if b > 63 {
+                            u64::MAX
+                        } else {
+                            a.checked_pow(b as u32).unwrap_or(u64::MAX)
+                        }
                     }
                     Shl => a.wrapping_shl(b as u32),
                     Shr => a.wrapping_shr(b as u32),
@@ -575,6 +582,8 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// Exponentiation `**` (VHDL and Verilog); saturates on overflow.
+    Pow,
     Shl,
     Shr,
     /// Arithmetic shift right (sign-preserving) — VHDL `sra`.
@@ -694,6 +703,27 @@ mod tests {
         }
         assert_eq!(Value::x(64).to_f64(), None);
         assert_eq!(Value::from_u64(32, 5).to_f64(), None);
+    }
+
+    #[test]
+    fn pow() {
+        let two = Value::from_u64(32, 2);
+        let three = Value::from_u64(32, 3);
+        assert_eq!(two.binop(BinOp::Pow, &three).to_u64(), Some(8));
+        assert_eq!(three.binop(BinOp::Pow, &two).to_u64(), Some(9));
+        assert_eq!(
+            Value::from_u64(32, 5)
+                .binop(BinOp::Pow, &Value::from_u64(32, 0))
+                .to_u64(),
+            Some(1)
+        );
+        // Overflow saturates (then truncates to the 32-bit operand width).
+        assert_eq!(
+            two.binop(BinOp::Pow, &Value::from_u64(32, 100)).to_u64(),
+            Some(u32::MAX as u64)
+        );
+        // Unknown exponent → X.
+        assert_eq!(two.binop(BinOp::Pow, &Value::x(32)).to_u64(), None);
     }
 
     #[test]

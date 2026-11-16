@@ -1649,6 +1649,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                     BinOp::Rol | BinOp::Ror => {
                         return Err("prove: rotate operators (rol/ror) unsupported".to_string());
                     }
+                    BinOp::Pow => {
+                        return Err("prove: '**' operator unsupported".to_string());
+                    }
                     BinOp::Lt => vec![lt_bits(b, &l2, &r2, w, signed)],
                     BinOp::Le => {
                         let lt = lt_bits(b, &l2, &r2, w, signed);

@@ -139,6 +139,7 @@ fn w_binop(w: &mut W, op: BinOp) {
         BinOp::GeM => 29,
         BinOp::Rol => 30,
         BinOp::Ror => 31,
+        BinOp::Pow => 32,
     })
 }
 fn r_binop(r: &mut R) -> Result<BinOp, String> {
@@ -175,6 +176,7 @@ fn r_binop(r: &mut R) -> Result<BinOp, String> {
         29 => BinOp::GeM,
         30 => BinOp::Rol,
         31 => BinOp::Ror,
+        32 => BinOp::Pow,
         t => return Err(format!("bad BinOp tag {}", t)),
     })
 }
