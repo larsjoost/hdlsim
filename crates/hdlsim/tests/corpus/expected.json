@@ -1,5 +1,5 @@
 {
-  "verilog/serv_alu.v": "diags",
+  "verilog/serv_alu.v": "clean",
   "verilog/serv_decode.v": "clean",
   "verilog/xilinx_unisim_BUFG.v": "clean",
   "verilog/xilinx_unisim_IBUF.v": "clean",
@@ -11,5 +11,5 @@
   "vhdl/unisim_BUFG.vhd": "clean",
   "vhdl/unisim_FD.vhd": "clean",
   "vhdl/unisim_IBUF.vhd": "clean",
-  "vhdl/unisim_ODDR.vhd": "diags"
+  "vhdl/unisim_ODDR.vhd": "clean"
 }
