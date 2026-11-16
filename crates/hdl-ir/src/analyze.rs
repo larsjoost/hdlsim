@@ -285,6 +285,7 @@ mod tests {
         let design = Design {
             modules: vec![m],
             top: None,
+            packages: Default::default(),
         };
         let fs = analyze_design(&design);
         // dead: neither driven nor read; unused_in: neither driven nor read;
@@ -349,6 +350,7 @@ mod tests {
         let design = Design {
             modules: vec![m],
             top: None,
+            packages: Default::default(),
         };
         assert!(analyze_design(&design).is_empty());
     }
@@ -378,6 +380,7 @@ mod tests {
         let design = Design {
             modules: vec![m],
             top: None,
+            packages: Default::default(),
         };
         let fs = analyze_design(&design);
         assert!(!fs.iter().any(|f| f.signal == "mem"), "{:?}", fs);

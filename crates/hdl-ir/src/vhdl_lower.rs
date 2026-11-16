@@ -22,13 +22,61 @@ use std::collections::HashMap;
 /// attached). `time_unit_fs` is the fallback for physical literals; VHDL
 /// physical literals carry their own unit (`10 ns`), so this is only used for
 /// unit-less numbers.
+/// What lowering one VHDL file produced: modules plus the package units the
+/// file declared (retained on the `Design` for other files' `use` clauses).
+pub struct Lowered {
+    pub modules: Vec<ModuleIr>,
+    pub packages: Vec<PackageIr>,
+}
+
+/// A lowered package's declarative items, keyed by unit name on the `Design`,
+/// so `use lib.pkg.all;` in another file can merge them into scope.
+#[derive(Clone, Debug, Default)]
+pub struct PackageIr {
+    pub name: String,
+    pub types: Vec<(String, TypeInfo)>,
+    pub consts: Vec<(String, Value)>,
+}
+
+/// Unit names referenced by the context clauses (`use lib.pkg...;`,
+/// `context lib.pkg...;`) at the top of a design file — e.g.
+/// `use ieee.std_logic_1164.all` yields `std_logic_1164`. The library manager
+/// resolves these before lowering the file so the packages are visible.
+pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in real_children(root) {
+        if matches!(
+            child.kind(),
+            SyntaxKind::ContextClause | SyntaxKind::UseClause
+        ) {
+            for n in real_children(&child) {
+                if n.kind() == SyntaxKind::Name {
+                    let text = db.span_text(n.span()).trim();
+                    let parts: Vec<&str> = text.split('.').collect();
+                    // `lib.unit.all` / `lib.unit.item` / `unit.all` / `unit.item`
+                    let unit = match parts.len() {
+                        n if n >= 3 => parts[n - 2],
+                        2 => parts[0],
+                        _ => continue,
+                    };
+                    if !unit.is_empty() && !out.iter().any(|u| u == unit) {
+                        out.push(unit.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn lower_file(
     file: FileId,
     root: &SyntaxNode,
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
-) -> Vec<ModuleIr> {
+    pkgs: &HashMap<String, PackageIr>,
+) -> Lowered {
     let _ = file;
     let mut lx = Lower {
         db,
@@ -42,8 +90,33 @@ pub fn lower_file(
         extra_base: 0,
     };
     lx.register_builtin_types();
+    // Context clauses: make the referenced packages' items visible
+    // (`use lib.pkg.all;` merges everything, `use lib.pkg.item;` just that item).
+    for child in real_children(root) {
+        if matches!(
+            child.kind(),
+            SyntaxKind::ContextClause | SyntaxKind::UseClause
+        ) {
+            for n in real_children(&child) {
+                if n.kind() == SyntaxKind::Name {
+                    let text = db.span_text(n.span()).trim();
+                    let parts: Vec<&str> = text.split('.').collect();
+                    let (unit, item) = match parts.len() {
+                        n if n >= 3 => (parts[n - 2], parts[n - 1]),
+                        2 => (parts[0], parts[1]),
+                        _ => continue,
+                    };
+                    if let Some(p) = pkgs.get(&unit.to_ascii_lowercase()) {
+                        let item = item.to_ascii_lowercase();
+                        lx.merge_package(p, if item == "all" { None } else { Some(&item) });
+                    }
+                }
+            }
+        }
+    }
     let mut modules: Vec<ModuleIr> = Vec::new();
     let mut entities: HashMap<String, usize> = HashMap::new();
+    let mut packages: Vec<PackageIr> = Vec::new();
     // Pass 1: entities (interfaces).
     for child in real_children(root) {
         if child.kind() == SyntaxKind::Entity {
@@ -55,12 +128,12 @@ pub fn lower_file(
     // Pass 2: packages (constants/types into scope) and architectures (bodies).
     for child in real_children(root) {
         match child.kind() {
-            SyntaxKind::Package => lx.lower_package(&child),
+            SyntaxKind::Package => packages.push(lx.lower_package(&child)),
             SyntaxKind::Architecture => lx.lower_architecture(&child, &mut modules, &entities),
             _ => {}
         }
     }
-    modules
+    Lowered { modules, packages }
 }
 
 /// Result of lowering a concurrent signal assignment: either a continuous
@@ -96,7 +169,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
 
 /// Static type info for a VHDL type mark.
 #[derive(Clone, Debug)]
-enum TypeInfo {
+pub enum TypeInfo {
     /// Scalar 1-bit (std_logic, bit, boolean).
     Scalar,
     /// Vector (std_logic_vector/unsigned/signed/bit_vector); the width comes
@@ -458,8 +531,40 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn lower_package(&mut self, p: &SyntaxNode) {
+    /// Merge a package's items into scope: all of them, or only `item`.
+    /// Built-in type marks win (`or_insert`), so e.g. `std_logic` keeps the
+    /// 1-bit scalar model even though ieee.std_logic_1164 declares it as a
+    /// resolved 9-state subtype.
+    fn merge_package(&mut self, p: &PackageIr, item: Option<&str>) {
+        for (tname, tinfo) in &p.types {
+            if item.is_none_or(|i| i == tname) {
+                self.types
+                    .entry(tname.clone())
+                    .or_insert_with(|| tinfo.clone());
+            }
+        }
+        for (cname, cval) in &p.consts {
+            if item.is_none_or(|i| i == cname) {
+                self.consts
+                    .entry(cname.clone())
+                    .or_insert_with(|| cval.clone());
+            }
+        }
+    }
+
+    fn lower_package(&mut self, p: &SyntaxNode) -> PackageIr {
+        // Package name: `package NAME is ...` — the second ident.
+        let kids = real_children(p);
+        let name = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .nth(1)
+            .map(|k| self.kw(k))
+            .unwrap_or_default();
         // Package declarations: constants and types become visible in this file.
+        let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
+        let consts_before: std::collections::HashSet<String> =
+            self.consts.keys().cloned().collect();
         for d in real_children(p) {
             match d.kind() {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
@@ -467,6 +572,28 @@ impl<'a> Lower<'a> {
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
                 _ => {}
             }
+        }
+        // Collect the items this package added, for cross-file `use` clauses.
+        let types = self
+            .types
+            .iter()
+            .filter(|(k, _)| !types_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // Single-character consts are char-type enum literals ('U', '0', ...);
+        // they are never referenced as bare names (char literals lex as
+        // CharLiteral) and merging them would shadow same-named signals (e.g. a
+        // signal `u` vs std_ulogic's 'U'), so keep them file-local.
+        let consts = self
+            .consts
+            .iter()
+            .filter(|(k, _)| !consts_before.contains(*k) && k.chars().count() > 1)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        PackageIr {
+            name,
+            types,
+            consts,
         }
     }
 
@@ -1747,16 +1874,20 @@ impl<'a> Lower<'a> {
                 let name = self.text(e);
                 let base = name.rsplit('.').next().unwrap_or(name.as_str());
                 let key = base.to_ascii_lowercase();
-                if let Some(v) = env.get(&key).or_else(|| self.consts.get(&key)) {
+                // Local scope (env: loop vars, params) first, then signals, then
+                // constants — so an enum literal from a `use`d package (e.g. 'U'
+                // from std_logic_1164) cannot shadow a signal named `u`.
+                if let Some(v) = env.get(&key) {
                     return Expr::Lit(v.clone());
                 }
-                match self.sig_id(base) {
-                    Some(id) => Expr::Sig(id),
-                    None => {
-                        self.err(e.span(), format!("unknown identifier '{}'", base));
-                        Expr::Lit(Value::x(1))
-                    }
+                if let Some(id) = self.sig_id(base) {
+                    return Expr::Sig(id);
                 }
+                if let Some(v) = self.consts.get(&key) {
+                    return Expr::Lit(v.clone());
+                }
+                self.err(e.span(), format!("unknown identifier '{}'", base));
+                Expr::Lit(Value::x(1))
             }
             SyntaxKind::BinExpr => {
                 let kids = real_children(e);
