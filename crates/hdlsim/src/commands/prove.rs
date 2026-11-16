@@ -7,11 +7,27 @@
 //! 1 = a property is violated (counterexample trace printed), 2 = usage or
 //! unsupported-construct error.
 
-use super::{build_manager, extract_common, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::bmc::{prove, wrap_top, ProveStatus};
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "prove properties with bounded model checking: hdlsim prove [--top t] [--bmc N] [files...]"
+)]
+struct ProveArgs {
+    /// Top-level unit (default: the single compiled module).
+    #[arg(long)]
+    top: Option<String>,
+    /// BMC depth.
+    #[arg(long, default_value_t = 10)]
+    bmc: usize,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct Prove;
 
@@ -24,38 +40,21 @@ impl Command for Prove {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut top: Option<String> = None;
-        let mut bmc: usize = 10;
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--bmc" => {
-                    bmc = rest
-                        .get(i + 1)
-                        .ok_or("--bmc needs a value")?
-                        .parse()
-                        .map_err(|_| "--bmc needs a number")?;
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        if files.is_empty() && top.is_none() {
+        let a = match parse_with::<ProveArgs>("prove", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let top = a.top;
+        let bmc = a.bmc;
+        if a.files.is_empty() && top.is_none() {
             return Err("no input files (or pass --top to resolve from libraries)".to_string());
         }
         let (mut mgr, root) = build_manager(&opts)?;
-        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
+        let files: Vec<PathBuf> = a
+            .files
+            .iter()
+            .map(|f| remap_into_bundle(f, &root))
+            .collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {

@@ -4,7 +4,8 @@
 //! Also usable as a library: `hdl_sim::debug::Watcher` is an `Observer` you can
 //! attach to any `Simulator` in your own tooling.
 
-use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::debug::{fmt_time, fmt_value, Watcher};
@@ -24,6 +25,39 @@ impl Observer for Transcript {
     }
 }
 
+#[derive(Parser)]
+#[command(
+    about = "inspect the simulated design: hdlsim debug --top tb [--watch sig]... [--driver d]... [--mem m]... [--all] [--dump] [--max-time T] [--seed N] [files...]"
+)]
+struct DebugArgs {
+    /// Top-level unit.
+    #[arg(long)]
+    top: Option<String>,
+    /// Signal to watch.
+    #[arg(long)]
+    watch: Vec<String>,
+    /// Driver to trace.
+    #[arg(long)]
+    driver: Vec<String>,
+    /// Memory to dump.
+    #[arg(long)]
+    mem: Vec<String>,
+    /// Dump/watch everything.
+    #[arg(long)]
+    all: bool,
+    /// Dump the elaborated design.
+    #[arg(long)]
+    dump: bool,
+    /// Stop time (e.g. 10us).
+    #[arg(long)]
+    max_time: Option<String>,
+    /// RNG seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
+
 pub struct Debug;
 
 impl Command for Debug {
@@ -35,68 +69,24 @@ impl Command for Debug {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut top: Option<String> = None;
-        let mut watches: Vec<String> = Vec::new();
-        let mut drivers: Vec<String> = Vec::new();
-        let mut mems: Vec<String> = Vec::new();
-        let mut all = false;
-        let mut dump = false;
-        let mut max_time_fs = u64::MAX;
-        let mut seed: Option<u64> = None;
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--watch" => {
-                    watches.push(rest.get(i + 1).ok_or("--watch needs a value")?.clone());
-                    i += 2;
-                }
-                "--driver" => {
-                    drivers.push(rest.get(i + 1).ok_or("--driver needs a value")?.clone());
-                    i += 2;
-                }
-                "--mem" => {
-                    mems.push(rest.get(i + 1).ok_or("--mem needs a value")?.clone());
-                    i += 2;
-                }
-                "--all" => {
-                    all = true;
-                    i += 1;
-                }
-                "--dump" => {
-                    dump = true;
-                    i += 1;
-                }
-                "--max-time" => {
-                    let v = rest.get(i + 1).ok_or("--max-time needs a value")?;
-                    max_time_fs = parse_time(v)?;
-                    i += 2;
-                }
-                "--seed" => {
-                    seed = Some(
-                        rest.get(i + 1)
-                            .ok_or("--seed needs a value")?
-                            .parse()
-                            .map_err(|_| "--seed needs a u64")?,
-                    );
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let top = top.ok_or(
+        let a = match parse_with::<DebugArgs>("debug", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let top = a.top.ok_or(
             "debug needs --top TB (file arguments may be omitted when libraries are configured)",
         )?;
+        let watches = a.watch;
+        let drivers = a.driver;
+        let mems = a.mem;
+        let all = a.all;
+        let dump = a.dump;
+        let max_time_fs = match &a.max_time {
+            Some(v) => parse_time(v)?,
+            None => u64::MAX,
+        };
+        let seed = a.seed;
+        let files: Vec<PathBuf> = a.files;
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();

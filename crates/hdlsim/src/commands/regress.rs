@@ -5,7 +5,10 @@
 //! existing `TestFailed`/exit-code path; `--coverage` attaches a
 //! CoverageCollector per test and folds its report into the XML.
 
-use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command, CommonOpts};
+use super::{
+    build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command, CommonOpts,
+};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::coverage::{CoverageCollector, SharedCollector};
@@ -42,6 +45,27 @@ struct TestResult {
     coverage: Option<String>,
 }
 
+#[derive(Parser)]
+#[command(
+    about = "run a regression list of testbenches: hdlsim regress [--list tests.txt] [--junit out.xml] [--max-time T] [--coverage] [tops...]"
+)]
+struct RegressArgs {
+    /// Write a JUnit XML report to this file.
+    #[arg(long)]
+    junit: Option<PathBuf>,
+    /// Test list file (one `top` or `name=top` per line).
+    #[arg(long)]
+    list: Option<PathBuf>,
+    /// Per-test stop time (e.g. 10us).
+    #[arg(long)]
+    max_time: Option<String>,
+    /// Attach a coverage collector per test and fold it into the report.
+    #[arg(long)]
+    coverage: bool,
+    /// Test tops.
+    tops: Vec<String>,
+}
+
 pub struct Regress;
 
 impl Command for Regress {
@@ -55,43 +79,18 @@ impl Command for Regress {
 
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut junit: Option<PathBuf> = None;
-        let mut list: Option<PathBuf> = None;
-        let mut max_time_fs = u64::MAX;
-        let mut coverage = false;
-        let mut tops: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--junit" => {
-                    junit = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--junit needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--list" => {
-                    list = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--list needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--max-time" => {
-                    max_time_fs = parse_time(rest.get(i + 1).ok_or("--max-time needs a value")?)?;
-                    i += 2;
-                }
-                "--coverage" => {
-                    coverage = true;
-                    i += 1;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                t => {
-                    tops.push(t.to_string());
-                    i += 1;
-                }
-            }
-        }
+        let a = match parse_with::<RegressArgs>("regress", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let junit = a.junit;
+        let list = a.list;
+        let max_time_fs = match &a.max_time {
+            Some(v) => parse_time(v)?,
+            None => u64::MAX,
+        };
+        let coverage = a.coverage;
+        let tops = a.tops;
         let mut tests: Vec<TestSpec> = Vec::new();
         if let Some(lf) = &list {
             let text = std::fs::read_to_string(lf)
