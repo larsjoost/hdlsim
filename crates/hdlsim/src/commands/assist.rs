@@ -340,8 +340,8 @@ fn common_args(opts: &CommonOpts) -> Vec<String> {
 
 /// Compile + elaborate the given files and print every diagnostic annotated
 /// with its code explanation (the inline answer for check/compile prompts).
-fn run_check_inline(opts: &CommonOpts, files: &[String]) -> Result<(), String> {
-    let (mut mgr, root) = build_manager(opts)?;
+fn run_check_inline(opts: &CommonOpts, files: &[String]) -> anyhow::Result<()> {
+    let (mut mgr, root) = build_manager(opts).map_err(anyhow::Error::msg)?;
     let paths: Vec<PathBuf> = files
         .iter()
         .map(|f| remap_into_bundle(Path::new(f), &root))
@@ -400,7 +400,7 @@ impl Command for Assist {
     fn about(&self) -> &'static str {
         "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AssistArgs>("assist", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -410,7 +410,9 @@ impl Command for Assist {
         let top = a.top;
         let prompt = a.prompt.join(" ");
         if prompt.is_empty() {
-            return Err("usage: hdlsim assist [--yes] [--top T] \"<prompt>\"".to_string());
+            return Err(anyhow::anyhow!(
+                "usage: hdlsim assist [--yes] [--top T] \"<prompt>\""
+            ));
         }
         let files = extract_files(&prompt);
         let s = route(&prompt, top.as_deref(), &files);
@@ -428,7 +430,7 @@ impl Command for Assist {
             if let Some(code) = extract_code(&prompt) {
                 print_code_explanation(&code);
             } else if s.command.first().is_some_and(|c| c == "check") {
-                run_check_inline(&opts, &files)?;
+                run_check_inline(&opts, &files).map_err(anyhow::Error::msg)?;
             } else {
                 print!("{}", task_list());
             }
@@ -458,7 +460,7 @@ impl Command for Explain {
     fn about(&self) -> &'static str {
         "explain a diagnostic/lint code: hdlsim explain E0301 (no arg lists all codes)"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ExplainArgs>("explain", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),

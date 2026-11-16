@@ -31,22 +31,25 @@ impl Command for LintCmd {
     fn about(&self) -> &'static str {
         "lint sources: hdlsim lint [--fix] file.v ... (exit 1 if any finding)"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<LintArgs>("lint", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let fix = a.fix;
         if a.files.is_empty() {
-            return Err("usage: hdlsim lint [--fix] <file.v|file.vhd> ...".to_string());
+            return Err(anyhow::anyhow!(
+                "usage: hdlsim lint [--fix] <file.v|file.vhd> ..."
+            ));
         }
         let mut total = 0;
         let mut files_with_issues = 0;
         for f in &a.files {
             let text = std::fs::read_to_string(f)
-                .map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", f.display(), e))?;
             let lang = Language::from_path(f)
-                .ok_or_else(|| format!("unknown file extension: {}", f.display()))?;
+                .ok_or_else(|| format!("unknown file extension: {}", f.display()))
+                .map_err(anyhow::Error::msg)?;
             let name = f.display().to_string();
             let (lints, db) = if fix {
                 let mut db = SourceDb::new();
@@ -54,7 +57,7 @@ impl Command for LintCmd {
                 let (fixed, applied) = apply_fixes(&text, &lints);
                 if applied > 0 {
                     std::fs::write(f, &fixed)
-                        .map_err(|e| format!("cannot write {}: {}", f.display(), e))?;
+                        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", f.display(), e))?;
                     eprintln!("hdlsim lint: {}: applied {} fix(es)", f.display(), applied);
                 }
                 // Re-lint the fixed text so remaining spans are valid.

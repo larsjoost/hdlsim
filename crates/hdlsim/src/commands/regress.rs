@@ -79,7 +79,7 @@ impl Command for Regress {
         "run testbenches, emit JUnit XML: hdlsim regress [--junit out.xml] [--list tests.txt] [--max-time 10us] [--coverage] [top ...]"
     }
 
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<RegressArgs>("regress", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -96,7 +96,7 @@ impl Command for Regress {
         let mut tests: Vec<TestSpec> = Vec::new();
         if let Some(lf) = &list {
             let text = std::fs::read_to_string(lf)
-                .map_err(|e| format!("cannot read {}: {}", lf.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", lf.display(), e))?;
             for line in text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -121,7 +121,9 @@ impl Command for Regress {
             });
         }
         if tests.is_empty() {
-            return Err("no tests: pass top names and/or --list FILE".to_string());
+            return Err(anyhow::anyhow!(
+                "no tests: pass top names and/or --list FILE"
+            ));
         }
 
         let mut results = Vec::new();
@@ -153,7 +155,7 @@ impl Command for Regress {
         if let Some(path) = &junit {
             let xml = junit_xml(&results, total_secs);
             std::fs::write(path, xml)
-                .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot write {}: {}", path.display(), e))?;
             println!("hdlsim: JUnit XML written to {}", path.display());
         }
         Ok(if failures > 0 { 1 } else { 0 })

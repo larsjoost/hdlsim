@@ -27,29 +27,30 @@ impl Command for Ast {
     fn about(&self) -> &'static str {
         "parse a file and print its CST (s-expression) — the reusable syntax tree"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AstArgs>("ast", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let path = &a.file;
         let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {}", path.display(), e))?;
         let lang = Language::from_path(path)
-            .ok_or_else(|| format!("unknown file extension: {}", path.display()))?;
+            .ok_or_else(|| format!("unknown file extension: {}", path.display()))
+            .map_err(anyhow::Error::msg)?;
         match lang {
             Language::Verilog => {
                 let mut db = SourceDb::new();
                 let raw_id = db
                     .add_file(path.display().to_string(), text)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(anyhow::Error::msg)?;
                 let mut macros = HashMap::new();
                 let mut pdiags = Vec::new();
                 let expanded =
                     preproc::preprocess(raw_id, db.file(raw_id), &[], &mut macros, &mut pdiags);
                 let id = db
                     .add_file(path.display().to_string(), expanded)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(anyhow::Error::msg)?;
                 let parsed = parser::parse_file(id, db.file(id));
                 for d in pdiags.iter().chain(parsed.diags.iter()) {
                     eprint!("{}", d.render(&db));
@@ -69,7 +70,7 @@ impl Command for Ast {
                 let mut db = SourceDb::new();
                 let id = db
                     .add_file(path.display().to_string(), text)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(anyhow::Error::msg)?;
                 let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
                 for d in &parsed.diags {
                     eprint!("{}", d.render(&db));

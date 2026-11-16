@@ -34,7 +34,7 @@ impl Command for Fmt {
     fn about(&self) -> &'static str {
         "format sources: hdlsim fmt [--check] [-w] file.v ... (default: print to stdout)"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<FmtArgs>("fmt", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -42,22 +42,25 @@ impl Command for Fmt {
         let check = a.check;
         let write = a.write;
         if a.files.is_empty() {
-            return Err("usage: hdlsim fmt [--check] [-w] <file.v|file.vhd> ...".to_string());
+            return Err(anyhow::anyhow!(
+                "usage: hdlsim fmt [--check] [-w] <file.v|file.vhd> ..."
+            ));
         }
         if check && write {
-            return Err("--check and -w are mutually exclusive".to_string());
+            return Err(anyhow::anyhow!("--check and -w are mutually exclusive"));
         }
         if !check && !write && a.files.len() > 1 {
-            return Err(
-                "multiple files need --check or -w (default prints one file to stdout)".to_string(),
-            );
+            return Err(anyhow::anyhow!(
+                "multiple files need --check or -w (default prints one file to stdout)"
+            ));
         }
         let mut unformatted = 0;
         for f in &a.files {
             let text = std::fs::read_to_string(f)
-                .map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", f.display(), e))?;
             let lang = Language::from_path(f)
-                .ok_or_else(|| format!("unknown file extension: {}", f.display()))?;
+                .ok_or_else(|| format!("unknown file extension: {}", f.display()))
+                .map_err(anyhow::Error::msg)?;
             let (out, diags) = hdl_syntax::fmt::format_source(lang, &text);
             let errs = diags
                 .iter()
@@ -78,7 +81,7 @@ impl Command for Fmt {
             } else if write {
                 if out != text {
                     std::fs::write(f, &out)
-                        .map_err(|e| format!("cannot write {}: {}", f.display(), e))?;
+                        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", f.display(), e))?;
                     println!("reformatted {}", f.display());
                 }
             } else {

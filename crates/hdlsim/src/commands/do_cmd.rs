@@ -51,21 +51,24 @@ impl Command for DoCmd {
     fn about(&self) -> &'static str {
         "run a mini-Tcl do-file: hdlsim do script.do --top tb [files]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DoArgs>("do", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
         let script = a.script;
-        let top = a.top.ok_or("--top is required")?;
+        let top = a
+            .top
+            .ok_or("--top is required")
+            .map_err(anyhow::Error::msg)?;
         let max_time_fs = match &a.max_time {
             Some(v) => parse_time(v)?,
             None => u64::MAX,
         };
         let files: Vec<PathBuf> = a.files;
         let text = std::fs::read_to_string(&script)
-            .map_err(|e| format!("cannot read {}: {}", script.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {}", script.display(), e))?;
         let (_mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
 
@@ -80,7 +83,11 @@ impl Command for DoCmd {
             seed: None,
         };
         let mut interp = Interp::new();
-        let flow = interp.eval(&text, &mut |_i, args| session.command(args))?;
+        let flow = interp
+            .eval(&text, &mut |_i, args| {
+                session.command(args).map_err(|e| e.to_string())
+            })
+            .map_err(anyhow::Error::msg)?;
         let code = match flow {
             Flow::Quit(c) => c,
             _ => 0,
@@ -111,17 +118,18 @@ struct DoSession {
 }
 
 impl DoSession {
-    fn build_sim(&mut self) -> Result<(), String> {
-        let (mut mgr, _root) = build_manager(&self.opts)?;
+    fn build_sim(&mut self) -> anyhow::Result<()> {
+        let (mut mgr, _root) = build_manager(&self.opts).map_err(anyhow::Error::msg)?;
         let mut design = Design::default();
         mgr.compile_files(&mut design, &self.files);
         if mgr.diags().has_errors() {
-            return Err(mgr.diags().render_all(mgr.db()));
+            return Err(anyhow::Error::msg(mgr.diags().render_all(mgr.db())));
         }
         let flat = elab::elaborate_with(&mut design, &self.top, &mut mgr)
-            .map_err(|e| format!("elaboration error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))
+            .map_err(anyhow::Error::msg)?;
         if mgr.diags().has_errors() {
-            return Err(mgr.diags().render_all(mgr.db()));
+            return Err(anyhow::Error::msg(mgr.diags().render_all(mgr.db())));
         }
         let mut sim = Simulator::new(flat);
         if let Some(s) = self.seed {
@@ -138,7 +146,7 @@ impl DoSession {
         Ok(())
     }
 
-    fn command(&mut self, args: &[String]) -> Result<Flow, String> {
+    fn command(&mut self, args: &[String]) -> anyhow::Result<Flow> {
         match args.first().map(|s| s.as_str()) {
             Some("run") => {
                 if self.sim.is_none() {
@@ -149,7 +157,7 @@ impl DoSession {
                     match args.get(1).map(|s| s.as_str()) {
                         None | Some("-all") => sim.run_until(self.max_time_fs),
                         Some(t) => {
-                            let d = parse_time(t)?;
+                            let d = parse_time(t).map_err(anyhow::Error::msg)?;
                             let target = sim.time().saturating_add(d);
                             sim.run_until(target);
                         }
@@ -165,10 +173,10 @@ impl DoSession {
                     None => 1usize,
                     Some(t) => t
                         .parse::<usize>()
-                        .map_err(|_| format!("back: bad step count '{}'", t))?,
+                        .map_err(|_| anyhow::anyhow!("back: bad step count '{}'", t))?,
                 };
                 if n == 0 || n >= self.history.len() {
-                    return Err(format!(
+                    return Err(anyhow::anyhow!(
                         "back: only {} step(s) of history",
                         self.history.len().saturating_sub(1)
                     ));
@@ -178,10 +186,13 @@ impl DoSession {
                 let flat = match &self.sim {
                     Some(s) => s.flat().clone(),
                     None => {
-                        return Err("back: simulation not started (use `run` first)".to_string())
+                        return Err(anyhow::anyhow!(
+                            "back: simulation not started (use `run` first)"
+                        ))
                     }
                 };
-                let mut sim = Simulator::restore_checkpoint_bytes(flat, &bytes)?;
+                let mut sim = Simulator::restore_checkpoint_bytes(flat, &bytes)
+                    .map_err(anyhow::Error::msg)?;
                 sim.add_observer(Box::new(Transcript));
                 if let Some(p) = &self.vcd_path {
                     attach_vcd(&mut sim, p)?;
@@ -197,7 +208,11 @@ impl DoSession {
                 Ok(Flow::Continue)
             }
             Some("vcd") if args.get(1).map(|s| s.as_str()) == Some("dumpfile") => {
-                let path = args.get(2).ok_or("vcd dumpfile needs a path")?.clone();
+                let path = args
+                    .get(2)
+                    .ok_or("vcd dumpfile needs a path")
+                    .map_err(anyhow::Error::msg)?
+                    .clone();
                 let p = PathBuf::from(&path);
                 self.vcd_path = Some(p.clone());
                 if let Some(sim) = self.sim.as_mut() {
@@ -208,9 +223,10 @@ impl DoSession {
             Some("seed") => {
                 let s: u64 = args
                     .get(1)
-                    .ok_or("seed needs a u64 value")?
+                    .ok_or("seed needs a u64 value")
+                    .map_err(anyhow::Error::msg)?
                     .parse()
-                    .map_err(|_| "seed needs a u64 value")?;
+                    .map_err(|_| anyhow::anyhow!("seed needs a u64 value"))?;
                 self.seed = Some(s);
                 if let Some(sim) = self.sim.as_ref() {
                     sim.set_seed(s);
@@ -219,39 +235,52 @@ impl DoSession {
                 Ok(Flow::Continue)
             }
             Some("examine") => {
-                let name = args.get(1).ok_or("examine needs a signal name")?;
+                let name = args
+                    .get(1)
+                    .ok_or("examine needs a signal name")
+                    .map_err(anyhow::Error::msg)?;
                 let sim = self
                     .sim
                     .as_ref()
-                    .ok_or("examine: simulation not started (use `run` first)")?;
+                    .ok_or("examine: simulation not started (use `run` first)")
+                    .map_err(anyhow::Error::msg)?;
                 match sim.signal_id(name) {
                     Some(id) => println!(
                         "{} = {}",
                         name,
                         hdl_sim::debug::fmt_value(&sim.signal_value(id))
                     ),
-                    None => return Err(format!("examine: no signal '{}'", name)),
+                    None => return Err(anyhow::anyhow!("examine: no signal '{}'", name)),
                 }
                 Ok(Flow::Continue)
             }
             Some("checkpoint") => {
-                let path = args.get(1).ok_or("checkpoint needs a path")?;
+                let path = args
+                    .get(1)
+                    .ok_or("checkpoint needs a path")
+                    .map_err(anyhow::Error::msg)?;
                 let sim = self
                     .sim
                     .as_mut()
-                    .ok_or("checkpoint: simulation not started (use `run` first)")?;
+                    .ok_or("checkpoint: simulation not started (use `run` first)")
+                    .map_err(anyhow::Error::msg)?;
                 sim.save_checkpoint(std::path::Path::new(path))
-                    .map_err(|e| format!("checkpoint: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("checkpoint: {}", e))
+                    .map_err(anyhow::Error::msg)?;
                 println!("hdlsim do: checkpoint written to {}", path);
                 Ok(Flow::Continue)
             }
             Some("restore") => {
-                let path = args.get(1).ok_or("restore needs a path")?;
+                let path = args
+                    .get(1)
+                    .ok_or("restore needs a path")
+                    .map_err(anyhow::Error::msg)?;
                 if self.sim.is_none() {
                     self.build_sim()?;
                 }
                 let flat = self.sim.as_ref().unwrap().flat().clone();
-                let mut sim = Simulator::restore_checkpoint(flat, std::path::Path::new(path))?;
+                let mut sim = Simulator::restore_checkpoint(flat, std::path::Path::new(path))
+                    .map_err(anyhow::Error::msg)?;
                 sim.add_observer(Box::new(Transcript));
                 if let Some(p) = &self.vcd_path {
                     attach_vcd(&mut sim, p)?;
@@ -261,15 +290,16 @@ impl DoSession {
                 println!("hdlsim do: restored checkpoint {}", path);
                 Ok(Flow::Continue)
             }
-            Some(other) => Err(format!("unknown do-file command '{}'", other)),
+            Some(other) => Err(anyhow::anyhow!("unknown do-file command '{}'", other)),
             None => Ok(Flow::Continue),
         }
     }
 }
 
-fn attach_vcd(sim: &mut Simulator, path: &std::path::Path) -> Result<(), String> {
+fn attach_vcd(sim: &mut Simulator, path: &std::path::Path) -> anyhow::Result<()> {
     let file = std::fs::File::create(path)
-        .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {}", path.display(), e))
+        .map_err(anyhow::Error::msg)?;
     let sink = hdl_wave::sinks::vcd::VcdSink::new(file, sim.flat());
     sim.add_observer(Box::new(hdl_wave::SinkAdapter {
         sink,

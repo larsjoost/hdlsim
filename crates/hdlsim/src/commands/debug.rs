@@ -69,7 +69,7 @@ impl Command for Debug {
     fn about(&self) -> &'static str {
         "debug a design: hdlsim debug --top tb [files] [--dump] [--watch sig]... [--all] [--mem name]... [--max-time 10us] [--seed N]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DebugArgs>("debug", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -77,7 +77,7 @@ impl Command for Debug {
         let opts = a.common.into_opts()?;
         let top = a.top.ok_or(
             "debug needs --top TB (file arguments may be omitted when libraries are configured)",
-        )?;
+        ).map_err(anyhow::Error::msg)?;
         let watches = a.watch;
         let drivers = a.driver;
         let mems = a.mem;
@@ -98,7 +98,7 @@ impl Command for Debug {
             return Ok(1);
         }
         let flat = elab::elaborate_with(&mut design, &top, &mut mgr)
-            .map_err(|e| format!("elaboration error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }

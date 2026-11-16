@@ -27,14 +27,14 @@ impl Command for Analyze {
     fn about(&self) -> &'static str {
         "static design heuristics (undriven/unread signals): hdlsim analyze [files...]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AnalyzeArgs>("analyze", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
         if a.files.is_empty() {
-            return Err("no input files".to_string());
+            return Err(anyhow::anyhow!("no input files"));
         }
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = a

@@ -98,7 +98,7 @@ impl HtmlSink {
         let file = self.file.take();
         if let Some(mut f) = file {
             if let Err(e) = f.write_all(html.as_bytes()) {
-                eprintln!("hdlsim: cannot write {}: {}", self.path.display(), e);
+                log::warn!("hdlsim: cannot write {}: {}", self.path.display(), e);
             }
         }
         let _ = flat;

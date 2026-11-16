@@ -25,14 +25,14 @@ impl Command for Check {
     fn about(&self) -> &'static str {
         "compile files and report diagnostics without simulating"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<CheckArgs>("check", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
         if a.files.is_empty() {
-            return Err("no input files".to_string());
+            return Err(anyhow::anyhow!("no input files"));
         }
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = a

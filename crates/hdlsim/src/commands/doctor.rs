@@ -23,7 +23,7 @@ impl Command for Doctor {
     fn about(&self) -> &'static str {
         "check the environment (stdlib, config, libraries, cache): hdlsim doctor"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DoctorArgs>("doctor", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),

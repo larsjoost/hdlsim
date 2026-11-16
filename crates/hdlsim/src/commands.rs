@@ -31,6 +31,7 @@ mod regress;
 mod run;
 mod wave;
 
+use anyhow::Context as _;
 use hdl_lib::LibraryManager;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +41,7 @@ pub trait Command {
     /// Human-readable one-liner for `hdlsim --help`.
     fn about(&self) -> &'static str;
     /// Run with the arguments after the subcommand name. Returns the exit code.
-    fn run(&self, args: &[String]) -> Result<i32, String>;
+    fn run(&self, args: &[String]) -> anyhow::Result<i32>;
 }
 
 struct Help;
@@ -52,7 +53,7 @@ impl Command for Help {
     fn about(&self) -> &'static str {
         "show this help"
     }
-    fn run(&self, _args: &[String]) -> Result<i32, String> {
+    fn run(&self, _args: &[String]) -> anyhow::Result<i32> {
         println!(
             "hdlsim {} — self-contained VHDL + Verilog simulator",
             env!("CARGO_PKG_VERSION")
@@ -108,7 +109,7 @@ pub struct CommonArgs {
 
 impl CommonArgs {
     /// Validate (`name=path`) and convert into [`CommonOpts`].
-    pub fn into_opts(self) -> Result<CommonOpts, String> {
+    pub fn into_opts(self) -> anyhow::Result<CommonOpts> {
         let mut opts = CommonOpts::default();
         for v in &self.lib {
             opts.libs.push(parse_lib_mapping(v)?);
@@ -136,12 +137,12 @@ pub fn parse_with<T: clap::Parser>(cmd: &str, args: &[String]) -> Result<T, i32>
 }
 
 /// Parse a `name=path` library mapping (`-L work=./rtl`).
-pub fn parse_lib_mapping(v: &str) -> Result<(String, PathBuf), String> {
+pub fn parse_lib_mapping(v: &str) -> anyhow::Result<(String, PathBuf)> {
     let (n, p) = v
         .split_once('=')
-        .ok_or_else(|| format!("-L expects name=path, got '{}'", v))?;
+        .ok_or_else(|| anyhow::anyhow!("-L expects name=path, got '{}'", v))?;
     if n.is_empty() || p.is_empty() {
-        return Err(format!("-L expects name=path, got '{}'", v));
+        return Err(anyhow::anyhow!("-L expects name=path, got '{}'", v));
     }
     Ok((n.to_string(), PathBuf::from(p)))
 }
@@ -153,21 +154,21 @@ pub fn parse_lib_mapping(v: &str) -> Result<(String, PathBuf), String> {
 /// everything (config, libraries, include dirs) resolves from there; the
 /// returned `Option<PathBuf>` is that extraction root (so callers can remap
 /// file arguments into it), `None` otherwise.
-pub fn build_manager(opts: &CommonOpts) -> Result<(LibraryManager, Option<PathBuf>), String> {
+pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Option<PathBuf>)> {
     let mut mgr = LibraryManager::new();
     mgr.use_env_cache(); // `.hdlsim-cache/` unless HDLSIM_NO_CACHE / HDLSIM_CACHE_DIR
     let mut root: Option<PathBuf> = None;
     if let Some(b) = &opts.bundle {
         let bytes =
-            std::fs::read(b).map_err(|e| format!("cannot read bundle {}: {}", b.display(), e))?;
+            std::fs::read(b).with_context(|| format!("cannot read bundle {}", b.display()))?;
         let dir = std::env::temp_dir().join(format!("hdlsim_bundle_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         hdl_lib::bundle::extract_to(&bytes, &dir)
-            .map_err(|e| format!("bad bundle {}: {}", b.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("bad bundle {}: {}", b.display(), e))?;
         root = Some(dir.clone());
         let cfg = dir.join("hdlsim.ini");
         if cfg.is_file() {
-            mgr.load_config(&cfg)?;
+            mgr.load_config(&cfg).map_err(anyhow::Error::msg)?;
         }
         // Bundles record include dirs as inc/0, inc/1, ...
         let inc = dir.join("inc");
@@ -192,7 +193,7 @@ pub fn build_manager(opts: &CommonOpts) -> Result<(LibraryManager, Option<PathBu
     };
     if root.is_none() {
         if let Some(c) = &config {
-            mgr.load_config(c)?;
+            mgr.load_config(c).map_err(anyhow::Error::msg)?;
         }
     }
     for (name, path) in &opts.libs {
@@ -225,12 +226,14 @@ pub fn remap_into_bundle(f: &Path, root: &Option<PathBuf>) -> PathBuf {
 }
 
 /// Parse a time like `100ns`, `10us`, `1ms`, `500` (bare = ns) into femtoseconds.
-pub fn parse_time(s: &str) -> Result<u64, String> {
+pub fn parse_time(s: &str) -> anyhow::Result<u64> {
     let (num, unit) = s
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .map(|i| (&s[..i], &s[i..]))
         .unwrap_or((s, ""));
-    let v: f64 = num.parse().map_err(|_| format!("bad time value '{}'", s))?;
+    let v: f64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad time value '{}'", s))?;
     let mult: f64 = match unit {
         "" | "ns" => 1e6,
         "fs" => 1.0,
@@ -238,7 +241,7 @@ pub fn parse_time(s: &str) -> Result<u64, String> {
         "us" | "µs" => 1e9,
         "ms" => 1e12,
         "s" => 1e15,
-        _ => return Err(format!("unknown time unit '{}'", unit)),
+        _ => return Err(anyhow::anyhow!("unknown time unit '{}'", unit)),
     };
     Ok((v * mult) as u64)
 }
@@ -309,14 +312,14 @@ fn parse_color_mode(v: &str) -> hdl_syntax::diagnostic::ColorMode {
     }
 }
 
-pub fn dispatch(args: &[String]) -> Result<i32, String> {
+pub fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     match args.first() {
         None => COMMANDS[0].run(&[]),
         Some(name) => {
             let cmd = COMMANDS
                 .iter()
                 .find(|c| c.name() == name.as_str())
-                .ok_or_else(|| format!("unknown command '{}'", name))?;
+                .ok_or_else(|| anyhow::anyhow!("unknown command '{}'", name))?;
             cmd.run(&args[1..])
         }
     }
