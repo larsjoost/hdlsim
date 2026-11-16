@@ -2925,44 +2925,81 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
 
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+    ce_impl(e, env, &HashMap::new(), None)
+}
+
+/// Like [`const_eval`], but user function bodies (`funcs`, e.g. VHDL package
+/// functions visible through `use`) are const-evaluated for `Expr::Call` —
+/// needed for constant initializers like `constant c : natural := f(1, 2);`.
+pub fn const_eval_f(
+    e: &Expr,
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, FuncIr>,
+) -> Option<Value> {
+    ce_impl(e, env, funcs, None)
+}
+
+/// `Some(slots)` while interpreting a function body: `Expr::Sig(i)` then
+/// reads slot `i` (slot 0 = return value, then args, then locals) instead of
+/// failing.
+fn ce_impl(
+    e: &Expr,
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, FuncIr>,
+    mut slots: Option<&mut Vec<Value>>,
+) -> Option<Value> {
     match e {
         Expr::Rising(_) | Expr::Falling(_) | Expr::Prev(_) | Expr::ToInt(_) | Expr::ToString(_) => {
             None
         }
         Expr::Lit(v) => Some(v.clone()),
         Expr::Real(x) => Some(Value::from_f64(*x)),
-        Expr::Sig(_) => None,
-        Expr::Bin { op, l, r } => Some(const_eval(l, env)?.binop(*op, &const_eval(r, env)?)),
-        Expr::Un { op, e } => Some(const_eval(e, env)?.unop(*op)),
+        Expr::Sig(i) => match slots {
+            Some(s) => {
+                while s.len() <= *i as usize {
+                    s.push(Value::x(32));
+                }
+                Some(s[*i as usize].clone())
+            }
+            None => None,
+        },
+        Expr::Bin { op, l, r } => Some(
+            ce_impl(l, env, funcs, slots.as_deref_mut())?
+                .binop(*op, &ce_impl(r, env, funcs, slots.as_deref_mut())?),
+        ),
+        Expr::Un { op, e } => Some(ce_impl(e, env, funcs, slots.as_deref_mut())?.unop(*op)),
         Expr::Cond { c, t, e } => {
-            if const_eval(c, env)?.to_u64()? != 0 {
-                const_eval(t, env)
+            if ce_impl(c, env, funcs, slots.as_deref_mut())?.to_u64()? != 0 {
+                ce_impl(t, env, funcs, slots.as_deref_mut())
             } else {
-                const_eval(e, env)
+                ce_impl(e, env, funcs, slots.as_deref_mut())
             }
         }
         Expr::Concat(parts) => {
-            let vals: Option<Vec<Value>> = parts.iter().map(|p| const_eval(p, env)).collect();
-            Some(Value::concat(&vals?))
+            let mut vals = Vec::with_capacity(parts.len());
+            for p in parts {
+                vals.push(ce_impl(p, env, funcs, slots.as_deref_mut())?);
+            }
+            Some(Value::concat(&vals))
         }
         Expr::Replicate { count, e } => {
-            let n = const_eval(count, env)?.to_u64()? as usize;
-            let v = const_eval(e, env)?;
+            let n = ce_impl(count, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
             Some(Value::concat(&vec![v; n]))
         }
         Expr::Sel { e, msb, lsb } => {
-            let v = const_eval(e, env)?;
-            let msb = const_eval(msb, env)?.to_u64()? as usize;
-            let lsb = const_eval(lsb, env)?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let msb = ce_impl(msb, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
+            let lsb = ce_impl(lsb, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
             Some(v.slice(msb, lsb))
         }
         Expr::Idx { e, i } => {
-            let v = const_eval(e, env)?;
-            let i = const_eval(i, env)?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let i = ce_impl(i, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
             Some(Value::from_bit(v.bit(i)))
         }
         Expr::Resize { e, width, signed } => {
-            let v = const_eval(e, env)?;
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
             if *signed && v.width() < *width {
                 let mut bits = vec![if v.bit(v.width() - 1) == V1 { V1 } else { V0 }; *width];
                 for i in 0..v.width() {
@@ -2973,8 +3010,152 @@ pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
                 Some(v.resize(*width))
             }
         }
-        Expr::Signed(e) => const_eval(e, env),
-        Expr::Call { .. } => None,
+        Expr::Signed(e) => ce_impl(e, env, funcs, slots.as_deref_mut()),
+        Expr::Call { name, args } => {
+            let f = funcs.get(&name.to_ascii_lowercase())?;
+            let mut argv = Vec::with_capacity(args.len());
+            for a in args {
+                argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
+            }
+            const_eval_func(f, &argv, env, funcs)
+        }
+    }
+}
+
+/// Control flow out of a const-evaluated function body.
+#[derive(PartialEq, Debug)]
+enum CeFlow {
+    Continue,
+    Return,
+    Abort,
+}
+
+/// Const-evaluate a user function body: slot 0 is the return value, then
+/// args, then locals. Supports the statement subset that appears in pure
+/// package functions (block/if/case/assign/for/return).
+fn const_eval_func(
+    f: &FuncIr,
+    argv: &[Value],
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, FuncIr>,
+) -> Option<Value> {
+    let mut slots: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
+    slots.extend(argv.iter().cloned());
+    slots.extend(
+        f.locals
+            .iter()
+            .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
+    );
+    let mut flow = CeFlow::Continue;
+    ce_stmt(&f.body, &mut slots, env, funcs, &mut flow);
+    if flow == CeFlow::Abort {
+        return None;
+    }
+    Some(slots.into_iter().next().unwrap_or(Value::x(1)))
+}
+
+fn ce_stmt(
+    s: &Stmt,
+    slots: &mut Vec<Value>,
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, FuncIr>,
+    flow: &mut CeFlow,
+) {
+    if *flow != CeFlow::Continue {
+        return;
+    }
+    let ev = |e: &Expr, slots: &mut Vec<Value>| ce_impl(e, env, funcs, Some(slots));
+    match s {
+        Stmt::Null => {}
+        Stmt::Spanned { inner, .. } => ce_stmt(inner, slots, env, funcs, flow),
+        Stmt::Block(ss) => {
+            for x in ss {
+                ce_stmt(x, slots, env, funcs, flow);
+                if *flow != CeFlow::Continue {
+                    return;
+                }
+            }
+        }
+        Stmt::If { cond, then, els } => match ev(cond, slots).and_then(|v| v.to_u64()) {
+            Some(0) => {
+                if let Some(els) = els {
+                    ce_stmt(els, slots, env, funcs, flow);
+                }
+            }
+            Some(_) => ce_stmt(then, slots, env, funcs, flow),
+            None => *flow = CeFlow::Abort,
+        },
+        Stmt::Assign { lhs, rhs, .. } => match (ev(rhs, slots), lhs) {
+            (Some(v), Expr::Sig(i)) => {
+                while slots.len() <= *i as usize {
+                    slots.push(Value::x(32));
+                }
+                slots[*i as usize] = v;
+            }
+            _ => *flow = CeFlow::Abort,
+        },
+        Stmt::Return(e) => match ev(e, slots) {
+            Some(v) => {
+                slots[0] = v;
+                *flow = CeFlow::Return;
+            }
+            None => *flow = CeFlow::Abort,
+        },
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            ce_stmt(init, slots, env, funcs, flow);
+            let mut guard = 0u32;
+            loop {
+                if *flow != CeFlow::Continue {
+                    return;
+                }
+                match ev(cond, slots).and_then(|v| v.to_u64()) {
+                    Some(n) if n != 0 => {
+                        ce_stmt(body, slots, env, funcs, flow);
+                        if *flow != CeFlow::Continue {
+                            return;
+                        }
+                        ce_stmt(step, slots, env, funcs, flow);
+                        guard += 1;
+                        if guard > 100_000 {
+                            *flow = CeFlow::Abort;
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        }
+        Stmt::Case {
+            expr,
+            items,
+            default,
+            ..
+        } => {
+            let v = match ev(expr, slots) {
+                Some(v) => v,
+                None => {
+                    *flow = CeFlow::Abort;
+                    return;
+                }
+            };
+            for (choices, body) in items {
+                for ch in choices {
+                    if ev(ch, slots) == Some(v.clone()) {
+                        ce_stmt(body, slots, env, funcs, flow);
+                        return;
+                    }
+                }
+            }
+            if let Some(d) = default {
+                ce_stmt(d, slots, env, funcs, flow);
+            }
+        }
+        _ => *flow = CeFlow::Abort,
     }
 }
 

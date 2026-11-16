@@ -509,7 +509,19 @@ pub fn compile_one(
             design.modules.extend(lowered.modules);
             pending_archs.extend(lowered.pending);
             for p in lowered.packages {
-                design.packages.insert(p.name.clone(), p);
+                // `package p` and `package body p` arrive as two entries with
+                // the same name — merge their items instead of last-wins.
+                match design.packages.entry(p.name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let e = e.get_mut();
+                        e.types.extend(p.types);
+                        e.consts.extend(p.consts);
+                        e.functions.extend(p.functions);
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(p);
+                    }
+                }
             }
         }
     }
