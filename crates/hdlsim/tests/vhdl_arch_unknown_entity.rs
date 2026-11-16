@@ -91,3 +91,26 @@ fn unknown_entity_error_points_at_name_and_ends_with_newline() {
         stderr
     );
 }
+
+#[test]
+fn cross_file_architecture_binds_in_either_order() {
+    // The entity lives in edge_detector_entity.vhd, the architecture in a
+    // separate file — `hdlsim check` must accept both command-line orders.
+    let entity = fixture("arch_unknown/edge_detector_entity.vhd");
+    let rtl = fixture("arch_unknown/edge_detector_rtl_ok.vhd");
+    for args in [
+        vec![rtl.clone(), entity.clone()],
+        vec![entity.clone(), rtl.clone()],
+    ] {
+        let out = hdlsim().arg("check").args(&args).output().expect("runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "order {:?}: expected exit 0\n{}{}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            stderr
+        );
+        assert!(!stderr.contains("E0401"), "order {:?}: {}", args, stderr);
+    }
+}

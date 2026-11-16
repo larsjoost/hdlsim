@@ -57,6 +57,9 @@ pub struct LibraryManager {
     cache: Option<cache::Cache>,
     /// Parse-cache hits this session.
     cache_hits: u64,
+    /// VHDL architectures whose entity was not in the same file; re-bound
+    /// design-wide once all known files are lowered (see `compile_files`).
+    pending_archs: Vec<hdl_ir::vhdl_lower::PendingArch>,
 }
 
 impl LibraryManager {
@@ -72,6 +75,7 @@ impl LibraryManager {
             compiled: HashSet::new(),
             cache: None,
             cache_hits: 0,
+            pending_archs: Vec::new(),
         }
     }
 
@@ -233,6 +237,7 @@ impl LibraryManager {
             design,
             cache,
             &mut self.cache_hits,
+            &mut self.pending_archs,
         )
     }
 
@@ -246,12 +251,37 @@ impl LibraryManager {
     }
 
     /// Compile a list of explicit files (e.g. the CLI's file arguments).
+    /// After all files are lowered, architectures whose entity lives in
+    /// another file are bound design-wide (regardless of file order);
+    /// architectures still naming an unknown entity produce E0401.
     pub fn compile_files(&mut self, design: &mut Design, paths: &[PathBuf]) {
         for p in paths {
             if let Err(e) = self.compile_file(design, p) {
                 self.diags.push(Diagnostic::error("E0501", None, e));
             }
         }
+        self.retry_pending_architectures(design, true);
+    }
+
+    /// Re-bind deferred architectures against the design-wide module list.
+    /// With `emit_errors`, still-unknown entities produce E0401; otherwise the
+    /// architectures stay pending (e.g. while elaboration resolves more units).
+    fn retry_pending_architectures(&mut self, design: &mut Design, emit_errors: bool) {
+        if self.pending_archs.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_archs);
+        let mut lower_diags = Vec::new();
+        let still = hdl_ir::vhdl_lower::lower_pending_architectures(
+            &self.db,
+            &mut lower_diags,
+            &design.packages,
+            &mut design.modules,
+            pending,
+            emit_errors,
+        );
+        self.diags.extend(lower_diags);
+        self.pending_archs = still;
     }
 }
 
@@ -287,6 +317,7 @@ impl UnitResolver for LibraryManager {
                 continue;
             };
             self.compile_text(design, &path, &text)?;
+            self.retry_pending_architectures(design, false);
             if design.modules.iter().any(|m| m.name == name) {
                 return Ok(true);
             }
@@ -380,6 +411,7 @@ pub fn compile_one(
     design: &mut Design,
     cache: Option<&cache::Cache>,
     cache_hits: &mut u64,
+    pending_archs: &mut Vec<hdl_ir::vhdl_lower::PendingArch>,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
         .ok_or_else(|| format!("unknown file extension: {}", path.display()))?;
@@ -437,8 +469,6 @@ pub fn compile_one(
             };
             diags.extend(parse_diags);
             let mut lower_diags = Vec::new();
-            let known_entities: Vec<String> =
-                design.modules.iter().map(|m| m.name.clone()).collect();
             let lowered = hdl_ir::vhdl_lower::lower_file(
                 id,
                 &root,
@@ -446,10 +476,10 @@ pub fn compile_one(
                 &mut lower_diags,
                 1_000_000,
                 &design.packages,
-                &known_entities,
             );
             diags.extend(lower_diags);
             design.modules.extend(lowered.modules);
+            pending_archs.extend(lowered.pending);
             for p in lowered.packages {
                 design.packages.insert(p.name.clone(), p);
             }
@@ -507,6 +537,68 @@ mod tests {
             "{}",
             err
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_file_architecture_binds_regardless_of_order() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_xfile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entity = dir.join("ent.vhd");
+        let arch = dir.join("arch.vhd");
+        std::fs::write(
+            &entity,
+            "entity top is\n    port (clk : in bit; q : out bit);\nend entity;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &arch,
+            "architecture rtl of top is\n    signal s : bit;\nbegin\n    q <= s;\nend architecture;\n",
+        )
+        .unwrap();
+        // Architecture file first or second: binding must be order-independent.
+        for paths in [
+            vec![arch.clone(), entity.clone()],
+            vec![entity.clone(), arch.clone()],
+        ] {
+            let mut mgr = LibraryManager::new();
+            let mut design = Design::default();
+            mgr.compile_files(&mut design, &paths);
+            assert!(
+                !mgr.diags().has_errors(),
+                "{:?}: {}",
+                paths,
+                mgr.diags().render_all(mgr.db())
+            );
+            let m = design
+                .modules
+                .iter()
+                .find(|m| m.name == "top")
+                .expect("entity lowered");
+            assert!(
+                m.signals.iter().any(|s| s.name == "s"),
+                "architecture body attached: {:?}",
+                m.signals
+            );
+            assert_eq!(m.assigns.len(), 1, "concurrent assign attached");
+        }
+        // A genuinely unknown entity name still errors, with a did-you-mean.
+        std::fs::write(
+            &arch,
+            "architecture rtl of topp is\nbegin\nend architecture;\n",
+        )
+        .unwrap();
+        let mut mgr = LibraryManager::new();
+        let mut design = Design::default();
+        mgr.compile_files(&mut design, &[arch.clone(), entity.clone()]);
+        let rendered = mgr.diags().render_all(mgr.db());
+        assert!(
+            rendered.contains("architecture for unknown entity 'topp'"),
+            "{}",
+            rendered
+        );
+        assert!(rendered.contains("did you mean 'top'?"), "{}", rendered);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
