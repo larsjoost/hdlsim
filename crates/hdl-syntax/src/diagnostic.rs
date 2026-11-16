@@ -444,6 +444,11 @@ impl Diagnostics {
                 )
             ));
         }
+        // Terminate the last line so callers printing with `eprint!` do not
+        // glue the next output onto the summary.
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
         out
     }
 }
@@ -528,6 +533,21 @@ mod tests {
             out
         );
         assert!(out.contains("warning: 1 warning generated"), "{}", out);
+    }
+
+    #[test]
+    fn render_all_ends_with_newline() {
+        let db = SourceDb::new();
+        let mut ds = Diagnostics::new();
+        ds.push(Diagnostic::error("E0001", None, "e1"));
+        let out = ds.render_all_with(&db, false);
+        assert!(
+            out.ends_with("error: could not compile due to 1 previous error\n"),
+            "{}",
+            out
+        );
+        // Empty diagnostics still render as an empty string.
+        assert_eq!(Diagnostics::new().render_all_with(&db, false), "");
     }
 
     #[test]

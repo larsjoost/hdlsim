@@ -123,13 +123,17 @@ impl DoSession {
         let mut design = Design::default();
         mgr.compile_files(&mut design, &self.files);
         if mgr.diags().has_errors() {
-            return Err(anyhow::Error::msg(mgr.diags().render_all(mgr.db())));
+            return Err(anyhow::Error::msg(
+                mgr.diags().render_all(mgr.db()).trim_end().to_string(),
+            ));
         }
         let flat = elab::elaborate_with(&mut design, &self.top, &mut mgr)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))
             .map_err(anyhow::Error::msg)?;
         if mgr.diags().has_errors() {
-            return Err(anyhow::Error::msg(mgr.diags().render_all(mgr.db())));
+            return Err(anyhow::Error::msg(
+                mgr.diags().render_all(mgr.db()).trim_end().to_string(),
+            ));
         }
         let mut sim = Simulator::new(flat);
         if let Some(s) = self.seed {
