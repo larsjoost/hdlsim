@@ -75,8 +75,9 @@ case/operators, `to_xstring`, conditional/selected assigns) are supported and
 locked in by self-checking examples in `examples/features/` (each prints
 `PASS`; run via `cargo test -p hdlsim --test examples`). See `docs/plan.md`
 for the roadmap, `docs/worldclass.md` for feature ideas under consideration,
-and `REVIEWING.md` for the code conventions (reviewability + extensibility
-rules) every contribution follows.
+`docs/vhdl-support.md` for the VHDL feature support matrix (with the tests
+that pin each row), and `REVIEWING.md` for the code conventions (reviewability
++ extensibility rules) every contribution follows.
 
 ## Install
 
