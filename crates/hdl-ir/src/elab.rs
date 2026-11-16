@@ -439,6 +439,7 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
             e: Box::new(remap_expr(e, map)),
         },
         Expr::Rising(e) => Expr::Rising(Box::new(remap_expr(e, map))),
+        Expr::Prev(e) => Expr::Prev(Box::new(remap_expr(e, map))),
         Expr::Falling(e) => Expr::Falling(Box::new(remap_expr(e, map))),
         Expr::ToInt(e) => Expr::ToInt(Box::new(remap_expr(e, map))),
         Expr::ToString(e) => Expr::ToString(Box::new(remap_expr(e, map))),

@@ -2925,7 +2925,9 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
     match e {
-        Expr::Rising(_) | Expr::Falling(_) | Expr::ToInt(_) | Expr::ToString(_) => None,
+        Expr::Rising(_) | Expr::Falling(_) | Expr::Prev(_) | Expr::ToInt(_) | Expr::ToString(_) => {
+            None
+        }
         Expr::Lit(v) => Some(v.clone()),
         Expr::Real(x) => Some(Value::from_f64(*x)),
         Expr::Sig(_) => None,

@@ -264,6 +264,8 @@ pub enum Expr {
     Rising(Box<Expr>),
     /// VHDL `falling_edge(sig)`.
     Falling(Box<Expr>),
+    /// VHDL `sig'last_value` — the signal's value before the current delta.
+    Prev(Box<Expr>),
     /// VHDL `to_integer(x)` — unsigned numeric value as a 32-bit integer.
     ToInt(Box<Expr>),
     /// VHDL `t'image(x)` — decimal string of the value, as ASCII bytes.
@@ -319,9 +321,11 @@ impl Expr {
                 e.collect_sigs(out);
                 i.collect_sigs(out);
             }
-            Expr::Rising(e) | Expr::Falling(e) | Expr::ToInt(e) | Expr::ToString(e) => {
-                e.collect_sigs(out)
-            }
+            Expr::Rising(e)
+            | Expr::Falling(e)
+            | Expr::Prev(e)
+            | Expr::ToInt(e)
+            | Expr::ToString(e) => e.collect_sigs(out),
             Expr::Resize { e, .. } => e.collect_sigs(out),
             Expr::Signed(e) => e.collect_sigs(out),
         }
