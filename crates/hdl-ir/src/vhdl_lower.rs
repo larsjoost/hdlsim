@@ -819,6 +819,13 @@ impl<'a> Lower<'a> {
                     self.mems.insert(id, d);
                 }
                 self.sig_signed.insert(id, signed);
+                if let Some(tm) = &type_mark {
+                    if let Some(TypeInfo::Record { .. }) =
+                        self.types.get(&self.text(tm).to_ascii_lowercase())
+                    {
+                        self.sig_rec.insert(id, self.text(tm).to_ascii_lowercase());
+                    }
+                }
                 module.ports.push(PortIr {
                     name: n.clone(),
                     dir,

@@ -2,19 +2,25 @@
 //! `corpus/README.md`) must lex + parse cleanly, and a full compile+lower
 //! (`check`) must run to completion without panicking — diagnostics for
 //! unsupported constructs are expected and must render rustc-style.
+//!
+//! Like a real project, each language directory is compiled as one library
+//! (`hdlsim check -L neorv32=<dir> <dir>/*.vhd`): the directory is registered
+//! under the logical library names its files declare, so cross-file units
+//! (`use neorv32.neorv32_package.all;`) resolve on demand while compiling.
 
 use hdl_lib::LibraryManager;
 use hdl_syntax::language::Language;
 use hdl_syntax::source::SourceDb;
 use hdl_syntax::{verilog, vhdl};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
 }
 
-fn corpus_sources() -> Vec<PathBuf> {
+/// `(subdir, files)` groups — each group is compiled together as one library.
+fn corpus_groups() -> Vec<(&'static str, Vec<PathBuf>)> {
     let mut out = Vec::new();
     for sub in ["verilog", "vhdl"] {
         let dir = corpus_dir().join(sub);
@@ -32,10 +38,86 @@ fn corpus_sources() -> Vec<PathBuf> {
             })
             .collect();
         files.sort();
+        out.push((sub, files));
+    }
+    out
+}
+
+fn corpus_sources() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (_, files) in corpus_groups() {
         out.extend(files);
     }
     assert!(out.len() >= 10, "corpus should hold the fetched files");
     out
+}
+
+fn rel_path(f: &Path) -> String {
+    f.strip_prefix(corpus_dir())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Compile one group as a single library, registering the directory under the
+/// logical library names its files declare in `library` clauses.
+fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
+    let dir = corpus_dir().join(sub);
+    let mut mgr = LibraryManager::new();
+    match sub {
+        "vhdl" => {
+            mgr.add_library_dir("neorv32", &dir);
+            mgr.add_library_dir("unisim", &dir);
+            mgr.add_library_dir("work", &dir);
+        }
+        _ => {
+            mgr.add_library_dir("work", &dir);
+        }
+    }
+    let mut design = hdl_ir::Design::default();
+    mgr.compile_files(&mut design, files);
+    mgr
+}
+
+/// Per-file status for a group compile: an error diagnostic counts against
+/// the file its span points into; spanless errors count against every file.
+fn group_statuses(sub: &str, files: &[PathBuf]) -> HashMap<String, &'static str> {
+    let mgr = compile_group(sub, files);
+    let mut name_to_rel: HashMap<String, String> = HashMap::new();
+    for f in files {
+        name_to_rel.insert(f.display().to_string(), rel_path(f));
+        if let Ok(canon) = std::fs::canonicalize(f) {
+            name_to_rel.insert(canon.display().to_string(), rel_path(f));
+        }
+    }
+    let mut err_files: HashSet<String> = HashSet::new();
+    let mut spanless_error = false;
+    for d in &mgr.diags().items {
+        if d.severity != hdl_syntax::diagnostic::Severity::Error {
+            continue;
+        }
+        match d.span {
+            Some(sp) => match name_to_rel.get(mgr.db().file(sp.file).name()) {
+                Some(rel) => {
+                    err_files.insert(rel.clone());
+                }
+                None => spanless_error = true,
+            },
+            None => spanless_error = true,
+        }
+    }
+    files
+        .iter()
+        .map(|f| {
+            let rel = rel_path(f);
+            let status = if spanless_error || err_files.contains(&rel) {
+                "diags"
+            } else {
+                "clean"
+            };
+            (rel, status)
+        })
+        .collect()
 }
 
 fn parse_one(path: &Path) -> Vec<hdl_syntax::diagnostic::Diagnostic> {
@@ -89,11 +171,10 @@ fn corpus_files_lex_and_parse_without_errors() {
 fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
     let mut checked = 0;
     let mut with_diags = 0;
-    for f in corpus_sources() {
-        let mut mgr = LibraryManager::new();
-        let mut design = hdl_ir::Design::default();
-        mgr.compile_files(&mut design, &[f.clone()]);
-        checked += 1;
+    for (sub, files) in corpus_groups() {
+        // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
+        let mgr = compile_group(sub, &files);
+        checked += files.len();
         let rendered = mgr.diags().render_all(mgr.db());
         if !mgr.diags().is_empty() {
             with_diags += 1;
@@ -102,7 +183,7 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
                 assert!(
                     line.starts_with("error[") || line.starts_with("error:"),
                     "{}: non-rustc-style line: {}",
-                    f.display(),
+                    sub,
                     line
                 );
             }
@@ -111,7 +192,7 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
     // Sanity: the corpus is real code, so at least some files should produce
     // diagnostics for constructs outside the current subset (no panics either way).
     eprintln!(
-        "corpus: {} files checked, {} with diagnostics",
+        "corpus: {} files checked, {} group(s) with diagnostics",
         checked, with_diags
     );
     assert_eq!(checked, corpus_sources().len());
@@ -122,20 +203,11 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
 // Each corpus file has a recorded status in `corpus/expected.json`:
 //   "clean" = compile+lower with zero *error* diagnostics (warnings ok)
 //   "diags" = parses cleanly but still hits unsupported constructs
-// The test asserts every file reaches at least its recorded status, so fixes
+// Statuses are computed from a per-library group compile (see compile_group),
+// attributing each error diagnostic to the file its span points into. The
+// test asserts every file reaches at least its recorded status, so fixes
 // only ever move files up (promote the entry in expected.json in the same PR
 // that fixes the file). Regenerate/snapshot with HDLSIM_UPDATE_CORPUS_EXPECTED=1.
-
-fn file_status(f: &Path) -> &'static str {
-    let mut mgr = LibraryManager::new();
-    let mut design = hdl_ir::Design::default();
-    mgr.compile_files(&mut design, &[f.to_path_buf()]);
-    if mgr.diags().has_errors() {
-        "diags"
-    } else {
-        "clean"
-    }
-}
 
 fn rank(status: &str) -> u8 {
     match status {
@@ -149,13 +221,10 @@ fn rank(status: &str) -> u8 {
 fn corpus_files_meet_their_recorded_status() {
     let expected_path = corpus_dir().join("expected.json");
     let mut actual: HashMap<String, String> = HashMap::new();
-    for f in corpus_sources() {
-        let rel = f
-            .strip_prefix(corpus_dir())
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        actual.insert(rel, file_status(&f).to_string());
+    for (sub, files) in corpus_groups() {
+        for (rel, status) in group_statuses(sub, &files) {
+            actual.insert(rel, status.to_string());
+        }
     }
     if std::env::var_os("HDLSIM_UPDATE_CORPUS_EXPECTED").is_some() {
         let mut entries: Vec<(&String, &String)> = actual.iter().collect();
