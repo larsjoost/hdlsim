@@ -759,18 +759,15 @@ impl<'a> Lower<'a> {
             let mut constraint = None;
             for k in &dk {
                 match k.kind() {
-                    SyntaxKind::Name => {
-                        let t = self.text(k);
-                        match t.to_ascii_lowercase().as_str() {
-                            "in" | "out" | "inout" | "buffer" => mode = t.to_ascii_lowercase(),
-                            _ => {
-                                // First name(s) before ':' are the port names; the
-                                // type mark follows the ':'. Distinguish by position:
-                                // names come before the ':' punct.
-                                names.push(t);
-                            }
+                    // Mode keywords (`in`/`out`/…) are keyword tokens (Ident),
+                    // not Name nodes — check them here or every port stays `in`.
+                    SyntaxKind::Ident => {
+                        let t = self.kw(k);
+                        if matches!(t.as_str(), "in" | "out" | "inout" | "buffer") {
+                            mode = t;
                         }
                     }
+                    SyntaxKind::Name => names.push(self.text(k)),
                     SyntaxKind::Range => constraint = Some(k.clone()),
                     _ => {}
                 }
@@ -799,7 +796,7 @@ impl<'a> Lower<'a> {
                 None => (1, false, None, false),
             };
             let dir = match mode.as_str() {
-                "out" => Dir::Out,
+                "out" | "buffer" => Dir::Out,
                 "inout" => Dir::Inout,
                 _ => Dir::In,
             };
