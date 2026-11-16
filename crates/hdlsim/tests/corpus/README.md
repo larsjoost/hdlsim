@@ -18,3 +18,14 @@ lossless), and a full `check` (parse + lower + resolve) runs to completion on
 each file without panicking, rendering any diagnostics rustc-style. Files that
 use language features outside hdlsim's current subset are expected to produce
 *diagnostics* (that is what the check is for) — never a crash.
+
+## expected.json — per-file progress tracking
+
+`expected.json` records each file's current status: `clean` (compiles+lowers
+with zero *error* diagnostics) or `diags` (parses clean, still hits unsupported
+constructs). `corpus_files_meet_their_recorded_status` asserts every file
+reaches at least its recorded status, so a fix only moves files up: promote the
+entry in `expected.json` in the same PR that fixes the file (regression below
+the recorded status fails CI). New corpus files must be added to `expected.json`
+explicitly — regenerate with `HDLSIM_UPDATE_CORPUS_EXPECTED=1 cargo test -p hdlsim
+--test corpus`.

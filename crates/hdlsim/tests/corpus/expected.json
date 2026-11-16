@@ -1,0 +1,13 @@
+{
+  "verilog/serv_alu.v": "diags",
+  "verilog/serv_decode.v": "clean",
+  "verilog/xilinx_unisim_BUFG.v": "clean",
+  "verilog/xilinx_unisim_IBUF.v": "clean",
+  "verilog/xilinx_unisim_ODDR.v": "clean",
+  "vhdl/neorv32_cpu_alu.vhd": "diags",
+  "vhdl/neorv32_imem.vhd": "diags",
+  "vhdl/unisim_BUFG.vhd": "clean",
+  "vhdl/unisim_FD.vhd": "clean",
+  "vhdl/unisim_IBUF.vhd": "clean",
+  "vhdl/unisim_ODDR.vhd": "diags"
+}
