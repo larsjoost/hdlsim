@@ -1019,6 +1019,7 @@ impl Simulator {
                 e: Box::new(self.concretize_target(e)),
             },
             Expr::Rising(e) => Expr::Rising(Box::new(self.concretize_target(e))),
+            Expr::Prev(e) => Expr::Prev(Box::new(self.concretize_target(e))),
             Expr::Falling(e) => Expr::Falling(Box::new(self.concretize_target(e))),
             Expr::ToInt(e) => Expr::ToInt(Box::new(self.concretize_target(e))),
             Expr::ToString(e) => Expr::ToString(Box::new(self.concretize_target(e))),
@@ -1677,6 +1678,7 @@ impl Simulator {
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
             Expr::Rising(_) | Expr::Falling(_) => 1,
+            Expr::Prev(e) => self.expr_width(e, locals),
             Expr::ToInt(_) => 32,
             Expr::ToString(_) => 8 * 12, // decimal digits, upper bound
             Expr::Resize { width, .. } => *width,
@@ -1903,6 +1905,21 @@ impl Simulator {
                     VX
                 };
                 Value::from_u64(1, (cur == V0 && prev == V1) as u64)
+            }
+            Expr::Prev(e) => {
+                // `sig'last_value`: the value before the current delta.
+                let v = self.eval_expr(e, locals);
+                match &**e {
+                    Expr::Sig(s) => {
+                        let i = *s as usize;
+                        if i < self.prev.len() {
+                            self.prev[i].clone()
+                        } else {
+                            v
+                        }
+                    }
+                    _ => v,
+                }
             }
             Expr::ToInt(e) => {
                 let v = self.eval_expr(e, locals);

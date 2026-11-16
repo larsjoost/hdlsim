@@ -2490,6 +2490,38 @@ impl<'a> Lower<'a> {
                         }
                         Expr::Lit(Value::x(32))
                     }
+                    // `sig'last_value` — value before the current delta.
+                    "last_value" => {
+                        if let Some(id) = self.sig_id(&bn) {
+                            Expr::Prev(Box::new(Expr::Sig(id)))
+                        } else {
+                            self.warn(
+                                e.span(),
+                                format!("attribute '{}\\'{}' not supported; X", bn, attr),
+                            );
+                            Expr::Lit(Value::x(1))
+                        }
+                    }
+                    // `sig'stable` — no event this delta: NOT (rising OR falling).
+                    "stable" => {
+                        if let Some(id) = self.sig_id(&bn) {
+                            let s = || Box::new(Expr::Sig(id));
+                            Expr::Un {
+                                op: UnOp::Not,
+                                e: Box::new(Expr::Bin {
+                                    op: BinOp::LogOr,
+                                    l: Box::new(Expr::Rising(s())),
+                                    r: Box::new(Expr::Falling(s())),
+                                }),
+                            }
+                        } else {
+                            self.warn(
+                                e.span(),
+                                format!("attribute '{}\\'{}' not supported; X", bn, attr),
+                            );
+                            Expr::Lit(Value::x(1))
+                        }
+                    }
                     // `sig'event` — true on any value change of sig this delta:
                     // rising OR falling edge (scalar signals).
                     "event" => {
@@ -2528,9 +2560,11 @@ impl<'a> Lower<'a> {
     fn lower_call(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         let kids = real_children(e);
         // `integer'image(x)` arrives as Call(Attr(Name integer, 'image), args).
-        let attr = kids.iter().find(|k| k.kind() == SyntaxKind::Attr);
-        if let Some(a) = attr {
-            let ak = real_children(a);
+        // The argument may itself be an attribute (`sig'last_value`, …), so
+        // only the callee Attr is excluded from the argument search.
+        let attr_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Attr);
+        if let Some(ap) = attr_pos {
+            let ak = real_children(&kids[ap]);
             let attr_name = ak
                 .iter()
                 .filter(|k| k.kind() == SyntaxKind::Ident)
@@ -2540,7 +2574,9 @@ impl<'a> Lower<'a> {
             if attr_name == "image" {
                 if let Some(arg) = kids
                     .iter()
-                    .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Attr)
+                    .enumerate()
+                    .find(|(i, k)| *i != ap && is_expr_node(k.kind()))
+                    .map(|(_, k)| k)
                 {
                     return Expr::ToString(Box::new(self.lower_expr(arg, env)));
                 }

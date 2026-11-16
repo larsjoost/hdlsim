@@ -1808,6 +1808,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                 bits: vec![self.enc.b.false_lit()],
                 signed: false,
             }),
+            Expr::Prev(_) => {
+                return Err("prove: 'last_value (Prev) unsupported".to_string());
+            }
             Expr::ToInt(e) => {
                 let v = self.eval(e)?;
                 let b = &self.enc.b;
@@ -2157,7 +2160,9 @@ fn expr_has_dash(e: &Expr) -> bool {
         Expr::Replicate { count, e } => expr_has_dash(count) || expr_has_dash(e),
         Expr::Sel { e, msb, lsb } => expr_has_dash(e) || expr_has_dash(msb) || expr_has_dash(lsb),
         Expr::Idx { e, i } => expr_has_dash(e) || expr_has_dash(i),
-        Expr::Rising(e) | Expr::Falling(e) | Expr::ToInt(e) | Expr::ToString(e) => expr_has_dash(e),
+        Expr::Rising(e) | Expr::Falling(e) | Expr::Prev(e) | Expr::ToInt(e) | Expr::ToString(e) => {
+            expr_has_dash(e)
+        }
         Expr::Resize { e, .. } | Expr::Signed(e) => expr_has_dash(e),
         Expr::Sig(_) | Expr::Real(_) => false,
     }

@@ -317,6 +317,10 @@ fn w_expr(w: &mut W, e: &Expr) {
             w.u8(11);
             w_expr(w, e);
         }
+        Expr::Prev(e) => {
+            w.u8(17);
+            w_expr(w, e);
+        }
         Expr::ToInt(e) => {
             w.u8(12);
             w_expr(w, e);
@@ -398,6 +402,7 @@ fn r_expr(r: &mut R) -> Result<Expr, String> {
         },
         10 => Expr::Rising(Box::new(r_expr(r)?)),
         11 => Expr::Falling(Box::new(r_expr(r)?)),
+        17 => Expr::Prev(Box::new(r_expr(r)?)),
         12 => Expr::ToInt(Box::new(r_expr(r)?)),
         13 => Expr::ToString(Box::new(r_expr(r)?)),
         14 => Expr::Resize {
