@@ -46,7 +46,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | integer/natural/positive ranges, `time` | ✅ | examples |
 | 1-D arrays (range- or enum-indexed), `(others => x)` aggregates | ✅ | `tests/vhdl_array_enum.rs` |
 | multi-dimensional arrays | ◐ (`<>` box → depth 1) | — |
-| records | ◐ parsed, skipped in lowering | parser tests |
+| records (flat vector + `r.field` select + named/positional aggregates) | ✅ | `tests/vhdl_record.rs` |
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
 | functions/procedures with bodies, `return` | ◐ | `tests/vhdl2008.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |
@@ -70,7 +70,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 |---|---|---|
 | arithmetic/relational operators, `mod`/`rem`, `abs`/`not` | ✅ | `tests/vhdl_counter.rs`, `vhdl_signed.rs` |
 | logical `and/or/xor/…` on std_logic/vectors | ✅ (via 1164 operator functions) | examples |
-| concatenation `&`, aggregates, slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs` |
+| concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
 | attributes | ◐ `'range` on arrays (for-loops), `'image`; others → X with diagnostic | `tests/loops.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
 | shifts/rotates (`sll`, `srl`, `shift_left`, …) | ❌ declared, not simulated | — |

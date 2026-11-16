@@ -1970,6 +1970,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One aggregate element: `choice [| choice...] [=> value]` where the
+    /// choice is `others` or an expression.
+    fn parse_agg_element(&mut self) {
+        loop {
+            if self.at_kw("others") {
+                self.start(SyntaxKind::Others);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                self.parse_expression();
+            }
+            if !self.eat_punct('|') {
+                break;
+            }
+        }
+        if self.peek_op2().as_deref() == Some("=>") {
+            self.bump();
+            self.bump();
+            if self.at_kw("others") {
+                self.start(SyntaxKind::Others);
+                self.bump();
+                self.builder.finish_node();
+            } else {
+                self.parse_expression();
+            }
+        }
+    }
+
     fn parse_primary(&mut self) {
         let t = self.peek().clone();
         match t.kind {
@@ -2058,14 +2086,20 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 self.parse_expression();
-                if self.eat_punct(',') || self.peek_op2().as_deref() == Some("=>") {
-                    // Aggregate.
+                // Aggregate if the first element is followed by `,`, `|`
+                // (more choices) or `=>` (named association).
+                let mut is_agg =
+                    self.peek_op2().as_deref() == Some("=>") || self.peek_text() == "|";
+                let mut first_comma = false;
+                if self.eat_punct(',') {
+                    is_agg = true;
+                    first_comma = true;
+                }
+                if is_agg {
+                    // Aggregate: elements are `choice [| choice...] [=> value]`.
                     self.builder.start_node_at(mark, SyntaxKind::Aggregate);
-                    while self.eat_punct(',') || self.peek_op2().as_deref() == Some("=>") {
-                        if self.peek_op2().as_deref() == Some("=>") {
-                            self.bump();
-                            self.bump();
-                        }
+                    // Finish the first element (extra choices / `=> value`).
+                    while self.eat_punct('|') {
                         if self.at_kw("others") {
                             self.start(SyntaxKind::Others);
                             self.bump();
@@ -2073,8 +2107,30 @@ impl<'a> Parser<'a> {
                         } else {
                             self.parse_expression();
                         }
-                        if !self.eat_punct(',') && !self.eat_punct('|') {
-                            break; // `|` separates aggregate choices too
+                    }
+                    if self.peek_op2().as_deref() == Some("=>") {
+                        self.bump();
+                        self.bump();
+                        if self.at_kw("others") {
+                            self.start(SyntaxKind::Others);
+                            self.bump();
+                            self.builder.finish_node();
+                        } else {
+                            self.parse_expression();
+                        }
+                    }
+                    if first_comma {
+                        // The separating `,` is already consumed: parse the
+                        // remaining elements.
+                        loop {
+                            self.parse_agg_element();
+                            if !self.eat_punct(',') {
+                                break;
+                            }
+                        }
+                    } else {
+                        while self.eat_punct(',') {
+                            self.parse_agg_element();
                         }
                     }
                     self.expect_punct(')', "to close the aggregate");
@@ -2159,6 +2215,24 @@ end architecture;
         assert!(sexp.contains("(ConcAssign"), "{}", sexp);
         assert!(sexp.contains("(If"), "{}", sexp);
         assert!(sexp.contains("(Call"), "{}", sexp); // rising_edge(...)
+    }
+
+    #[test]
+    fn parses_named_aggregates() {
+        // Named associations `(f => v, ...)`, positional, `others`, and
+        // choice lists `1 | 2 => v` must all parse losslessly.
+        let sexp = ok(r#"architecture rtl of m is
+    type rt is record a : bit; b : bit; end record;
+    signal r : rt;
+begin
+    r <= (a => '1', b => '0');
+    r <= ('1', '0');
+    r <= (others => '0');
+    r <= (1 | 2 => '1', others => '0');
+end architecture;
+"#);
+        assert!(sexp.contains("(Aggregate"), "{}", sexp);
+        assert!(sexp.contains("(Others"), "{}", sexp);
     }
 
     #[test]

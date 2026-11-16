@@ -237,6 +237,9 @@ pub enum TypeInfo {
     Enum(Vec<String>),
     /// Array type: element width + depth (memories).
     Array { elem: usize, depth: usize },
+    /// Record type: fields as (name, width, signed) in declaration order.
+    /// Lowered as one flat vector; the first declared field is the MSB.
+    Record { fields: Vec<(String, usize, bool)> },
 }
 
 struct Lower<'a> {
@@ -252,6 +255,8 @@ struct Lower<'a> {
     mems: HashMap<SigId, usize>,
     /// Signal id → signed flag (for `resize`/`to_signed` context).
     sig_signed: HashMap<SigId, bool>,
+    /// Signal id → record type name (for `sig.field` selects), if record-typed.
+    sig_rec: HashMap<SigId, String>,
     /// Hidden signals allocated while lowering statements (for-loop vars),
     /// appended to the module after the process body is lowered.
     extra_signals: Vec<SignalIr>,
@@ -269,6 +274,7 @@ impl<'a> Lower<'a> {
             names: HashMap::new(),
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
+            sig_rec: HashMap::new(),
             extra_signals: Vec::new(),
             extra_base: 0,
         }
@@ -409,6 +415,12 @@ impl<'a> Lower<'a> {
                 (w, false, None, false)
             }
             TypeInfo::Array { elem, depth } => (elem, false, Some(depth), false),
+            TypeInfo::Record { fields } => (
+                fields.iter().map(|f| f.1).sum::<usize>().max(1),
+                false,
+                None,
+                false,
+            ),
         }
     }
 
@@ -846,6 +858,7 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let span = d.span();
+        let type_name = type_mark.map(|tm| self.text(tm).to_ascii_lowercase());
         let (width, signed, mem, real) = match type_mark {
             Some(tm) => self.resolve_type(tm, constraint, span),
             None => (1, false, None, false),
@@ -872,6 +885,11 @@ impl<'a> Lower<'a> {
                 self.mems.insert(id, d);
             }
             self.sig_signed.insert(id, signed);
+            if let Some(tn) = &type_name {
+                if matches!(self.types.get(tn), Some(TypeInfo::Record { .. })) {
+                    self.sig_rec.insert(id, tn.clone());
+                }
+            }
             self.names.insert(n.clone(), id);
         }
     }
@@ -887,12 +905,29 @@ impl<'a> Lower<'a> {
             .filter(|k| k.kind() == SyntaxKind::Name)
             .map(|k| self.text(k))
             .collect();
+        let type_mark = kids[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name);
         let init = kids[colon + 1..]
             .iter()
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let Some(init) = init else { return };
         let env = self.consts.clone();
-        let ex = self.lower_expr(init, &env);
+        // Record-typed constant: order named aggregate fields by the record.
+        let ex = match type_mark {
+            Some(tm)
+                if init.kind() == SyntaxKind::Aggregate
+                    && matches!(
+                        self.types.get(&self.text(tm).to_ascii_lowercase()),
+                        Some(TypeInfo::Record { .. })
+                    ) =>
+            {
+                let tn = self.text(tm).to_ascii_lowercase();
+                let fields = self.record_fields_of_type(&tn);
+                self.lower_record_aggregate(init, &fields, &env)
+            }
+            _ => self.lower_expr(init, &env),
+        };
         if let Some(v) = const_eval(&ex, &env) {
             for n in &names {
                 self.consts.insert(n.to_ascii_lowercase(), v.clone());
@@ -909,6 +944,36 @@ impl<'a> Lower<'a> {
             return;
         };
         let name = self.kw(name_node);
+        // Record: `type t is record f : typ [constraint]; ... end record;`
+        // (checked before enum: field constraints contain `(` too).
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "record")
+        {
+            let mut fields: Vec<(String, usize, bool)> = Vec::new();
+            let mut i = 0;
+            while i < kids.len() {
+                let is_field = kids[i].kind() == SyntaxKind::Name
+                    && kids
+                        .get(i + 1)
+                        .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ":")
+                        .unwrap_or(false);
+                if is_field {
+                    if let Some(tm) = kids.get(i + 2).filter(|k| k.kind() == SyntaxKind::Name) {
+                        let constraint = kids.get(i + 3).filter(|k| k.kind() == SyntaxKind::Range);
+                        let (w, signed, _, _) = self.resolve_type(tm, constraint, d.span());
+                        fields.push((self.text(&kids[i]).to_ascii_lowercase(), w.max(1), signed));
+                        i += 3;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if !fields.is_empty() {
+                self.types.insert(name, TypeInfo::Record { fields });
+            }
+            return;
+        }
         // Enum: `type t is (a, b, c);`
         let enum_lits: Vec<String> = kids
             .iter()
@@ -1329,7 +1394,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                let val = self.lower_expr(&e.val, &self.consts.clone());
+                let val = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
                 let a = Stmt::Assign {
                     lhs: lhs.clone(),
                     rhs: val,
@@ -1362,7 +1427,7 @@ impl<'a> Lower<'a> {
             // Conditional waveform → nested ternary, first true condition wins.
             let mut rhs: Option<Expr> = None;
             for e in elems.iter().rev() {
-                let v = self.lower_expr(&e.val, &self.consts.clone());
+                let v = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
                 rhs = Some(match (&e.cond, rhs) {
                     (Some(c), Some(r)) => Expr::Cond {
                         c: Box::new(self.lower_expr(c, &self.consts.clone())),
@@ -1380,7 +1445,7 @@ impl<'a> Lower<'a> {
             return Some(ConcOut::Assign(AssignIr { lhs, rhs: rhs? }));
         }
         // Plain waveform: the last element at t=0 wins.
-        let rhs = self.lower_expr(&elems.last()?.val, &self.consts.clone());
+        let rhs = self.lower_rhs(&kids[lhs_pos], &elems.last()?.val, &self.consts.clone());
         Some(ConcOut::Assign(AssignIr { lhs, rhs }))
     }
 
@@ -1555,7 +1620,7 @@ impl<'a> Lower<'a> {
                 match (lhs, rhs) {
                     (Some(l), Some(r)) => Stmt::Assign {
                         lhs: self.lower_expr(l, &self.consts.clone()),
-                        rhs: self.lower_expr(r, &self.consts.clone()),
+                        rhs: self.lower_rhs(l, r, &self.consts.clone()),
                         nba: true, // VHDL signal assignment is delta-delayed
                     },
                     _ => Stmt::Null,
@@ -1572,7 +1637,7 @@ impl<'a> Lower<'a> {
                 match (lhs, rhs) {
                     (Some(l), Some(r)) => Stmt::Assign {
                         lhs: self.lower_expr(l, &self.consts.clone()),
-                        rhs: self.lower_expr(r, &self.consts.clone()),
+                        rhs: self.lower_rhs(l, r, &self.consts.clone()),
                         nba: false,
                     },
                     _ => Stmt::Null,
@@ -2001,6 +2066,36 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::Name => {
                 let name = self.text(e);
+                // Record field select: `r.field` on a record-typed signal →
+                // slice of the flat record vector (first field = MSB).
+                if let Some(dot) = name.find('.') {
+                    let base = name[..dot].to_ascii_lowercase();
+                    let field = name[dot + 1..].to_ascii_lowercase();
+                    if let Some(id) = self.sig_id(&base) {
+                        if let Some(tn) = self.sig_rec.get(&id).cloned() {
+                            if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                                let total: usize = fields.iter().map(|f| f.1).sum();
+                                let mut run = 0usize;
+                                for (fn_, w, _) in fields {
+                                    let lsb = total - run - w;
+                                    if *fn_ == field {
+                                        return Expr::Sel {
+                                            e: Box::new(Expr::Sig(id)),
+                                            msb: Box::new(Expr::Lit(Value::from_u64(
+                                                32,
+                                                (lsb + w - 1) as u64,
+                                            ))),
+                                            lsb: Box::new(Expr::Lit(Value::from_u64(
+                                                32, lsb as u64,
+                                            ))),
+                                        };
+                                    }
+                                    run += w;
+                                }
+                            }
+                        }
+                    }
+                }
                 let base = name.rsplit('.').next().unwrap_or(name.as_str());
                 let key = base.to_ascii_lowercase();
                 // Local scope (env: loop vars, params) first, then signals, then
@@ -2279,12 +2374,132 @@ impl<'a> Lower<'a> {
                 None => Expr::Lit(Value::x(width.max(1))),
             };
         }
-        let parts: Vec<Expr> = kids
-            .iter()
-            .filter(|k| is_expr_node(k.kind()))
-            .map(|k| self.lower_expr(k, env))
-            .collect();
+        // Positional values only: a choice followed by `=>` is an association
+        // name, not a value (record-typed targets use lower_record_aggregate).
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut i = 0;
+        while i < kids.len() {
+            let k = &kids[i];
+            let arrow = kids
+                .get(i + 1)
+                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
+                .unwrap_or(false)
+                && kids
+                    .get(i + 2)
+                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
+                    .unwrap_or(false);
+            if is_expr_node(k.kind()) && !arrow {
+                parts.push(self.lower_expr(k, env));
+            }
+            i += 1;
+        }
         Expr::Concat(parts)
+    }
+
+    /// Field layout of a record type name: (field name, lsb offset, width)
+    /// per field, in declaration order (first field = MSB of the flat vector).
+    fn record_fields_of_type(&self, type_name: &str) -> Vec<(String, usize, usize)> {
+        let Some(TypeInfo::Record { fields }) = self.types.get(type_name) else {
+            return Vec::new();
+        };
+        let total: usize = fields.iter().map(|f| f.1).sum();
+        let mut run = 0usize;
+        let mut out = Vec::new();
+        for (fn_, w, _) in fields {
+            out.push((fn_.clone(), total - run - w, *w));
+            run += w;
+        }
+        out
+    }
+
+    /// Field layout of a record-typed LHS node, if it is one.
+    fn record_fields_of_lhs(&self, lhs: &SyntaxNode) -> Option<Vec<(String, usize, usize)>> {
+        if lhs.kind() != SyntaxKind::Name {
+            return None;
+        }
+        let name = self.text(lhs);
+        let base = name.split('.').next().unwrap_or("").to_ascii_lowercase();
+        let id = self.sig_id(&base)?;
+        let tn = self.sig_rec.get(&id)?;
+        let out = self.record_fields_of_type(tn);
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Lower a record aggregate: named associations (`field => value`) are
+    /// placed by declaration order, positional ones in order; each field value
+    /// is resized to the field width. Unassigned fields (no `others`) → X.
+    fn lower_record_aggregate(
+        &mut self,
+        e: &SyntaxNode,
+        fields: &[(String, usize, usize)],
+        env: &HashMap<String, Value>,
+    ) -> Expr {
+        let kids = real_children(e);
+        let mut named: Vec<(String, usize)> = Vec::new();
+        let mut positional: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < kids.len() {
+            let k = &kids[i];
+            let arrow = kids
+                .get(i + 1)
+                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
+                .unwrap_or(false)
+                && kids
+                    .get(i + 2)
+                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
+                    .unwrap_or(false);
+            if arrow {
+                named.push((self.text(k).to_ascii_lowercase(), i + 3));
+                i += 4;
+            } else if is_expr_node(k.kind()) {
+                positional.push(i);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let others = named.iter().find(|(n, _)| n == "others").map(|(_, v)| *v);
+        let mut parts: Vec<Expr> = Vec::new();
+        for (fi, (fname, _, fw)) in fields.iter().enumerate() {
+            let vi = named
+                .iter()
+                .find(|(n, _)| n == fname)
+                .map(|(_, v)| *v)
+                .or(others);
+            let raw = match vi {
+                Some(vi) => self.lower_expr(&kids[vi], env),
+                None => positional
+                    .get(fi)
+                    .map(|&pi| self.lower_expr(&kids[pi], env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(*fw))),
+            };
+            parts.push(Expr::Resize {
+                e: Box::new(raw),
+                width: *fw,
+                signed: false,
+            });
+        }
+        Expr::Concat(parts)
+    }
+
+    /// Lower an assignment RHS, using the LHS record type (if any) to order
+    /// named aggregate associations.
+    fn lower_rhs(
+        &mut self,
+        lhs: &SyntaxNode,
+        rhs: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> Expr {
+        if rhs.kind() == SyntaxKind::Aggregate {
+            if let Some(fields) = self.record_fields_of_lhs(lhs) {
+                return self.lower_record_aggregate(rhs, &fields, env);
+            }
+        }
+        self.lower_expr(rhs, env)
     }
 
     fn lower_literal(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
