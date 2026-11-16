@@ -3,7 +3,7 @@
 //! module/entity with parameter/port/instance tables and syntax-highlighted
 //! source. Instances link to the page of the instantiated unit.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::doc::generate_docs;
 use hdl_ir::Design;
@@ -14,6 +14,8 @@ use std::path::PathBuf;
     about = "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
 )]
 struct DocArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Output directory (default: html-docs/).
     #[arg(long, short = 'o', default_value = "html-docs")]
     out: PathBuf,
@@ -31,11 +33,11 @@ impl Command for Doc {
         "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<DocArgs>("doc", &rest) {
+        let a = match parse_with::<DocArgs>("doc", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let out = a.out;
         let (mut mgr, root) = build_manager(&opts)?;
         if a.files.is_empty() {

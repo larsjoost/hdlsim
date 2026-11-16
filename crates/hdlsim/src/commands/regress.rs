@@ -6,7 +6,7 @@
 //! CoverageCollector per test and folds its report into the XML.
 
 use super::{
-    build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command, CommonOpts,
+    build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs, CommonOpts,
 };
 use clap::Parser;
 use hdl_ir::elab;
@@ -50,6 +50,8 @@ struct TestResult {
     about = "run a regression list of testbenches: hdlsim regress [--list tests.txt] [--junit out.xml] [--max-time T] [--coverage] [tops...]"
 )]
 struct RegressArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Write a JUnit XML report to this file.
     #[arg(long)]
     junit: Option<PathBuf>,
@@ -78,11 +80,11 @@ impl Command for Regress {
     }
 
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<RegressArgs>("regress", &rest) {
+        let a = match parse_with::<RegressArgs>("regress", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let junit = a.junit;
         let list = a.list;
         let max_time_fs = match &a.max_time {

@@ -4,7 +4,7 @@
 //! that defines the top (`--lang verilog|vhdl` overrides). Output goes to
 //! stdout, or to `-o FILE`.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab::UnitResolver;
 use hdl_ir::gen;
@@ -17,6 +17,8 @@ use std::path::PathBuf;
     about = "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
 )]
 struct GenArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// What to generate ("tb").
     what: String,
     /// Top-level unit.
@@ -42,11 +44,11 @@ impl Command for Gen {
         "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<GenArgs>("gen", &rest) {
+        let a = match parse_with::<GenArgs>("gen", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         if a.what != "tb" {
             return Err(
                 "usage: hdlsim gen tb --top <unit> [-o out.v] [--lang verilog|vhdl] [files...]"

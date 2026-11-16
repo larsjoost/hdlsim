@@ -7,7 +7,7 @@
 //! 1 = a property is violated (counterexample trace printed), 2 = usage or
 //! unsupported-construct error.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -19,6 +19,8 @@ use std::path::PathBuf;
     about = "prove properties with bounded model checking: hdlsim prove [--top t] [--bmc N] [files...]"
 )]
 struct ProveArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Top-level unit (default: the single compiled module).
     #[arg(long)]
     top: Option<String>,
@@ -39,11 +41,11 @@ impl Command for Prove {
         "bounded model check a DUT: hdlsim prove --top dut [--bmc N] files..."
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<ProveArgs>("prove", &rest) {
+        let a = match parse_with::<ProveArgs>("prove", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let top = a.top;
         let bmc = a.bmc;
         if a.files.is_empty() && top.is_none() {

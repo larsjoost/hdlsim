@@ -2,7 +2,7 @@
 //! (currently: never-driven W0501 / never-read W0502 signals per module).
 //! Prints lint-style findings and exits 1 if any are found, like `lint`.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::analyze;
 use hdl_ir::Design;
@@ -12,6 +12,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about = "static design heuristics (undriven/unread signals): hdlsim analyze [files...]")]
 struct AnalyzeArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Source files.
     files: Vec<PathBuf>,
 }
@@ -26,11 +28,11 @@ impl Command for Analyze {
         "static design heuristics (undriven/unread signals): hdlsim analyze [files...]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<AnalyzeArgs>("analyze", &rest) {
+        let a = match parse_with::<AnalyzeArgs>("analyze", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         if a.files.is_empty() {
             return Err("no input files".to_string());
         }

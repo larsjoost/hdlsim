@@ -3,7 +3,7 @@
 //! missing units on demand from the libraries), then prints the compiled
 //! file set — one canonical path per line, sorted.
 
-use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -12,6 +12,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about = "list all files a top unit depends on: hdlsim deps --top tb [files...]")]
 struct DepsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Top-level unit to elaborate.
     #[arg(long)]
     top: String,
@@ -29,11 +31,11 @@ impl Command for Deps {
         "list all files a top unit depends on: hdlsim deps --top tb [files...]"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<DepsArgs>("deps", &rest) {
+        let a = match parse_with::<DepsArgs>("deps", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = a
             .files

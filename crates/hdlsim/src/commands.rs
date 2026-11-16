@@ -2,10 +2,12 @@
 //!
 //! Each subcommand is a module under `commands/` implementing [`Command`] and
 //! registered in [`COMMANDS`]. `dispatch` looks the first argument up in the
-//! registry. Shared flags (`-L`, `--config`, `-I`) are parsed once in
-//! [`extract_common`] and turned into a `LibraryManager` by [`build_manager`].
-//! A command parses its own args with a `clap::Parser` derive via [`parse_with`]
-//! (see `commands/deps.rs` for the pattern).
+//! registry. A command parses its args with a `clap::Parser` derive via
+//! [`parse_with`], flattening in [`CommonArgs`] for the shared `-L`/`--config`/
+//! `-I`/`--bundle` flags (see `commands/deps.rs` for the pattern); the parsed
+//! [`CommonOpts`] are turned into a `LibraryManager` by [`build_manager`].
+//! `--color`/`--no-color` are handled globally in `main.rs` because they must
+//! work before the subcommand name.
 
 mod analyze;
 mod assist;
@@ -86,43 +88,36 @@ pub struct CommonOpts {
     pub bundle: Option<PathBuf>,
 }
 
-/// Split `args` into common library flags and the rest.
-pub fn extract_common(args: &[String]) -> Result<(CommonOpts, Vec<String>), String> {
-    let mut opts = CommonOpts::default();
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-L" | "--lib" => {
-                let v = args.get(i + 1).ok_or("-L needs a name=path value")?;
-                let (n, p) = parse_lib_mapping(v)?;
-                opts.libs.push((n, p));
-                i += 2;
-            }
-            "--config" => {
-                opts.config = Some(PathBuf::from(
-                    args.get(i + 1).ok_or("--config needs a value")?,
-                ));
-                i += 2;
-            }
-            "-I" | "--incdir" => {
-                opts.incdirs
-                    .push(PathBuf::from(args.get(i + 1).ok_or("-I needs a value")?));
-                i += 2;
-            }
-            "--bundle" => {
-                opts.bundle = Some(PathBuf::from(
-                    args.get(i + 1).ok_or("--bundle needs a value")?,
-                ));
-                i += 2;
-            }
-            other => {
-                rest.push(other.to_string());
-                i += 1;
-            }
+/// Shared library/include/bundle flags. Commands that compile sources flatten
+/// this into their args struct: `#[command(flatten)] common: CommonArgs`.
+#[derive(clap::Args, Clone, Default)]
+pub struct CommonArgs {
+    /// Map a logical library to a directory: -L name=path.
+    #[arg(long, short = 'L', value_name = "name=path")]
+    pub lib: Vec<String>,
+    /// Library config file (default: ./hdlsim.ini if present).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Add an `include search directory.
+    #[arg(long, short = 'I')]
+    pub incdir: Vec<PathBuf>,
+    /// Read the whole project from a reproducer .tar.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+}
+
+impl CommonArgs {
+    /// Validate (`name=path`) and convert into [`CommonOpts`].
+    pub fn into_opts(self) -> Result<CommonOpts, String> {
+        let mut opts = CommonOpts::default();
+        for v in &self.lib {
+            opts.libs.push(parse_lib_mapping(v)?);
         }
+        opts.config = self.config;
+        opts.incdirs = self.incdir;
+        opts.bundle = self.bundle;
+        Ok(opts)
     }
-    Ok((opts, rest))
 }
 
 /// Parse a subcommand's args with its `clap::Parser` derive. `cmd` is the
@@ -330,6 +325,7 @@ pub fn dispatch(args: &[String]) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn help_lists_commands() {
@@ -367,21 +363,35 @@ mod tests {
     }
 
     #[test]
-    fn extracts_common_flags() {
-        let args = vec![
-            "-L".to_string(),
-            "work=./rtl".to_string(),
-            "--lib".to_string(),
-            "ieee=./ieee".to_string(),
-            "-I".to_string(),
-            "inc".to_string(),
-            "tb.v".to_string(),
-        ];
-        let (opts, rest) = extract_common(&args).unwrap();
+    fn common_args_parse_and_validate() {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            common: CommonArgs,
+            file: String,
+        }
+        let t = T::try_parse_from([
+            "x",
+            "-L",
+            "work=./rtl",
+            "--lib",
+            "ieee=./ieee",
+            "-I",
+            "inc",
+            "--bundle",
+            "b.tar",
+            "tb.v",
+        ])
+        .unwrap();
+        assert_eq!(t.file, "tb.v");
+        let opts = t.common.into_opts().unwrap();
         assert_eq!(opts.libs.len(), 2);
         assert_eq!(opts.libs[0].0, "work");
         assert_eq!(opts.incdirs, vec![PathBuf::from("inc")]);
-        assert_eq!(rest, vec!["tb.v".to_string()]);
+        assert_eq!(opts.bundle, Some(PathBuf::from("b.tar")));
+        // Bad name=path is a validation error, not a parse error.
+        let t = T::try_parse_from(["x", "-L", "noequals", "tb.v"]).unwrap();
+        assert!(t.common.into_opts().is_err());
         assert!(parse_lib_mapping("noequals").is_err());
     }
 }

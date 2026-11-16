@@ -13,7 +13,7 @@
 //! explanation.
 
 use super::{
-    build_manager, dispatch, extract_common, parse_with, remap_into_bundle, Command, CommonOpts,
+    build_manager, dispatch, parse_with, remap_into_bundle, Command, CommonArgs, CommonOpts,
 };
 use clap::Parser;
 use hdl_ir::elab;
@@ -381,6 +381,8 @@ pub struct Assist;
     about = "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
 )]
 struct AssistArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     /// Execute the suggested command instead of only printing it.
     #[arg(long, short = 'y')]
     yes: bool,
@@ -399,11 +401,11 @@ impl Command for Assist {
         "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let (opts, rest) = extract_common(args)?;
-        let a = match parse_with::<AssistArgs>("assist", &rest) {
+        let a = match parse_with::<AssistArgs>("assist", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
+        let opts = a.common.into_opts()?;
         let yes = a.yes;
         let top = a.top;
         let prompt = a.prompt.join(" ");
