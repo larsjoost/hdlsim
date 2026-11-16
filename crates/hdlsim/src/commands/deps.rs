@@ -3,10 +3,21 @@
 //! missing units on demand from the libraries), then prints the compiled
 //! file set — one canonical path per line, sorted.
 
-use super::{build_manager, extract_common, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(about = "list all files a top unit depends on: hdlsim deps --top tb [files...]")]
+struct DepsArgs {
+    /// Top-level unit to elaborate.
+    #[arg(long)]
+    top: String,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct Deps;
 
@@ -19,31 +30,20 @@ impl Command for Deps {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut top: Option<String> = None;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let top = top.ok_or("usage: hdlsim deps --top <unit> [files...]")?;
+        let a = match parse_with::<DepsArgs>("deps", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
         let (mut mgr, root) = build_manager(&opts)?;
-        let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
+        let files: Vec<PathBuf> = a
+            .files
+            .iter()
+            .map(|f| remap_into_bundle(f, &root))
+            .collect();
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         // Elaborating the top pulls in every transitively referenced unit.
-        let res = elab::elaborate_with(&mut design, &top, &mut mgr);
+        let res = elab::elaborate_with(&mut design, &a.top, &mut mgr);
         let mut failed = false;
         if let Err(e) = res {
             eprintln!("hdlsim deps: elaboration error: {}", e);

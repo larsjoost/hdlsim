@@ -27,7 +27,9 @@ hdlsim = { path = "crates/hdlsim", version = "0.2.0" }
 # a reasonable fit; a crate opts in to one of these with `x.workspace = true`.
 thiserror = "2"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# default-features off: no ANSI color in clap's own output (the binary has its
+# own --color/NO_COLOR handling) and no strsim dependency for suggestions.
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 serde = { version = "1", features = ["derive"] }
 # arbitrary_precision keeps number lexemes verbatim (JSON-RPC ids round-trip).
 serde_json = { version = "1", features = ["arbitrary_precision"] }

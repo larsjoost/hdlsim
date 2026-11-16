@@ -4,6 +4,8 @@
 //! registered in [`COMMANDS`]. `dispatch` looks the first argument up in the
 //! registry. Shared flags (`-L`, `--config`, `-I`) are parsed once in
 //! [`extract_common`] and turned into a `LibraryManager` by [`build_manager`].
+//! A command parses its own args with a `clap::Parser` derive via [`parse_with`]
+//! (see `commands/deps.rs` for the pattern).
 
 mod analyze;
 mod assist;
@@ -121,6 +123,21 @@ pub fn extract_common(args: &[String]) -> Result<(CommonOpts, Vec<String>), Stri
         }
     }
     Ok((opts, rest))
+}
+
+/// Parse a subcommand's args with its `clap::Parser` derive. `cmd` is the
+/// subcommand name, shown in usage/help as `hdlsim <cmd>`. On `--help` or a
+/// parse error the message is printed (stdout for help, stderr for errors) and
+/// the exit code is returned as `Err` (0 for help, 2 for errors).
+pub fn parse_with<T: clap::Parser>(cmd: &str, args: &[String]) -> Result<T, i32> {
+    let argv = std::iter::once(format!("hdlsim {}", cmd)).chain(args.iter().cloned());
+    match T::try_parse_from(argv) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = e.print();
+            Err(if e.use_stderr() { 2 } else { 0 })
+        }
+    }
 }
 
 /// Parse a `name=path` library mapping (`-L work=./rtl`).
@@ -322,6 +339,20 @@ mod tests {
     #[test]
     fn unknown_command_is_an_error() {
         assert!(dispatch(&["frobnicate".to_string()]).is_err());
+    }
+
+    #[test]
+    fn clap_help_and_parse_error_exit_codes() {
+        // --help prints usage and exits 0; parse errors print to stderr, exit 2.
+        assert_eq!(
+            dispatch(&["deps".to_string(), "--help".to_string()]).unwrap(),
+            0
+        );
+        assert_eq!(dispatch(&["deps".to_string()]).unwrap(), 2);
+        assert_eq!(
+            dispatch(&["doctor".to_string(), "extra".to_string()]).unwrap(),
+            2
+        );
     }
 
     #[test]
