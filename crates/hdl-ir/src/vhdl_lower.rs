@@ -3422,6 +3422,7 @@ fn vhdl_binop(op: &str) -> Option<BinOp> {
         "*" => BinOp::Mul,
         "/" => BinOp::Div,
         "mod" | "rem" => BinOp::Mod,
+        "**" => BinOp::Pow,
         "=" => BinOp::Eq,
         "/=" => BinOp::Ne,
         "?=" => BinOp::EqM,
