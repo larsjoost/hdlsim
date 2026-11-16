@@ -40,7 +40,7 @@ impl Command for Prove {
     fn about(&self) -> &'static str {
         "bounded model check a DUT: hdlsim prove --top dut [--bmc N] files..."
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ProveArgs>("prove", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -49,7 +49,9 @@ impl Command for Prove {
         let top = a.top;
         let bmc = a.bmc;
         if a.files.is_empty() && top.is_none() {
-            return Err("no input files (or pass --top to resolve from libraries)".to_string());
+            return Err(anyhow::anyhow!(
+                "no input files (or pass --top to resolve from libraries)"
+            ));
         }
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = a
@@ -70,17 +72,17 @@ impl Command for Prove {
                     design.modules[0].name.clone()
                 } else {
                     let names: Vec<&str> = design.modules.iter().map(|m| m.name.as_str()).collect();
-                    return Err(format!(
+                    return Err(anyhow::anyhow!(
                         "multiple modules ({}); pick one with --top",
                         names.join(", ")
                     ));
                 }
             }
         };
-        wrap_top(&mut design, &top_name)?;
+        wrap_top(&mut design, &top_name).map_err(anyhow::Error::msg)?;
         let flat = elab::elaborate_with(&mut design, "__hdlsim_prove_top", &mut mgr)
-            .map_err(|e| format!("elaboration error: {}", e))?;
-        let r = prove(&flat, bmc)?;
+            .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
+        let r = prove(&flat, bmc).map_err(anyhow::Error::msg)?;
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }

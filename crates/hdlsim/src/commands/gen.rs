@@ -43,27 +43,29 @@ impl Command for Gen {
     fn about(&self) -> &'static str {
         "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<GenArgs>("gen", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
         if a.what != "tb" {
-            return Err(
+            return Err(anyhow::anyhow!(
                 "usage: hdlsim gen tb --top <unit> [-o out.v] [--lang verilog|vhdl] [files...]"
-                    .to_string(),
-            );
+            ));
         }
         let lang = match a.lang.as_deref().map(str::to_ascii_lowercase) {
             Some(v) => match v.as_str() {
                 "verilog" | "v" | "sv" => Some(Language::Verilog),
                 "vhdl" | "vhd" => Some(Language::Vhdl),
-                other => return Err(format!("unknown language '{}'", other)),
+                other => return Err(anyhow::anyhow!("unknown language '{}'", other)),
             },
             None => None,
         };
-        let top = a.top.ok_or("--top is required")?;
+        let top = a
+            .top
+            .ok_or("--top is required")
+            .map_err(anyhow::Error::msg)?;
         let out = a.out;
         let files: Vec<PathBuf> = a.files;
         let (mut mgr, root) = build_manager(&opts)?;
@@ -97,11 +99,11 @@ impl Command for Gen {
                 .or_else(|| files.first().and_then(|f| Language::from_path(f)))
                 .unwrap_or(Language::Verilog),
         };
-        let src = gen::testbench(&design, &top, lang)?;
+        let src = gen::testbench(&design, &top, lang).map_err(anyhow::Error::msg)?;
         match &out {
             Some(p) => {
                 std::fs::write(p, &src)
-                    .map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {}", p.display(), e))?;
                 println!(
                     "wrote {} ({} lines, {})",
                     p.display(),

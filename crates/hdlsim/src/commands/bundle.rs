@@ -47,7 +47,7 @@ impl Command for Bundle {
     fn about(&self) -> &'static str {
         "pack the project into one .tar reproducer for a bug report: hdlsim bundle --out repro.tar [--top tb] [files]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<BundleArgs>("bundle", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -70,7 +70,7 @@ impl Command for Bundle {
         let mut libs: Vec<(String, PathBuf)> = Vec::new();
         if let Some(c) = &cfg {
             let text = std::fs::read_to_string(c)
-                .map_err(|e| format!("cannot read {}: {}", c.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", c.display(), e))?;
             let base = c.parent().unwrap_or_else(|| Path::new("."));
             for (n, p) in parse_library_config(&text, base) {
                 if !libs.iter().any(|(e, _)| e == &n) {
@@ -91,12 +91,12 @@ impl Command for Bundle {
             size: &mut u64,
             path: String,
             data: Vec<u8>,
-        ) -> Result<(), String> {
+        ) -> anyhow::Result<()> {
             *size += data.len() as u64;
             if *size > SIZE_CAP {
-                return Err(
-                    "bundle exceeds 256 MB — refusing to pack (is a build dir mapped?)".to_string(),
-                );
+                return Err(anyhow::anyhow!(
+                    "bundle exceeds 256 MB — refusing to pack (is a build dir mapped?)"
+                ));
             }
             entries.push(BundleEntry { path, data });
             Ok(())
@@ -113,14 +113,15 @@ impl Command for Bundle {
             if lib_dirs.iter().any(|d| canon.starts_with(d)) {
                 continue; // already packed via libs/<name>/
             }
-            let data =
-                std::fs::read(f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+            let data = std::fs::read(f)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", f.display(), e))?;
             let rel = rel_of(
                 f,
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             );
             src_files.push(rel.clone());
-            push(&mut entries, &mut size, format!("src/{}", rel), data)?;
+            push(&mut entries, &mut size, format!("src/{}", rel), data)
+                .map_err(anyhow::Error::msg)?;
         }
 
         // libs/<name>/: full recursive copy of each library directory.
@@ -129,13 +130,15 @@ impl Command for Bundle {
                 continue;
             }
             let safe = sanitize(n);
-            walk_files(p, p, &format!("libs/{}", safe), &mut entries, &mut size)?;
+            walk_files(p, p, &format!("libs/{}", safe), &mut entries, &mut size)
+                .map_err(anyhow::Error::msg)?;
         }
 
         // inc/<i>/: include search dirs.
         for (idx, d) in opts.incdirs.iter().enumerate() {
             if d.is_dir() {
-                walk_files(d, d, &format!("inc/{}", idx), &mut entries, &mut size)?;
+                walk_files(d, d, &format!("inc/{}", idx), &mut entries, &mut size)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
 
@@ -154,12 +157,14 @@ impl Command for Bundle {
             &mut size,
             "hdlsim.ini".to_string(),
             ini.into_bytes(),
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
 
         // Original config for reference.
         if let Some(c) = &cfg {
             if let Ok(text) = std::fs::read(c) {
-                push(&mut entries, &mut size, "hdlsim.ini.orig".to_string(), text)?;
+                push(&mut entries, &mut size, "hdlsim.ini.orig".to_string(), text)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
 
@@ -222,10 +227,12 @@ impl Command for Bundle {
             &mut size,
             "REPRO.md".to_string(),
             repro.into_bytes(),
-        )?;
+        )
+        .map_err(anyhow::Error::msg)?;
 
-        let tar = write_tar(&entries)?;
-        std::fs::write(&out, &tar).map_err(|e| format!("cannot write {}: {}", out.display(), e))?;
+        let tar = write_tar(&entries).map_err(anyhow::Error::msg)?;
+        std::fs::write(&out, &tar)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {}", out.display(), e))?;
         println!(
             "hdlsim: wrote {} ({} files, {} bytes) — attach it to a GitHub issue",
             out.display(),
@@ -282,7 +289,7 @@ fn walk_files(
     prefix: &str,
     entries: &mut Vec<BundleEntry>,
     size: &mut u64,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let mut children: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
         Err(_) => return Ok(()), // unreadable dir: skip
@@ -292,11 +299,12 @@ fn walk_files(
         if p.is_dir() {
             walk_files(&p, base, prefix, entries, size)?;
         } else if p.is_file() {
-            let data =
-                std::fs::read(&p).map_err(|e| format!("cannot read {}: {}", p.display(), e))?;
+            let data = std::fs::read(&p)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {}", p.display(), e))
+                .map_err(anyhow::Error::msg)?;
             *size += data.len() as u64;
             if *size > SIZE_CAP {
-                return Err("bundle exceeds 256 MB — refusing to pack".to_string());
+                return Err(anyhow::anyhow!("bundle exceeds 256 MB — refusing to pack"));
             }
             entries.push(BundleEntry {
                 path: format!("{}/{}", prefix, rel_of(&p, base)),

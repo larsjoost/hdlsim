@@ -43,7 +43,7 @@ impl Command for Completions {
     fn about(&self) -> &'static str {
         "print a shell completion script: hdlsim completions <bash|zsh|fish>"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<CompletionsArgs>("completions", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -59,7 +59,7 @@ impl Command for Completions {
                 print!("{}", s);
                 Ok(0)
             }
-            None => Err(format!(
+            None => Err(anyhow::anyhow!(
                 "unknown shell '{}' (expected bash, zsh or fish)",
                 shell
             )),

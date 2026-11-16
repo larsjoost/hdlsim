@@ -32,7 +32,7 @@ impl Command for Doc {
     fn about(&self) -> &'static str {
         "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DocArgs>("doc", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -41,7 +41,9 @@ impl Command for Doc {
         let out = a.out;
         let (mut mgr, root) = build_manager(&opts)?;
         if a.files.is_empty() {
-            return Err("no input files (or pass files to document)".to_string());
+            return Err(anyhow::anyhow!(
+                "no input files (or pass files to document)"
+            ));
         }
         let files: Vec<PathBuf> = a
             .files
@@ -55,7 +57,7 @@ impl Command for Doc {
             return Ok(1);
         }
         let all_files = mgr.compiled_files();
-        let summary = generate_docs(&design, &all_files, &out)?;
+        let summary = generate_docs(&design, &all_files, &out).map_err(anyhow::Error::msg)?;
         for u in &summary.units {
             println!("  {} ({}) -> {}", u.name, u.lang.name(), u.page);
         }

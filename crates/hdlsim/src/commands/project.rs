@@ -41,7 +41,7 @@ impl Command for Project {
     fn about(&self) -> &'static str {
         "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ProjectArgs>("project", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -50,8 +50,10 @@ impl Command for Project {
         let format = ProjectFormat::from_str(
             a.format
                 .as_deref()
-                .ok_or("missing --format (vivado|json)")?,
-        )?;
+                .ok_or("missing --format (vivado|json)")
+                .map_err(anyhow::Error::msg)?,
+        )
+        .map_err(anyhow::Error::msg)?;
         let out = a.out;
         let mut spec = ProjectSpec::default();
         spec.name = a.name.unwrap_or_default();
@@ -60,7 +62,7 @@ impl Command for Project {
         spec.part = a.part;
         spec.files = a.files;
         if spec.files.is_empty() {
-            return Err("no input files".to_string());
+            return Err(anyhow::anyhow!("no input files"));
         }
         let (mgr, root) = build_manager(&opts)?;
         spec.files = spec
@@ -77,11 +79,11 @@ impl Command for Project {
         if spec.name.is_empty() {
             spec.name = "hdlsim_proj".to_string();
         }
-        let text = generate(&spec, format, Some(&mgr))?;
+        let text = generate(&spec, format, Some(&mgr)).map_err(anyhow::Error::msg)?;
         match out {
             Some(path) => {
                 std::fs::write(&path, &text)
-                    .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {}", path.display(), e))?;
                 println!("hdlsim: wrote {} ({})", path.display(), format.extension());
             }
             None => print!("{}", text),

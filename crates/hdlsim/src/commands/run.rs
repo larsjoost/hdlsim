@@ -88,7 +88,7 @@ impl Command for Run {
     fn about(&self) -> &'static str {
         "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--hwf out.hwf] [--fst out.fst] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<RunArgs>("run", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -114,7 +114,9 @@ impl Command for Run {
         // Files may be omitted when --top is given: the top (and its
         // dependencies) are then resolved on demand from the libraries.
         if files.is_empty() && top.is_none() {
-            return Err("no input files (or pass --top to resolve from libraries)".to_string());
+            return Err(anyhow::anyhow!(
+                "no input files (or pass --top to resolve from libraries)"
+            ));
         }
         // Compile the explicit files, then let elaboration pull in any missing
         // design units from the configured libraries on demand.
@@ -133,7 +135,7 @@ impl Command for Run {
                     design.modules[0].name.clone()
                 } else {
                     let names: Vec<&str> = design.modules.iter().map(|m| m.name.as_str()).collect();
-                    return Err(format!(
+                    return Err(anyhow::anyhow!(
                         "multiple modules ({}); pick one with --top",
                         names.join(", ")
                     ));
@@ -141,12 +143,12 @@ impl Command for Run {
             }
         };
         let flat = elab::elaborate_with(&mut design, &top_name, &mut mgr)
-            .map_err(|e| format!("elaboration error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
         let mut sim = match &restore {
-            Some(p) => Simulator::restore_checkpoint(flat, p)?,
+            Some(p) => Simulator::restore_checkpoint(flat, p).map_err(anyhow::Error::msg)?,
             None => Simulator::new(flat),
         };
         if let Some(s) = seed {
@@ -167,7 +169,7 @@ impl Command for Run {
         };
         if let Some(path) = vcd {
             let file = std::fs::File::create(&path)
-                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {}", path.display(), e))?;
             let sink = hdl_wave::sinks::vcd::VcdSink::new(file, sim.flat());
             sim.add_observer(Box::new(hdl_wave::SinkAdapter {
                 sink,
@@ -176,7 +178,7 @@ impl Command for Run {
         }
         if let Some(path) = hwf {
             let file = std::fs::File::create(&path)
-                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {}", path.display(), e))?;
             let sink = hdl_wave::sinks::hwf::HwfSink::new(file, sim.flat());
             sim.add_observer(Box::new(hdl_wave::SinkAdapter {
                 sink,
@@ -186,7 +188,7 @@ impl Command for Run {
         }
         if let Some(path) = fst {
             let file = std::fs::File::create(&path)
-                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {}", path.display(), e))?;
             let sink = hdl_wave::sinks::fst::FstSink::new(file, sim.flat());
             sim.add_observer(Box::new(hdl_wave::SinkAdapter {
                 sink,
@@ -196,7 +198,7 @@ impl Command for Run {
         }
         if let Some(path) = wave {
             let file = std::fs::File::create(&path)
-                .map_err(|e| format!("cannot create {}: {}", path.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {}", path.display(), e))?;
             let sink = hdl_wave::sinks::html::HtmlSink::new(file, path.clone(), sim.flat());
             sim.add_observer(Box::new(hdl_wave::SinkAdapter {
                 sink,
@@ -207,7 +209,7 @@ impl Command for Run {
         let (live_bus, live_port) = if live {
             let bus = hdl_wave::sinks::live::LiveBus::new(sim.flat());
             let (bound, _server) = hdl_wave::sinks::live::spawn_live_server(bus.clone(), port)
-                .map_err(|e| format!("cannot start live server on port {}: {}", port, e))?;
+                .map_err(|e| anyhow::anyhow!("cannot start live server on port {}: {}", port, e))?;
             sim.set_stop_flag(bus.stop_flag());
             sim.add_observer(Box::new(hdl_wave::SinkAdapter {
                 sink: hdl_wave::sinks::live::LiveSink::new(bus.clone()),
@@ -230,7 +232,7 @@ impl Command for Run {
         );
         if let Some(p) = &checkpoint {
             sim.save_checkpoint(p)
-                .map_err(|e| format!("cannot write checkpoint {}: {}", p.display(), e))?;
+                .map_err(|e| anyhow::anyhow!("cannot write checkpoint {}: {}", p.display(), e))?;
             println!("hdlsim: checkpoint written to {}", p.display());
         }
         if let Some(cov) = &cov {
@@ -238,7 +240,7 @@ impl Command for Run {
             match &coverage_out {
                 Some(p) => {
                     std::fs::write(p, &report)
-                        .map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+                        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", p.display(), e))?;
                     println!("hdlsim: coverage report written to {}", p.display());
                 }
                 None => print!("{}", report),

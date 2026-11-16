@@ -27,7 +27,7 @@ impl Command for Lsp {
     fn about(&self) -> &'static str {
         "run an LSP server on stdio (initialize + live parse diagnostics)"
     }
-    fn run(&self, _args: &[String]) -> Result<i32, String> {
+    fn run(&self, _args: &[String]) -> anyhow::Result<i32> {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let mut r = stdin.lock();

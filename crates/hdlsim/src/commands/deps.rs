@@ -30,7 +30,7 @@ impl Command for Deps {
     fn about(&self) -> &'static str {
         "list all files a top unit depends on: hdlsim deps --top tb [files...]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DepsArgs>("deps", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),

@@ -29,7 +29,7 @@ impl Command for Wave {
     fn about(&self) -> &'static str {
         "render a .hwf/.fst wave file to the HTML viewer: hdlsim wave file.hwf [-o out.html]"
     }
-    fn run(&self, args: &[String]) -> Result<i32, String> {
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<WaveArgs>("wave", args) {
             Ok(a) => a,
             Err(code) => return Ok(code),
@@ -39,14 +39,14 @@ impl Command for Wave {
             Some(p) => p.clone(),
             None => input.with_extension("html"),
         };
-        let bytes =
-            std::fs::read(&input).map_err(|e| format!("cannot read {}: {}", input.display(), e))?;
+        let bytes = std::fs::read(&input)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {}", input.display(), e))?;
         let (flat, events) = match input.extension().and_then(|e| e.to_str()) {
-            Some("fst") => hdl_wave::fst::read_fst(&bytes)?,
-            _ => hdl_wave::sinks::hwf::read_hwf(&bytes)?,
+            Some("fst") => hdl_wave::fst::read_fst(&bytes).map_err(anyhow::Error::msg)?,
+            _ => hdl_wave::sinks::hwf::read_hwf(&bytes).map_err(anyhow::Error::msg)?,
         };
         let file = std::fs::File::create(&out)
-            .map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("cannot create {}: {}", out.display(), e))?;
         let mut sink = hdl_wave::sinks::html::HtmlSink::new(file, out.clone(), &flat);
         for ev in &events {
             sink.on_event(ev, &flat);
