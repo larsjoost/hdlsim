@@ -52,7 +52,7 @@ impl<W: Write> VcdSink<W> {
         let _ = writeln!(self.w, "    hdlsim");
         let _ = writeln!(self.w, "$end");
         let _ = writeln!(self.w, "$version");
-        let _ = writeln!(self.w, "    hdlsim 0.1.0");
+        let _ = writeln!(self.w, "    hdlsim {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(self.w, "$end");
         let _ = writeln!(self.w, "$timescale 1fs $end");
         // Scope tree.

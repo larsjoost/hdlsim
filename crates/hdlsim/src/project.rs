@@ -178,7 +178,8 @@ pub fn manifest_json(spec: &ProjectSpec, mgr: Option<&LibraryManager>) -> Result
     let mut j = String::new();
     j.push_str("{\n");
     j.push_str(&format!(
-        "  \"tool\": \"hdlsim\",\n  \"version\": \"0.1.0\",\n"
+        "  \"tool\": \"hdlsim\",\n  \"version\": \"{}\",\n",
+        env!("CARGO_PKG_VERSION")
     ));
     j.push_str(&format!("  \"name\": {},\n", js(&spec.name)));
     j.push_str(&format!(

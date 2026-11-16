@@ -24,6 +24,28 @@ fn counter_vcd_matches_golden() {
     assert_eq!(code, 0, "counter tb passes");
     let got = std::fs::read_to_string(&vcd).unwrap();
     let golden = include_str!("fixtures/counter_golden.vcd");
-    assert_eq!(got, golden, "VCD differs from golden fixture");
+    // The $version header embeds the crate version; normalize it so a version
+    // bump does not invalidate the golden waveform.
+    assert_eq!(
+        norm_tool_version(&got),
+        norm_tool_version(golden),
+        "VCD differs from golden fixture"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Replace the version token on the `$version` header line with a placeholder.
+fn norm_tool_version(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        match line.strip_prefix("    hdlsim ") {
+            Some(rest) => {
+                let end = rest.find('\n').unwrap_or(rest.len());
+                out.push_str("    hdlsim <version>");
+                out.push_str(&rest[end..]);
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
 }

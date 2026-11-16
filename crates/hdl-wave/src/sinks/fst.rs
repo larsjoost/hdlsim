@@ -17,7 +17,7 @@ use hdl_sim::events::SimEvent;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const WRITER_STR: &str = "hdlsim 0.1.0";
+const WRITER_STR: &str = concat!("hdlsim ", env!("CARGO_PKG_VERSION"));
 const TIMESCALE_FS: i8 = -15;
 
 /// Buffered `.fst` writer.

@@ -4,7 +4,7 @@ resolver = "2"
 
 # Shared package metadata — everything needed for `cargo publish` (crates.io).
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -16,12 +16,12 @@ authors = ["Lars Joost Jensen <larsjoostjensen@gmail.com>"]
 # Path deps also carry a version so `cargo publish` can rewrite them to
 # registry deps in the packaged manifests.
 [workspace.dependencies]
-hdl-syntax = { path = "crates/hdl-syntax", version = "0.1.0" }
-hdl-ir = { path = "crates/hdl-ir", version = "0.1.0" }
-hdl-lib = { path = "crates/hdl-lib", version = "0.1.0" }
-hdl-sim = { path = "crates/hdl-sim", version = "0.1.0" }
-hdl-wave = { path = "crates/hdl-wave", version = "0.1.0" }
-hdlsim = { path = "crates/hdlsim", version = "0.1.0" }
+hdl-syntax = { path = "crates/hdl-syntax", version = "0.2.0" }
+hdl-ir = { path = "crates/hdl-ir", version = "0.2.0" }
+hdl-lib = { path = "crates/hdl-lib", version = "0.2.0" }
+hdl-sim = { path = "crates/hdl-sim", version = "0.2.0" }
+hdl-wave = { path = "crates/hdl-wave", version = "0.2.0" }
+hdlsim = { path = "crates/hdlsim", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3

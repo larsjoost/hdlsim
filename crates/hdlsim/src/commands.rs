@@ -49,7 +49,10 @@ impl Command for Help {
         "show this help"
     }
     fn run(&self, _args: &[String]) -> Result<i32, String> {
-        println!("hdlsim 0.1.0 — self-contained VHDL + Verilog simulator");
+        println!(
+            "hdlsim {} — self-contained VHDL + Verilog simulator",
+            env!("CARGO_PKG_VERSION")
+        );
         println!("usage: hdlsim <command> [args]");
         for c in COMMANDS {
             println!("  {:<12} {}", c.name(), c.about());
