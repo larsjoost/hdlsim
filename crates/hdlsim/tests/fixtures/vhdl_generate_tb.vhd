@@ -27,13 +27,11 @@ architecture sim of tb_generate is
   signal d, e, f, g, h : std_ulogic;
   signal acc : std_ulogic_vector(W-1 downto 0);
 begin
-  -- for-generate, ascending, with a per-iteration signal and an instance
+  -- for-generate, ascending, instantiating per bit with bit-slice port
+  -- connections (regression: out ports used to lower as `in`, so an out-port
+  -- connected to b(i) drove the implicit wire from b and looped)
   gen_b: for i in 0 to W-1 generate
-    signal xi, yi : std_ulogic;
-  begin
-    xi <= a(i);
-    u: entity work.inv1 port map (x => xi, y => yi);
-    b(i) <= yi;
+    u: entity work.inv1 port map (x => a(i), y => b(i));
   end generate;
 
   -- for-generate, descending
