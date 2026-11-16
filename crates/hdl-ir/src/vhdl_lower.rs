@@ -2206,7 +2206,7 @@ impl<'a> Lower<'a> {
             "to_integer" | "conv_integer" if args.len() == 1 => {
                 Expr::ToInt(Box::new(args.into_iter().next().unwrap()))
             }
-            "to_unsigned" if args.len() == 2 => {
+            "to_unsigned" | "conv_unsigned" | "conv_std_logic_vector" if args.len() == 2 => {
                 let w = const_eval(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
@@ -2216,7 +2216,7 @@ impl<'a> Lower<'a> {
                     signed: false,
                 }
             }
-            "to_signed" if args.len() == 2 => {
+            "to_signed" | "conv_signed" if args.len() == 2 => {
                 let w = const_eval(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;

@@ -15,7 +15,10 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
     vec![
         EmbeddedProvider::new(
             "std",
-            &[("standard", include_str!("../stdlib/std/standard.vhd"))],
+            &[
+                ("standard", include_str!("../stdlib/std/standard.vhd")),
+                ("env", include_str!("../stdlib/std/env.vhd")),
+            ],
         ),
         EmbeddedProvider::new(
             "ieee",
@@ -27,6 +30,22 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
                 (
                     "numeric_std",
                     include_str!("../stdlib/ieee/numeric_std.vhd"),
+                ),
+                (
+                    "std_logic_arith",
+                    include_str!("../stdlib/ieee/std_logic_arith.vhd"),
+                ),
+                (
+                    "std_logic_signed",
+                    include_str!("../stdlib/ieee/std_logic_signed.vhd"),
+                ),
+                (
+                    "std_logic_unsigned",
+                    include_str!("../stdlib/ieee/std_logic_unsigned.vhd"),
+                ),
+                (
+                    "std_logic_textio",
+                    include_str!("../stdlib/ieee/std_logic_textio.vhd"),
                 ),
             ],
         ),
@@ -78,7 +97,16 @@ mod tests {
             .iter()
             .flat_map(|p| p.scan().into_iter().map(|(u, _)| u))
             .collect();
-        for u in ["standard", "std_logic_1164", "numeric_std"] {
+        for u in [
+            "standard",
+            "env",
+            "std_logic_1164",
+            "numeric_std",
+            "std_logic_arith",
+            "std_logic_signed",
+            "std_logic_unsigned",
+            "std_logic_textio",
+        ] {
             assert!(units.contains(&u.to_string()), "{:?}", units);
         }
     }
@@ -112,8 +140,8 @@ mod tests {
             }
         }
         assert!(
-            count >= 3,
-            "expected at least 3 stdlib units, got {}",
+            count >= 8,
+            "expected at least 8 stdlib units, got {}",
             count
         );
     }

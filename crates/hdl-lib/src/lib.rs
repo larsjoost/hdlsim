@@ -60,6 +60,10 @@ pub struct LibraryManager {
     /// VHDL architectures whose entity was not in the same file; re-bound
     /// design-wide once all known files are lowered (see `compile_files`).
     pending_archs: Vec<hdl_ir::vhdl_lower::PendingArch>,
+    /// `use`d library units that failed to resolve while compiling a file:
+    /// (unit name, resolve error). Warned about at the end of `compile_files`
+    /// if still unresolved (a later explicit file may still provide them).
+    unresolved_units: Vec<(String, String)>,
 }
 
 impl LibraryManager {
@@ -76,6 +80,7 @@ impl LibraryManager {
             cache: None,
             cache_hits: 0,
             pending_archs: Vec::new(),
+            unresolved_units: Vec::new(),
         }
     }
 
@@ -223,7 +228,11 @@ impl LibraryManager {
             let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
             for unit in hdl_ir::vhdl_lower::context_units(&self.db, &parsed.root) {
                 if !design.packages.contains_key(&unit) {
-                    let _ = self.resolve(design, &unit);
+                    if let Err(e) = self.resolve(design, &unit) {
+                        if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
+                            self.unresolved_units.push((unit, e));
+                        }
+                    }
                 }
             }
         }
@@ -261,6 +270,25 @@ impl LibraryManager {
             }
         }
         self.retry_pending_architectures(design, true);
+        self.warn_unresolved_context_units(design);
+    }
+
+    /// Warn about `use`d library units that could not be resolved anywhere.
+    /// A warning, not an error: the design may still elaborate fine if the
+    /// unit is never actually referenced.
+    fn warn_unresolved_context_units(&mut self, design: &Design) {
+        let pending = std::mem::take(&mut self.unresolved_units);
+        for (unit, msg) in pending {
+            // A file compiled later in the list may have provided it.
+            if design.packages.contains_key(&unit) {
+                continue;
+            }
+            self.diags.push(Diagnostic::warning(
+                "W0501",
+                None,
+                format!("`use` of unresolved library unit '{unit}' has no effect: {msg}"),
+            ));
+        }
     }
 
     /// Re-bind deferred architectures against the design-wide module list.
@@ -619,7 +647,16 @@ mod tests {
         // compile cleanly through the real parse+lower pipeline — no disk
         // tree needed.
         let mut design = Design::default();
-        for unit in ["standard", "std_logic_1164", "numeric_std"] {
+        for unit in [
+            "standard",
+            "env",
+            "std_logic_1164",
+            "numeric_std",
+            "std_logic_arith",
+            "std_logic_signed",
+            "std_logic_unsigned",
+            "std_logic_textio",
+        ] {
             // Packages compile but produce no module, so resolve may return
             // Ok(false); what matters is that compilation is error-free.
             assert!(mgr.resolve(&mut design, unit).is_ok(), "{}", unit);
