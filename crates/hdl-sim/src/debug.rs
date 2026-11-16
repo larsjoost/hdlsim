@@ -103,7 +103,8 @@ impl Watcher {
         self
     }
 
-    /// Also `println!` each line as the event arrives (live tracing).
+    /// Also emit each line through the `log` facade as the event arrives
+    /// (live tracing; the binary routes it to stderr).
     pub fn echo(mut self, on: bool) -> Self {
         self.echo = on;
         self
@@ -116,7 +117,7 @@ impl Watcher {
 
     fn emit(&mut self, line: String) {
         if self.echo {
-            println!("{}", line);
+            log::info!("{}", line);
         }
         self.lines.push(line);
     }

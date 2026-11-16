@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -68,6 +74,7 @@ version = "0.2.0"
 dependencies = [
  "hdl-ir",
  "hdl-syntax",
+ "log",
 ]
 
 [[package]]
@@ -80,18 +87,21 @@ version = "0.2.0"
 dependencies = [
  "hdl-ir",
  "hdl-sim",
+ "log",
 ]
 
 [[package]]
 name = "hdlsim"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "clap",
  "hdl-ir",
  "hdl-lib",
  "hdl-sim",
  "hdl-syntax",
  "hdl-wave",
+ "log",
  "serde",
  "serde_json",
 ]
@@ -107,6 +117,12 @@ name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "memchr"
