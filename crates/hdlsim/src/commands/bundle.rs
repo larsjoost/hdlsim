@@ -9,7 +9,8 @@
 //! Consume it with `hdlsim run --bundle repro.tar --top tb` (also `check`,
 //! `debug`, `project`) or plain `tar -xf`.
 
-use super::{extract_common, Command};
+use super::{extract_common, parse_with, Command};
+use clap::Parser;
 use hdl_lib::bundle::{write_tar, BundleEntry};
 use hdl_lib::parse_library_config;
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +18,23 @@ use std::path::{Component, Path, PathBuf};
 /// Total bundle size cap (sources are small; this guards against packing
 /// e.g. a `target/` dir by accident).
 const SIZE_CAP: u64 = 256 * 1024 * 1024;
+
+#[derive(Parser)]
+#[command(
+    about = "pack a project into a single .tar reproducer: hdlsim bundle [--out repro.tar] [--top tb] [--label text] [files...]"
+)]
+struct BundleArgs {
+    /// Output tar file (default: hdlsim-repro.tar).
+    #[arg(long, short = 'o')]
+    out: Option<PathBuf>,
+    #[arg(long)]
+    top: Option<String>,
+    /// Free-text label recorded in REPRO.md.
+    #[arg(long, default_value = "")]
+    label: String,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 pub struct Bundle;
 
@@ -29,35 +47,14 @@ impl Command for Bundle {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut out: Option<PathBuf> = None;
-        let mut top: Option<String> = None;
-        let mut label = String::new();
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--out" | "-o" => {
-                    out = Some(PathBuf::from(rest.get(i + 1).ok_or("--out needs a value")?));
-                    i += 2;
-                }
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--label" => {
-                    label = rest.get(i + 1).ok_or("--label needs a value")?.clone();
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
-        let out = out.unwrap_or_else(|| PathBuf::from("hdlsim-repro.tar"));
+        let a = match parse_with::<BundleArgs>("bundle", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let out = a.out.unwrap_or_else(|| PathBuf::from("hdlsim-repro.tar"));
+        let top = a.top;
+        let label = a.label;
+        let files: Vec<PathBuf> = a.files;
 
         // Library mappings: from the config file (explicit --config or
         // ./hdlsim.ini), then -L flags; first mapping wins per name.

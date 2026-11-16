@@ -1,10 +1,49 @@
 //! `hdlsim run` — compile (with libraries) and simulate one design.
 
-use super::{build_manager, extract_common, parse_time, remap_into_bundle, Command};
+use super::{build_manager, extract_common, parse_time, parse_with, remap_into_bundle, Command};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::{Observer, SimEvent, Simulator};
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    about = "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--live] [--max-time 10us] [--seed N]"
+)]
+struct RunArgs {
+    /// Top-level unit (default: the single compiled module).
+    #[arg(long)]
+    top: Option<String>,
+    #[arg(long)]
+    vcd: Option<PathBuf>,
+    #[arg(long)]
+    hwf: Option<PathBuf>,
+    #[arg(long)]
+    fst: Option<PathBuf>,
+    #[arg(long)]
+    wave: Option<PathBuf>,
+    /// Open the live wave viewer in the browser.
+    #[arg(long)]
+    live: bool,
+    #[arg(long, default_value_t = 8085)]
+    port: u16,
+    /// Stop time (e.g. 10us); default: run until there are no more events.
+    #[arg(long)]
+    max_time: Option<String>,
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
+    #[arg(long)]
+    restore: Option<PathBuf>,
+    #[arg(long)]
+    coverage: bool,
+    #[arg(long)]
+    coverage_out: Option<PathBuf>,
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Source files.
+    files: Vec<PathBuf>,
+}
 
 /// Prints `$display`/`report` messages to stdout, like a simulator transcript.
 pub(crate) struct Transcript;
@@ -49,102 +88,27 @@ impl Command for Run {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut top: Option<String> = None;
-        let mut vcd: Option<PathBuf> = None;
-        let mut hwf: Option<PathBuf> = None;
-        let mut fst: Option<PathBuf> = None;
-        let mut wave: Option<PathBuf> = None;
-        let mut live = false;
-        let mut port: u16 = 8085;
-        let mut max_time_fs = u64::MAX;
-        let mut coverage = false;
-        let mut coverage_out: Option<PathBuf> = None;
-        let mut checkpoint: Option<PathBuf> = None;
-        let mut restore: Option<PathBuf> = None;
-        let mut seed: Option<u64> = None;
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                "--vcd" => {
-                    vcd = Some(PathBuf::from(rest.get(i + 1).ok_or("--vcd needs a value")?));
-                    i += 2;
-                }
-                "--hwf" => {
-                    hwf = Some(PathBuf::from(rest.get(i + 1).ok_or("--hwf needs a value")?));
-                    i += 2;
-                }
-                "--fst" => {
-                    fst = Some(PathBuf::from(rest.get(i + 1).ok_or("--fst needs a value")?));
-                    i += 2;
-                }
-                "--wave" => {
-                    wave = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--wave needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--live" => {
-                    live = true;
-                    i += 1;
-                }
-                "--port" => {
-                    port = rest
-                        .get(i + 1)
-                        .ok_or("--port needs a value")?
-                        .parse()
-                        .map_err(|_| "--port needs a number")?;
-                    i += 2;
-                }
-                "--max-time" => {
-                    let v = rest.get(i + 1).ok_or("--max-time needs a value")?;
-                    max_time_fs = parse_time(v)?;
-                    i += 2;
-                }
-                "--checkpoint" => {
-                    checkpoint = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--checkpoint needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--restore" => {
-                    restore = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--restore needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--coverage" => {
-                    coverage = true;
-                    i += 1;
-                }
-                "--coverage-out" => {
-                    coverage_out = Some(PathBuf::from(
-                        rest.get(i + 1).ok_or("--coverage-out needs a value")?,
-                    ));
-                    i += 2;
-                }
-                "--seed" => {
-                    seed = Some(
-                        rest.get(i + 1)
-                            .ok_or("--seed needs a value")?
-                            .parse()
-                            .map_err(|_| "--seed needs a u64")?,
-                    );
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                f => {
-                    files.push(PathBuf::from(f));
-                    i += 1;
-                }
-            }
-        }
+        let a = match parse_with::<RunArgs>("run", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let top = a.top;
+        let vcd = a.vcd;
+        let hwf = a.hwf;
+        let fst = a.fst;
+        let wave = a.wave;
+        let live = a.live;
+        let port = a.port;
+        let max_time_fs = match &a.max_time {
+            Some(v) => parse_time(v)?,
+            None => u64::MAX,
+        };
+        let checkpoint = a.checkpoint;
+        let restore = a.restore;
+        let coverage = a.coverage;
+        let coverage_out = a.coverage_out;
+        let seed = a.seed;
+        let files: Vec<PathBuf> = a.files;
         // Files may be omitted when --top is given: the top (and its
         // dependencies) are then resolved on demand from the libraries.
         if files.is_empty() && top.is_none() {
