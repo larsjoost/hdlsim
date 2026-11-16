@@ -19,7 +19,7 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 | `std.env` | ✅ | `finish`/`stop` are simulator builtins | `tests/fixtures/tb_pass.vhd`, `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_1164` | ✅ | 9-value logic as 1-bit scalar, vectors, logic ops, `rising_edge`/`falling_edge`, `to_x01` | `tests/vhdl_std_ulogic.rs`, examples |
 | `ieee.numeric_std` | ✅ | `unsigned`/`signed` arithmetic, comparisons, `resize`, `to_integer`, `to_unsigned`/`to_signed` | `tests/vhdl_signed.rs`, `tests/vhdl_std_arith.rs` |
-| `ieee.std_logic_arith` | ◐ | package resolves; `conv_*` conversions builtin; shifts declared but not simulated | `tests/vhdl_std_arith.rs` |
+| `ieee.std_logic_arith` | ✅ | package resolves; `conv_*` conversions and shift/rotate builtins simulated | `tests/vhdl_std_arith.rs`, `tests/vhdl_shifts.rs` |
 | `ieee.std_logic_signed` / `std_logic_unsigned` | ◐ | same: decls resolve, common ops builtin | `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_textio` | ◐ | declarations only — no text I/O simulated | parse via `tests/corpus.rs` |
 | `ieee.fixed_pkg`, `float_pkg`, `vital_*` | ❌ | | |
@@ -74,7 +74,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
 | attributes | ◐ `'length`/`'high`/`'low`/`'left`/`'right` static on signals, `'range` in for-loops, `'image`; others → X with diagnostic | `tests/vhdl_gaps.rs`, `tests/loops.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
-| shifts/rotates (`sll`, `srl`, `shift_left`, …) | ❌ declared, not simulated | — |
+| shifts/rotates `sll`/`srl`/`sla`/`sra`/`rol`/`ror` + function forms `shift_left`/`shift_right`/`rotate_left`/`rotate_right` | ✅ (signed `sra`/`to_integer` decode signed; rotates keep operand width; not in `prove`/BMC) | `tests/vhdl_shifts.rs`, value unit tests |
 
 ## Real-world corpus
 

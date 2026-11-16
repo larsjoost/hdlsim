@@ -1629,7 +1629,18 @@ impl Simulator {
                 }
                 i < self.flat.signals.len() && self.flat.signals[i].signed
             }
-            Expr::Bin { l, r, .. } => self.expr_signed(l, locals) && self.expr_signed(r, locals),
+            Expr::Bin { op, l, r } => {
+                // Shifts/rotates preserve the operand's signedness (the amount
+                // is just a count).
+                if matches!(
+                    op,
+                    BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
+                ) {
+                    self.expr_signed(l, locals)
+                } else {
+                    self.expr_signed(l, locals) && self.expr_signed(r, locals)
+                }
+            }
             Expr::Un { e, .. } => self.expr_signed(e, locals),
             Expr::Resize { e, signed, .. } => *signed || self.expr_signed(e, locals),
             Expr::Signed(_) => true,
@@ -1819,7 +1830,15 @@ impl Simulator {
                 // VHDL signed operands: sign-extend both to the wider width
                 // before arithmetic/comparison (zero-extend is the default).
                 if self.expr_signed(l, locals) || self.expr_signed(r, locals) {
-                    let w = lv.width().max(rv.width()).max(1);
+                    // Shifts/rotates: the amount must not widen the result.
+                    let w = if matches!(
+                        op,
+                        BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
+                    ) {
+                        lv.width().max(1)
+                    } else {
+                        lv.width().max(rv.width()).max(1)
+                    };
                     let l2 = sign_extend(&lv, w);
                     let r2 = sign_extend(&rv, w);
                     // Comparisons must be signed; arithmetic is two's
@@ -1888,7 +1907,21 @@ impl Simulator {
             Expr::ToInt(e) => {
                 let v = self.eval_expr(e, locals);
                 match v.to_u64() {
-                    Some(n) => Value::from_u64(32, n),
+                    Some(n) => {
+                        // Signed operand (e.g. `to_integer(signed_val)`): decode
+                        // as a signed value, keep the 32-bit two's complement.
+                        if self.expr_signed(e, locals) {
+                            let w = v.width();
+                            let x = if w < 64 && (n >> (w - 1)) & 1 == 1 {
+                                (n | (u64::MAX << w)) as i64
+                            } else {
+                                n as i64
+                            };
+                            Value::from_u64(32, x as u64)
+                        } else {
+                            Value::from_u64(32, n)
+                        }
+                    }
                     None => Value::x(32),
                 }
             }
