@@ -12,7 +12,10 @@
 //! runs the check in-process and annotates every diagnostic with its
 //! explanation.
 
-use super::{build_manager, dispatch, extract_common, remap_into_bundle, Command, CommonOpts};
+use super::{
+    build_manager, dispatch, extract_common, parse_with, remap_into_bundle, Command, CommonOpts,
+};
+use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_syntax::diagnostic::{explain_code, explained_codes};
@@ -373,6 +376,21 @@ fn print_code_explanation(code: &str) {
 
 pub struct Assist;
 
+#[derive(Parser)]
+#[command(
+    about = "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
+)]
+struct AssistArgs {
+    /// Execute the suggested command instead of only printing it.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Top-level unit for context.
+    #[arg(long)]
+    top: Option<String>,
+    /// Prompt words.
+    prompt: Vec<String>,
+}
+
 impl Command for Assist {
     fn name(&self) -> &'static str {
         "assist"
@@ -382,30 +400,13 @@ impl Command for Assist {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        let mut yes = false;
-        let mut top: Option<String> = None;
-        let mut prompt_parts: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < rest.len() {
-            match rest[i].as_str() {
-                "--yes" | "-y" => {
-                    yes = true;
-                    i += 1;
-                }
-                "--top" => {
-                    top = Some(rest.get(i + 1).ok_or("--top needs a value")?.clone());
-                    i += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(format!("unknown flag '{}'", other));
-                }
-                w => {
-                    prompt_parts.push(w.to_string());
-                    i += 1;
-                }
-            }
-        }
-        let prompt = prompt_parts.join(" ");
+        let a = match parse_with::<AssistArgs>("assist", &rest) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let yes = a.yes;
+        let top = a.top;
+        let prompt = a.prompt.join(" ");
         if prompt.is_empty() {
             return Err("usage: hdlsim assist [--yes] [--top T] \"<prompt>\"".to_string());
         }
@@ -441,6 +442,13 @@ impl Command for Assist {
 
 pub struct Explain;
 
+#[derive(Parser)]
+#[command(about = "explain a diagnostic/lint code: hdlsim explain E0301 (no arg lists all codes)")]
+struct ExplainArgs {
+    /// Diagnostic/lint code (e.g. E0301); omit to list all codes.
+    code: Option<String>,
+}
+
 impl Command for Explain {
     fn name(&self) -> &'static str {
         "explain"
@@ -449,7 +457,11 @@ impl Command for Explain {
         "explain a diagnostic/lint code: hdlsim explain E0301 (no arg lists all codes)"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        match args.first() {
+        let a = match parse_with::<ExplainArgs>("explain", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        match a.code.as_deref() {
             None => {
                 for (code, text) in explained_codes() {
                     println!("{}: {}", code, text);

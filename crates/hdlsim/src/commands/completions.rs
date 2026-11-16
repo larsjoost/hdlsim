@@ -2,7 +2,16 @@
 //! completion script (subcommand names are taken from the COMMANDS registry,
 //! so the script never drifts from the binary).
 
-use super::{Command, COMMANDS};
+use super::{parse_with, Command, COMMANDS};
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(about = "print a shell completion script: hdlsim completions <bash|zsh|fish>")]
+struct CompletionsArgs {
+    /// Shell to generate completions for.
+    #[arg(value_parser = ["bash", "zsh", "fish"])]
+    shell: String,
+}
 
 pub struct Completions;
 
@@ -35,9 +44,11 @@ impl Command for Completions {
         "print a shell completion script: hdlsim completions <bash|zsh|fish>"
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
-        let shell = args
-            .first()
-            .ok_or("usage: hdlsim completions <bash|zsh|fish>")?;
+        let a = match parse_with::<CompletionsArgs>("completions", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        let shell = &a.shell;
         let cmds: Vec<String> = COMMANDS
             .iter()
             .map(|c| c.name().to_string())
