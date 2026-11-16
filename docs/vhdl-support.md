@@ -45,7 +45,8 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | enum types (incl. as array index) | ✅ | `tests/vhdl_array_enum.rs` |
 | integer/natural/positive ranges, `time` | ✅ | examples |
 | 1-D arrays (range- or enum-indexed), `(others => x)` aggregates | ✅ | `tests/vhdl_array_enum.rs` |
-| multi-dimensional arrays | ◐ (`<>` box → depth 1) | — |
+| multi-dimensional arrays `array (a to b, c to d) of …`, `m(i, j)` | ✅ (flat index, first dim = MSB) | `tests/vhdl_gaps.rs` |
+| unconstrained box index `range <>` | ◐ (depth 1) | — |
 | records (flat vector + `r.field` select + named/positional aggregates) | ✅ | `tests/vhdl_record.rs` |
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
 | functions/procedures with bodies, `return` | ◐ | `tests/vhdl2008.rs` |
@@ -60,7 +61,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | concurrent: process (sensitivity list / `all`), assigns, conditional (`when/else`), selected (`with/select`) | ✅ (no `after` delays) | examples, `tests/loops.rs` |
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
 | sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until rising_edge(…)` etc.) | `tests/loops.rs`, `tests/vhdl2008.rs` |
-| `assert … report … severity …` | ◐ concurrent assert not lowered; sequential assert drives pass/fail exit codes | `tests/exit_code.rs` |
+| `assert … report … severity …` (sequential and concurrent) | ✅ concurrent → always-process on the condition's signals; severity drives exit codes | `tests/exit_code.rs`, `tests/vhdl_gaps.rs` |
 | generate (for/if/case), blocks | ◐ parsed | parser tests |
 | instantiation `label : entity lib.name(arch)` | ✅ | user repro, corpus |
 
@@ -71,7 +72,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | arithmetic/relational operators, `mod`/`rem`, `abs`/`not` | ✅ | `tests/vhdl_counter.rs`, `vhdl_signed.rs` |
 | logical `and/or/xor/…` on std_logic/vectors | ✅ (via 1164 operator functions) | examples |
 | concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
-| attributes | ◐ `'range` on arrays (for-loops), `'image`; others → X with diagnostic | `tests/loops.rs` |
+| attributes | ◐ `'length`/`'high`/`'low`/`'left`/`'right` static on signals, `'range` in for-loops, `'image`; others → X with diagnostic | `tests/vhdl_gaps.rs`, `tests/loops.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
 | shifts/rotates (`sll`, `srl`, `shift_left`, …) | ❌ declared, not simulated | — |
 
