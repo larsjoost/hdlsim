@@ -419,7 +419,20 @@ impl<'a> Lower<'a> {
         if self.text(c).contains("<>") {
             return 1;
         }
-        let exprs: Vec<Expr> = real_children(c)
+        let kids = real_children(c);
+        // Index given as a type mark (`array (device_under_test_t) of ...`):
+        // the depth is the enum's literal count. Integer/other type marks are
+        // unconstrained here — fall back to 1. A name that is a *constant*
+        // (not a type) still goes through the expression path below.
+        if let Some(n) = kids.iter().find(|k| k.kind() == SyntaxKind::Name) {
+            let tn = self.text(n).to_ascii_lowercase();
+            match self.types.get(&tn) {
+                Some(TypeInfo::Enum(lits)) => return lits.len().max(1),
+                Some(_) => return 1,
+                None => {}
+            }
+        }
+        let exprs: Vec<Expr> = kids
             .into_iter()
             .filter(|k| is_expr_node(k.kind()))
             .map(|k| self.lower_expr(&k, &HashMap::new()))
