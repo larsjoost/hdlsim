@@ -63,7 +63,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
 | sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs` |
 | `assert … report … severity …` (sequential and concurrent) | ✅ concurrent → always-process on the condition's signals; severity drives exit codes | `tests/exit_code.rs`, `tests/vhdl_gaps.rs` |
-| generate (for/if/case), blocks | ◐ parsed | parser tests |
+| generate (for/if/case, incl. `elsif`/`else`, declarative parts, nesting), blocks | ✅ unrolled/selected at lower time (loop var as constant; out-port connections to bit slices not yet supported) | parser tests, `tests/vhdl_generate.rs` |
 | instantiation `label : entity lib.name(arch)` | ✅ | user repro, corpus |
 
 ## Expressions

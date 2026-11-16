@@ -286,6 +286,29 @@ fn is_expr_node(k: SyntaxKind) -> bool {
     )
 }
 
+/// True for node kinds produced by `parse_decl` — used to tell a generate or
+/// block declarative item from a concurrent statement when no `begin`
+/// keyword separates them.
+fn is_decl_kind(k: SyntaxKind) -> bool {
+    matches!(
+        k,
+        SyntaxKind::SignalDecl
+            | SyntaxKind::ConstantDecl
+            | SyntaxKind::VariableDecl
+            | SyntaxKind::ComponentDecl
+            | SyntaxKind::TypeDecl
+            | SyntaxKind::SubtypeDecl
+            | SyntaxKind::Function
+            | SyntaxKind::AliasDecl
+            | SyntaxKind::AttrDecl
+            | SyntaxKind::AttrSpec
+            | SyntaxKind::FileDecl
+            | SyntaxKind::UseClause
+            | SyntaxKind::ForSpec
+            | SyntaxKind::PackageInst
+    )
+}
+
 /// Static type info for a VHDL type mark.
 #[derive(Clone, Debug)]
 pub enum TypeInfo {
@@ -338,6 +361,9 @@ struct Lower<'a> {
     extra_signals: Vec<SignalIr>,
     /// `module.signals.len()` captured when statement lowering starts.
     extra_base: usize,
+    /// Counter for auto-naming instances (the parser drops statement labels,
+    /// so `InstIr.name` is always empty; elab needs unique prefixes).
+    inst_count: usize,
 }
 
 impl<'a> Lower<'a> {
@@ -355,6 +381,7 @@ impl<'a> Lower<'a> {
             sig_dims: HashMap::new(),
             extra_signals: Vec::new(),
             extra_base: 0,
+            inst_count: 0,
         }
     }
 
@@ -945,42 +972,316 @@ impl<'a> Lower<'a> {
         };
         let mut proc_idx = 0;
         for s in &stmts {
-            match s.kind() {
-                SyntaxKind::Process => {
-                    let p = self.lower_process(module, s, proc_idx);
-                    proc_idx += 1;
-                    module.processes.push(p);
-                }
-                SyntaxKind::ConcAssign => match self.lower_conc_assign(s, proc_idx) {
-                    Some(ConcOut::Assign(a)) => module.assigns.push(a),
-                    Some(ConcOut::Proc(p)) => {
-                        module.processes.push(p);
-                        proc_idx += 1;
-                    }
-                    None => {}
-                },
-                SyntaxKind::SelectedAssign => {
-                    if let Some(a) = self.lower_selected_assign(s) {
-                        module.assigns.push(a);
-                    }
-                }
-                SyntaxKind::Inst => {
-                    if let Some(i) = self.lower_inst(s) {
-                        module.instances.push(i);
-                    }
-                }
-                SyntaxKind::AssertStmt => {
-                    // Concurrent assert → always-process sensitive to the
-                    // condition's signals; body is the sequential assert.
-                    let p = self.lower_conc_assert(s, proc_idx);
-                    proc_idx += 1;
-                    module.processes.push(p);
-                }
-                _ => {}
-            }
+            self.lower_conc_stmt(module, s, &mut proc_idx);
         }
         modules.push(module_owned);
         Some((entity_name, arch_name))
+    }
+
+    /// Lower one concurrent statement (architecture body, block, or generate
+    /// body — generate unrolls and re-enters here per iteration/branch).
+    fn lower_conc_stmt(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        match s.kind() {
+            SyntaxKind::Process => {
+                let p = self.lower_process(module, s, *proc_idx);
+                *proc_idx += 1;
+                module.processes.push(p);
+            }
+            SyntaxKind::ConcAssign => match self.lower_conc_assign(s, *proc_idx) {
+                Some(ConcOut::Assign(a)) => module.assigns.push(a),
+                Some(ConcOut::Proc(p)) => {
+                    module.processes.push(p);
+                    *proc_idx += 1;
+                }
+                None => {}
+            },
+            SyntaxKind::SelectedAssign => {
+                if let Some(a) = self.lower_selected_assign(s) {
+                    module.assigns.push(a);
+                }
+            }
+            SyntaxKind::Inst => {
+                if let Some(mut i) = self.lower_inst(s) {
+                    if i.name.is_empty() {
+                        i.name = format!("inst{}", self.inst_count);
+                        self.inst_count += 1;
+                    }
+                    module.instances.push(i);
+                }
+            }
+            SyntaxKind::AssertStmt => {
+                // Concurrent assert → always-process sensitive to the
+                // condition's signals; body is the sequential assert.
+                let p = self.lower_conc_assert(s, *proc_idx);
+                *proc_idx += 1;
+                module.processes.push(p);
+            }
+            SyntaxKind::GenFor => self.lower_gen_for(module, s, proc_idx),
+            SyntaxKind::GenIf => self.lower_gen_if(module, s, proc_idx),
+            SyntaxKind::GenCase => self.lower_gen_case(module, s, proc_idx),
+            SyntaxKind::Block => self.lower_block(module, s, proc_idx),
+            _ => {}
+        }
+    }
+
+    /// Split the nodes of a generate/block body into declarative items and
+    /// concurrent statements, classified by node kind (a `begin` keyword is
+    /// optional in generate bodies, so position alone is not enough).
+    fn gen_body(&self, after: &[SyntaxNode]) -> (Vec<SyntaxNode>, Vec<SyntaxNode>) {
+        let mut decls = Vec::new();
+        let mut stmts = Vec::new();
+        for k in after {
+            if k.kind() == SyntaxKind::Ident {
+                continue;
+            }
+            if is_decl_kind(k.kind()) {
+                decls.push(k.clone());
+            } else {
+                stmts.push(k.clone());
+            }
+        }
+        (decls, stmts)
+    }
+
+    /// Lower the declarative items of a generate/block body. When `fresh` is
+    /// set (for-generate iterations) existing signal bindings are dropped
+    /// first, so each iteration gets its own signal.
+    fn lower_gen_decls(&mut self, module: &mut ModuleIr, decls: &[SyntaxNode], fresh: bool) {
+        for d in decls {
+            if fresh && matches!(d.kind(), SyntaxKind::SignalDecl | SyntaxKind::VariableDecl) {
+                let dk = real_children(d);
+                if let Some(colon) = dk
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+                {
+                    for k in &dk[..colon] {
+                        if k.kind() == SyntaxKind::Name {
+                            self.names.remove(&self.text(k));
+                        }
+                    }
+                }
+            }
+            match d.kind() {
+                SyntaxKind::SignalDecl | SyntaxKind::VariableDecl => {
+                    self.lower_signal_decl(module, d)
+                }
+                SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
+                SyntaxKind::TypeDecl => self.lower_type_decl(d),
+                SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                _ => {}
+            }
+        }
+    }
+
+    /// `for i in lo to/ downto hi generate … end generate;` — unrolled at
+    /// lower time with the loop variable as a constant per iteration.
+    fn lower_gen_for(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        let kids = real_children(s);
+        let var = kids
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k).to_ascii_lowercase());
+        let gen_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "generate")
+            .unwrap_or(kids.len());
+        if gen_pos >= kids.len() {
+            return;
+        }
+        let in_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "in")
+            .unwrap_or(0);
+        let downto = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "downto");
+        let env = self.consts.clone();
+        let exprs: Vec<Expr> = kids
+            .iter()
+            .enumerate()
+            .filter(|(i, k)| *i > in_pos && *i < gen_pos && is_expr_node(k.kind()))
+            .map(|(_, k)| self.lower_expr(k, &env))
+            .collect();
+        if exprs.len() < 2 {
+            return;
+        }
+        let ev = |e: &Expr| const_eval(e, &env).and_then(|v| v.to_u64());
+        let (Some(lo), Some(hi)) = (ev(&exprs[0]), ev(&exprs[1])) else {
+            self.warn(s.span(), "generate range is not constant; skipped");
+            return;
+        };
+        let (decls, body) = self.gen_body(&kids[gen_pos + 1..]);
+        let saved = var.as_ref().and_then(|v| self.consts.get(v).cloned());
+        let vals: Vec<u64> = if downto {
+            (hi..=lo).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        for v in vals {
+            if let Some(var) = &var {
+                self.consts.insert(var.clone(), Value::from_u64(32, v));
+            }
+            self.lower_gen_decls(module, &decls, true);
+            for k in &body {
+                self.lower_conc_stmt(module, k, proc_idx);
+            }
+        }
+        match (var, saved) {
+            (Some(v), Some(old)) => {
+                self.consts.insert(v, old);
+            }
+            (Some(v), None) => {
+                self.consts.remove(&v);
+            }
+            _ => {}
+        }
+    }
+
+    /// `if cond generate … [elsif …] [else …] end if generate;` — the first
+    /// branch whose condition is constant-true is lowered.
+    fn lower_gen_if(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        let kids = real_children(s);
+        // Split into branches at if/elsif/else. Within a branch the condition
+        // comes before `generate`, declarations between `generate` and
+        // `begin`, and statements after `begin`.
+        struct Seg {
+            kw: String,
+            cond: Option<SyntaxNode>,
+            decls: Vec<SyntaxNode>,
+            stmts: Vec<SyntaxNode>,
+        }
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut seen_generate = false;
+        for k in &kids {
+            let w = if k.kind() == SyntaxKind::Ident {
+                self.kw(k)
+            } else {
+                String::new()
+            };
+            match w.as_str() {
+                "if" | "elsif" | "else" => {
+                    segs.push(Seg {
+                        kw: w,
+                        cond: None,
+                        decls: Vec::new(),
+                        stmts: Vec::new(),
+                    });
+                    seen_generate = false;
+                }
+                "generate" => seen_generate = true,
+                _ => {
+                    if let Some(seg) = segs.last_mut() {
+                        if !seen_generate && seg.cond.is_none() && is_expr_node(k.kind()) {
+                            seg.cond = Some(k.clone());
+                        } else if k.kind() != SyntaxKind::Ident {
+                            if is_decl_kind(k.kind()) {
+                                seg.decls.push(k.clone());
+                            } else {
+                                seg.stmts.push(k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for seg in segs {
+            let take = if seg.kw == "else" {
+                true
+            } else {
+                seg.cond
+                    .map(|c| {
+                        let env = self.consts.clone();
+                        let e = self.lower_expr(&c, &env);
+                        const_eval(&e, &env)
+                            .and_then(|v| v.to_u64())
+                            .map(|n| n != 0)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            };
+            if take {
+                self.lower_gen_decls(module, &seg.decls, false);
+                for st in &seg.stmts {
+                    self.lower_conc_stmt(module, st, proc_idx);
+                }
+                return;
+            }
+        }
+    }
+
+    /// `case sel generate when c => … [when others => …] end case generate;`
+    /// — first matching alternative is lowered.
+    fn lower_gen_case(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        let kids = real_children(s);
+        let env = self.consts.clone();
+        let sel_pos = kids
+            .iter()
+            .position(|k| is_expr_node(k.kind()))
+            .unwrap_or(kids.len());
+        let sel = self.lower_expr(&kids[sel_pos], &env);
+        let sel_v = const_eval(&sel, &env).and_then(|v| v.to_u64());
+        let items: Vec<&SyntaxNode> = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::CaseItem)
+            .collect();
+        let mut others: Option<(Vec<SyntaxNode>, Vec<SyntaxNode>)> = None;
+        for item in items {
+            let ik = real_children(item);
+            let has_others = ik.iter().any(|k| k.kind() == SyntaxKind::Others);
+            let choices: Vec<Expr> = ik
+                .iter()
+                .filter(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Others)
+                .map(|k| self.lower_expr(k, &env))
+                .collect();
+            let arrow = ik
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+                .unwrap_or(ik.len());
+            let after_arrow = if arrow < ik.len() {
+                &ik[arrow + 1..]
+            } else {
+                &ik[arrow..]
+            };
+            let (decls, stmts) = self.gen_body(after_arrow);
+            let matches = has_others
+                || sel_v
+                    .map(|sv| {
+                        choices.iter().any(|c| {
+                            const_eval(c, &env)
+                                .and_then(|v| v.to_u64())
+                                .map(|cv| cv == sv)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            if matches {
+                self.lower_gen_decls(module, &decls, false);
+                for st in &stmts {
+                    self.lower_conc_stmt(module, st, proc_idx);
+                }
+                return;
+            }
+            if has_others {
+                others = Some((decls, stmts));
+            }
+        }
+        if let Some((decls, stmts)) = others {
+            self.lower_gen_decls(module, &decls, false);
+            for st in &stmts {
+                self.lower_conc_stmt(module, st, proc_idx);
+            }
+        }
+    }
+
+    /// `block [is] decls begin stmts end block;` — decls and statements are
+    /// lowered into the enclosing module (block scoping is not modeled).
+    fn lower_block(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        let kids = real_children(s);
+        let (decls, stmts) = self.gen_body(&kids);
+        self.lower_gen_decls(module, &decls, false);
+        for st in &stmts {
+            self.lower_conc_stmt(module, st, proc_idx);
+        }
     }
 
     /// E0401 for an architecture naming an entity that is unknown design-wide:

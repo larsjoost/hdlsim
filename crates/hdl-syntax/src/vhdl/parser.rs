@@ -1261,6 +1261,7 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::GenCase);
         self.bump(); // case
         self.parse_expression();
+        self.eat_kw("is"); // tolerated though not standard
         self.expect_kw("generate", "after the case-generate expression");
         loop {
             if self.at_kw("end") || self.peek().kind == TokenKind::Eof {
@@ -1289,12 +1290,14 @@ impl<'a> Parser<'a> {
             } else {
                 self.error_here("expected '=>' in a case-generate alternative");
             }
+            self.parse_gen_decl_part();
             while !self.at_kw("when") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
                 self.parse_concurrent_stmt();
             }
             self.builder.finish_node();
         }
         self.expect_kw("end", "to close the case-generate");
+        self.eat_kw("case"); // `end case generate;` / `end generate;`
         self.eat_kw("generate");
         if self.peek().kind == TokenKind::Ident {
             self.bump(); // optional label
@@ -1332,7 +1335,42 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// `[label :] for var in range generate concurrent-stmts end generate [label] ;`
+    /// True when the next token starts a declarative item (as opposed to a
+    /// concurrent statement) inside a generate body. `for` is excluded: it
+    /// would be ambiguous with a nested for-generate.
+    fn at_decl_start(&self) -> bool {
+        if self.peek().kind != TokenKind::Ident {
+            return false;
+        }
+        matches!(
+            self.peek_text().to_ascii_lowercase().as_str(),
+            "signal"
+                | "constant"
+                | "variable"
+                | "type"
+                | "subtype"
+                | "component"
+                | "function"
+                | "procedure"
+                | "shared"
+                | "alias"
+                | "attribute"
+                | "file"
+                | "use"
+                | "package"
+        )
+    }
+
+    /// Declarative part of a generate body: declarations up to an optional
+    /// `begin` keyword (required by VHDL only when declarations are present).
+    fn parse_gen_decl_part(&mut self) {
+        while self.at_decl_start() && self.peek().kind != TokenKind::Eof {
+            self.parse_decl();
+        }
+        self.eat_kw("begin");
+    }
+
+    /// `[label :] for var in range generate [decls begin] concurrent-stmts end generate [label] ;`
     fn parse_gen_for(&mut self) {
         self.start(SyntaxKind::GenFor);
         self.bump(); // for
@@ -1360,10 +1398,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_kw("generate", "in for-generate");
+        self.parse_gen_decl_part();
         while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
             self.parse_concurrent_stmt();
         }
         self.expect_kw("end", "to close for-generate");
+        self.eat_kw("for"); // `end for generate;` / `end generate;`
         self.eat_kw("generate");
         if self.peek().kind == TokenKind::Ident {
             self.bump(); // optional label
@@ -1379,6 +1419,7 @@ impl<'a> Parser<'a> {
         self.parse_expression();
         self.expect_kw("generate", "in if-generate");
         loop {
+            self.parse_gen_decl_part();
             while !self.at_kw("end")
                 && !self.at_kw("elsif")
                 && !self.at_kw("else")
@@ -1395,6 +1436,7 @@ impl<'a> Parser<'a> {
             if self.at_kw("else") {
                 self.bump();
                 self.expect_kw("generate", "in else-generate");
+                self.parse_gen_decl_part();
                 while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
                     self.parse_concurrent_stmt();
                 }
@@ -1402,6 +1444,7 @@ impl<'a> Parser<'a> {
             break;
         }
         self.expect_kw("end", "to close if-generate");
+        self.eat_kw("if"); // `end if generate;` / `end generate;`
         self.eat_kw("generate");
         if self.peek().kind == TokenKind::Ident {
             self.bump(); // optional label
@@ -2258,6 +2301,50 @@ end architecture;
             let sexp = ok(&src);
             assert!(sexp.contains("(Architecture"), "{}: {}", tail, sexp);
         }
+    }
+
+    #[test]
+    fn parses_generate_and_block_forms() {
+        // All `end ... generate;` tails, generate declarative parts (with and
+        // without `begin`), elsif/else branches in if-generate, and
+        // case-generate (the non-standard `case x is generate` is tolerated).
+        let src = r#"architecture rtl of m is
+    signal a, b : bit_vector(3 downto 0);
+begin
+    g1: for i in 0 to 3 generate
+        b(i) <= not a(i);
+    end generate g1;
+    g2: for i in 3 downto 0 generate
+        signal t : bit;
+    begin
+        t <= a(i);
+        b(i) <= t;
+    end for generate;
+    g3: if true generate
+        b <= a;
+    elsif false generate
+        b <= not a;
+    else generate
+        b <= (others => '0');
+    end if generate;
+    g4: case a is generate
+        when x"0" => b <= a;
+        when others => b <= (others => '1');
+    end case generate;
+    blk: block
+        signal t : bit;
+    begin
+        t <= '1';
+    end block blk;
+end architecture;
+"#;
+        let sexp = ok(src);
+        assert_eq!(sexp.matches("(GenFor").count(), 2, "{}", sexp);
+        assert_eq!(sexp.matches("(GenIf").count(), 1, "{}", sexp);
+        assert_eq!(sexp.matches("(GenCase").count(), 1, "{}", sexp);
+        assert_eq!(sexp.matches("(Block").count(), 1, "{}", sexp);
+        assert_eq!(sexp.matches("(SignalDecl").count(), 3, "{}", sexp);
+        assert_eq!(sexp.matches("(CaseItem").count(), 2, "{}", sexp);
     }
 
     #[test]
