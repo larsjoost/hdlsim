@@ -29,3 +29,4 @@ hdl-sim.workspace = true
 hdl-wave.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+clap.workspace = true

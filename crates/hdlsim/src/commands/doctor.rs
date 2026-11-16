@@ -2,9 +2,14 @@
 //! resolution, project config, `-L`/`-I` dirs, parse-cache writability.
 //! Prints one line per check and exits 1 if any check fails.
 
-use super::{extract_common, Command};
+use super::{extract_common, parse_with, Command};
+use clap::Parser;
 use hdl_lib::doctor::{cache_from_env, checks, Status};
 use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(about = "check the environment (stdlib, config, libraries, cache)")]
+struct DoctorArgs {}
 
 pub struct Doctor;
 
@@ -17,8 +22,8 @@ impl Command for Doctor {
     }
     fn run(&self, args: &[String]) -> Result<i32, String> {
         let (opts, rest) = extract_common(args)?;
-        if !rest.is_empty() {
-            return Err(format!("doctor takes no arguments (got '{}')", rest[0]));
+        if let Err(code) = parse_with::<DoctorArgs>("doctor", &rest) {
+            return Ok(code);
         }
         let config = match &opts.config {
             Some(c) => Some(c.clone()),
@@ -35,10 +40,7 @@ impl Command for Doctor {
         );
         let mut fails = 0usize;
         let mut warns = 0usize;
-        println!(
-            "hdlsim {} \u{2014} environment check",
-            env!("CARGO_PKG_VERSION")
-        );
+        println!("hdlsim {} — environment check", env!("CARGO_PKG_VERSION"));
         for c in &cs {
             let (tag, is_fail, is_warn) = match c.status {
                 Status::Ok => ("ok  ", false, false),
