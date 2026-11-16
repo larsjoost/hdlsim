@@ -2382,6 +2382,24 @@ impl<'a> Lower<'a> {
                         }
                         Expr::Lit(Value::x(32))
                     }
+                    // `sig'event` — true on any value change of sig this delta:
+                    // rising OR falling edge (scalar signals).
+                    "event" => {
+                        if let Some(id) = self.sig_id(&bn) {
+                            let s = || Box::new(Expr::Sig(id));
+                            Expr::Bin {
+                                op: BinOp::LogOr,
+                                l: Box::new(Expr::Rising(s())),
+                                r: Box::new(Expr::Falling(s())),
+                            }
+                        } else {
+                            self.warn(
+                                e.span(),
+                                format!("attribute '{}\\'{}' not supported; X", bn, attr),
+                            );
+                            Expr::Lit(Value::x(1))
+                        }
+                    }
                     _ => {
                         self.warn(
                             e.span(),
