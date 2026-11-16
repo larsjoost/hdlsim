@@ -167,6 +167,9 @@ impl<'a> Lower<'a> {
         self.consts.insert("true".into(), Value { bits: vec![V1] });
         self.consts.insert("false".into(), Value { bits: vec![V0] });
         self.types.insert("std_logic".into(), TypeInfo::Scalar);
+        // std_ulogic is the enum from ieee.std_logic_1164; hdlsim models it as
+        // a 1-bit scalar like std_logic (the `use` clause is not needed).
+        self.types.insert("std_ulogic".into(), TypeInfo::Scalar);
         self.types.insert("bit".into(), TypeInfo::Scalar);
         self.types.insert("boolean".into(), TypeInfo::Scalar);
         self.types.insert(
@@ -191,6 +194,7 @@ impl<'a> Lower<'a> {
         self.types
             .insert("positive".into(), TypeInfo::Integer { signed: false });
         self.types.insert("char".into(), TypeInfo::Char);
+        self.types.insert("character".into(), TypeInfo::Char);
         self.types
             .insert("string".into(), TypeInfo::Vector { signed: false });
         self.types
@@ -207,7 +211,19 @@ impl<'a> Lower<'a> {
         let name = self.kw(mark);
         let base = self.types.get(&name).cloned();
         let Some(base) = base else {
-            self.err(span, format!("unknown type '{}'", name));
+            self.diags.push(Diagnostic {
+                code: "E0401",
+                severity: Severity::Error,
+                span: Some(span),
+                message: format!("unknown type '{}'", name),
+                help: Some(
+                    "known type marks: bit, boolean, character, integer, natural, positive, \
+                     real, time, string, bit_vector, std_logic, std_ulogic, std_logic_vector, \
+                     std_ulogic_vector, unsigned, signed \
+                     (std.standard / ieee.std_logic_1164 / ieee.numeric_std)"
+                        .to_string(),
+                ),
+            });
             return (1, false, None, false);
         };
         match base {

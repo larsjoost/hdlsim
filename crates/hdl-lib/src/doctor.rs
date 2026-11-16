@@ -73,34 +73,34 @@ pub fn checks(
 ) -> Vec<Check> {
     let mut out = Vec::new();
 
-    match builtin::stdlib_dir() {
-        Some(dir) => {
-            let mut missing: Vec<&str> = Vec::new();
-            for rel in [
-                "std/standard.vhd",
-                "ieee/std_logic_1164.vhd",
-                "ieee/numeric_std.vhd",
-            ] {
-                if !dir.join(rel).is_file() {
-                    missing.push(rel);
-                }
-            }
-            if missing.is_empty() {
-                out.push(Check::ok(
-                    "stdlib",
-                    format!("{} (std, ieee present)", dir.display()),
-                ));
-            } else {
-                out.push(Check::fail(
-                    "stdlib",
-                    format!("{} is missing {}", dir.display(), missing.join(", ")),
-                ));
+    {
+        let custom = std::env::var("HDLSIM_STDLIB").ok().map(PathBuf::from);
+        let providers = builtin::stdlib_providers();
+        let scanned: Vec<String> = providers
+            .iter()
+            .flat_map(|p| p.scan().into_iter().map(|(u, _)| u))
+            .collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for unit in ["standard", "std_logic_1164", "numeric_std"] {
+            if !scanned.iter().any(|u| u == unit) {
+                missing.push(unit);
             }
         }
-        None => out.push(Check::fail(
-            "stdlib",
-            "not found (set HDLSIM_STDLIB or use the installed layout)".to_string(),
-        )),
+        if missing.is_empty() {
+            let where_ = match &custom {
+                Some(d) if d.is_dir() => format!("{} (custom $HDLSIM_STDLIB)", d.display()),
+                _ => "embedded in the binary".to_string(),
+            };
+            out.push(Check::ok(
+                "stdlib",
+                format!("{} (std, ieee present)", where_),
+            ));
+        } else {
+            out.push(Check::fail(
+                "stdlib",
+                format!("missing units: {}", missing.join(", ")),
+            ));
+        }
     }
 
     let mut mgr = LibraryManager::new();

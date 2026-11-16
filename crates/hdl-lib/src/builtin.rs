@@ -1,65 +1,65 @@
-//! Built-in standard libraries (`std`, `ieee`) as real VHDL source files on
-//! disk — NOT compiled into the binary. The tree lives in this crate at
-//! `stdlib/{std,ieee}/*.vhd` and is located at runtime by [`stdlib_dir`].
+//! Built-in standard libraries (`std`, `ieee`) — the VHDL sources in this
+//! crate's `stdlib/` tree, embedded into the binary with `include_str!` and
+//! parsed through the normal parse/lower pipeline like any other library, so
+//! no on-disk stdlib is needed (installed binaries always have `std`/`ieee`).
 //!
-//! Search order:
-//! 1. `$HDLSIM_STDLIB` (explicit override),
-//! 2. `<dir of the hdlsim executable>/stdlib` and
-//!    `<exe>/../share/hdlsim/stdlib` (installed layout),
-//! 3. the crate's source tree (`CARGO_MANIFEST_DIR/stdlib`) — covers
-//!    `cargo build` / `cargo test` / `cargo install --path` from a checkout.
-//!
+//! `$HDLSIM_STDLIB` overrides the embedded tree with a custom on-disk one.
 //! The providers are appended *last* in the library search path, so a user
-//! mapping like `-L ieee=./my_ieee` overrides the built-ins. Kernel-primitive
-//! semantics (integer, std_logic, arithmetic) remain fast paths in the
-//! lowerer; these files make the standard names resolve through the normal
-//! parse/lower pipeline and are what `project`/tooling export sees.
+//! mapping like `-L ieee=./my_ieee` wins over the built-ins.
 
-use crate::providers::{DirProvider, UnitProvider};
+use crate::providers::{DirProvider, EmbeddedProvider, UnitProvider};
 use std::path::PathBuf;
 
-/// Locate the on-disk stdlib root (containing `std/` and `ieee/` subdirs).
-pub fn stdlib_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("HDLSIM_STDLIB") {
-        let p = PathBuf::from(d);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for cand in [
-                dir.join("stdlib"),
-                dir.join("share/hdlsim/stdlib"),
-                dir.join("../share/hdlsim/stdlib"),
-            ] {
-                if cand.is_dir() {
-                    return Some(cand);
+/// The embedded stdlib: `(unit name, source)` per library.
+fn embedded_stdlib() -> Vec<EmbeddedProvider> {
+    vec![
+        EmbeddedProvider::new(
+            "std",
+            &[("standard", include_str!("../stdlib/std/standard.vhd"))],
+        ),
+        EmbeddedProvider::new(
+            "ieee",
+            &[
+                (
+                    "std_logic_1164",
+                    include_str!("../stdlib/ieee/std_logic_1164.vhd"),
+                ),
+                (
+                    "numeric_std",
+                    include_str!("../stdlib/ieee/numeric_std.vhd"),
+                ),
+            ],
+        ),
+    ]
+}
+
+/// The built-in library providers (`std`, then `ieee`): the custom
+/// `$HDLSIM_STDLIB` tree if set and valid, otherwise the embedded stdlib.
+pub fn stdlib_providers() -> Vec<Box<dyn UnitProvider>> {
+    stdlib_providers_from(std::env::var("HDLSIM_STDLIB").ok().map(PathBuf::from))
+}
+
+/// Providers for an optional custom stdlib root (); falls back
+/// to the embedded tree when unset, invalid, or empty.
+fn stdlib_providers_from(custom: Option<PathBuf>) -> Vec<Box<dyn UnitProvider>> {
+    if let Some(root) = custom {
+        if root.is_dir() {
+            let mut out: Vec<Box<dyn UnitProvider>> = Vec::new();
+            for name in ["std", "ieee"] {
+                let dir = root.join(name);
+                if dir.is_dir() {
+                    out.push(Box::new(DirProvider::vhdl(name, &dir)));
                 }
+            }
+            if !out.is_empty() {
+                return out;
             }
         }
     }
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stdlib");
-    if src.is_dir() {
-        return Some(src);
-    }
-    None
-}
-
-/// The built-in library providers (`std`, then `ieee`), empty if the stdlib
-/// tree cannot be located.
-pub fn stdlib_providers() -> Vec<Box<dyn UnitProvider>> {
-    let mut out: Vec<Box<dyn UnitProvider>> = Vec::new();
-    let Some(root) = stdlib_dir() else {
-        return out;
-    };
-    for name in ["std", "ieee"] {
-        let dir = root.join(name);
-        if dir.is_dir() {
-            out.push(Box::new(DirProvider::vhdl(name, &dir)));
-        }
-    }
-    out
+    embedded_stdlib()
+        .into_iter()
+        .map(|p| Box::new(p) as Box<dyn UnitProvider>)
+        .collect()
 }
 
 #[cfg(test)]
@@ -69,15 +69,8 @@ mod tests {
     use hdl_syntax::vhdl::parser;
 
     #[test]
-    fn stdlib_dir_is_found_in_checkout() {
-        let dir = stdlib_dir().expect("stdlib dir must resolve in a source checkout");
-        assert!(dir.join("std/standard.vhd").is_file(), "{}", dir.display());
-        assert!(dir.join("ieee/std_logic_1164.vhd").is_file());
-        assert!(dir.join("ieee/numeric_std.vhd").is_file());
-    }
-
-    #[test]
-    fn stdlib_providers_scan_expected_units() {
+    fn embedded_stdlib_scans_expected_units() {
+        // No env var set: the embedded tree is used, no disk access needed.
         let providers = stdlib_providers();
         let names: Vec<&str> = providers.iter().map(|p| p.name()).collect();
         assert_eq!(names, vec!["std", "ieee"]);
@@ -85,25 +78,21 @@ mod tests {
             .iter()
             .flat_map(|p| p.scan().into_iter().map(|(u, _)| u))
             .collect();
-        assert!(units.contains(&"standard".to_string()), "{:?}", units);
-        assert!(units.contains(&"std_logic_1164".to_string()), "{:?}", units);
-        assert!(units.contains(&"numeric_std".to_string()), "{:?}", units);
+        for u in ["standard", "std_logic_1164", "numeric_std"] {
+            assert!(units.contains(&u.to_string()), "{:?}", units);
+        }
     }
 
     #[test]
-    fn every_stdlib_file_parses_without_errors() {
-        let root = stdlib_dir().unwrap();
+    fn embedded_stdlib_reads_and_parses_without_errors() {
+        let providers = stdlib_providers();
         let mut count = 0;
-        for lib in ["std", "ieee"] {
-            for entry in std::fs::read_dir(root.join(lib)).unwrap().flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("vhd") {
-                    continue;
-                }
+        for p in &providers {
+            for (unit, file) in p.scan() {
+                let text = p.read(&unit, &file).expect("embedded source reads");
                 count += 1;
-                let text = std::fs::read_to_string(&path).unwrap();
                 let mut db = SourceDb::new();
-                let id = db.add_file(path.display().to_string(), text).unwrap();
+                let id = db.add_file(file.display().to_string(), text).unwrap();
                 let parsed = parser::parse_file(id, db.file(id));
                 let errs: Vec<_> = parsed
                     .diags
@@ -112,19 +101,46 @@ mod tests {
                     .collect();
                 assert!(
                     errs.is_empty(),
-                    "{}:\n{}",
-                    path.display(),
-                    errs.iter()
-                        .map(|d| d.render(&db))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    "{}:
+{}",
+                    unit,
+                    errs.iter().map(|d| d.render(&db)).collect::<Vec<_>>().join(
+                        "
+"
+                    )
                 );
             }
         }
         assert!(
             count >= 3,
-            "expected at least 3 stdlib files, got {}",
+            "expected at least 3 stdlib units, got {}",
             count
+        );
+    }
+
+    #[test]
+    fn custom_stdlib_root_overrides_embedded() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_stdlib_it_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ieee")).unwrap();
+        std::fs::write(
+            dir.join("ieee/std_logic_1164.vhd"),
+            "package std_logic_1164 is end;",
+        )
+        .unwrap();
+        let providers = stdlib_providers_from(Some(dir.clone()));
+        let names: Vec<&str> = providers.iter().map(|p| p.name()).collect();
+        assert_eq!(names, vec!["ieee"]);
+        let units = providers[0].scan();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].0, "std_logic_1164");
+        assert!(units[0].1.starts_with(&dir));
+        // Unset/invalid -> embedded tree.
+        assert_eq!(stdlib_providers_from(None).len(), 2);
+        assert_eq!(
+            stdlib_providers_from(Some(PathBuf::from("/nonexistent"))).len(),
+            2
         );
     }
 }

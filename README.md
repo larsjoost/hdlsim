@@ -18,10 +18,10 @@ the graphical wave display are all implemented here.
   directories (`hdlsim.ini` — created by `hdlsim init` — plus `-L name=dir` flags);
   undefined modules and `` `include `` files are found and compiled on demand in
   dependency order, with an in-session compile cache. `std` and `ieee` are built in
-  as real VHDL source files shipped in the repo (`crates/hdl-lib/stdlib/`, not
-  compiled into the binary) and parsed by the same front-end; they are found via
-  `$HDLSIM_STDLIB`, an installed `share/hdlsim/stdlib` next to the executable, or
-  the source tree, and are searched last so `-L ieee=...` overrides them.
+  as real VHDL source files (`crates/hdl-lib/stdlib/`), embedded into the binary
+  with `include_str!` and parsed by the same front-end, so they always resolve —
+  no on-disk stdlib needed. They are searched last so `-L ieee=...` overrides them;
+  `$HDLSIM_STDLIB` points the built-ins at a custom source tree.
 - **Persistent parse cache.** The CLI caches each file's parse tree under
   `.hdlsim-cache/` (own binary format, keyed by source-text hash + format
   version), so repeated runs skip lexing/parsing unchanged files. Control with
