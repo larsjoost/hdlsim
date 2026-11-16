@@ -3,7 +3,7 @@
 //! exit — checking the framed responses, including publishDiagnostics.
 
 use hdlsim::commands::lsp::{read_message, serve, write_message};
-use hdlsim::json::Json;
+use hdlsim::json::{Json, JsonCtor};
 use std::io::Cursor;
 
 fn frame(s: &str) -> Vec<u8> {
@@ -56,7 +56,7 @@ fn lsp_completion_over_framed_session() {
         .unwrap()
         .get("items")
         .unwrap()
-        .as_arr()
+        .as_array()
         .unwrap();
     let labels: Vec<&str> = items
         .iter()
@@ -140,7 +140,7 @@ fn lsp_session_serves_diagnostics_and_exits_zero() {
         .unwrap()
         .get("diagnostics")
         .unwrap()
-        .as_arr()
+        .as_array()
         .unwrap();
     assert_eq!(first.len(), 1, "{}", diags[0]);
     assert_eq!(first[0].get("severity"), Some(&Json::num(1)));
@@ -158,7 +158,7 @@ fn lsp_session_serves_diagnostics_and_exits_zero() {
         .unwrap()
         .get("diagnostics")
         .unwrap()
-        .as_arr()
+        .as_array()
         .unwrap()
         .is_empty());
 }
