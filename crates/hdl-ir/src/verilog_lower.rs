@@ -1194,10 +1194,34 @@ impl<'a> Lower<'a> {
                 ));
             }
             SyntaxKind::Port | SyntaxKind::Decl | SyntaxKind::ParamDecl => {
-                // Already handled in the pre-pass / param pass; re-lowering a Decl
-                // for its init value:
+                // Handled in the pre-pass / param pass at module level;
+                // re-lowering a Decl for its init value. A ParamDecl inside a
+                // generate block was not covered by the pre-pass, so lower it now.
                 if item.kind() == SyntaxKind::Decl {
+                    // Declarations inside generate blocks were not registered
+                    // by the module-level pre-pass: register them now.
+                    let dk = real_children(item);
+                    let width = self.decl_width(&dk, env);
+                    for k in &dk {
+                        if k.kind() == SyntaxKind::Name {
+                            let n = self.text(k);
+                            if self.sig_id(&n).is_none() {
+                                let id = module.signals.len() as SigId;
+                                module.signals.push(SignalIr {
+                                    name: n.clone(),
+                                    width: width.max(1),
+                                    kind: SigKind::Wire,
+                                    init: None,
+                                    mem: None,
+                                    signed: false,
+                                });
+                                self.names.insert(n, id);
+                            }
+                        }
+                    }
                     self.lower_decl_init(module, item, env);
+                } else if item.kind() == SyntaxKind::ParamDecl {
+                    self.lower_param(module, item, env);
                 }
             }
             // Handled in the pre-pass.
@@ -1229,6 +1253,13 @@ impl<'a> Lower<'a> {
                     match k.kind() {
                         SyntaxKind::GenFor => self.lower_gen_for(module, &k, env),
                         SyntaxKind::GenIf => self.lower_gen_if(module, &k, env),
+                        SyntaxKind::GenBlock => {
+                            for k2 in real_children(&k) {
+                                if is_module_item(k2.kind()) {
+                                    self.lower_module_item(module, &k2, env);
+                                }
+                            }
+                        }
                         _ if is_module_item(k.kind()) => self.lower_module_item(module, &k, env),
                         _ => {}
                     }
@@ -1331,10 +1362,19 @@ impl<'a> Lower<'a> {
                     if is_expr_node(e.kind()) {
                         let expr = self.lower_expr(e, env);
                         let val = const_eval(&expr, env).unwrap_or_else(|| Value::x(32));
-                        module.params.push(ParamIr {
-                            name: self.text(&kids[i]),
-                            default: val,
-                        });
+                        let pname = self.text(&kids[i]);
+                        // The module-level param pass may have registered this
+                        // already (lower_module_item re-lowers ParamDecls inside
+                        // generate blocks) — don't push a duplicate.
+                        if !module.params.iter().any(|p| p.name == pname) {
+                            module.params.push(ParamIr {
+                                name: pname.clone(),
+                                default: val.clone(),
+                            });
+                        }
+                        // Also visible as a constant to later items (e.g. decls
+                        // inside generate blocks that the pre-pass did not see).
+                        self.gconsts.insert(pname, val);
                         i += 3;
                         continue;
                     }
@@ -2120,10 +2160,11 @@ impl<'a> Lower<'a> {
         let cond_node = kids.iter().find(|k| is_expr_node(k.kind()));
         // The body is the last statement node — not one of the header
         // StmtAssigns (init/step).
-        let body = kids
-            .iter()
-            .rev()
-            .find(|k| k.kind() == SyntaxKind::Block || is_stmt_node(k.kind()));
+        let body = kids.iter().rev().find(|k| {
+            k.kind() == SyntaxKind::Block
+                || k.kind() == SyntaxKind::GenBlock
+                || is_stmt_node(k.kind())
+        });
         if assigns.len() < 2 || cond_node.is_none() || body.is_none() {
             self.err(g.span(), "malformed generate for");
             return;
@@ -2175,7 +2216,7 @@ impl<'a> Lower<'a> {
                 break;
             }
             match body_node.kind() {
-                SyntaxKind::Block => {
+                SyntaxKind::Block | SyntaxKind::GenBlock => {
                     for k in real_children(&body_node) {
                         // Skip `begin`/`end` keywords, `:` and the block label.
                         if matches!(
@@ -2225,11 +2266,15 @@ impl<'a> Lower<'a> {
             .map_or(false, |v| v != 0);
         let bodies: Vec<&SyntaxNode> = kids
             .iter()
-            .filter(|k| is_stmt_node(k.kind()) || k.kind() == SyntaxKind::Block)
+            .filter(|k| {
+                is_stmt_node(k.kind())
+                    || k.kind() == SyntaxKind::Block
+                    || k.kind() == SyntaxKind::GenBlock
+            })
             .collect();
         let chosen = if take { bodies.first() } else { bodies.get(1) };
         if let Some(b) = chosen {
-            if b.kind() == SyntaxKind::Block {
+            if b.kind() == SyntaxKind::Block || b.kind() == SyntaxKind::GenBlock {
                 for k in real_children(b) {
                     // Skip `begin`/`end` keywords, `:` and the block label.
                     if matches!(
@@ -2518,6 +2563,28 @@ impl<'a> Lower<'a> {
                                 args: vec![self.this_expr()],
                             };
                         }
+                        // A bare type keyword used as a value (`parameter type t = logic`)
+                        // means the default type; treat as 0.
+                        if matches!(
+                            base,
+                            "logic"
+                                | "reg"
+                                | "wire"
+                                | "bit"
+                                | "int"
+                                | "integer"
+                                | "longint"
+                                | "shortint"
+                                | "byte"
+                                | "real"
+                                | "time"
+                                | "string"
+                                | "chandle"
+                                | "signed"
+                                | "unsigned"
+                        ) {
+                            return Expr::Lit(Value::from_u64(1, 0));
+                        }
                         self.err(e.span(), format!("unknown identifier '{}'", base));
                         Expr::Lit(Value::x(1))
                     }
@@ -2564,6 +2631,24 @@ impl<'a> Lower<'a> {
                     .map(|k| self.text(k))
                     .collect();
                 let operand = kids.iter().find(|k| is_expr_node(k.kind()));
+                // `x++` / `x--` (postfix) and `++x` / `--x` (prefix) become
+                // `x+1` / `x-1` (the assignment side effect is modeled by the
+                // enclosing statement).
+                if op_text == "++" || op_text == "--" {
+                    let Some(o) = operand else {
+                        return Expr::Lit(Value::x(1));
+                    };
+                    let base = self.lower_expr(o, env);
+                    return Expr::Bin {
+                        op: if op_text == "++" {
+                            BinOp::Add
+                        } else {
+                            BinOp::Sub
+                        },
+                        l: Box::new(base),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    };
+                }
                 let Some(op) = unop_from_str(&op_text) else {
                     self.err(
                         e.span(),
@@ -3069,6 +3154,12 @@ fn ce_impl(
         Expr::Signed(e) => ce_impl(e, env, funcs, slots.as_deref_mut()),
         Expr::SigAttr { .. } => None, // width only known after port connection
         Expr::Call { name, args } => {
+            // System functions usable in constant expressions.
+            if name == "$clog2" && args.len() == 1 {
+                let v = ce_impl(&args[0], env, funcs, slots.as_deref_mut())?;
+                let n = v.to_u64()?;
+                return Some(Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64));
+            }
             let f = funcs.get(&name.to_ascii_lowercase())?;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {

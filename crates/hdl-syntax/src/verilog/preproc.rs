@@ -72,6 +72,21 @@ pub fn preprocess(
                 }
             }
         }
+        if let Some(rest) = line.trim_start().strip_prefix('`') {
+            let (name, _) = split_ident(rest);
+            if !name.is_empty() && !KNOWN_DIRECTIVES.contains(&name.as_str()) {
+                // Unknown directive (e.g. a macro invocation like `ASSERT(...)`):
+                // it is dropped below, so also join a multi-line parenthesized
+                // argument list to keep the following lines from leaking through.
+                let mut bal = paren_balance(&line);
+                while bal > 0 && i + 1 < raw_lines.len() {
+                    i += 1;
+                    line.push('\n');
+                    line.push_str(raw_lines[i]);
+                    bal += paren_balance(raw_lines[i]);
+                }
+            }
+        }
         lines.push(line);
         i += 1;
     }
@@ -160,10 +175,10 @@ pub fn preprocess(
                             ),
                         },
                         None => diags.push(
-                            Diagnostic::error(
-                                "E0202",
+                            Diagnostic::warning(
+                                "W0202",
                                 Some(Span::new(file, line_start, line_start + line.len() as u32)),
-                                format!("`include \"{}\" not found", inc),
+                                format!("`include \"{}\" not found; skipped", inc),
                             )
                             .with_help("searched incdirs and the including file's directory"),
                         ),
@@ -212,6 +227,21 @@ const KNOWN_DIRECTIVES: &[&str] = &[
     "begin_keywords",
     "end_keywords",
 ];
+
+/// Paren balance of a line, ignoring quoted strings.
+fn paren_balance(s: &str) -> i32 {
+    let mut bal = 0;
+    let mut in_str = false;
+    for c in s.chars() {
+        match c {
+            '"' => in_str = !in_str,
+            '(' if !in_str => bal += 1,
+            ')' if !in_str => bal -= 1,
+            _ => {}
+        }
+    }
+    bal
+}
 
 fn split_ident(s: &str) -> (String, &str) {
     let mut end = 0;
