@@ -71,9 +71,12 @@ Pipeline: `source → tokens → CST → AST → IR → sim events → sinks`.
 
 ## Status
 
-Early development. Verilog-2005, a SystemVerilog subset (packages, typedefs,
-structs/enums, arrays/queues, classes with `randomize()` + constraints,
-generate, `unique case`), and VHDL incl. VHDL-2008 (`process(all)`, matching
+Early development. Verilog-2005, a SystemVerilog subset (packages with
+`pkg::` scope resolution and const-evaluable package functions, typedefs,
+structs/enums, `parameter type`, typed parameters, gen-block localparams,
+multi-dim ranges, `inst.port` reads, arrays/queues, classes with
+`randomize()` + constraints, generate, `unique case`), and VHDL incl. VHDL-2008
+(`process(all)`, matching
 case/operators, `to_xstring`, conditional/selected assigns) are supported and
 locked in by self-checking examples in `examples/features/` (each prints
 `PASS`; run via `cargo test -p hdlsim --test examples`). See `docs/plan.md`
