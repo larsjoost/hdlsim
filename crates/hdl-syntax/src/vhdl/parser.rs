@@ -300,9 +300,9 @@ impl<'a> Parser<'a> {
             && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
     }
 
-    /// Parameter class keyword (signal/constant/variable/file) — precedes the names.
+    /// Parameter class keyword (signal/constant/variable/file/type) — precedes the names.
     fn at_param_class_kw(&self) -> bool {
-        const KWS: &[&str] = &["signal", "constant", "variable", "file"];
+        const KWS: &[&str] = &["signal", "constant", "variable", "file", "type"];
         self.peek().kind == TokenKind::Ident
             && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
     }
@@ -532,6 +532,16 @@ impl<'a> Parser<'a> {
         self.bump(); // generic
         self.expect_punct('(', "to open the generic list");
         while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
+            // VHDL-2008 generic clauses may also carry `type T;` entries and
+            // subprogram specifications (`impure function f(...) ...;`).
+            if self.at_kw("function")
+                || self.at_kw("procedure")
+                || self.at_kw("pure")
+                || self.at_kw("impure")
+            {
+                self.parse_subprogram(); // consumes its own ';'
+                continue;
+            }
             self.parse_interface_decl(SyntaxKind::GenericDecl);
             if !self.eat_punct(';') {
                 break;
@@ -561,10 +571,15 @@ impl<'a> Parser<'a> {
     fn parse_interface_decl(&mut self, kind: SyntaxKind) {
         self.start(kind);
         // Optional parameter class BEFORE the names: `signal s : t`,
-        // `constant c : t`, `variable v : t` (subprogram parameters).
-        if self.at_param_class_kw() {
+        // `constant c : t`, `variable v : t` (subprogram parameters),
+        // `type T` (VHDL-2008 type generic in a generic clause).
+        let class = if self.at_param_class_kw() {
+            let t = self.peek_text().to_ascii_lowercase();
             self.bump();
-        }
+            Some(t)
+        } else {
+            None
+        };
         loop {
             // Names only; a class/mode keyword ends the name list.
             if self.peek().kind == TokenKind::Ident && !self.at_class_or_mode_kw() {
@@ -573,6 +588,14 @@ impl<'a> Parser<'a> {
             if !self.eat_punct(',') {
                 break;
             }
+        }
+        // `type T;` — a type generic has no mode or type mark.
+        if class.as_deref() == Some("type") && !self.at_punct(':') {
+            while self.peek().kind != TokenKind::Eof && !self.at_punct(';') {
+                self.bump();
+            }
+            self.builder.finish_node();
+            return;
         }
         self.expect_punct(':', "before the mode/type");
         // Optional mode after the colon: in/out/inout/buffer/linkage.
@@ -617,6 +640,11 @@ impl<'a> Parser<'a> {
             _ if self.at_kw("subtype") => self.parse_subtype_decl(),
             _ if self.at_kw("component") => self.parse_component_decl(),
             _ if self.at_kw("function") || self.at_kw("procedure") => self.parse_subprogram(),
+            // VHDL-2008 `pure`/`impure` function prefixes (kept as tokens in
+            // the subprogram node; semantics unchanged for simulation).
+            _ if self.at_kw("pure") || self.at_kw("impure") => {
+                self.parse_subprogram();
+            }
             _ if self.at_kw("shared") => {
                 // `shared variable v : t;` — VariableDecl with the `shared`
                 // keyword kept in the tree.
@@ -674,12 +702,24 @@ impl<'a> Parser<'a> {
         self.bump(); // alias
         self.parse_name();
         if self.eat_punct('(') {
-            // Subprogram signature: `[...]` / `(param; ...)` — skip balanced.
+            // Subprogram signature: `(param; ...)` — skip balanced.
             let mut depth = 1;
             while depth > 0 && self.peek().kind != TokenKind::Eof {
                 if self.at_punct('(') {
                     depth += 1;
                 } else if self.at_punct(')') {
+                    depth -= 1;
+                }
+                self.bump();
+            }
+        }
+        if self.eat_punct('[') {
+            // Subprogram signature in brackets: `alias a is f[T1, T2];`
+            let mut depth = 1;
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('[') {
+                    depth += 1;
+                } else if self.at_punct(']') {
                     depth -= 1;
                 }
                 self.bump();
@@ -693,6 +733,19 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("is", "in the alias declaration");
         self.parse_name();
+        // Optional signature on the target: `alias a is f[T1, T2];`
+        if self.at_punct('[') {
+            let mut depth = 1;
+            self.bump();
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('[') {
+                    depth += 1;
+                } else if self.at_punct(']') {
+                    depth -= 1;
+                }
+                self.bump();
+            }
+        }
         self.expect_punct(';', "to end the alias declaration");
         self.builder.finish_node();
     }
@@ -834,6 +887,11 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::TypeDecl);
         self.bump(); // type
         self.expect_ident("for the type name");
+        // Incomplete (forward) type declaration: `type ListType;`
+        if self.eat_punct(';') {
+            self.builder.finish_node();
+            return;
+        }
         self.expect_kw("is", "after the type name");
         if self.at_punct('(') {
             // Enumeration type: (idle, running, ...)
@@ -899,6 +957,9 @@ impl<'a> Parser<'a> {
             }
             self.expect_kw("end", "to close the record type");
             self.eat_kw("record");
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // optional record name
+            }
         } else if self.at_kw("access") {
             // `access type_mark [constraint]` — pointer type.
             self.bump();
@@ -912,21 +973,22 @@ impl<'a> Parser<'a> {
             self.expect_kw("of", "in the file type");
             self.parse_type_mark();
         } else if self.at_kw("protected") {
-            // `protected ... end protected;` (+ optional `body ... end protected body;`)
+            // `protected ... end protected [name];` and the separate-body form
+            // `type X is protected body ... end protected body [X];`
             self.bump();
+            let is_body = self.at_kw("body");
+            if is_body {
+                self.bump();
+            }
             while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
                 self.parse_decl();
             }
             self.expect_kw("end", "to close the protected type");
             self.eat_kw("protected");
-            if self.at_kw("body") {
-                self.bump();
-                while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
-                    self.parse_decl();
-                }
-                self.expect_kw("end", "to close the protected body");
-                self.eat_kw("protected");
-                self.eat_kw("body");
+            // `end protected [body] [name];`
+            self.eat_kw("body");
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // optional type name
             }
         } else {
             self.error_here("unsupported type definition (only enum/range/array/record-skip)");
@@ -1013,6 +1075,10 @@ impl<'a> Parser<'a> {
     /// into the tree; lowering them is a later milestone.
     fn parse_subprogram(&mut self) {
         self.start(SyntaxKind::Function);
+        // Optional VHDL-2008 purity prefix: `impure function f ...`.
+        if self.at_kw("pure") || self.at_kw("impure") {
+            self.bump();
+        }
         self.bump(); // function | procedure
                      // Operator symbols are string literals: `function "and" (...)`.
         if self.peek().kind == TokenKind::Ident || self.peek().kind == TokenKind::StrLiteral {
@@ -1047,11 +1113,16 @@ impl<'a> Parser<'a> {
             if self.peek().kind == TokenKind::Ident {
                 self.bump(); // function/procedure
             }
-            if self.peek().kind == TokenKind::Ident {
+            // Optional name — an operator symbol is a string literal: `end function "ABS";`
+            if self.peek().kind == TokenKind::Ident || self.peek().kind == TokenKind::StrLiteral {
                 self.bump(); // name
             }
         }
-        self.expect_punct(';', "to end the subprogram");
+        // Tolerate a missing ';' right before the ')' of a generic list
+        // (some sources rely on it).
+        if !self.eat_punct(';') && !self.at_punct(')') {
+            self.error_here("expected ';' to end the subprogram");
+        }
         self.builder.finish_node();
     }
 
@@ -1655,6 +1726,29 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct(';', "to end the return statement");
             self.builder.finish_node();
+        } else if self.at_punct('(') {
+            // VHDL-2008 parenthesized target list: `(a, b) := f(...);`
+            let mark = self.builder.mark();
+            self.bump(); // (
+            loop {
+                self.parse_postfix_name();
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the target list");
+            if self.peek_op2().as_deref() == Some("<=") || self.peek_op2().as_deref() == Some(":=")
+            {
+                self.builder.start_node_at(mark, SyntaxKind::SeqAssign);
+                self.bump();
+                self.bump();
+                self.parse_expression();
+                self.expect_punct(';', "to end the assignment");
+                self.builder.finish_node();
+            } else {
+                self.error_here("expected '<=' or ':=' after the target list");
+                self.skip_to_semicolon();
+            }
         } else {
             // Assignment or procedure call: parse the target/name, then decide.
             let mark = self.builder.mark();
@@ -1668,6 +1762,16 @@ impl<'a> Parser<'a> {
                     self.bump();
                     self.parse_expression();
                 }
+                // Conditional waveform: `x <= a when c else b;` (flat tokens,
+                // lowered like the concurrent form).
+                loop {
+                    if self.at_kw("when") || self.at_kw("else") {
+                        self.bump();
+                        self.parse_expression();
+                        continue;
+                    }
+                    break;
+                }
                 self.expect_punct(';', "to end the signal assignment");
                 self.builder.finish_node();
             } else if self.peek_op2().as_deref() == Some(":=") {
@@ -1675,6 +1779,15 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.bump();
                 self.parse_expression();
+                // Conditional expression: `v := a when c else b;`
+                loop {
+                    if self.at_kw("when") || self.at_kw("else") {
+                        self.bump();
+                        self.parse_expression();
+                        continue;
+                    }
+                    break;
+                }
                 self.expect_punct(';', "to end the variable assignment");
                 self.builder.finish_node();
             } else {
@@ -1781,12 +1894,20 @@ impl<'a> Parser<'a> {
         self.bump(); // for
         self.expect_ident("for the loop variable");
         self.expect_kw("in", "after the loop variable");
-        // Discrete range: `expr to/downto expr`, or `name'range`, or a subtype.
+        // Discrete range: `expr to/downto expr`, `name'range`, attribute bounds
+        // (`t'left to t'right`), or a subtype.
         if self.peek().kind == TokenKind::Ident
             && self.peek2().kind == TokenKind::Punct
             && self.peek2_text() == "'"
         {
-            self.parse_name(); // includes the 'range attribute
+            let mark = self.builder.mark();
+            self.parse_name(); // includes the 'range/'left/'right attribute
+            if self.at_kw("to") || self.at_kw("downto") {
+                self.builder.start_node_at(mark, SyntaxKind::Range);
+                self.bump();
+                self.parse_expression();
+                self.builder.finish_node();
+            }
         } else {
             self.start(SyntaxKind::Range);
             self.parse_range();
@@ -1938,7 +2059,23 @@ impl<'a> Parser<'a> {
                     self.bump(); // '
                     self.builder.start_node_at(mark, SyntaxKind::Qualified);
                     self.bump(); // (
+                                 // The operand may be an aggregate: `integer_vector'(1, 7)`,
+                                 // `rec_t'(ID => x)`, `s'(1 to N => ' ')`.
                     self.parse_expression();
+                    loop {
+                        if self.peek_op2().as_deref() == Some("=>") {
+                            self.bump();
+                            self.bump();
+                            self.parse_expression();
+                        } else if self.at_kw("to") || self.at_kw("downto") {
+                            self.bump();
+                            self.parse_expression();
+                        } else if self.eat_punct(',') {
+                            self.parse_agg_element();
+                        } else {
+                            break;
+                        }
+                    }
                     self.expect_punct(')', "to close the qualified expression");
                     self.builder.finish_node();
                 } else {
@@ -2052,15 +2189,33 @@ impl<'a> Parser<'a> {
 
     /// One aggregate element: `choice [| choice...] [=> value]` where the
     /// choice is `others` or an expression.
+    /// One aggregate choice: `others`, an expression, or a range choice
+    /// (`a to b`, `a downto b`, `range <>`).
+    fn parse_agg_choice(&mut self) {
+        if self.at_kw("others") {
+            self.start(SyntaxKind::Others);
+            self.bump();
+            self.builder.finish_node();
+            return;
+        }
+        if self.at_kw("range") {
+            self.bump();
+            if self.peek_op2().as_deref() == Some("<>") {
+                self.bump();
+                self.bump();
+            }
+            return;
+        }
+        self.parse_expression();
+        if self.at_kw("to") || self.at_kw("downto") {
+            self.bump();
+            self.parse_expression();
+        }
+    }
+
     fn parse_agg_element(&mut self) {
         loop {
-            if self.at_kw("others") {
-                self.start(SyntaxKind::Others);
-                self.bump();
-                self.builder.finish_node();
-            } else {
-                self.parse_expression();
-            }
+            self.parse_agg_choice();
             if !self.eat_punct('|') {
                 break;
             }
@@ -2166,10 +2321,17 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 self.parse_expression();
+                // A range choice (`1 to N => ' '`) also makes this an aggregate.
+                if self.at_kw("to") || self.at_kw("downto") {
+                    self.bump();
+                    self.parse_expression();
+                }
                 // Aggregate if the first element is followed by `,`, `|`
-                // (more choices) or `=>` (named association).
-                let mut is_agg =
-                    self.peek_op2().as_deref() == Some("=>") || self.peek_text() == "|";
+                // (more choices), `=>` (named association) or a range.
+                let mut is_agg = self.peek_op2().as_deref() == Some("=>")
+                    || self.peek_text() == "|"
+                    || self.at_kw("to")
+                    || self.at_kw("downto");
                 let mut first_comma = false;
                 if self.eat_punct(',') {
                     is_agg = true;
@@ -2180,13 +2342,7 @@ impl<'a> Parser<'a> {
                     self.builder.start_node_at(mark, SyntaxKind::Aggregate);
                     // Finish the first element (extra choices / `=> value`).
                     while self.eat_punct('|') {
-                        if self.at_kw("others") {
-                            self.start(SyntaxKind::Others);
-                            self.bump();
-                            self.builder.finish_node();
-                        } else {
-                            self.parse_expression();
-                        }
+                        self.parse_agg_choice();
                     }
                     if self.peek_op2().as_deref() == Some("=>") {
                         self.bump();
@@ -2477,6 +2633,55 @@ package p is new ieee.std_logic_1164.all generic map (W => 8);
 "#,
         );
         assert!(sexp.contains("(PackageInst"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_vhdl2008_constructs() {
+        // impure/pure functions, type generics + subprogram specs in a generic
+        // clause, protected type + body, incomplete type, alias with [signature],
+        // aggregate range choices, qualified aggregates, for-loop attribute
+        // bounds, conditional expressions, parenthesized target list.
+        let sexp = ok(r#"package p is
+  generic (
+    type ExpectedType;
+    impure function Match(A : ExpectedType) return boolean
+  );
+  type ListType;
+  type PType is protected
+    procedure bump(x : in integer);
+  end protected PType;
+  alias F is g[integer, string];
+end package;
+package body p is
+  type PType is protected body
+    variable n : integer;
+  end protected body PType;
+  function f(a : integer_vector) return integer is
+    variable v : integer;
+  begin
+    v := f(integer_vector'(1, 7)) when a'length > 0 else 0;
+    for i in integer'left to integer'right loop
+      v := v + i;
+    end loop;
+    return v;
+  end function "+";
+end package body;
+architecture rtl of t is
+  constant C : string := (1 to 4 => ' ');
+  signal s : bit;
+begin
+  s <= '1' when C = "    " else '0';
+  process
+  begin
+    (s, s) := f(integer_vector'(1, 2));
+    wait;
+  end process;
+end architecture;
+"#);
+        assert!(sexp.contains("(GenericClause"), "{}", sexp);
+        assert!(sexp.contains("(TypeDecl"), "{}", sexp);
+        assert!(sexp.contains("(AliasDecl"), "{}", sexp);
+        assert!(sexp.contains("(Qualified"), "{}", sexp);
     }
 
     #[test]

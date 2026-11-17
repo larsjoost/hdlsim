@@ -2863,12 +2863,40 @@ impl<'a> Lower<'a> {
         match s.kind() {
             SyntaxKind::SeqAssign => {
                 let kids = real_children(s);
+                // `(a, b) := f(...);` — parenthesized target list: not
+                // lowered (no error).
+                if kids
+                    .first()
+                    .map_or(false, |k| k.kind() == SyntaxKind::Punct)
+                {
+                    return Stmt::Null;
+                }
                 let lhs = kids.iter().find(|k| {
                     matches!(
                         k.kind(),
                         SyntaxKind::Name | SyntaxKind::Call | SyntaxKind::PartSelect
                     )
                 });
+                let op_pos = kids
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "<");
+                let has_when = kids
+                    .iter()
+                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
+                if has_when {
+                    if let (Some(l), Some(op)) = (lhs, op_pos) {
+                        if let Some(e) =
+                            self.lower_cond_waveform(&kids[op + 2..], &self.consts.clone())
+                        {
+                            return Stmt::Assign {
+                                lhs: self.lower_expr(l, &self.consts.clone()),
+                                rhs: e,
+                                nba: true,
+                            };
+                        }
+                    }
+                    return Stmt::Null;
+                }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
                     (Some(l), Some(r)) => Stmt::Assign {
@@ -2886,6 +2914,27 @@ impl<'a> Lower<'a> {
                         || k.kind() == SyntaxKind::Call
                         || k.kind() == SyntaxKind::PartSelect
                 });
+                // Conditional expression: `v := a when c else b;`
+                let has_when = kids
+                    .iter()
+                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
+                if has_when {
+                    let colon_pos = kids
+                        .iter()
+                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+                    if let (Some(l), Some(cp)) = (lhs, colon_pos) {
+                        if let Some(e) =
+                            self.lower_cond_waveform(&kids[cp + 2..], &self.consts.clone())
+                        {
+                            return Stmt::Assign {
+                                lhs: self.lower_expr(l, &self.consts.clone()),
+                                rhs: e,
+                                nba: false,
+                            };
+                        }
+                    }
+                    return Stmt::Null;
+                }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
                     (Some(l), Some(r)) => Stmt::Assign {
@@ -3441,6 +3490,11 @@ impl<'a> Lower<'a> {
                         };
                     }
                 }
+                // `open` (reserved word) in a port/generic map association:
+                // an unconnected port — X, no diagnostic.
+                if key == "open" {
+                    return Expr::Lit(Value::x(1));
+                }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
             }
@@ -3972,6 +4026,65 @@ impl<'a> Lower<'a> {
 
     /// Lower an assignment RHS, using the LHS record type (if any) to order
     /// named aggregate associations.
+    /// Lower a flat conditional waveform / expression
+    /// (`v0 when c0 else v1 when c1 else v2`) into nested `Expr::Cond`.
+    fn lower_cond_waveform(
+        &mut self,
+        kids: &[SyntaxNode],
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let mut pairs: Vec<(Expr, Option<Expr>)> = Vec::new();
+        let mut cur_val: Option<Expr> = None;
+        let mut cur_cond: Option<Expr> = None;
+        let mut i = 0;
+        while i < kids.len() {
+            let k = &kids[i];
+            if k.kind() == SyntaxKind::Ident {
+                match self.kw(k).as_str() {
+                    "when" => {
+                        if let Some(c) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
+                            cur_cond = Some(self.lower_expr(c, env));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    "else" => {
+                        if let Some(v) = cur_val.take() {
+                            pairs.push((v, cur_cond.take()));
+                        }
+                        if let Some(e) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
+                            cur_val = Some(self.lower_expr(e, env));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            } else if is_expr_node(k.kind()) {
+                if let Some(v) = cur_val.take() {
+                    pairs.push((v, cur_cond.take()));
+                }
+                cur_val = Some(self.lower_expr(k, env));
+            }
+            i += 1;
+        }
+        if let Some(v) = cur_val {
+            pairs.push((v, cur_cond));
+        }
+        let mut acc: Option<Expr> = None;
+        for (v, c) in pairs.into_iter().rev() {
+            acc = Some(match c {
+                Some(c) => Expr::Cond {
+                    c: Box::new(c),
+                    t: Box::new(v),
+                    e: Box::new(acc.unwrap_or(Expr::Lit(Value::x(1)))),
+                },
+                None => v,
+            });
+        }
+        acc
+    }
+
     fn lower_rhs(
         &mut self,
         lhs: &SyntaxNode,
