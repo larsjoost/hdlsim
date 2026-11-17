@@ -280,6 +280,13 @@ pub enum Expr {
     /// `signed(x)` — pure signedness marker: same bits/width, but signed
     /// semantics for arithmetic and comparisons.
     Signed(Box<Expr>),
+    /// `sig'length`/`sig'high`/… where the width is only known after port
+    /// connection (unconstrained array ports) — evaluated at runtime from
+    /// the (possibly aliased) flat signal.
+    SigAttr {
+        sig: SigId,
+        attr: &'static str,
+    },
 }
 
 impl Expr {
@@ -287,6 +294,7 @@ impl Expr {
     pub fn collect_sigs(&self, out: &mut Vec<SigId>) {
         match self {
             Expr::Lit(_) | Expr::Real(_) => {}
+            Expr::SigAttr { sig, .. } => out.push(*sig),
             Expr::Sig(s) => out.push(*s),
             Expr::Bin { l, r, .. } => {
                 l.collect_sigs(out);

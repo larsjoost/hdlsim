@@ -74,7 +74,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | arithmetic/relational operators, `mod`/`rem`, `**` (saturating), `abs`/`not` | ✅ | `tests/vhdl_counter.rs`, `vhdl_signed.rs`, `tests/vhdl_pow.rs` |
 | logical `and/or/xor/…` on std_logic/vectors | ✅ (via 1164 operator functions) | examples |
 | concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
-| attributes | ◐ `'event`, `'last_value`, `'stable` on scalar signals; `'length`/`'high`/`'low`/`'left`/`'right` static; `'range` in for-loops; `'image`/`to_string`; others → X with diagnostic | `tests/vhdl_event.rs`, `tests/vhdl_lastval.rs`, `tests/vhdl_gaps.rs`, `tests/loops.rs` |
+| attributes | ◐ `'event`, `'last_value`, `'stable` on scalar signals; `'length`/`'high`/`'low`/`'left`/`'right` static — on unconstrained array ports (`port (a : in std_ulogic_vector)`) lowered to runtime `Expr::SigAttr`; `'range` in for-loops; `'image`/`to_string`; others → X with diagnostic | `tests/vhdl_event.rs`, `tests/vhdl_lastval.rs`, `tests/vhdl_gaps.rs`, `tests/loops.rs`, `tests/vhdl_unconport.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
 | shifts/rotates `sll`/`srl`/`sla`/`sra`/`rol`/`ror` + function forms `shift_left`/`shift_right`/`rotate_left`/`rotate_right` | ✅ (signed `sra`/`to_integer` decode signed; rotates keep operand width; not in `prove`/BMC) | `tests/vhdl_shifts.rs`, value unit tests |
 

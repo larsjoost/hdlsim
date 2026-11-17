@@ -977,6 +977,10 @@ impl Simulator {
             Expr::Lit(v) => Expr::Lit(v.clone()),
             Expr::Real(x) => Expr::Real(*x),
             Expr::Sig(s) => Expr::Sig(*s),
+            Expr::SigAttr { sig, attr } => Expr::SigAttr {
+                sig: *sig,
+                attr: *attr,
+            },
             Expr::Idx { e, i } => {
                 let a = self.eval_expr(i, None);
                 Expr::Idx {
@@ -1653,6 +1657,7 @@ impl Simulator {
         match e {
             Expr::Lit(v) => v.width(),
             Expr::Real(_) => 64,
+            Expr::SigAttr { .. } => 32,
             Expr::Sig(s) => {
                 if let Some(l) = locals {
                     if (*s as usize) < l.len() {
@@ -1809,6 +1814,21 @@ impl Simulator {
         match e {
             Expr::Lit(v) => v.clone(),
             Expr::Real(x) => Value::from_f64(*x),
+            Expr::SigAttr { sig, attr } => {
+                let sig = *sig as usize;
+                let w = self.flat.signals[sig].width.max(1);
+                let n = self
+                    .mems
+                    .get(sig)
+                    .filter(|m| !m.is_empty())
+                    .map_or(w, |m| m.len().max(1));
+                let v = match *attr {
+                    "length" => n as u64,
+                    "high" | "left" => (n as u64).saturating_sub(1),
+                    _ => 0, // low | right
+                };
+                Value::from_u64(32, v)
+            }
             Expr::Sig(s) => {
                 let i = *s as usize;
                 if let Some(l) = locals {

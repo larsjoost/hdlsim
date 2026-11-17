@@ -370,6 +370,10 @@ struct Lower<'a> {
     /// Counter for auto-naming instances (the parser drops statement labels,
     /// so `InstIr.name` is always empty; elab needs unique prefixes).
     inst_count: usize,
+    /// Ports declared without a constraint (`port (a : in std_ulogic_vector)`)
+    /// — their width is only known after port connection, so static
+    /// attributes on them lower to runtime `Expr::SigAttr`.
+    uncon_ports: std::collections::HashSet<SigId>,
 }
 
 impl<'a> Lower<'a> {
@@ -389,6 +393,7 @@ impl<'a> Lower<'a> {
             extra_signals: Vec::new(),
             extra_base: 0,
             inst_count: 0,
+            uncon_ports: std::collections::HashSet::new(),
         }
     }
 
@@ -837,6 +842,24 @@ impl<'a> Lower<'a> {
             };
             for n in &names {
                 let id = module.signals.len() as SigId;
+                if constraint.is_none()
+                    && (mem.is_some()
+                        || matches!(
+                            type_mark
+                                .as_ref()
+                                .map(|tm| self.text(tm).to_ascii_lowercase())
+                                .as_deref(),
+                            Some(
+                                "std_ulogic_vector"
+                                    | "std_logic_vector"
+                                    | "unsigned"
+                                    | "signed"
+                                    | "bit_vector"
+                            )
+                        ))
+                {
+                    self.uncon_ports.insert(id);
+                }
                 module.signals.push(SignalIr {
                     name: n.clone(),
                     width,
@@ -2902,6 +2925,19 @@ impl<'a> Lower<'a> {
                         // Statically known for signals: arrays → element count
                         // (mem depth), vectors → bit width.
                         if let Some(id) = self.sig_id(&bn) {
+                            if self.uncon_ports.contains(&id) {
+                                // Width known only after port connection.
+                                return Expr::SigAttr {
+                                    sig: id,
+                                    attr: match attr.as_str() {
+                                        "length" => "length",
+                                        "high" => "high",
+                                        "low" => "low",
+                                        "left" => "left",
+                                        _ => "right",
+                                    },
+                                };
+                            }
                             let n = self
                                 .mems
                                 .get(&id)
@@ -2988,8 +3024,13 @@ impl<'a> Lower<'a> {
         let kids = real_children(e);
         // `integer'image(x)` arrives as Call(Attr(Name integer, 'image), args).
         // The argument may itself be an attribute (`sig'last_value`, …), so
-        // only the callee Attr is excluded from the argument search.
-        let attr_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Attr);
+        // only the callee Attr is excluded — and only when it appears before
+        // the callee Name (`a(a'high)` has the Attr as an *argument*).
+        let name_pos0 = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+        let attr_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Attr)
+            .filter(|&i| name_pos0.map_or(true, |np| i < np));
         if let Some(ap) = attr_pos {
             let ak = real_children(&kids[ap]);
             let attr_name = ak
@@ -3022,9 +3063,7 @@ impl<'a> Lower<'a> {
         let args: Vec<Expr> = kids
             .iter()
             .enumerate()
-            .filter(|(i, k)| {
-                Some(*i) != name_pos && is_expr_node(k.kind()) && k.kind() != SyntaxKind::Attr
-            })
+            .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
             .map(|(_, k)| self.lower_expr(k, env))
             .collect();
         match fname.as_str() {
