@@ -71,6 +71,9 @@ pub struct LibraryManager {
     search_index: Option<HashMap<String, PathBuf>>,
     /// Units already reported as found-by-search (warn once per unit).
     search_warned: HashSet<String>,
+    /// Cross-file Verilog library state: SV packages and their `pkg::`-qualified
+    /// constants/functions from all Verilog files compiled so far.
+    verilog_scope: verilog_lower::VerilogScope,
 }
 
 impl LibraryManager {
@@ -91,6 +94,7 @@ impl LibraryManager {
             search_roots: Vec::new(),
             search_index: None,
             search_warned: HashSet::new(),
+            verilog_scope: verilog_lower::VerilogScope::default(),
         }
     }
 
@@ -285,6 +289,7 @@ impl LibraryManager {
             cache,
             &mut self.cache_hits,
             &mut self.pending_archs,
+            &mut self.verilog_scope,
         )
     }
 
@@ -302,7 +307,24 @@ impl LibraryManager {
     /// another file are bound design-wide (regardless of file order);
     /// architectures still naming an unknown entity produce E0401.
     pub fn compile_files(&mut self, design: &mut Design, paths: &[PathBuf]) {
+        // Compile Verilog files that declare a `package` first, so `pkg::name`
+        // references resolve no matter what order the files were given in.
+        let mut pkgs: Vec<&PathBuf> = Vec::new();
+        let mut rest: Vec<&PathBuf> = Vec::new();
         for p in paths {
+            let is_verilog_pkg = matches!(
+                p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
+                Some(ref e) if e == "v" || e == "sv"
+            ) && std::fs::read_to_string(p)
+                .map(|t| t.lines().any(|l| l.trim_start().starts_with("package ")))
+                .unwrap_or(false);
+            if is_verilog_pkg {
+                pkgs.push(p);
+            } else {
+                rest.push(p);
+            }
+        }
+        for p in pkgs.into_iter().chain(rest) {
             // The directory of an explicitly compiled file is a project root
             // for the out-of-the-box fallback search.
             if let Some(parent) = p.parent() {
@@ -522,6 +544,7 @@ pub fn compile_one(
     cache: Option<&cache::Cache>,
     cache_hits: &mut u64,
     pending_archs: &mut Vec<hdl_ir::vhdl_lower::PendingArch>,
+    verilog_scope: &mut verilog_lower::VerilogScope,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
         .ok_or_else(|| format!("unknown file extension: {}", path.display()))?;
@@ -560,8 +583,14 @@ pub fn compile_one(
                 .map(parser::timescale_to_fs)
                 .unwrap_or(1_000_000); // LRM default: 1 ns
             let mut lower_diags = Vec::new();
-            let modules =
-                verilog_lower::lower_file_with_time(id, &root, db, &mut lower_diags, time_unit_fs);
+            let modules = verilog_lower::lower_file_with_time_scoped(
+                id,
+                &root,
+                db,
+                &mut lower_diags,
+                time_unit_fs,
+                verilog_scope,
+            );
             diags.extend(lower_diags);
             design.modules.extend(modules);
         }

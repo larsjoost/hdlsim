@@ -28,6 +28,16 @@ pub fn lower_file(
     lower_file_with_time(file, root, db, diags, 1_000_000) // 1 ns in fs
 }
 
+/// Cross-file Verilog library state: packages and their `pkg::`-qualified
+/// constants/functions, shared by all files compiled into the same library so
+/// `cc_pkg::idx_width(...)` in one file resolves against `cc_pkg.sv`.
+#[derive(Default)]
+pub struct VerilogScope {
+    pub packages: HashMap<String, ModuleIr>,
+    pub gconsts: HashMap<String, Value>,
+    pub funcs_all: HashMap<String, FuncIr>,
+}
+
 /// Lower one parsed file, with `time_unit_fs` taken from the file's
 /// `` `timescale `` directive (femtoseconds per time unit).
 pub fn lower_file_with_time(
@@ -37,6 +47,27 @@ pub fn lower_file_with_time(
     diags: &mut Vec<Diagnostic>,
     time_unit_fs: u64,
 ) -> Vec<ModuleIr> {
+    lower_file_with_time_scoped(
+        file,
+        root,
+        db,
+        diags,
+        time_unit_fs,
+        &mut VerilogScope::default(),
+    )
+}
+
+/// Like [`lower_file_with_time`], but seeds the lowerer from `scope` (packages
+/// and qualified constants/functions of previously compiled files) and writes
+/// back the `pkg::`-qualified entries discovered in this file.
+pub fn lower_file_with_time_scoped(
+    file: FileId,
+    root: &SyntaxNode,
+    db: &SourceDb,
+    diags: &mut Vec<Diagnostic>,
+    time_unit_fs: u64,
+    scope: &mut VerilogScope,
+) -> Vec<ModuleIr> {
     let _ = file; // spans on nodes already carry the file id
     let mut lx = Lower {
         db,
@@ -45,8 +76,9 @@ pub fn lower_file_with_time(
         names: HashMap::new(),
         sig_types: HashMap::new(),
         types: HashMap::new(),
-        gconsts: HashMap::new(),
-        packages: HashMap::new(),
+        gconsts: scope.gconsts.clone(),
+        packages: scope.packages.clone(),
+        funcs_all: scope.funcs_all.clone(),
         extra_signals: Vec::new(),
         sig_is_mem: HashSet::new(),
         extra_base: 0,
@@ -54,6 +86,7 @@ pub fn lower_file_with_time(
         classes: HashMap::new(),
         class_mems: HashMap::new(),
         cur_class: None,
+        inst_conns: HashMap::new(),
     };
     // Classes first (modules may reference them), then packages, then modules.
     let children = real_children(root);
@@ -63,14 +96,52 @@ pub fn lower_file_with_time(
         }
     }
     let mut modules = Vec::new();
-    for child in children {
-        match child.kind() {
-            SyntaxKind::Module => modules.push(lx.lower_module(&child)),
-            SyntaxKind::Package => {
-                let pkg = lx.lower_module(&child);
-                lx.packages.insert(pkg.name.clone(), pkg);
+    // Packages first (in file order): their params (`pkg::NAME` in gconsts)
+    // and functions (`pkg::fn` in funcs_all) must be visible when modules
+    // that appear earlier in the file reference them (e.g. `cc_pkg::idx_width`).
+    for child in &children {
+        if child.kind() == SyntaxKind::Package {
+            let pkg = lx.lower_module(child);
+            for f in &pkg.functions {
+                lx.funcs_all.insert(
+                    format!("{}::{}", pkg.name, f.name).to_ascii_lowercase(),
+                    f.clone(),
+                );
             }
-            _ => {}
+            lx.packages.insert(pkg.name.clone(), pkg);
+        }
+    }
+    // Bare-name aliases for package functions, so calls inside package
+    // function bodies (`cnt_width` calling `idx_width`) const-evaluate.
+    let pkg_funcs: Vec<(String, FuncIr)> = lx
+        .funcs_all
+        .iter()
+        .filter(|(k, _)| k.contains("::"))
+        .map(|(k, v)| (k.rsplit("::").next().unwrap().to_string(), v.clone()))
+        .collect();
+    for (k, v) in pkg_funcs {
+        lx.funcs_all.entry(k).or_insert(v);
+    }
+    for child in children {
+        if child.kind() == SyntaxKind::Module {
+            let m = lx.lower_module(&child);
+            for f in &m.functions {
+                lx.funcs_all.insert(f.name.to_ascii_lowercase(), f.clone());
+            }
+            modules.push(m);
+        }
+    }
+    // Write back only qualified names (`pkg::x`, `module::param`) so a plain
+    // localparam of one file cannot leak into another file's scope.
+    scope.packages.extend(lx.packages.drain());
+    for (k, v) in lx.gconsts.drain() {
+        if k.contains("::") {
+            scope.gconsts.insert(k, v);
+        }
+    }
+    for (k, v) in lx.funcs_all.drain() {
+        if k.contains("::") {
+            scope.funcs_all.insert(k, v);
         }
     }
     modules
@@ -98,6 +169,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Index
             | SyntaxKind::Pattern
             | SyntaxKind::Allocator
+            | SyntaxKind::Cast
     )
 }
 
@@ -163,6 +235,9 @@ struct Lower<'a> {
     gconsts: HashMap<String, Value>,
     /// Lowered SV packages by name.
     packages: HashMap<String, ModuleIr>,
+    /// All lowered functions (package functions keyed `pkg::name`), for
+    /// const-evaluating calls like `cc_pkg::idx_width(Depth)` in param defaults.
+    funcs_all: HashMap<String, FuncIr>,
     /// Signals allocated during statement lowering (e.g. foreach index vars).
     extra_signals: Vec<SignalIr>,
     /// module.signals.len() after the registration pre-pass — the id base of
@@ -178,6 +253,9 @@ struct Lower<'a> {
     class_mems: HashMap<String, SigId>,
     /// Class whose method body is being lowered (for `this`/bare fields).
     cur_class: Option<String>,
+    /// Current module's instances: instance name → port connections, for
+    /// hierarchical reads `inst.port`.
+    inst_conns: HashMap<String, Vec<Conn>>,
 }
 
 /// A user-defined type (typedef, enum, struct, class).
@@ -267,6 +345,7 @@ impl<'a> Lower<'a> {
         self.sig_types.clear();
         self.sig_is_mem.clear();
         self.class_mems.clear();
+        self.inst_conns.clear();
         self.gconsts
             .insert("null".to_string(), Value::from_u64(64, u64::MAX));
         // First pass: params (so ports and later items can use them in ranges).
@@ -460,6 +539,53 @@ impl<'a> Lower<'a> {
         module
     }
 
+    /// Parse a `struct packed { ... }` node into a struct `TypeDef` (fields with
+    /// bit offsets, first field at the MSB).
+    fn struct_type_def(&mut self, st: &SyntaxNode, env: &HashMap<String, Value>) -> TypeDef {
+        let sk = real_children(st);
+        let mut fields: Vec<(String, usize)> = Vec::new();
+        let mut i = 0;
+        while i < sk.len() {
+            let mut width = 1usize;
+            if sk[i].kind() == SyntaxKind::Ident {
+                let t = self.text(&sk[i]);
+                width = type_kw_width(&t)
+                    .or_else(|| self.types.get(&t).map(|td| td.width))
+                    .unwrap_or(1);
+                i += 1;
+                if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                    width = self.range_width(&sk[i], env);
+                    i += 1;
+                }
+            }
+            while i < sk.len() && sk[i].kind() == SyntaxKind::Name {
+                fields.push((self.text(&sk[i]), width));
+                i += 1;
+                if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                    i += 1; // array field dimension
+                }
+            }
+            // skip `;`
+            i += 1;
+        }
+        let total: usize = fields.iter().map(|f| f.1).sum();
+        let mut lsb = total;
+        let mut with_off: Vec<(String, usize, usize)> = Vec::new();
+        for (n, w) in &fields {
+            lsb -= w;
+            with_off.push((n.clone(), *w, lsb));
+        }
+        let signed = sk
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "signed");
+        TypeDef {
+            width: total.max(1),
+            signed,
+            real: false,
+            kind: TypeKind::Struct(with_off),
+        }
+    }
+
     /// Lower a `typedef` into the type table; enum labels also become
     /// constants. `pkg` prefixes names when the typedef lives in a package.
     fn lower_typedef(
@@ -546,51 +672,8 @@ impl<'a> Lower<'a> {
             return;
         }
         if let Some(st) = struct_node {
-            let sk = real_children(st);
-            let mut fields: Vec<(String, usize)> = Vec::new();
-            let mut i = 0;
-            while i < sk.len() {
-                let mut width = 1usize;
-                if sk[i].kind() == SyntaxKind::Ident {
-                    let t = self.text(&sk[i]);
-                    width = type_kw_width(&t)
-                        .or_else(|| self.types.get(&t).map(|td| td.width))
-                        .unwrap_or(1);
-                    i += 1;
-                    if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
-                        width = self.range_width(&sk[i], env);
-                        i += 1;
-                    }
-                }
-                while i < sk.len() && sk[i].kind() == SyntaxKind::Name {
-                    fields.push((self.text(&sk[i]), width));
-                    i += 1;
-                    if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
-                        i += 1; // array field dimension
-                    }
-                }
-                // skip `;`
-                i += 1;
-            }
-            let total: usize = fields.iter().map(|f| f.1).sum();
-            let mut lsb = total;
-            let mut with_off: Vec<(String, usize, usize)> = Vec::new();
-            for (n, w) in &fields {
-                lsb -= w;
-                with_off.push((n.clone(), *w, lsb));
-            }
-            let signed = sk
-                .iter()
-                .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "signed");
-            self.types.insert(
-                key,
-                TypeDef {
-                    width: total.max(1),
-                    signed,
-                    real: false,
-                    kind: TypeKind::Struct(with_off),
-                },
-            );
+            let td = self.struct_type_def(st, env);
+            self.types.insert(key, td);
             return;
         }
         let _ = body;
@@ -995,13 +1078,15 @@ impl<'a> Lower<'a> {
     /// type keyword (`integer` = 32 bits, …), else 1.
     fn decl_width(&mut self, kids: &[SyntaxNode], env: &HashMap<String, Value>) -> usize {
         let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
-        if let Some(r) = kids
+        // Packed dimensions multiply: `logic [A-1:0][B-1:0] x` is A*B wide.
+        let packed: Vec<&SyntaxNode> = kids
             .iter()
             .enumerate()
-            .find(|(i, k)| k.kind() == SyntaxKind::Range && name_pos.map_or(true, |np| *i < np))
+            .filter(|(i, k)| k.kind() == SyntaxKind::Range && name_pos.map_or(true, |np| *i < np))
             .map(|(_, k)| k)
-        {
-            return self.range_width(r, env);
+            .collect();
+        if !packed.is_empty() {
+            return packed.iter().map(|r| self.range_width(r, env)).product();
         }
         if let Some(t) = self.decl_type_name(kids) {
             if let Some(td) = self.types.get(&t) {
@@ -1055,13 +1140,13 @@ impl<'a> Lower<'a> {
             return 0; // `[]` or `[$]`
         }
         if exprs.len() == 1 {
-            if let Some(v) = const_eval(&exprs[0], env).and_then(|v| v.to_u64()) {
+            if let Some(v) = self.ce(&exprs[0], env).and_then(|v| v.to_u64()) {
                 // `mem [255:0]` style single bound, or assoc `[string]` (non-const).
                 return v as usize + 1;
             }
             return 0; // assoc array key type, e.g. `[string]`
         }
-        if let (Some(a), Some(b)) = (const_eval(&exprs[0], env), const_eval(&exprs[1], env)) {
+        if let (Some(a), Some(b)) = (self.ce(&exprs[0], env), self.ce(&exprs[1], env)) {
             if let (Some(a), Some(b)) = (a.to_u64(), b.to_u64()) {
                 return (a as i64 - b as i64).unsigned_abs() as usize + 1;
             }
@@ -1076,13 +1161,13 @@ impl<'a> Lower<'a> {
             .map(|c| self.lower_expr(&c, env))
             .collect();
         if exprs.len() == 2 {
-            if let (Some(a), Some(b)) = (const_eval(&exprs[0], env), const_eval(&exprs[1], env)) {
+            if let (Some(a), Some(b)) = (self.ce(&exprs[0], env), self.ce(&exprs[1], env)) {
                 if let (Some(a), Some(b)) = (a.to_u64(), b.to_u64()) {
                     return (a as i64 - b as i64).unsigned_abs() as usize + 1;
                 }
             }
         } else if exprs.len() == 1 {
-            if let Some(v) = const_eval(&exprs[0], env) {
+            if let Some(v) = self.ce(&exprs[0], env) {
                 if let Some(w) = v.to_u64() {
                     return w as usize;
                 }
@@ -1202,6 +1287,7 @@ impl<'a> Lower<'a> {
                     // by the module-level pre-pass: register them now.
                     let dk = real_children(item);
                     let width = self.decl_width(&dk, env);
+                    let tname = self.decl_type_name(&dk);
                     for k in &dk {
                         if k.kind() == SyntaxKind::Name {
                             let n = self.text(k);
@@ -1215,6 +1301,9 @@ impl<'a> Lower<'a> {
                                     mem: None,
                                     signed: false,
                                 });
+                                if let Some(t) = &tname {
+                                    self.sig_types.insert(id, t.clone());
+                                }
                                 self.names.insert(n, id);
                             }
                         }
@@ -1353,15 +1442,63 @@ impl<'a> Lower<'a> {
 
     fn lower_param(&mut self, module: &mut ModuleIr, p: &SyntaxNode, env: &HashMap<String, Value>) {
         let kids = real_children(p);
+        // `parameter type T = ...` declares a type, not a value constant.
+        let is_type_param = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "type");
         let mut i = 1;
         while i < kids.len() {
             if kids[i].kind() == SyntaxKind::Name
                 && kids.get(i + 1).map_or(false, |k| self.text(k) == "=")
             {
+                if is_type_param {
+                    // `parameter type rule_t = struct packed {...}` or
+                    // `parameter type t = logic [7:0]`: register the type so the
+                    // name can be used as a value (type-param passing) and for
+                    // struct field selects.
+                    let pname = self.text(&kids[i]);
+                    match kids.get(i + 2).map(|k| k.kind()) {
+                        Some(SyntaxKind::StructType) => {
+                            let td = self.struct_type_def(&kids[i + 2], env);
+                            self.types.insert(pname, td);
+                        }
+                        Some(SyntaxKind::EnumType) => {
+                            self.types.insert(
+                                pname,
+                                TypeDef {
+                                    width: 32,
+                                    signed: false,
+                                    real: false,
+                                    kind: TypeKind::Plain,
+                                },
+                            );
+                        }
+                        _ => {
+                            let mut width = 1usize;
+                            if kids
+                                .get(i + 3)
+                                .map_or(false, |k| k.kind() == SyntaxKind::Range)
+                            {
+                                width = self.range_width(&kids[i + 3], env);
+                            }
+                            self.types.insert(
+                                pname,
+                                TypeDef {
+                                    width,
+                                    signed: false,
+                                    real: false,
+                                    kind: TypeKind::Plain,
+                                },
+                            );
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
                 if let Some(e) = kids.get(i + 2) {
                     if is_expr_node(e.kind()) {
                         let expr = self.lower_expr(e, env);
-                        let val = const_eval(&expr, env).unwrap_or_else(|| Value::x(32));
+                        let val = self.ce(&expr, env).unwrap_or_else(|| Value::x(32));
                         let pname = self.text(&kids[i]);
                         // The module-level param pass may have registered this
                         // already (lower_module_item re-lowers ParamDecls inside
@@ -1477,6 +1614,48 @@ impl<'a> Lower<'a> {
     /// Lower one statement, wrapped in a `Stmt::Spanned` with its source span
     /// (drives line/branch coverage). Recursive calls go through this wrapper,
     /// so every nested statement is spanned too.
+    /// For-loop init statement. `for (int i = 0; ...)` arrives as a
+    /// StmtAssign whose leading type keyword marks it as a declaration:
+    /// register the loop variable, then emit its initializer assignment.
+    fn lower_for_init(&mut self, st: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
+        if st.kind() == SyntaxKind::StmtAssign {
+            let ik = real_children(st);
+            let name_pos = ik.iter().position(|k| k.kind() == SyntaxKind::Name);
+            let is_decl = name_pos.map_or(false, |np| {
+                ik[..np].iter().any(|k| {
+                    k.kind() == SyntaxKind::Ident && type_kw_width(&self.text(k)).is_some()
+                })
+            });
+            if is_decl {
+                let np = name_pos.unwrap();
+                let n = self.text(&ik[np]);
+                if self.sig_id(&n).is_none() {
+                    let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                    self.extra_signals.push(SignalIr {
+                        name: n.clone(),
+                        width: 32,
+                        kind: SigKind::Wire,
+                        init: None,
+                        mem: None,
+                        signed: false,
+                    });
+                    self.names.insert(n, id);
+                }
+                if ik.get(np + 1).map_or(false, |k| self.text(k) == "=") {
+                    if let Some(e) = ik.get(np + 2).filter(|e| is_expr_node(e.kind())) {
+                        return Stmt::Assign {
+                            lhs: Expr::Sig(self.sig_id(&self.text(&ik[np])).unwrap()),
+                            rhs: self.lower_expr(e, env),
+                            nba: false,
+                        };
+                    }
+                }
+                return Stmt::Null;
+            }
+        }
+        self.lower_stmt(st, env)
+    }
+
     fn lower_stmt(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
         let span = s.span();
         let inner = self.lower_stmt_impl(s, env);
@@ -1928,6 +2107,12 @@ impl<'a> Lower<'a> {
                 let kids = real_children(s);
                 let stmts: Vec<&SyntaxNode> =
                     kids.iter().filter(|k| is_stmt_node(k.kind())).collect();
+                // Lower the init first: `for (int i = 0; ...)` declares `i`,
+                // which the condition, step and body reference.
+                let init = stmts
+                    .first()
+                    .map(|st| self.lower_for_init(st, env))
+                    .unwrap_or(Stmt::Null);
                 let cond = kids
                     .iter()
                     .find(|k| is_expr_node(k.kind()))
@@ -1935,7 +2120,7 @@ impl<'a> Lower<'a> {
                     .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 1)));
                 if stmts.len() >= 3 {
                     Stmt::For {
-                        init: Box::new(self.lower_stmt(stmts[0], env)),
+                        init: Box::new(init),
                         cond,
                         step: Box::new(self.lower_stmt(stmts[1], env)),
                         body: Box::new(self.lower_stmt(stmts[2], env)),
@@ -2202,10 +2387,40 @@ impl<'a> Lower<'a> {
             // const-evaluates.
             let step_expr = {
                 let sk = real_children(step);
-                sk.iter()
-                    .filter(|k| is_expr_node(k.kind()))
-                    .last()
-                    .map(|k| self.lower_expr(k, &env2))
+                let op_text: String = sk
+                    .iter()
+                    .filter(|k| k.kind() == SyntaxKind::Punct)
+                    .map(|k| self.text(k))
+                    .collect();
+                let exprs: Vec<&SyntaxNode> =
+                    sk.iter().filter(|k| is_expr_node(k.kind())).collect();
+                // Compound step `j += 2` / `j -= 1`: desugar to `j = j +/- 2`.
+                if exprs.len() >= 2 && (op_text.contains("+=") || op_text.contains("-=")) {
+                    let op = if op_text.contains("-=") {
+                        BinOp::Sub
+                    } else {
+                        BinOp::Add
+                    };
+                    Some(Expr::Bin {
+                        op,
+                        l: Box::new(self.lower_expr(exprs[0], &env2)),
+                        r: Box::new(self.lower_expr(exprs[exprs.len() - 1], &env2)),
+                    })
+                } else if exprs.len() >= 1 && op_text.contains("++") {
+                    Some(Expr::Bin {
+                        op: BinOp::Add,
+                        l: Box::new(self.lower_expr(exprs[0], &env2)),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    })
+                } else if exprs.len() >= 1 && op_text.contains("--") {
+                    Some(Expr::Bin {
+                        op: BinOp::Sub,
+                        l: Box::new(self.lower_expr(exprs[0], &env2)),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    })
+                } else {
+                    exprs.last().map(|k| self.lower_expr(k, &env2))
+                }
             };
             let go = cond_node
                 .map(|c| self.lower_expr(c, &env2))
@@ -2452,6 +2667,7 @@ impl<'a> Lower<'a> {
             self.err(inst.span(), "instance without a name");
             return;
         }
+        self.inst_conns.insert(inst_name.clone(), conns.clone());
         module.instances.push(InstIr {
             module: module_name,
             name: inst_name,
@@ -2511,10 +2727,21 @@ impl<'a> Lower<'a> {
                 if let Some(v) = env.get(&name).or_else(|| self.gconsts.get(&name)) {
                     return Expr::Lit(v.clone());
                 }
-                // Dotted name: struct field select or class field read.
+                // Dotted name: struct field select, class field read, or a
+                // hierarchical read of an instance port (`arb.data`).
                 if let Some(dot) = name.find('.') {
                     let root = &name[..dot];
                     let field = &name[dot + 1..];
+                    if self.sig_id(root).is_none() {
+                        if let Some(conns) = self.inst_conns.get(root) {
+                            if let Some(Conn::Named(n, ex)) = conns
+                                .iter()
+                                .find(|c| matches!(c, Conn::Named(n, _) if n == field))
+                            {
+                                return ex.clone();
+                            }
+                        }
+                    }
                     if let Some(id) = self.sig_id(root) {
                         if let Some(tn) = self.sig_types.get(&id).cloned() {
                             if let Some(td) = self.types.get(&tn).cloned() {
@@ -2563,6 +2790,11 @@ impl<'a> Lower<'a> {
                                 args: vec![self.this_expr()],
                             };
                         }
+                        // A bare typedef name used as a value (passing a type to a
+                        // `parameter type` port, `.rule_t(rule_t)`) — treat as 0.
+                        if self.types.contains_key(base) {
+                            return Expr::Lit(Value::from_u64(1, 0));
+                        }
                         // A bare type keyword used as a value (`parameter type t = logic`)
                         // means the default type; treat as 0.
                         if matches!(
@@ -2598,6 +2830,26 @@ impl<'a> Lower<'a> {
                 match inner {
                     Some(k) => self.lower_expr(&k, env),
                     None => Expr::Lit(Value::x(1)),
+                }
+            }
+            SyntaxKind::Cast => {
+                // `signed'(e)` / `unsigned'(e)` / `N'(e)`: lower the operand;
+                // a signed cast keeps the signedness hint.
+                let kids = real_children(e);
+                let is_signed = kids
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Ident)
+                    .map_or(false, |k| self.text(k) == "signed");
+                let inner = kids
+                    .into_iter()
+                    .rev()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|k| self.lower_expr(&k, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(1)));
+                if is_signed {
+                    Expr::Signed(Box::new(inner))
+                } else {
+                    inner
                 }
             }
             SyntaxKind::BinExpr => {
@@ -2745,13 +2997,24 @@ impl<'a> Lower<'a> {
             ),
             // Assignment pattern `'{ a: x, b: y }`: lowered contextually in
             // assignments (struct field order); here, positional concat.
-            SyntaxKind::Pattern => Expr::Concat(
-                real_children(e)
-                    .into_iter()
-                    .filter(|k| is_expr_node(k.kind()))
-                    .map(|k| self.lower_expr(&k, env))
-                    .collect(),
-            ),
+            // `Field:` label names are children too — skip them.
+            SyntaxKind::Pattern => {
+                let kids = real_children(e);
+                let mut parts = Vec::new();
+                for (i, k) in kids.iter().enumerate() {
+                    if k.kind() == SyntaxKind::Name
+                        && kids.get(i + 1).map_or(false, |n| {
+                            n.kind() == SyntaxKind::Punct && self.text(n) == ":"
+                        })
+                    {
+                        continue;
+                    }
+                    if is_expr_node(k.kind()) {
+                        parts.push(self.lower_expr(k, env));
+                    }
+                }
+                Expr::Concat(parts)
+            }
             // `new[n]` for dynamic arrays: handled in assignment context; as a
             // bare expression it is an error.
             SyntaxKind::Allocator => {
@@ -3008,6 +3271,14 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
     Some(Value { bits })
 }
 
+impl<'a> Lower<'a> {
+    /// Const-evaluate with the global function table (package functions) so
+    /// param defaults like `cc_pkg::idx_width(Depth)` resolve.
+    fn ce(&self, e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+        const_eval_f(e, env, &self.funcs_all)
+    }
+}
+
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
     ce_impl(e, env, &HashMap::new(), None)
@@ -3155,7 +3426,8 @@ fn ce_impl(
         Expr::SigAttr { .. } => None, // width only known after port connection
         Expr::Call { name, args } => {
             // System functions usable in constant expressions.
-            if name == "$clog2" && args.len() == 1 {
+            // lower_expr strips the `$` from system tasks, so both spellings.
+            if (name == "$clog2" || name == "clog2") && args.len() == 1 {
                 let v = ce_impl(&args[0], env, funcs, slots.as_deref_mut())?;
                 let n = v.to_u64()?;
                 return Some(Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64));
@@ -3427,6 +3699,56 @@ endmodule
         assert_eq!(m.params.len(), 1);
         let a = m.signals.iter().find(|s| s.name == "a").unwrap();
         assert_eq!(a.width, 8);
+    }
+
+    #[test]
+    fn lowers_common_cells_constructs() {
+        // The constructs used by pulp-platform/common_cells: package functions
+        // called as `pkg::fn(...)` in param defaults, gen-block localparams,
+        // multi-dim ranges with `**`, struct patterns with field labels,
+        // `parameter type`, for-loop inline declarations, gen-for compound steps.
+        let src = "package cc_pkg;\n\
+                   \x20 function automatic int unsigned idx_width(input int unsigned num_idx);\n\
+                   \x20   if (num_idx > 32'd1) begin return unsigned'($clog2(num_idx)); end\n\
+                   \x20   return 32'd1;\n\
+                   \x20 endfunction\n\
+                   \x20 function automatic int unsigned cnt_width(input int unsigned max_cnt);\n\
+                   \x20   return idx_width(max_cnt + 1);\n\
+                   \x20 endfunction\n\
+                   \x20 localparam int unsigned LZC = 1;\n\
+                   endpackage\n\
+                   module m #(parameter int unsigned Depth = 8, parameter type rule_t = logic [7:0])\n\
+                   \x20 (input logic clk, output logic [7:0] y);\n\
+                   \x20 localparam int unsigned W = cc_pkg::idx_width(Depth);\n\
+                   \x20 localparam int unsigned U = cc_pkg::cnt_width(Depth);\n\
+                   \x20 if (Depth > 1) begin : g\n\
+                   \x20   localparam int unsigned Lvls = unsigned'($clog2(Depth)) + 1;\n\
+                   \x20   logic [Lvls-1:0][2**Lvls-2:0] sum;\n\
+                   \x20 end\n\
+                   \x20 logic [W-1:0] ptr;\n\
+                   \x20 logic [cc_pkg::LZC-1:0] x;\n\
+                   \x20 typedef struct packed { int unsigned a; int unsigned b; } seed_t;\n\
+                   \x20 localparam seed_t [1:0] seeds = '{'{a: 32'd1, b: 32'd2}, '{a: 32'd3, b: 32'd4}};\n\
+                   \x20 always_comb begin\n\
+                   \x20   ptr = 0;\n\
+                   \x20   for (int i = 0; i < W; i++) begin\n\
+                   \x20     ptr += x[i];\n\
+                   \x20   end\n\
+                   \x20 end\n\
+                   \x20 for (genvar j = 0; j < U; j += 2) begin : gj\n\
+                   \x20   assign y[j] = 1'b0;\n\
+                   \x20 end\n\
+                   endmodule\n";
+        let (modules, _db, diags) = lower_src(src);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let m = &modules[0];
+        let ptr = m.signals.iter().find(|s| s.name == "ptr").unwrap();
+        // W = idx_width(8) = $clog2(8) = 4 with the bits-needed formula.
+        assert_eq!(ptr.width, 4);
     }
 
     #[test]
