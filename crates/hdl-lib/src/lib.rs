@@ -517,6 +517,15 @@ pub fn compile_one(
                         e.types.extend(p.types);
                         e.consts.extend(p.consts);
                         e.functions.extend(p.functions);
+                        if e.generics.is_empty() {
+                            e.generics = p.generics;
+                        }
+                        if e.decl.is_none() {
+                            e.decl = p.decl;
+                        }
+                        if e.src.is_none() {
+                            e.src = p.src;
+                        }
                     }
                     std::collections::hash_map::Entry::Vacant(v) => {
                         v.insert(p);

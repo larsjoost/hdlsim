@@ -1130,7 +1130,12 @@ impl<'a> Parser<'a> {
         self.expect_ident("for the package name");
         self.expect_kw("is", "before the package declarative part");
         while !self.at_kw("end") && !self.at_kw("begin") && self.peek().kind != TokenKind::Eof {
-            self.parse_decl();
+            // VHDL-2008 generic packages: `generic (W : natural := 8);`
+            if self.at_kw("generic") {
+                self.parse_generic_clause();
+            } else {
+                self.parse_decl();
+            }
         }
         if self.eat_kw("begin") {
             while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
@@ -2459,6 +2464,27 @@ package p is new ieee.std_logic_1164.all generic map (W => 8);
 "#,
         );
         assert!(sexp.contains("(PackageInst"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_generic_package_declaration() {
+        let sexp = ok(r#"package gen_pkg is
+  generic (WIDTH : natural := 8; DEPTH : positive := 4);
+  constant C_W : natural := WIDTH;
+end package;
+package body gen_pkg is
+begin
+end package body;
+architecture rtl of top is
+  package inst_pkg is new work.gen_pkg generic map (WIDTH => 16);
+  use work.inst_pkg.all;
+begin
+end architecture;
+"#);
+        // one GenericClause in the package declaration
+        assert_eq!(sexp.matches("(GenericClause").count(), 1, "{}", sexp);
+        assert!(sexp.contains("(PackageInst"), "{}", sexp);
+        assert_eq!(sexp.matches("(UseClause").count(), 1, "{}", sexp);
     }
 
     #[test]
