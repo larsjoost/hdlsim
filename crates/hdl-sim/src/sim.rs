@@ -2392,6 +2392,30 @@ impl<'a> FnRunner<'a> {
             Stmt::ExprStmt(e) => {
                 self.sim.eval_expr(e, Some(self.locals));
             }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                self.exec(init);
+                let mut guard = 0u32;
+                loop {
+                    let c = self.sim.eval_expr(cond, Some(self.locals));
+                    if !truthy(&c) {
+                        break;
+                    }
+                    self.exec(body);
+                    if self.returned {
+                        return;
+                    }
+                    self.exec(step);
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        break;
+                    }
+                }
+            }
             Stmt::SysCall { name, args } => {
                 // Class field writes / randomize are &self-capable: run them
                 // as calls. Other syscalls need &mut self (process context).

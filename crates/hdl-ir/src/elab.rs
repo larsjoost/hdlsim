@@ -159,6 +159,22 @@ fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
     let root = f.new_scope("", None);
     f.top_scope = root;
     f.instantiate(design, top_id, root, "", &HashMap::new(), &[])?;
+    // Package function bodies (visible via `use lib.pkg.all;`) are callable
+    // at runtime too — register them like module functions. Bodies live in
+    // slot space, so they are cloned without remapping.
+    for p in design.packages.values() {
+        for func in &p.functions {
+            let mut slots: Vec<usize> = vec![func.ret_width.max(1)];
+            slots.extend(func.args.iter().map(|(_, w)| *w));
+            slots.extend(func.locals.iter().map(|l| l.width));
+            f.functions.push(FlatFunc {
+                name: func.name.clone(),
+                ret_width: func.ret_width,
+                slots,
+                body: func.body.clone(),
+            });
+        }
+    }
     Ok(f)
 }
 

@@ -15,7 +15,12 @@ begin
   v <= (others => '1');
 
   process
+    variable r : natural;
   begin
+    r := sel_f(C2 = 3, W, 0);
+    assert r = 3 report "runtime sel_f failed" severity error;
+    r := bits_f(16);
+    assert r = 4 report "runtime bits_f failed" severity error;
     wait for 1 ns;
     assert C = 7 report "sel_f(true) failed" severity error;
     assert C2 = 3 report "sel_f(false) failed" severity error;

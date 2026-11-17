@@ -50,7 +50,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | unconstrained box index `range <>` | ◐ (depth 1) | — |
 | records (flat vector + `r.field` select + named/positional aggregates) | ✅ | `tests/vhdl_record.rs` |
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
-| functions/procedures with bodies, `return` | ◐ runtime calls; ✅ const-eval in constant initializers (package function bodies interpreted with args bound — `constant c := f(1,2)`); functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
+| functions/procedures with bodies, `return` | ✅ runtime calls incl. package functions via `use` (registered at elab; for-loops in bodies supported); ✅ const-eval in constant initializers; functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |
 | alias / attribute decl / file objects | ◐ parsed | parser tests |
 | `real` | ❌ (literals → X) | lowerer warning |
