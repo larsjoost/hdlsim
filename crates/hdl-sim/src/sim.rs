@@ -1762,6 +1762,29 @@ impl Simulator {
             Expr::Sel { e, msb, lsb } => {
                 let msb = self.eval_expr(msb, locals).to_u64().unwrap_or(0) as usize;
                 let lsb = self.eval_expr(lsb, locals).to_u64().unwrap_or(0) as usize;
+                // `arr(i).field <= v` — slice write into a memory element.
+                if let Expr::Idx { e: ie, i } = &**e {
+                    if let Expr::Sig(s) = &**ie {
+                        let sig = *s as usize;
+                        if self.is_mem[sig] {
+                            let Some(a) = self.eval_expr(i, locals).to_u64() else {
+                                return false;
+                            };
+                            let w = self.flat.signals[sig].width.max(1);
+                            if (a as usize) >= self.mems[sig].len() {
+                                self.mems[sig].resize(a as usize + 1, Value::x(w));
+                            }
+                            let mut cur = self.mems[sig][a as usize].clone();
+                            let v = v.resize(msb - lsb + 1);
+                            for j in 0..=(msb - lsb) {
+                                cur.set_bit(lsb + j, v.bit(j));
+                            }
+                            self.mems[sig][a as usize] = cur;
+                            return false; // memory element: no scalar event phase 1
+                        }
+                    }
+                    return false;
+                }
                 let sig = match &**e {
                     Expr::Sig(s) => *s as FlatSigId,
                     _ => return false,
