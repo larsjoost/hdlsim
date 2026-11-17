@@ -64,6 +64,13 @@ pub struct LibraryManager {
     /// (unit name, resolve error). Warned about at the end of `compile_files`
     /// if still unresolved (a later explicit file may still provide them).
     unresolved_units: Vec<(String, String)>,
+    /// Project roots searched on a resolve miss (cwd, dirs of input files):
+    /// the "out of the box" fallback when no library maps the unit.
+    search_roots: Vec<PathBuf>,
+    /// Lazily built unit → file index over `search_roots` (built on first miss).
+    search_index: Option<HashMap<String, PathBuf>>,
+    /// Units already reported as found-by-search (warn once per unit).
+    search_warned: HashSet<String>,
 }
 
 impl LibraryManager {
@@ -81,7 +88,38 @@ impl LibraryManager {
             cache_hits: 0,
             pending_archs: Vec::new(),
             unresolved_units: Vec::new(),
+            search_roots: Vec::new(),
+            search_index: None,
+            search_warned: HashSet::new(),
         }
+    }
+
+    /// Add a project root that is searched (recursively, once) when a design
+    /// unit is not found in any registered library. Hidden directories,
+    /// `target`, `node_modules` and `.hdlsim-cache` are skipped.
+    pub fn add_search_root(&mut self, p: impl Into<PathBuf>) {
+        let p = p.into();
+        if !self.search_roots.iter().any(|r| *r == p) {
+            self.search_roots.push(p);
+        }
+    }
+
+    /// Build the fallback index over the search roots (once), then look up
+    /// `name`. Returns the file defining the unit, if the project has it.
+    fn search_project(&mut self, name: &str) -> Option<PathBuf> {
+        if self.search_index.is_none() {
+            let mut idx: HashMap<String, PathBuf> = HashMap::new();
+            for root in self.search_roots.clone() {
+                for (unit, path) in providers::walk_sources(&root) {
+                    idx.entry(unit.to_ascii_lowercase())
+                        .or_insert_with(|| path.clone());
+                }
+            }
+            self.search_index = Some(idx);
+        }
+        self.search_index
+            .as_ref()
+            .and_then(|i| i.get(&name.to_ascii_lowercase()).cloned())
     }
 
     /// Enable the persistent parse cache in `c`.
@@ -265,6 +303,13 @@ impl LibraryManager {
     /// architectures still naming an unknown entity produce E0401.
     pub fn compile_files(&mut self, design: &mut Design, paths: &[PathBuf]) {
         for p in paths {
+            // The directory of an explicitly compiled file is a project root
+            // for the out-of-the-box fallback search.
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    self.add_search_root(parent.to_path_buf());
+                }
+            }
             if let Err(e) = self.compile_file(design, p) {
                 self.diags.push(Diagnostic::error("E0501", None, e));
             }
@@ -324,19 +369,56 @@ impl Default for LibraryManager {
 impl UnitResolver for LibraryManager {
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
         self.ensure_index();
-        let Some(candidates) = self.index.get(name).cloned() else {
+        let candidates = self.index.get(name).cloned();
+        if candidates.is_none() {
+            // Out-of-the-box fallback: search the project roots (cwd, input
+            // file dirs) for a file defining this unit.
+            if let Some(path) = self.search_project(name) {
+                if self.search_warned.insert(name.to_ascii_lowercase()) {
+                    let root = self
+                        .search_roots
+                        .first()
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_else(|| ".".to_string());
+                    self.diags.push(Diagnostic::warning(
+                        "W0502",
+                        None,
+                        format!(
+                            "design unit '{name}' not in any library; found by searching the project ({root}) at {} — run `hdlsim init` to write hdlsim.ini so it is indexed directly next time",
+                            path.display()
+                        ),
+                    ));
+                }
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+                self.compile_text(design, &path, &text)?;
+                self.retry_pending_architectures(design, false);
+                if design.modules.iter().any(|m| m.name == name)
+                    || design.packages.contains_key(&name.to_ascii_lowercase())
+                {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
             let searched = self.library_names().join(", ");
+            let roots = self
+                .search_roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "design unit '{}' not found (searched libraries: {})",
+                "design unit '{}' not found (searched libraries: {}; project roots: {}) — run `hdlsim init` to index the project into hdlsim.ini, or add `-L name=path`",
                 name,
                 if searched.is_empty() {
                     "<none>".to_string()
                 } else {
                     searched
-                }
+                },
+                if roots.is_empty() { "<none>".to_string() } else { roots }
             ));
-        };
-        for (pi, path) in candidates {
+        }
+        for (pi, path) in candidates.unwrap() {
             let text = self
                 .all_providers()
                 .nth(pi)
@@ -583,6 +665,39 @@ mod tests {
         let err = mgr.resolve(&mut design, "nonexistent").unwrap_err();
         assert!(
             err.contains("nonexistent") && err.contains("work"),
+            "{}",
+            err
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_roots_resolve_units_outside_libraries_with_hint() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_search_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rtl")).unwrap();
+        std::fs::write(
+            dir.join("rtl/my_pkg.vhd"),
+            "package my_pkg is\n  constant WIDTH : natural := 8;\nend package;\n",
+        )
+        .unwrap();
+        let mut mgr = LibraryManager::new();
+        // No libraries registered; the project root is only a search root.
+        mgr.add_search_root(&dir);
+        let mut design = Design::default();
+        // Miss: found by searching the project roots, with a W0502 hint.
+        assert!(mgr.resolve(&mut design, "my_pkg").unwrap());
+        assert!(design.packages.contains_key("my_pkg"));
+        let warned = mgr
+            .diags()
+            .items
+            .iter()
+            .any(|d| d.code == "W0502" && d.message.contains("hdlsim init"));
+        assert!(warned, "{:?}", mgr.diags().items);
+        // Total miss: error names libraries, roots, and the remedy.
+        let err = mgr.resolve(&mut design, "nope").unwrap_err();
+        assert!(
+            err.contains("nope") && err.contains("hdlsim init"),
             "{}",
             err
         );
