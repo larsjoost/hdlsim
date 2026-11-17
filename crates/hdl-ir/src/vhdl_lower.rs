@@ -624,6 +624,9 @@ impl<'a> Lower<'a> {
         self.consts.insert("warning".into(), Value::from_u64(32, 1));
         self.consts.insert("error".into(), Value::from_u64(32, 2));
         self.consts.insert("failure".into(), Value::from_u64(32, 3));
+        // std.textio `justified` literals (the `write(l, v, left, 13)` form).
+        self.consts.insert("left".into(), Value::from_u64(32, 0));
+        self.consts.insert("right".into(), Value::from_u64(32, 1));
         self.types.insert("std_logic".into(), TypeInfo::Scalar);
         // std_ulogic is the enum from ieee.std_logic_1164; hdlsim models it as
         // a 1-bit scalar like std_logic (the `use` clause is not needed).

@@ -1896,25 +1896,11 @@ impl<'a> Parser<'a> {
         self.bump(); // for
         self.expect_ident("for the loop variable");
         self.expect_kw("in", "after the loop variable");
-        // Discrete range: `expr to/downto expr`, `name'range`, attribute bounds
-        // (`t'left to t'right`), or a subtype.
-        if self.peek().kind == TokenKind::Ident
-            && self.peek2().kind == TokenKind::Punct
-            && self.peek2_text() == "'"
-        {
-            let mark = self.builder.mark();
-            self.parse_name(); // includes the 'range/'left/'right attribute
-            if self.at_kw("to") || self.at_kw("downto") {
-                self.builder.start_node_at(mark, SyntaxKind::Range);
-                self.bump();
-                self.parse_expression();
-                self.builder.finish_node();
-            }
-        } else {
-            self.start(SyntaxKind::Range);
-            self.parse_range();
-            self.builder.finish_node();
-        }
+        // Discrete range: `expr to/downto expr` (bounds may be attribute
+        // expressions like `input'length-1`), `name'range`, or a subtype.
+        self.start(SyntaxKind::Range);
+        self.parse_range();
+        self.builder.finish_node();
         self.expect_kw("loop", "after the discrete range");
         while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
             self.parse_seq_stmt();
@@ -2635,6 +2621,28 @@ package p is new ieee.std_logic_1164.all generic map (W => 8);
 "#,
         );
         assert!(sexp.contains("(PackageInst"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_for_loop_range_expressions() {
+        // Attribute arithmetic in a for-loop discrete range (`input'length-1`)
+        // and plain attribute bounds (`t'left to t'right`).
+        let sexp = ok(r#"entity e is end entity;
+architecture a of e is
+  signal input : bit_vector(7 downto 0);
+begin
+  process
+  begin
+    for i in input'length-1 downto 0 loop
+      null;
+    end loop;
+    for j in input'left to input'right loop
+      null;
+    end loop;
+  end process;
+end architecture;
+"#);
+        assert!(sexp.contains("(For"), "{}", sexp);
     }
 
     #[test]
