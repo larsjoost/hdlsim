@@ -134,7 +134,7 @@ fn binop_prec(text: &str) -> Option<(u8, bool)> {
         "**" => (14, true),
         "*" | "/" | "%" => (13, false),
         "+" | "-" => (12, false),
-        "<<" | ">>" => (11, false),
+        "<<" | ">>" | "<<<" | ">>>" => (11, false),
         "<" | "<=" | ">" | ">=" => (10, false),
         "==" | "!=" | "===" | "!==" => (9, false),
         "&" => (8, false),
@@ -150,7 +150,8 @@ const UNARY_OPS: &[&str] = &["!", "~", "&", "|", "^", "~&", "~|", "~^", "^~", "+
 
 /// Multi-char operators the lexer split into single Punct tokens.
 const MULTI_OPS: &[&str] = &[
-    "<<", ">>", "<=", ">=", "==", "!=", "===", "!==", "&&", "||", "**", "~&", "~|", "~^", "^~",
+    "<<", ">>", "<<<", ">>>", "<=", ">=", "==", "!=", "===", "!==", "&&", "||", "**", "~&", "~|",
+    "~^", "^~",
 ];
 
 /// Number of punct tokens in a multi-char operator string.
@@ -241,6 +242,30 @@ impl<'a> Parser<'a> {
     }
 
     /// Consume the current real token, emitting any skipped trivia first.
+    /// Consume pending trivia into the currently open node, so a `Name` node
+    /// started right after does not absorb a preceding comment into its text.
+    fn eat_pending_trivia(&mut self) {
+        while self.pos < self.tokens.len() {
+            let t = &self.tokens[self.pos];
+            if matches!(t.kind, TokenKind::Whitespace | TokenKind::Comment) {
+                self.builder
+                    .token(SyntaxKind::from_token(t.kind), t.span.len());
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// A `Name` node around the current identifier, with any leading trivia
+    /// attached to the parent instead of the name itself.
+    fn bump_name_node(&mut self) {
+        self.eat_pending_trivia();
+        self.builder.start_node(SyntaxKind::Name);
+        self.bump();
+        self.builder.finish_node();
+    }
+
     fn bump(&mut self) -> Token {
         while self.pos < self.tokens.len() {
             let t = &self.tokens[self.pos];
@@ -377,11 +402,17 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::Module);
         self.bump(); // `module`
         if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
-            self.bump();
-            self.builder.finish_node();
+            self.bump_name_node();
         } else {
             self.error_here("expected module name");
+        }
+        // Package imports in the module header: `module m import p::*; ...`.
+        // The import's own `;` may double as the header end when no port list
+        // follows (`module m import p::*;`).
+        let mut had_header_import = false;
+        while self.at_kw("import") {
+            self.parse_import(false);
+            had_header_import = true;
         }
         // Optional `#(parameter ...)` header parameter list.
         if self.at_punct('#') {
@@ -390,8 +421,10 @@ impl<'a> Parser<'a> {
         if self.eat_punct('(') {
             self.parse_port_list();
             self.expect_punct(')', "to close the port list");
+            self.expect_punct(';', "after the module header");
+        } else if !had_header_import {
+            self.expect_punct(';', "after the module header");
         }
-        self.expect_punct(';', "after the module header");
         while !self.at_kw("endmodule") && self.peek().kind != TokenKind::Eof {
             self.parse_module_item();
         }
@@ -461,9 +494,7 @@ impl<'a> Parser<'a> {
         }
         self.parse_optional_range();
         if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
-            self.bump();
-            self.builder.finish_node();
+            self.bump_name_node();
         } else {
             self.error_here("expected port name");
         }
@@ -530,9 +561,7 @@ impl<'a> Parser<'a> {
             // Optional range: `parameter [0:0] PRE_REGISTER = 1`.
             self.parse_optional_range();
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected parameter name");
             }
@@ -549,7 +578,8 @@ impl<'a> Parser<'a> {
 
     /// `[msb:lsb]` or `[width]`, with proper expression nodes inside.
     fn parse_optional_range(&mut self) {
-        if self.at_punct('[') {
+        // Packed dimensions: `logic [2:0][5:0] x` — loop over every `[...]`.
+        while self.at_punct('[') {
             self.builder.start_node(SyntaxKind::Range);
             self.bump();
             if self.at_punct(']') {
@@ -813,6 +843,7 @@ impl<'a> Parser<'a> {
                 "event" => self.parse_event_decl(),
                 "defparam" => self.parse_defparam(),
                 "typedef" => self.parse_typedef(),
+                "enum" => self.parse_enum_decl(),
                 "class" => self.parse_class(),
                 "import" => self.parse_import(false),
                 "export" => self.parse_import(true),
@@ -842,15 +873,16 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Declaration with a user type: `word_t w;` / `C obj;`.
-                    if self.user_types.contains(&text)
-                        && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
-                    {
-                        self.parse_decl();
-                    } else if self.peek2().kind == TokenKind::Ident
-                        || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "#")
-                    {
+                    // A name list followed by `(` or `#` is a module
+                    // instantiation; anything else (`type_t a, b;`) is a
+                    // declaration with a (possibly package-imported) type.
+                    if self.instantiation_ahead() {
                         // Module instantiation: `modname [#(...)] inst (...) ;`
                         self.parse_instantiation();
+                    } else if self.peek2().kind == TokenKind::Ident
+                        || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "[")
+                    {
+                        self.parse_decl();
                     } else {
                         self.error_here(format!("unexpected `{}` in module body", text));
                         self.bump();
@@ -866,6 +898,65 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
+    }
+
+    /// True when the upcoming tokens are `Ident [, Ident]*` followed by `(` or
+    /// `#` — i.e. a module instantiation `mod [#(...)] inst (...)`, as opposed
+    /// to a declaration `type_t name;` whose name list ends at `;`/`,`/`=`.
+    fn instantiation_ahead(&self) -> bool {
+        let mut i = self.skip_trivia_from(self.pos);
+        if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::Ident {
+            return false;
+        }
+        i = self.skip_trivia_from(i + 1);
+        loop {
+            if i < self.tokens.len() && self.tokens[i].kind == TokenKind::Ident {
+                i = self.skip_trivia_from(i + 1);
+            }
+            if i < self.tokens.len()
+                && self.tokens[i].kind == TokenKind::Punct
+                && &self.src.text()
+                    [self.tokens[i].span.start as usize..self.tokens[i].span.end as usize]
+                    == ","
+            {
+                i = self.skip_trivia_from(i + 1);
+                continue;
+            }
+            break;
+        }
+        if i >= self.tokens.len() {
+            return false;
+        }
+        let t = &self.tokens[i];
+        t.kind == TokenKind::Punct
+            && matches!(
+                &self.src.text()[t.span.start as usize..t.span.end as usize],
+                "(" | "#"
+            )
+    }
+
+    /// `enum [base] { A, B = 2, ... } name [= init] [, name2 ...];` — a bare
+    /// enum type declaration with variable declarators in a module body.
+    fn parse_enum_decl(&mut self) {
+        self.builder.start_node(SyntaxKind::Decl);
+        self.parse_enum_type();
+        loop {
+            if self.peek().kind == TokenKind::Ident {
+                self.bump_name_node();
+            } else {
+                self.error_here("expected a name in the enum declaration");
+                break;
+            }
+            self.parse_optional_range();
+            if self.eat_punct('=') {
+                self.parse_expression();
+            }
+            if !self.eat_punct(',') {
+                break;
+            }
+        }
+        self.expect_punct(';', "to end the enum declaration");
+        self.builder.finish_node();
     }
 
     fn peek2_text(&self) -> String {
@@ -895,9 +986,7 @@ impl<'a> Parser<'a> {
         self.parse_optional_range();
         loop {
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected port name");
                 break;
@@ -932,9 +1021,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected a name in declaration");
                 break;
@@ -974,9 +1061,7 @@ impl<'a> Parser<'a> {
         self.parse_optional_range();
         loop {
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected parameter name");
                 break;
@@ -1266,9 +1351,7 @@ impl<'a> Parser<'a> {
         self.bump(); // event
         loop {
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected an event name");
                 break;
@@ -1387,9 +1470,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected an enum literal");
                 break;
@@ -1687,9 +1768,7 @@ impl<'a> Parser<'a> {
         // Instance name(s).
         loop {
             if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
+                self.bump_name_node();
             } else {
                 self.error_here("expected instance name");
                 break;
@@ -2063,8 +2142,7 @@ impl<'a> Parser<'a> {
                         | "randc"
                         | "vectored"
                         | "scalared"
-                ) || (self.user_types.contains(&text)
-                    && self.peek2().kind == TokenKind::Ident) =>
+                ) || (self.peek2().kind == TokenKind::Ident && !self.instantiation_ahead()) =>
             {
                 self.parse_decl();
             }
@@ -2094,6 +2172,23 @@ impl<'a> Parser<'a> {
                 let mark = self.builder.mark();
                 self.parse_postfix();
                 if self.parse_assign_op() {
+                    // Intra-assignment delay: `x <= #100 y;` / `x = #1 y;`.
+                    if self.at_punct('#') {
+                        self.builder.start_node(SyntaxKind::Delay);
+                        self.bump();
+                        if self.eat_punct('(') {
+                            loop {
+                                self.parse_expression();
+                                if !self.eat_punct(',') {
+                                    break;
+                                }
+                            }
+                            self.expect_punct(')', "to close the assignment delay");
+                        } else {
+                            self.parse_primary();
+                        }
+                        self.builder.finish_node();
+                    }
                     self.parse_expression();
                 } else {
                     self.parse_binops(mark, 1);
@@ -2242,6 +2337,44 @@ impl<'a> Parser<'a> {
     /// the lhs, so each operator wraps lhs+op+rhs into one BinExpr node.
     fn parse_binops(&mut self, mark: crate::cst::Mark, min_prec: u8) {
         loop {
+            // SystemVerilog `inside` operator: `expr inside { set }` /
+            // `expr inside [lo:hi, ...]`. Parsed like a binary op whose rhs is
+            // a set literal (equality-level precedence).
+            if self.at_kw("inside") && 9 >= min_prec {
+                self.builder.start_node_at(mark, SyntaxKind::BinExpr);
+                self.bump(); // inside
+                             // Set items may be plain expressions or `[lo:hi]` ranges,
+                             // in either brace or bracket form.
+                let (_open, close) = if self.at_punct('{') {
+                    ('{', '}')
+                } else if self.at_punct('[') {
+                    ('[', ']')
+                } else {
+                    self.error_here("expected `{` or `[` after `inside`");
+                    break;
+                };
+                self.bump(); // open
+                if !self.at_punct(close) {
+                    loop {
+                        if self.at_punct('[') {
+                            self.bump();
+                            self.parse_expression();
+                            if self.eat_punct(':') {
+                                self.parse_expression(); // `[lo:hi]` range item
+                            }
+                            self.expect_punct(']', "to close the range item");
+                        } else {
+                            self.parse_expression();
+                        }
+                        if !self.eat_punct(',') {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(close, "to close the `inside` set");
+                self.builder.finish_node();
+                continue;
+            }
             let op = if let Some(op) = self.peek_op3().or_else(|| self.peek_op2()) {
                 op
             } else {
@@ -2347,42 +2480,82 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at_punct('[') {
-                // Index or part-select.
-                let is_part = {
-                    // Start after the `[` itself: `pos` may still sit on trivia
-                    // preceding it, which would offset the depth scan.
-                    let mut i = self.skip_trivia_from(self.skip_trivia_from(self.pos) + 1);
-                    let mut depth = 0;
-                    let mut colon = false;
-                    while i < self.tokens.len() {
-                        let k = self.tokens[i].kind;
-                        let t = &self.src.text()
-                            [self.tokens[i].span.start as usize..self.tokens[i].span.end as usize];
-                        if k == TokenKind::Punct && t == "[" {
-                            depth += 1;
-                        } else if k == TokenKind::Punct && t == "]" {
-                            if depth == 0 {
-                                break;
-                            }
-                            depth -= 1;
-                        } else if k == TokenKind::Punct && t == ":" && depth == 0 {
-                            colon = true;
+                // Index, part-select, or indexed part-select (`+:` / `-:`).
+                // Scan to the matching `]`: a `:` at bracket/paren depth zero
+                // makes it a select; if the token right before that `:` is
+                // `+` or `-`, it is an indexed part-select. Counting parens
+                // keeps a ternary `? :` inside the index from being mistaken
+                // for a part-select colon.
+                let mut i = self.skip_trivia_from(self.skip_trivia_from(self.pos) + 1);
+                let mut depth = 0;
+                let mut colon = false;
+                let mut indexed = false;
+                // A `?` at depth zero claims the next depth-zero `:` as its
+                // ternary colon, not a part-select colon.
+                let mut ternary = 0;
+                while i < self.tokens.len() {
+                    let k = self.tokens[i].kind;
+                    let t = &self.src.text()
+                        [self.tokens[i].span.start as usize..self.tokens[i].span.end as usize];
+                    if k == TokenKind::Punct && (t == "[" || t == "(") {
+                        depth += 1;
+                    } else if k == TokenKind::Punct && (t == "]" || t == ")") {
+                        if t == "]" && depth == 0 {
+                            break;
                         }
-                        i += 1;
+                        depth -= 1;
+                    } else if k == TokenKind::Punct && t == "?" && depth == 0 {
+                        ternary += 1;
+                    } else if k == TokenKind::Punct && t == ":" && depth == 0 {
+                        if ternary > 0 {
+                            ternary -= 1;
+                        } else {
+                            colon = true;
+                            let mut j = i;
+                            while j > 0 {
+                                j -= 1;
+                                if !matches!(
+                                    self.tokens[j].kind,
+                                    TokenKind::Whitespace | TokenKind::Comment
+                                ) {
+                                    break;
+                                }
+                            }
+                            if j < self.tokens.len() {
+                                let pt = &self.src.text()[self.tokens[j].span.start as usize
+                                    ..self.tokens[j].span.end as usize];
+                                indexed = self.tokens[j].kind == TokenKind::Punct
+                                    && (pt == "+" || pt == "-");
+                            }
+                        }
                     }
-                    colon
-                };
-                let kind = if is_part {
-                    SyntaxKind::PartSelect
+                    i += 1;
+                }
+                let kind = if colon {
+                    if indexed {
+                        SyntaxKind::IndexedPartSelect
+                    } else {
+                        SyntaxKind::PartSelect
+                    }
                 } else {
                     SyntaxKind::Index
                 };
                 self.builder.start_node_at(mark, kind);
                 self.bump(); // [
-                self.parse_expression();
-                if is_part {
-                    self.expect_punct(':', "in part-select");
+                if indexed {
+                    // `base +: width` / `base -: width`: parse the base with a
+                    // precedence above `+`/`-` so the sign stays for the
+                    // indexed operator.
+                    self.parse_expr_prec(13);
+                    self.bump(); // `+` or `-`
+                    self.expect_punct(':', "in the indexed part-select");
+                    self.parse_expression(); // width
+                } else {
                     self.parse_expression();
+                    if colon {
+                        self.expect_punct(':', "in part-select");
+                        self.parse_expression();
+                    }
                 }
                 self.expect_punct(']', "to close the select");
                 self.builder.finish_node();
@@ -2568,7 +2741,12 @@ impl<'a> Parser<'a> {
                 if self.at_punct('{') {
                     self.builder.start_node_at(mark, SyntaxKind::Replicate);
                     self.bump(); // inner {
+                                 // The replicated operand may itself be a concatenation:
+                                 // `{4{3'b000, bmask}}`.
                     self.parse_expression();
+                    while self.eat_punct(',') {
+                        self.parse_expression();
+                    }
                     self.expect_punct('}', "to close the replication");
                     self.expect_punct('}', "to close the replication");
                     self.builder.finish_node();
@@ -3077,5 +3255,51 @@ endmodule : m
         let bin = &bin[..bin.find("Punct \";\"").unwrap_or(bin.len())];
         assert!(bin.contains("Punct \"^\" (Replicate"), "{}", bin);
         assert_eq!(bin.matches("Punct \"}\"").count(), 2, "{}", bin);
+    }
+
+    #[test]
+    fn parses_module_header_package_imports() {
+        // `module m import p::*; (...)` and `module m import p::*;` (no ports).
+        let sexp = ok("module m import p::*; (input logic a); endmodule\n");
+        assert!(sexp.contains("(Import"), "{}", sexp);
+        let sexp = ok("module m import p::*, q::x; #(parameter W=8) (input logic a); endmodule\n");
+        assert!(sexp.contains("(Import"), "{}", sexp);
+        ok("module m import p::*; endmodule\n");
+    }
+
+    #[test]
+    fn parses_indexed_part_select_and_ternary_index() {
+        // `base +: width` / `base -: width`, and a ternary `? :` inside an
+        // index must not be mistaken for a part-select colon.
+        let sexp = ok("module m(input [7:0] d, input [2:0] s, output [3:0] o); assign o = d[{1'b0,s}+:4]; endmodule\n");
+        assert!(sexp.contains("(IndexedPartSelect"), "{}", sexp);
+        let sexp = ok("module m #(parameter W=2) (input [3:0] c, output [3:0] x); assign x = c[(W == 1) ? 0 : 2]; endmodule\n");
+        assert!(sexp.contains("(Index"), "{}", sexp);
+        assert!(sexp.contains("(CondExpr"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_bare_enum_decl_and_multidim_ports() {
+        let sexp = ok("module m(input logic [2:0][5:0] r, output logic [1:0] o); enum logic [1:0] { A, B } state, next; assign o = state; endmodule\n");
+        assert!(sexp.contains("(EnumType"), "{}", sexp);
+        assert!((sexp.matches("(Range").count() >= 3), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_inside_operator_arith_shift_replicate_concat() {
+        let sexp = ok("module m(input [2:0] x, output y, output [7:0] z); assign y = x inside {[3'b000:3'b010], 3'b111}; assign z = {4{3'b000, x[0]}}; endmodule\n");
+        assert!(sexp.contains("inside"), "{}", sexp);
+        let sexp = ok("module m(input signed [7:0] a, input [2:0] s, output signed [7:0] y); assign y = a >>> s; endmodule\n");
+        assert!(
+            sexp.contains("Punct \">\" Punct \">\" Punct \">\""),
+            "{}",
+            sexp
+        );
+    }
+
+    #[test]
+    fn parses_intra_assignment_delay() {
+        let sexp = ok("module m(input d, output reg q); always @(d) q <= #100 d; endmodule\n");
+        assert!(sexp.contains("(Delay"), "{}", sexp);
     }
 }

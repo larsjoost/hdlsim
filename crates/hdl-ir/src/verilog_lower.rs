@@ -166,6 +166,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Concat
             | SyntaxKind::Replicate
             | SyntaxKind::PartSelect
+            | SyntaxKind::IndexedPartSelect
             | SyntaxKind::Index
             | SyntaxKind::Pattern
             | SyntaxKind::Allocator
@@ -371,6 +372,15 @@ impl<'a> Lower<'a> {
             match item.kind() {
                 SyntaxKind::Import => self.lower_import(&mut module, item, &env),
                 SyntaxKind::Typedef => self.lower_typedef(item, &env, pkg_of.as_deref()),
+                // Bare enum declaration: `enum logic [2:0] { A, B } s;` —
+                // register the labels like a typedef enum (module scope).
+                SyntaxKind::Decl
+                    if real_children(item)
+                        .iter()
+                        .any(|k| k.kind() == SyntaxKind::EnumType) =>
+                {
+                    self.lower_typedef(item, &env, pkg_of.as_deref());
+                }
                 _ => {}
             }
         }
@@ -639,12 +649,19 @@ impl<'a> Lower<'a> {
                         continue;
                     }
                     let mut v = next;
-                    // Look for `= expr` right after this Name.
+                    // Look for `= expr` right after this Name: the child after
+                    // the label must be the `=` punct, then the value expression.
                     if let Some(pos) = ek.iter().position(|x| std::ptr::eq(x, k)) {
-                        if let Some(e) = ek.get(pos + 1).filter(|e| is_expr_node(e.kind())) {
-                            if let Some(cv) = const_eval(&self.lower_expr(e, env), env) {
-                                if let Some(n) = cv.to_u64() {
-                                    v = n;
+                        let has_eq = ek.get(pos + 1).is_some_and(|c| {
+                            c.kind() == SyntaxKind::Punct
+                                && self.db.span_text(c.span()).trim() == "="
+                        });
+                        if has_eq {
+                            if let Some(e) = ek[pos + 2..].iter().find(|e| is_expr_node(e.kind())) {
+                                if let Some(cv) = const_eval(&self.lower_expr(e, env), env) {
+                                    if let Some(n) = cv.to_u64() {
+                                        v = n;
+                                    }
                                 }
                             }
                         }
@@ -1590,12 +1607,21 @@ impl<'a> Lower<'a> {
                 }
                 _ if is_expr_node(c.kind()) => {
                     let e = self.lower_expr(&c, env);
-                    match e {
-                        Expr::Sig(id) => edges.push(Edge {
+                    // `a`, `a[1:0]`, `a[i]` — the entry's base signal.
+                    let base_sig = match &e {
+                        Expr::Sig(id) => Some(*id),
+                        Expr::Idx { e, .. } | Expr::Sel { e, .. } => match &**e {
+                            Expr::Sig(id) => Some(*id),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    match base_sig {
+                        Some(id) => edges.push(Edge {
                             sig: id,
                             kind: pending,
                         }),
-                        _ => self.err(c.span(), "sensitivity list entry must be a signal"),
+                        None => self.err(c.span(), "sensitivity list entry must be a signal"),
                     }
                     pending = EdgeKind::Any;
                 }
@@ -1935,6 +1961,20 @@ impl<'a> Lower<'a> {
                                             };
                                         }
                                     }
+                                }
+                            }
+                            // Bare task call without parens: `my_task;` — a
+                            // name that is neither a signal nor a constant.
+                            if e.kind() == SyntaxKind::Name {
+                                let n = self.text(e);
+                                if self.sig_id(&n).is_none()
+                                    && !self.gconsts.contains_key(&n)
+                                    && !self.gconsts.contains_key(&n.to_ascii_lowercase())
+                                {
+                                    return Stmt::ExprStmt(Expr::Call {
+                                        name: n,
+                                        args: Vec::new(),
+                                    });
                                 }
                             }
                             Stmt::ExprStmt(self.lower_expr(e, env))
@@ -2716,6 +2756,75 @@ impl<'a> Lower<'a> {
 
     // ---- expressions ------------------------------------------------------------
 
+    /// `lhs inside { a, b, [lo:hi], ... }` — OR chain of `lhs == item` and
+    /// `lo <= lhs <= hi` range comparisons.
+    fn lower_inside(&mut self, kids: &[SyntaxNode], env: &HashMap<String, Value>) -> Expr {
+        let inside_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "inside")
+            .unwrap_or(0);
+        let Some(lhs_node) = kids[..inside_pos]
+            .iter()
+            .rev()
+            .find(|k| is_expr_node(k.kind()))
+        else {
+            return Expr::Lit(Value::x(1));
+        };
+        let x = self.lower_expr(lhs_node, env);
+        let rest = &kids[inside_pos + 1..];
+        let mut terms: Vec<Expr> = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            if !is_expr_node(rest[i].kind()) {
+                i += 1;
+                continue;
+            }
+            let v = self.lower_expr(&rest[i], env);
+            let is_range = rest.get(i + 1).map_or(false, |k| {
+                k.kind() == SyntaxKind::Punct && self.text(k) == ":"
+            });
+            if is_range {
+                if let Some(hi_node) = rest[i + 2..].iter().find(|k| is_expr_node(k.kind())) {
+                    let hi = self.lower_expr(hi_node, env);
+                    terms.push(Expr::Bin {
+                        op: BinOp::LogAnd,
+                        l: Box::new(Expr::Bin {
+                            op: BinOp::Ge,
+                            l: Box::new(x.clone()),
+                            r: Box::new(v),
+                        }),
+                        r: Box::new(Expr::Bin {
+                            op: BinOp::Le,
+                            l: Box::new(x.clone()),
+                            r: Box::new(hi),
+                        }),
+                    });
+                    // Skip past the range's hi expression.
+                    if let Some(j) = rest[i + 2..].iter().position(|k| std::ptr::eq(k, hi_node)) {
+                        i = i + 2 + j + 1;
+                        continue;
+                    }
+                }
+            } else {
+                terms.push(Expr::Bin {
+                    op: BinOp::Eq,
+                    l: Box::new(x.clone()),
+                    r: Box::new(v),
+                });
+            }
+            i += 1;
+        }
+        let mut acc = Expr::Lit(Value::from_u64(1, 0));
+        for t in terms {
+            acc = Expr::Bin {
+                op: BinOp::LogOr,
+                l: Box::new(acc),
+                r: Box::new(t),
+            };
+        }
+        acc
+    }
+
     fn lower_expr(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         match e.kind() {
             SyntaxKind::Literal => self.lower_literal(e),
@@ -2854,6 +2963,14 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::BinExpr => {
                 let kids = real_children(e);
+                // `lhs inside { a, b, [lo:hi], ... }` — lower to an OR chain of
+                // equality / range comparisons.
+                if kids
+                    .iter()
+                    .any(|k| k.kind() == SyntaxKind::Ident && self.text(k) == "inside")
+                {
+                    return self.lower_inside(&kids, env);
+                }
                 let expr_nodes: Vec<&SyntaxNode> =
                     kids.iter().filter(|k| is_expr_node(k.kind())).collect();
                 let op_text: String = kids
@@ -3051,6 +3168,49 @@ impl<'a> Lower<'a> {
                     Expr::Lit(Value::x(1))
                 }
             }
+            SyntaxKind::IndexedPartSelect => {
+                // `base +: width` = `base[width-1 + base : base]`;
+                // `base -: width` = `base[base : base - (width-1)]`.
+                let kids = real_children(e);
+                let exprs: Vec<&SyntaxNode> =
+                    kids.iter().filter(|k| is_expr_node(k.kind())).collect();
+                if exprs.len() == 2 {
+                    let plus = e.children().any(|c| {
+                        c.kind() == SyntaxKind::Punct && self.db.span_text(c.span()) == "+"
+                    });
+                    let one = Expr::Lit(parse_int_literal("1").unwrap_or(Value::x(32)));
+                    let base = self.lower_expr(exprs[0], env);
+                    let width = self.lower_expr(exprs[1], env);
+                    let span = Expr::Bin {
+                        op: BinOp::Sub,
+                        l: Box::new(width),
+                        r: Box::new(one),
+                    };
+                    if plus {
+                        Expr::Sel {
+                            e: Box::new(base.clone()),
+                            msb: Box::new(Expr::Bin {
+                                op: BinOp::Add,
+                                l: Box::new(base.clone()),
+                                r: Box::new(span),
+                            }),
+                            lsb: Box::new(base),
+                        }
+                    } else {
+                        Expr::Sel {
+                            e: Box::new(base.clone()),
+                            msb: Box::new(base.clone()),
+                            lsb: Box::new(Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(base),
+                                r: Box::new(span),
+                            }),
+                        }
+                    }
+                } else {
+                    Expr::Lit(Value::x(1))
+                }
+            }
             SyntaxKind::Index => {
                 let kids = real_children(e);
                 let exprs: Vec<&SyntaxNode> =
@@ -3108,8 +3268,9 @@ fn binop_from_str(s: &str) -> Option<BinOp> {
         "/" => BinOp::Div,
         "%" => BinOp::Mod,
         "**" => BinOp::Pow,
-        "<<" => BinOp::Shl,
+        "<<" | "<<<" => BinOp::Shl,
         ">>" => BinOp::Shr,
+        ">>>" => BinOp::Sar,
         "<" => BinOp::Lt,
         "<=" => BinOp::Le,
         ">" => BinOp::Gt,
@@ -3295,6 +3456,14 @@ pub fn const_eval_f(
     ce_impl(e, env, funcs, None)
 }
 
+thread_local! {
+    /// Const-eval call depth: recursive or mutually recursive functions
+    /// (e.g. OSVVM's MetaMatch) must abort instead of overflowing the stack.
+    static CE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+const CE_MAX_DEPTH: u32 = 64;
+
 /// Whether a const-evaluated expression is real-typed (mirrors the
 /// simulator's `expr_real`): literals and arithmetic propagate realness.
 fn ce_real(e: &Expr) -> bool {
@@ -3437,7 +3606,14 @@ fn ce_impl(
             for a in args {
                 argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
             }
-            const_eval_func(f, &argv, env, funcs)
+            let depth = CE_DEPTH.with(|d| d.get());
+            if depth >= CE_MAX_DEPTH {
+                return None; // recursive const-eval: not constant
+            }
+            CE_DEPTH.with(|d| d.set(depth + 1));
+            let r = const_eval_func(f, &argv, env, funcs);
+            CE_DEPTH.with(|d| d.set(depth));
+            r
         }
     }
 }
@@ -3771,5 +3947,24 @@ endmodule
         let x = parse_int_literal("4'b10x1").unwrap();
         assert_eq!(x.to_u64(), None);
         assert_eq!(x.bit(1), VX);
+    }
+
+    #[test]
+    fn inside_operator_lowers_to_comparison_chain() {
+        let src = "module m(input [2:0] x, output y); assign y = x inside {[3'b000:3'b010], 3'b111}; endmodule\n";
+        let (_m, _db, diags) = lower_src(src);
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == hdl_syntax::diagnostic::Severity::Error)
+            .collect();
+        assert!(errs.is_empty(), "{:?}", errs);
+    }
+
+    #[test]
+    fn const_eval_of_recursive_function_aborts_instead_of_overflowing() {
+        // A self-recursive function is not constant; const-eval must give up
+        // (depth guard) rather than recurse until the stack overflows.
+        let src = "module m;\nfunction automatic integer f(input integer x);\n  f = f(x) + 1;\nendfunction\nlocalparam integer P = f(1);\nendmodule\n";
+        let (_m, _db, _diags) = lower_src(src); // returns at all = pass
     }
 }

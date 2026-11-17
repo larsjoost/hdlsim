@@ -137,6 +137,8 @@ pub enum SyntaxKind {
     Replicate,
     /// `expr[msb:lsb]` part-select.
     PartSelect,
+    /// `expr[base +: width]` / `expr[base -: width]` indexed part-select.
+    IndexedPartSelect,
     /// `expr[idx]` indexing.
     Index,
     /// `(expr)` grouping.
@@ -193,6 +195,8 @@ pub enum SyntaxKind {
     ConfigDecl,
     /// VHDL-2008 context clause: `context lib.name;`.
     ContextClause,
+    /// Context declaration: `context name is ... end context;`.
+    ContextDecl,
     /// VHDL-2008 package instantiation: `package p is new g generic map (...);`.
     PackageInst,
     /// `alias name [: type] is target;`.
@@ -321,6 +325,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Concat,
     SyntaxKind::Replicate,
     SyntaxKind::PartSelect,
+    SyntaxKind::IndexedPartSelect,
     SyntaxKind::Index,
     SyntaxKind::ParenExpr,
     SyntaxKind::Name,
@@ -352,6 +357,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::ReturnStmt,
     SyntaxKind::ConfigDecl,
     SyntaxKind::ContextClause,
+    SyntaxKind::ContextDecl,
     SyntaxKind::PackageInst,
     SyntaxKind::AliasDecl,
     SyntaxKind::AttrDecl,
@@ -477,6 +483,7 @@ impl SyntaxKind {
                 | SyntaxKind::Concat
                 | SyntaxKind::Replicate
                 | SyntaxKind::PartSelect
+                | SyntaxKind::IndexedPartSelect
                 | SyntaxKind::Index
                 | SyntaxKind::ParenExpr
                 | SyntaxKind::Name
@@ -525,6 +532,7 @@ impl SyntaxKind {
                 | SyntaxKind::Others
                 | SyntaxKind::ConfigDecl
                 | SyntaxKind::ContextClause
+                | SyntaxKind::ContextDecl
                 | SyntaxKind::PackageInst
                 | SyntaxKind::AliasDecl
                 | SyntaxKind::AttrDecl
@@ -554,6 +562,7 @@ impl SyntaxKind {
                 | SyntaxKind::Call
                 | SyntaxKind::Index
                 | SyntaxKind::PartSelect
+                | SyntaxKind::IndexedPartSelect
                 | SyntaxKind::ParenExpr
                 | SyntaxKind::Name
                 | SyntaxKind::Literal
@@ -567,7 +576,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 122);
+        assert_eq!(ALL.len(), 124);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));
