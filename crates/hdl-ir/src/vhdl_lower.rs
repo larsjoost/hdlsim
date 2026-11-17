@@ -2947,18 +2947,29 @@ impl<'a> Lower<'a> {
                                     },
                                 };
                             }
-                            let n = self
-                                .mems
-                                .get(&id)
-                                .copied()
+                            // Arrays: element count = product of dimension sizes
+                            // (sig_dims when present, else mem depth); vectors: bit
+                            // width. `low` is the first dimension's left.
+                            let dims = self.sig_dims.get(&id);
+                            let n: usize = dims
+                                .and_then(|d| {
+                                    if d.is_empty() {
+                                        None
+                                    } else {
+                                        Some(d.iter().map(|(_, s)| (*s).max(1)).product::<usize>())
+                                    }
+                                })
+                                .or_else(|| self.mems.get(&id).copied())
                                 .or_else(|| self.sig_width.get(&id).copied())
                                 .unwrap_or(1);
+                            let lo: i64 =
+                                dims.and_then(|d| d.first().map(|(l, _)| *l)).unwrap_or(0);
                             let v = match attr.as_str() {
-                                "length" => n,
-                                "high" | "left" => n.saturating_sub(1),
-                                _ => 0, // low | right
+                                "length" => n as u64,
+                                "high" | "left" => (lo + n as i64 - 1).max(0) as u64,
+                                _ => lo.max(0) as u64, // low | right
                             };
-                            return Expr::Lit(Value::from_u64(32, v as u64));
+                            return Expr::Lit(Value::from_u64(32, v));
                         }
                         Expr::Lit(Value::x(32))
                     }

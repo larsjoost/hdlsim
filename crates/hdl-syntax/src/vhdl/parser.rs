@@ -1097,12 +1097,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_range(&mut self) {
+        // Box constraint `range <>` (unconstrained index) — the `range`
+        // keyword may come first (`range <>`) or after an index type mark
+        // (`natural range <>`), so check both positions.
+        if self.at_kw("range") {
+            self.bump();
+            if self.peek_text() == "<" && self.peek2_text() == ">" {
+                self.bump();
+                self.bump(); // <>
+            }
+            return;
+        }
         self.parse_expression();
         if self.at_kw("to") || self.at_kw("downto") {
             self.bump();
             self.parse_expression();
         } else if self.at_kw("range") {
-            // Box constraint: `natural range <>` (unconstrained index).
             self.bump();
             if self.peek_text() == "<" && self.peek2_text() == ">" {
                 self.bump();
