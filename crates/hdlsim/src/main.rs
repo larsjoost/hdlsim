@@ -25,6 +25,9 @@ fn report_hint() {
     );
     eprintln!("        hdlsim bundle --out hdlsim-repro.tar --top <top> [files...]");
     eprintln!("      https://github.com/larsjoost/hdlsim/issues/new");
+    eprintln!(
+        "        or rerun with `--report \"what went wrong\"` to file the issue automatically"
+    );
 }
 
 fn main() {
@@ -36,10 +39,16 @@ fn main() {
     if let Some(mode) = color {
         hdl_syntax::diagnostic::set_color_mode(mode);
     }
+    // Global `--report <msg>` / `--report-dry-run`: on failure, file a GitHub
+    // issue with a reproducer bundle instead of only printing the URL.
+    let (args, report) = hdlsim::commands::report::extract_report_args(&args);
     match hdlsim::commands::dispatch(&args) {
         Ok(code) => {
             if code != 0 {
                 report_hint();
+                if let Some(req) = &report {
+                    hdlsim::commands::report::maybe_file_issue(req, &args);
+                }
             }
             std::process::exit(code)
         }
@@ -47,6 +56,9 @@ fn main() {
             eprintln!("hdlsim: {:#}", e);
             eprintln!("try 'hdlsim --help'");
             report_hint();
+            if let Some(req) = &report {
+                hdlsim::commands::report::maybe_file_issue(req, &args);
+            }
             std::process::exit(2);
         }
     }

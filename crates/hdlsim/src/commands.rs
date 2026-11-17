@@ -28,6 +28,7 @@ pub mod lsp;
 mod project;
 mod prove;
 mod regress;
+pub mod report;
 mod run;
 mod wave;
 
@@ -74,6 +75,10 @@ impl Command for Help {
         );
         println!("                                 NO_COLOR also apply)");
         println!("    --no-color                   disable color output");
+        println!(
+            "    --report \"msg\"             on failure, file a GitHub issue with a reproducer"
+        );
+        println!("                                 bundle (uses the gh CLI; --report-dry-run to preview)");
         Ok(0)
     }
 }

@@ -193,6 +193,14 @@ hdlsim bundle --out repro.tar --top tb_my_test my_tb.vhd ...   # add -L/--config
 # include dirs, a generated hdlsim.ini, and a REPRO.md with the exact commands
 ```
 
+Or file the issue directly from the failing command (uses the `gh` CLI's auth —
+`gh auth login` or `GITHUB_TOKEN`; the bundle with your sources becomes public,
+`--report-dry-run` previews without uploading):
+
+```
+hdlsim check my_tb.vhd --report "wrong result on my design"   # files a GitHub issue on failure
+```
+
 Reproduce it (with any hdlsim build) either by extracting:
 
 ```
