@@ -1920,7 +1920,7 @@ impl Simulator {
                 _ => false,
             },
             Expr::Un { op, e } => match op {
-                UnOp::Neg | UnOp::Pos => self.expr_real(e, locals),
+                UnOp::Neg | UnOp::Pos | UnOp::Abs => self.expr_real(e, locals),
                 _ => false,
             },
             Expr::Resize { e, .. } | Expr::Signed(e) => self.expr_real(e, locals),
@@ -2196,6 +2196,7 @@ impl Simulator {
                     return match (op, v.to_f64()) {
                         (UnOp::Neg, Some(x)) => Value::from_f64(-x),
                         (UnOp::Pos, Some(x)) => Value::from_f64(x),
+                        (UnOp::Abs, Some(x)) => Value::from_f64(x.abs()),
                         _ => Value::x(64),
                     };
                 }

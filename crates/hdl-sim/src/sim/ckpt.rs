@@ -193,6 +193,7 @@ fn w_unop(w: &mut W, op: UnOp) {
         UnOp::RedNand => 7,
         UnOp::RedNor => 8,
         UnOp::RedXnor => 9,
+        UnOp::Abs => 10,
     })
 }
 fn r_unop(r: &mut R) -> Result<UnOp, String> {
@@ -207,6 +208,7 @@ fn r_unop(r: &mut R) -> Result<UnOp, String> {
         7 => UnOp::RedNand,
         8 => UnOp::RedNor,
         9 => UnOp::RedXnor,
+        10 => UnOp::Abs,
         t => return Err(format!("bad UnOp tag {}", t)),
     })
 }

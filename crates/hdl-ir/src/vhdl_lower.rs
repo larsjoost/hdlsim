@@ -75,6 +75,10 @@ pub struct PackageIr {
     /// generic package with the `generic map` values as overrides.
     pub decl: Option<SyntaxNode>,
     pub src: Option<SyntaxNode>,
+    /// Unit names this package made visible with its own `use lib.p.all;`
+    /// clauses — use clauses are transitive through packages in VHDL, so
+    /// `use work.p.all` also exposes what `p` used.
+    pub uses: Vec<String>,
 }
 
 /// Unit names referenced by the context clauses (`use lib.pkg...;`,
@@ -102,6 +106,28 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                         out.push(unit.to_ascii_lowercase());
                     }
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Unit names referenced by a single `use lib.unit...;` clause node — used to
+/// record a package's own uses so `use work.p.all` is transitive.
+fn use_clause_units(u: &SyntaxNode, db: &SourceDb) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in real_children(u) {
+        if n.kind() == SyntaxKind::Name {
+            let text = db.span_text(n.span()).trim();
+            let parts: Vec<&str> = text.split('.').collect();
+            let unit = match parts.len() {
+                n if n >= 3 => parts[n - 2],
+                2 => parts[0],
+                _ => continue,
+            };
+            let unit = unit.to_ascii_lowercase();
+            if !unit.is_empty() && !out.contains(&unit) {
+                out.push(unit);
             }
         }
     }
@@ -1261,6 +1287,17 @@ impl<'a> Lower<'a> {
     /// (e.g. the generic package's own defaults that leaked into scope while
     /// it was lowered); otherwise built-ins and earlier bindings win.
     fn merge_package(&mut self, p: &PackageIr, item: Option<&str>, force: bool) {
+        let mut visited = std::collections::HashSet::new();
+        self.merge_package_rec(p, item, force, &mut visited);
+    }
+
+    fn merge_package_rec(
+        &mut self,
+        p: &PackageIr,
+        item: Option<&str>,
+        force: bool,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
         for (tname, tinfo) in &p.types {
             if item.is_none_or(|i| i == tname) {
                 if force {
@@ -1288,6 +1325,16 @@ impl<'a> Lower<'a> {
                 // Last wins: the package body (with real bodies) follows the
                 // declaration (signature-only) in the merged package.
                 self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
+            }
+        }
+        // Use clauses are transitive through packages: `use work.p.all` also
+        // exposes what `p` itself made visible via `use lib.q.all;`.
+        if item.is_none() && visited.insert(p.name.to_ascii_lowercase()) {
+            let uses = p.uses.clone();
+            for u in uses {
+                if let Some(q) = self.pkgs.get(&u).cloned() {
+                    self.merge_package_rec(&q, None, false, visited);
+                }
             }
         }
     }
@@ -1331,13 +1378,17 @@ impl<'a> Lower<'a> {
             }
         }
         let mut functions: Vec<FuncIr> = Vec::new();
+        let mut uses: Vec<String> = Vec::new();
         for d in real_children(p) {
             match d.kind() {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
-                SyntaxKind::UseClause => self.merge_use_clause(&d),
+                SyntaxKind::UseClause => {
+                    uses.extend(use_clause_units(&d, self.db));
+                    self.merge_use_clause(&d);
+                }
                 SyntaxKind::PackageInst => self.register_package_inst(&d),
                 SyntaxKind::FileDecl => self.lower_file_decl(&d),
                 SyntaxKind::Function => {
@@ -1389,6 +1440,7 @@ impl<'a> Lower<'a> {
             generics,
             decl: Some(p.clone()),
             src: Some(root.clone()),
+            uses,
         }
     }
 
@@ -1492,6 +1544,7 @@ impl<'a> Lower<'a> {
             pkg.types.extend(part.types);
             pkg.consts.extend(part.consts);
             pkg.functions.extend(part.functions);
+            pkg.uses.extend(part.uses);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -4716,6 +4769,10 @@ fn vhdl_unop(op: &str) -> Option<UnOp> {
         "-" => UnOp::Neg,
         "+" => UnOp::Pos,
         "not" => UnOp::BNot,
+        "abs" => UnOp::Abs,
+        // `??x` (VHDL-2008 condition operator) lexes as two `?` puncts; the
+        // lowerer sees the first one — identity to boolean.
+        "?" => UnOp::Pos,
         _ => return None,
     })
 }

@@ -437,6 +437,19 @@ impl Value {
                 }
                 self.clone()
             }
+            Abs => {
+                if !self.is_known() {
+                    return Value::x(self.bits.len());
+                }
+                let w = self.bits.len();
+                let n = self.to_u64().unwrap_or(0);
+                let x = if w < 64 && (n >> (w - 1)) & 1 == 1 {
+                    (n | (u64::MAX << w)) as i64
+                } else {
+                    n as i64
+                };
+                Value::from_u64(w, x.unsigned_abs())
+            }
         }
     }
 
@@ -633,6 +646,8 @@ pub enum UnOp {
     RedNand,
     RedNor,
     RedXnor,
+    /// VHDL `abs x` — absolute value (two's complement).
+    Abs,
 }
 
 #[cfg(test)]
