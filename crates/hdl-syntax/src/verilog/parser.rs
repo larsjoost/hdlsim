@@ -2425,6 +2425,20 @@ impl<'a> Parser<'a> {
             self.builder.finish_node();
             return;
         }
+        // Type cast: `SomeType'(expr)` (peek3 `(` excludes based literals `N'h..`).
+        if self.peek().kind == TokenKind::Ident
+            && !self.at_kw("signed")
+            && !self.at_kw("unsigned")
+            && self.peek2_text() == "'"
+            && self.peek3_text() == "("
+        {
+            self.builder.start_node(SyntaxKind::Cast);
+            self.bump();
+            self.bump(); // '
+            self.parse_unary();
+            self.builder.finish_node();
+            return;
+        }
         // Longest-match multi-char unary op first (`~&`, `~^`…), else single char.
         let op = self
             .peek_op3()
@@ -3301,5 +3315,20 @@ endmodule : m
     fn parses_intra_assignment_delay() {
         let sexp = ok("module m(input d, output reg q); always @(d) q <= #100 d; endmodule\n");
         assert!(sexp.contains("(Delay"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_type_cast_and_hierarchical_name() {
+        // `Type'(expr)` cast and `glbl.GSR` hierarchical name.
+        let sexp = ok("module m; wire [11:0] a = csr_num_e'(x ? b[11:0] : '0); tri0 g = glbl.GSR; endmodule\n");
+        assert!(sexp.contains("(Cast"), "{}", sexp);
+        assert!(
+            sexp.contains("Ident \"glbl\" Punct \".\" Ident \"GSR\""),
+            "{}",
+            sexp
+        );
+        // A based literal `32'hFF` is not a cast.
+        let sexp2 = ok("module m; wire [31:0] w = 32'hFF; endmodule\n");
+        assert!(!sexp2.contains("(Cast"), "{}", sexp2);
     }
 }

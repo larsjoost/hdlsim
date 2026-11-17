@@ -205,7 +205,10 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
         .filter(|c| {
             matches!(
                 c.kind(),
-                SyntaxKind::Entity | SyntaxKind::Package | SyntaxKind::ConfigDecl
+                SyntaxKind::Entity
+                    | SyntaxKind::Package
+                    | SyntaxKind::PackageInst
+                    | SyntaxKind::ConfigDecl
             )
         })
         .filter_map(|u| {

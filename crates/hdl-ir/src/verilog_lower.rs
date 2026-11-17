@@ -36,6 +36,9 @@ pub struct VerilogScope {
     pub packages: HashMap<String, ModuleIr>,
     pub gconsts: HashMap<String, Value>,
     pub funcs_all: HashMap<String, FuncIr>,
+    /// `pkg::Type` typedefs of previously compiled files, so a later file's
+    /// `import pkg::*;` can resolve imported struct/enum types (field selects).
+    pub types: HashMap<String, TypeDef>,
 }
 
 /// Lower one parsed file, with `time_unit_fs` taken from the file's
@@ -75,7 +78,7 @@ pub fn lower_file_with_time_scoped(
         time_unit_fs,
         names: HashMap::new(),
         sig_types: HashMap::new(),
-        types: HashMap::new(),
+        types: scope.types.clone(),
         gconsts: scope.gconsts.clone(),
         packages: scope.packages.clone(),
         funcs_all: scope.funcs_all.clone(),
@@ -142,6 +145,11 @@ pub fn lower_file_with_time_scoped(
     for (k, v) in lx.funcs_all.drain() {
         if k.contains("::") {
             scope.funcs_all.insert(k, v);
+        }
+    }
+    for (k, v) in lx.types.drain() {
+        if k.contains("::") {
+            scope.types.insert(k, v);
         }
     }
     modules
@@ -261,7 +269,7 @@ struct Lower<'a> {
 
 /// A user-defined type (typedef, enum, struct, class).
 #[derive(Clone, Debug)]
-struct TypeDef {
+pub struct TypeDef {
     width: usize,
     signed: bool,
     real: bool,
@@ -269,7 +277,7 @@ struct TypeDef {
 }
 
 #[derive(Clone, Debug)]
-enum TypeKind {
+pub enum TypeKind {
     Plain,
     /// Enum labels in declaration order (label → value).
     #[allow(dead_code)]
@@ -890,6 +898,27 @@ impl<'a> Lower<'a> {
         if let Some(ci) = self.classes.get_mut(&name) {
             ci.methods = methods;
         }
+    }
+
+    /// `glbl.GSR` / `glbl.GRESTORE` / `glbl.GTS`: the Xilinx `glbl` primitive is
+    /// auto-instantiated by the tools, so a hierarchical read of it materializes
+    /// a per-module 1-bit signal on first reference.
+    fn glbl_sig(&mut self, field: &str) -> SigId {
+        let name = format!("glbl.{}", field);
+        if let Some(id) = self.names.get(&name) {
+            return *id;
+        }
+        let id = (self.extra_base + self.extra_signals.len()) as SigId;
+        self.extra_signals.push(SignalIr {
+            name: name.clone(),
+            width: 1,
+            kind: SigKind::Wire,
+            init: None,
+            mem: None,
+            signed: false,
+        });
+        self.names.insert(name, id);
+        id
     }
 
     /// Allocate (once per module) the object-memory signal for class `cn`.
@@ -2842,6 +2871,10 @@ impl<'a> Lower<'a> {
                 if let Some(dot) = name.find('.') {
                     let root = &name[..dot];
                     let field = &name[dot + 1..];
+                    // Hierarchical read of the auto-instantiated `glbl` primitive.
+                    if root.eq_ignore_ascii_case("glbl") {
+                        return Expr::Sig(self.glbl_sig(field));
+                    }
                     if self.sig_id(root).is_none() {
                         if let Some(conns) = self.inst_conns.get(root) {
                             if let Some(Conn::Named(_, ex)) = conns
@@ -2943,24 +2976,36 @@ impl<'a> Lower<'a> {
                 }
             }
             SyntaxKind::Cast => {
-                // `signed'(e)` / `unsigned'(e)` / `N'(e)`: lower the operand;
-                // a signed cast keeps the signedness hint.
+                // `signed'(e)` / `unsigned'(e)` / `N'(e)` / `Type'(e)`: lower the
+                // operand; a signed cast keeps the signedness hint, a type cast
+                // resizes to the typedef's width when known.
                 let kids = real_children(e);
-                let is_signed = kids
+                let target = kids
                     .iter()
-                    .find(|k| k.kind() == SyntaxKind::Ident)
-                    .map_or(false, |k| self.text(k) == "signed");
+                    .find(|k| k.kind() == SyntaxKind::Ident || k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k));
+                let is_signed = target.as_deref() == Some("signed");
                 let inner = kids
-                    .into_iter()
+                    .iter()
                     .rev()
                     .find(|k| is_expr_node(k.kind()))
-                    .map(|k| self.lower_expr(&k, env))
+                    .map(|k| self.lower_expr(k, env))
                     .unwrap_or_else(|| Expr::Lit(Value::x(1)));
                 if is_signed {
-                    Expr::Signed(Box::new(inner))
-                } else {
-                    inner
+                    return Expr::Signed(Box::new(inner));
                 }
+                if let Some(t) = target {
+                    if let Some(td) = self.types.get(&t.to_ascii_lowercase()).cloned() {
+                        if td.width > 0 && !td.real {
+                            return Expr::Resize {
+                                e: Box::new(inner),
+                                width: td.width,
+                                signed: td.signed,
+                            };
+                        }
+                    }
+                }
+                inner
             }
             SyntaxKind::BinExpr => {
                 let kids = real_children(e);
@@ -3536,6 +3581,12 @@ fn ce_impl(
                     _ => None,
                 }
             } else {
+                // Const-eval convention (same as the BMC encoding): div/mod by
+                // zero yields 0, so a default like `depth = N/width` with
+                // `width=0` still folds instead of failing the range check.
+                if matches!(op, BinOp::Div | BinOp::Mod) && rv.to_u64() == Some(0) {
+                    return Some(Value::from_u64(1, 0));
+                }
                 Some(lv.binop(*op, &rv))
             }
         }

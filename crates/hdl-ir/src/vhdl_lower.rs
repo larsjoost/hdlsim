@@ -129,25 +129,42 @@ pub enum Binding {
 pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
     let mut out = Vec::new();
     for child in real_children(root) {
-        if matches!(
-            child.kind(),
-            SyntaxKind::ContextClause | SyntaxKind::UseClause
-        ) {
-            for n in real_children(&child) {
-                if n.kind() == SyntaxKind::Name {
-                    let text = db.span_text(n.span()).trim();
-                    let parts: Vec<&str> = text.split('.').collect();
-                    // `lib.unit.all` / `lib.unit.item` / `unit.all` / `unit.item`
-                    let unit = match parts.len() {
-                        n if n >= 3 => parts[n - 2],
-                        2 => parts[0],
-                        _ => continue,
-                    };
-                    if !unit.is_empty() && !out.iter().any(|u| u == unit) {
-                        out.push(unit.to_ascii_lowercase());
+        match child.kind() {
+            SyntaxKind::ContextClause | SyntaxKind::UseClause => {
+                for n in real_children(&child) {
+                    if n.kind() == SyntaxKind::Name {
+                        let text = db.span_text(n.span()).trim();
+                        let parts: Vec<&str> = text.split('.').collect();
+                        // `lib.unit.all` / `lib.unit.item` / `unit.all` / `unit.item`
+                        let unit = match parts.len() {
+                            n if n >= 3 => parts[n - 2],
+                            2 => parts[0],
+                            _ => continue,
+                        };
+                        if !unit.is_empty() && !out.iter().any(|u| u == unit) {
+                            out.push(unit.to_ascii_lowercase());
+                        }
                     }
                 }
             }
+            // `package p is new g generic map (...)` depends on `g` too.
+            SyntaxKind::PackageInst => {
+                for n in real_children(&child) {
+                    if n.kind() == SyntaxKind::Name {
+                        let unit = db
+                            .span_text(n.span())
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if !unit.is_empty() && !out.iter().any(|u| u == &unit) {
+                            out.push(unit);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -710,11 +727,21 @@ struct Lower<'a> {
     sig_width: HashMap<SigId, usize>,
     /// Signal id → array dimensions [(low, size), …] (for `m(i, j)` flat index).
     sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
+    /// Access type name → designated type name, so `p.field` on an
+    /// access-to-record lowers as an implicit `.all` dereference.
+    access_inner: HashMap<String, String>,
+    /// (record type, field) → field type mark, for nested record selects
+    /// (`rv.param.distribution`).
+    rec_field_ty: HashMap<(String, String), String>,
     /// Hidden signals allocated while lowering statements (for-loop vars),
     /// appended to the module after the process body is lowered.
     extra_signals: Vec<SignalIr>,
     /// `module.signals.len()` captured when statement lowering starts.
     extra_base: usize,
+    /// Enclosing function scopes while lowering a nested function body, so a
+    /// reference to an outer parameter/local (`buf.all` inside a nested
+    /// function) resolves instead of erroring.
+    names_stack: Vec<HashMap<String, SigId>>,
     /// Counter for auto-naming instances (the parser drops statement labels,
     /// so `InstIr.name` is always empty; elab needs unique prefixes).
     inst_count: usize,
@@ -779,6 +806,9 @@ impl<'a> Lower<'a> {
             sig_elem_rec: HashMap::new(),
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
+            access_inner: HashMap::new(),
+            rec_field_ty: HashMap::new(),
+            names_stack: Vec::new(),
             extra_signals: Vec::new(),
             extra_base: 0,
             inst_count: 0,
@@ -1384,6 +1414,88 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Xilinx implicit globals (`GSR`/`GRESTORE`/`GTS` from the auto-instantiated
+    /// `glbl` primitive, referenced bare in unisim VHDL): materialize a
+    /// per-module 1-bit signal on first reference. Caller must have armed
+    /// `extra_base` (== `module.signals.len()`) for the current phase.
+    fn ensure_global_sig(&mut self, name: &str) -> SigId {
+        if let Some(id) = self.sig_id(name) {
+            return id;
+        }
+        let id = (self.extra_base + self.extra_signals.len()) as SigId;
+        self.extra_signals.push(SignalIr {
+            name: name.to_string(),
+            width: 1,
+            kind: SigKind::Wire,
+            init: None,
+            mem: None,
+            signed: false,
+        });
+        self.sig_width.insert(id, 1);
+        self.sig_signed.insert(id, false);
+        self.names.insert(name.to_string(), id);
+        id
+    }
+
+    /// If `tn` is (or is an access to) a record type, return the record type
+    /// name — access-typed signals get implicit `.all` on field selects.
+    fn as_record(&self, tn: &str) -> Option<String> {
+        if matches!(self.types.get(tn), Some(TypeInfo::Record { .. })) {
+            return Some(tn.to_string());
+        }
+        self.access_inner.get(tn).and_then(|inner| {
+            matches!(self.types.get(inner), Some(TypeInfo::Record { .. })).then(|| inner.clone())
+        })
+    }
+
+    /// If `tn` is (or is an access to) an array-of-records, return the element
+    /// record type name (for `arr(i).field`).
+    fn as_elem_record(&self, tn: &str) -> Option<String> {
+        let get = |t: &str| match self.types.get(t) {
+            Some(TypeInfo::Array {
+                elem_name: Some(en),
+                ..
+            }) => matches!(self.types.get(en), Some(TypeInfo::Record { .. })).then(|| en.clone()),
+            _ => None,
+        };
+        get(tn).or_else(|| self.access_inner.get(tn).and_then(|i| get(i)))
+    }
+
+    /// Offset (lsb, width) of a (possibly nested) record field path inside
+    /// record type `tn`; fields are packed first-declared = MSB.
+    fn record_field_offset(&self, tn: &str, segs: &[&str]) -> Option<(usize, usize)> {
+        let mut cur = tn.to_string();
+        let mut base_lsb = 0usize;
+        for (si, seg) in segs.iter().enumerate() {
+            let TypeInfo::Record { fields } = self.types.get(&cur)? else {
+                return None;
+            };
+            let total: usize = fields.iter().map(|f| f.1).sum();
+            let mut run = 0usize;
+            let mut found: Option<(usize, usize, Option<String>)> = None;
+            for (fn_, w, _) in fields {
+                let lsb = total - run - w;
+                if fn_ == seg {
+                    found = Some((
+                        lsb,
+                        *w,
+                        self.rec_field_ty.get(&(cur.clone(), fn_.clone())).cloned(),
+                    ));
+                    break;
+                }
+                run += *w;
+            }
+            let (lsb, w, fty) = found?;
+            base_lsb += lsb;
+            if si + 1 < segs.len() {
+                cur = fty?;
+            } else {
+                return Some((base_lsb, w));
+            }
+        }
+        None
+    }
+
     /// Const-eval in the lowerer's constant scope, with visible package
     /// function bodies (for calls in constant initializers).
     fn ce(&self, e: &Expr) -> Option<Value> {
@@ -1421,11 +1533,19 @@ impl<'a> Lower<'a> {
         };
         self.names.clear();
         for k in &kids {
+            // Arm the hidden-signal allocator for this phase (ports/generics
+            // push directly into `module.signals`, so re-arm per item).
+            self.extra_base = module.signals.len();
+            self.extra_signals.clear();
             match k.kind() {
                 SyntaxKind::GenericClause => self.lower_generic_clause(&mut module, k),
                 SyntaxKind::PortClause => self.lower_port_clause(&mut module, k),
                 _ => {}
             }
+            for sig in self.extra_signals.drain(..) {
+                module.signals.push(sig);
+            }
+            self.extra_base = module.signals.len();
         }
         // Rebuild names from signals (ports registered above).
         self.names = module
@@ -1627,27 +1747,20 @@ impl<'a> Lower<'a> {
                 self.sig_width.insert(id, width);
                 if let Some(tm) = &type_mark {
                     let tn = self.text(tm).to_ascii_lowercase();
-                    match self.types.get(&tn) {
-                        Some(TypeInfo::Record { .. }) => {
-                            self.sig_rec.insert(id, tn);
+                    if let Some(rn) = self.as_record(&tn) {
+                        self.sig_rec.insert(id, rn);
+                    }
+                    if let Some(en) = self.as_elem_record(&tn) {
+                        self.sig_elem_rec.insert(id, en);
+                    }
+                    if let Some(TypeInfo::Array { dims, .. }) = self.types.get(&tn) {
+                        if !dims.is_empty() {
+                            let d = match &constraint {
+                                Some(c) => self.constraint_dims(c),
+                                None => dims.clone(),
+                            };
+                            self.sig_dims.insert(id, d);
                         }
-                        Some(TypeInfo::Array {
-                            dims, elem_name, ..
-                        }) => {
-                            if let Some(en) = elem_name {
-                                if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
-                                    self.sig_elem_rec.insert(id, en.clone());
-                                }
-                            }
-                            if !dims.is_empty() {
-                                let d = match &constraint {
-                                    Some(c) => self.constraint_dims(c),
-                                    None => dims.clone(),
-                                };
-                                self.sig_dims.insert(id, d);
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 module.ports.push(PortIr {
@@ -2016,6 +2129,10 @@ impl<'a> Lower<'a> {
         self.aliases.clear();
         let mut config_specs: Vec<&SyntaxNode> = Vec::new();
         for d in &decls {
+            // Arm the hidden-signal allocator per declarative item (decls push
+            // directly into `module.signals`, so the base moves between items).
+            self.extra_base = module.signals.len();
+            self.extra_signals.clear();
             match d.kind() {
                 SyntaxKind::SignalDecl => self.lower_signal_decl(module, d),
                 SyntaxKind::ConstantDecl => {
@@ -2035,6 +2152,10 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ForSpec => config_specs.push(d),
                 _ => {}
             }
+            for sig in self.extra_signals.drain(..) {
+                module.signals.push(sig);
+            }
+            self.extra_base = module.signals.len();
         }
         // Rebuild names (signals added); re-apply whole-signal aliases.
         self.names = module
@@ -2087,6 +2208,11 @@ impl<'a> Lower<'a> {
     /// Lower one concurrent statement (architecture body, block, or generate
     /// body — generate unrolls and re-enters here per iteration/branch).
     fn lower_conc_stmt(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
+        // Arm the hidden-signal allocator for this statement (declarations
+        // inside generate/block bodies push into `module.signals` directly, so
+        // the id base must be re-captured per statement).
+        self.extra_base = module.signals.len();
+        self.extra_signals.clear();
         match s.kind() {
             SyntaxKind::Process => {
                 let p = self.lower_process(module, s, *proc_idx);
@@ -2128,6 +2254,10 @@ impl<'a> Lower<'a> {
             SyntaxKind::Block => self.lower_block(module, s, proc_idx),
             _ => {}
         }
+        for sig in self.extra_signals.drain(..) {
+            module.signals.push(sig);
+        }
+        self.extra_base = module.signals.len();
     }
 
     /// Split the nodes of a generate/block body into declarative items and
@@ -2507,31 +2637,24 @@ impl<'a> Lower<'a> {
             self.sig_signed.insert(id, signed);
             self.sig_width.insert(id, width);
             if let Some(tn) = &type_name {
-                match self.types.get(tn) {
-                    Some(TypeInfo::Record { .. }) => {
-                        self.sig_rec.insert(id, tn.clone());
+                if let Some(rn) = self.as_record(tn) {
+                    self.sig_rec.insert(id, rn);
+                }
+                // Array: remember the element record type for
+                // `arr(i).field` selects (arrays of records), and the
+                // dims from the signal's own constraint if present, else
+                // from the array type declaration.
+                if let Some(en) = self.as_elem_record(tn) {
+                    self.sig_elem_rec.insert(id, en);
+                }
+                if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
+                    if !dims.is_empty() {
+                        let d = match constraint {
+                            Some(c) => self.constraint_dims(c),
+                            None => dims.clone(),
+                        };
+                        self.sig_dims.insert(id, d);
                     }
-                    // Array: remember the element record type for
-                    // `arr(i).field` selects (arrays of records), and the
-                    // dims from the signal's own constraint if present, else
-                    // from the array type declaration.
-                    Some(TypeInfo::Array {
-                        dims, elem_name, ..
-                    }) => {
-                        if let Some(en) = elem_name {
-                            if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
-                                self.sig_elem_rec.insert(id, en.clone());
-                            }
-                        }
-                        if !dims.is_empty() {
-                            let d = match constraint {
-                                Some(c) => self.constraint_dims(c),
-                                None => dims.clone(),
-                            };
-                            self.sig_dims.insert(id, d);
-                        }
-                    }
-                    _ => {}
                 }
             }
             self.names.insert(n.clone(), id);
@@ -2732,11 +2855,28 @@ impl<'a> Lower<'a> {
             return;
         }
         // Access type: `type p is access t;` — opaque handle placeholder
-        // (`.all` deref is handled at the use site).
+        // (`.all` deref is handled at the use site); remember the designated
+        // type so `p.field` on an access-to-record resolves as implicit `.all`.
         if kids
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "access")
         {
+            let access_pos = kids
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "access");
+            if let Some(ap) = access_pos {
+                if let Some(tm) = kids[ap + 1..].iter().find(|k| k.kind() == SyntaxKind::Name) {
+                    let inner = self.kw(tm);
+                    self.access_inner.insert(name.clone(), inner.clone());
+                    // If the designated type is already known, adopt its
+                    // TypeInfo so `p.field` on an access-to-record lowers as an
+                    // implicit `.all` field select at the use site.
+                    if let Some(ti) = self.types.get(&inner).cloned() {
+                        self.types.insert(name.clone(), ti);
+                        return;
+                    }
+                }
+            }
             self.types.insert(name, TypeInfo::Scalar);
             return;
         }
@@ -2791,7 +2931,10 @@ impl<'a> Lower<'a> {
                             let constraint =
                                 kids.get(j + 2).filter(|k| k.kind() == SyntaxKind::Range);
                             let (w, signed, _, _) = self.resolve_type(tm, constraint, d.span());
+                            let fty = self.kw(tm);
                             for n in names {
+                                self.rec_field_ty
+                                    .insert((name.clone(), n.clone()), fty.clone());
                                 fields.push((n, w.max(1), signed));
                             }
                             i = j + 2;
@@ -2975,9 +3118,8 @@ impl<'a> Lower<'a> {
         let kids = real_children(f);
         let mut name = String::new();
         let mut ret_mark: Option<SyntaxNode> = None;
-        let mut param_decls: Vec<SyntaxNode> = Vec::new();
-        let mut local_decls: Vec<SyntaxNode> = Vec::new();
-        let mut extra_decls: Vec<SyntaxNode> = Vec::new();
+        let mut decl_nodes: Vec<SyntaxNode> = Vec::new();
+        let mut nested_fns: Vec<SyntaxNode> = Vec::new();
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
         let mut seen_return = false;
         let mut seen_begin = false;
@@ -2989,20 +3131,23 @@ impl<'a> Lower<'a> {
                 SyntaxKind::Name if seen_return && !seen_begin && ret_mark.is_none() => {
                     ret_mark = Some(k.clone())
                 }
-                SyntaxKind::PortDecl if !seen_begin => param_decls.push(k.clone()),
-                SyntaxKind::VariableDecl if !seen_begin => local_decls.push(k.clone()),
-                // Constants/aliases/types/subtypes may reference the parameters
-                // (`constant pos : time := ifelse(T >= 0 ns, T, -T);`), so they
-                // are lowered after the slot map is installed below.
-                SyntaxKind::ConstantDecl
+                // Declarative items in textual order: each may reference the
+                // ones before it (params, types, constants, locals).
+                SyntaxKind::PortDecl
+                | SyntaxKind::VariableDecl
+                | SyntaxKind::ConstantDecl
                 | SyntaxKind::AliasDecl
                 | SyntaxKind::TypeDecl
                 | SyntaxKind::SubtypeDecl
                 | SyntaxKind::FileDecl
                     if !seen_begin =>
                 {
-                    extra_decls.push(k.clone())
+                    decl_nodes.push(k.clone())
                 }
+                // Nested function declarations (`impure function f return t is
+                // ...`) — lowered after the outer slot map is installed below,
+                // so outer parameters/locals are visible via the names stack.
+                SyntaxKind::Function if !seen_begin => nested_fns.push(k.clone()),
                 _ if seen_begin && is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
             }
@@ -3017,7 +3162,10 @@ impl<'a> Lower<'a> {
         // Params: PortDecl `a, b : integer [range]` — names before ':', type after.
         let mut args: Vec<(String, usize)> = Vec::new();
         let mut arg_types: Vec<(String, String)> = Vec::new();
-        for pd in &param_decls {
+        for pd in decl_nodes
+            .iter()
+            .filter(|d| d.kind() == SyntaxKind::PortDecl)
+        {
             let pk = real_children(pd);
             let colon = pk
                 .iter()
@@ -3027,13 +3175,23 @@ impl<'a> Lower<'a> {
                 .filter(|k| k.kind() == SyntaxKind::Name)
                 .map(|k| self.text(k))
                 .collect();
-            let tmark = colon
-                .and_then(|c| pk.get(c + 1))
-                .filter(|k| k.kind() == SyntaxKind::Name);
-            let constraint = colon
-                .and_then(|c| pk.get(c + 2))
+            // Type mark is the first Name after `:` — a mode keyword
+            // (`inout`, `out`, …) may sit between them.
+            let tmark = colon.and_then(|c| {
+                pk[c + 1..]
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .cloned()
+            });
+            let constraint = tmark
+                .as_ref()
+                .and_then(|tm| {
+                    pk.iter()
+                        .position(|k| std::ptr::eq(k, tm))
+                        .and_then(|i| pk.get(i + 1))
+                })
                 .filter(|k| k.kind() == SyntaxKind::Range);
-            let (w, _, _, _) = match tmark {
+            let (w, _, _, _) = match &tmark {
                 Some(tm) => self.resolve_type(tm, constraint, pd.span()),
                 None => (32, false, None, false),
             };
@@ -3048,6 +3206,7 @@ impl<'a> Lower<'a> {
         // return + parameter slots first so function-local constants can
         // reference parameters (`constant pos : time := ifelse(T >= 0 ns, T, -T);`).
         let saved_names = std::mem::take(&mut self.names);
+        self.names_stack.push(saved_names);
         let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
         slots.extend(args.iter().cloned());
         self.names = slots
@@ -3055,64 +3214,63 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
-        for k in &extra_decls {
-            match k.kind() {
-                SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
-                SyntaxKind::AliasDecl => self.lower_alias_decl(k),
-                SyntaxKind::TypeDecl => self.lower_type_decl(k),
-                SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
-                SyntaxKind::FileDecl => self.lower_file_decl(k),
+        // Declarative items in textual order: each may reference the ones
+        // before it (parameters, types, constants, locals).
+        let mut locals: Vec<SignalIr> = Vec::new();
+        let mut local_types: Vec<(String, String)> = Vec::new();
+        for d in &decl_nodes {
+            match d.kind() {
+                SyntaxKind::PortDecl => {} // parameters were slotted above
+                SyntaxKind::TypeDecl => self.lower_type_decl(d),
+                SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::FileDecl => self.lower_file_decl(d),
+                SyntaxKind::VariableDecl => {
+                    let dk = real_children(d);
+                    let Some(colon) = dk
+                        .iter()
+                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+                    else {
+                        continue;
+                    };
+                    let names: Vec<String> = dk[..colon]
+                        .iter()
+                        .filter(|k| k.kind() == SyntaxKind::Name)
+                        .map(|k| self.text(k))
+                        .collect();
+                    let tmark = dk[colon + 1..]
+                        .iter()
+                        .find(|k| k.kind() == SyntaxKind::Name);
+                    let constraint = dk[colon + 1..]
+                        .iter()
+                        .find(|k| k.kind() == SyntaxKind::Range);
+                    let (w, signed, _, real) = match tmark {
+                        Some(tm) => self.resolve_type(tm, constraint, d.span()),
+                        None => (32, false, None, false),
+                    };
+                    for n in names {
+                        let id = slots.len() as SigId;
+                        if let Some(tm) = &tmark {
+                            local_types.push((n.clone(), self.kw(tm)));
+                        }
+                        slots.push((n.clone(), w));
+                        self.names.insert(n.clone(), id);
+                        locals.push(SignalIr {
+                            name: n,
+                            width: w,
+                            kind: if real { SigKind::Real } else { SigKind::Wire },
+                            init: None,
+                            mem: None,
+                            signed,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
-        // Local variables.
-        let mut locals: Vec<SignalIr> = Vec::new();
-        let mut local_types: Vec<(String, String)> = Vec::new();
-        for d in &local_decls {
-            let dk = real_children(d);
-            let Some(colon) = dk
-                .iter()
-                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
-            else {
-                continue;
-            };
-            let names: Vec<String> = dk[..colon]
-                .iter()
-                .filter(|k| k.kind() == SyntaxKind::Name)
-                .map(|k| self.text(k))
-                .collect();
-            let tmark = dk[colon + 1..]
-                .iter()
-                .find(|k| k.kind() == SyntaxKind::Name);
-            let constraint = dk[colon + 1..]
-                .iter()
-                .find(|k| k.kind() == SyntaxKind::Range);
-            let (w, signed, _, real) = match tmark {
-                Some(tm) => self.resolve_type(tm, constraint, d.span()),
-                None => (32, false, None, false),
-            };
-            for n in names {
-                if let Some(tm) = &tmark {
-                    local_types.push((n.clone(), self.kw(tm)));
-                }
-                locals.push(SignalIr {
-                    name: n,
-                    width: w,
-                    kind: if real { SigKind::Real } else { SigKind::Wire },
-                    init: None,
-                    mem: None,
-                    signed,
-                });
-            }
-        }
-        slots.extend(locals.iter().map(|l| (l.name.clone(), l.width)));
-        self.names = slots
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| (n.clone(), i as SigId))
-            .collect();
-        // Record-typed parameters: remember the record type so `arg.field`
-        // resolves to a field select.
+        // Record-typed parameters/locals: remember the record type so
+        // `arg.field` and `arr(i).field` resolve to field selects.
         for (i, (n, _)) in slots.iter().enumerate() {
             let tn = arg_types
                 .iter()
@@ -3120,9 +3278,18 @@ impl<'a> Lower<'a> {
                 .find(|(an, _)| an == n)
                 .map(|(_, tn)| tn.clone());
             if let Some(tn) = tn {
-                if matches!(self.types.get(&tn), Some(TypeInfo::Record { .. })) {
-                    self.sig_rec.insert(i as SigId, tn);
+                if let Some(rn) = self.as_record(&tn) {
+                    self.sig_rec.insert(i as SigId, rn);
                 }
+                if let Some(en) = self.as_elem_record(&tn) {
+                    self.sig_elem_rec.insert(i as SigId, en);
+                }
+            }
+        }
+        // Nested function declarations, now that all outer slots are visible.
+        for k in &nested_fns {
+            if let Some(fi) = self.lower_function_node(k) {
+                self.funcs.insert(fi.name.to_ascii_lowercase(), fi);
             }
         }
         // Loop variables allocated while lowering the body get slots after the
@@ -3139,7 +3306,7 @@ impl<'a> Lower<'a> {
             locals.push(sig);
         }
         self.extra_base = 0;
-        self.names = saved_names;
+        self.names = self.names_stack.pop().unwrap_or_default();
         // Unconstrained vector/string return type (`return bit_vector` /
         // `return string`): take the width of the returned expressions.
         let ret_is_uncon_vector = ret_mark
@@ -3309,27 +3476,20 @@ impl<'a> Lower<'a> {
             self.sig_signed.insert(id, signed);
             self.sig_width.insert(id, width);
             if let Some(tn) = &type_name {
-                match self.types.get(tn) {
-                    Some(TypeInfo::Record { .. }) => {
-                        self.sig_rec.insert(id, tn.clone());
+                if let Some(rn) = self.as_record(tn) {
+                    self.sig_rec.insert(id, rn);
+                }
+                if let Some(en) = self.as_elem_record(tn) {
+                    self.sig_elem_rec.insert(id, en);
+                }
+                if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
+                    if !dims.is_empty() {
+                        let dd = match constraint {
+                            Some(c) => self.constraint_dims(c),
+                            None => dims.clone(),
+                        };
+                        self.sig_dims.insert(id, dd);
                     }
-                    Some(TypeInfo::Array {
-                        dims, elem_name, ..
-                    }) => {
-                        if let Some(en) = elem_name {
-                            if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
-                                self.sig_elem_rec.insert(id, en.clone());
-                            }
-                        }
-                        if !dims.is_empty() {
-                            let dd = match constraint {
-                                Some(c) => self.constraint_dims(c),
-                                None => dims.clone(),
-                            };
-                            self.sig_dims.insert(id, dd);
-                        }
-                    }
-                    _ => {}
                 }
             }
             self.names.insert(n.clone(), id);
@@ -4374,35 +4534,31 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                // Record field select: `r.field` on a record-typed signal →
-                // slice of the flat record vector (first field = MSB).
-                if let Some(dot) = name.find('.') {
-                    let base = name[..dot].to_ascii_lowercase();
-                    let field = name[dot + 1..].to_ascii_lowercase();
+                // Record field select: `r.field` (or nested `r.a.b`) on a
+                // record-typed signal → slice of the flat record vector
+                // (first field = MSB).
+                if name.contains('.') {
+                    let segs: Vec<&str> = name.split('.').collect();
+                    let base = segs[0].to_ascii_lowercase();
+                    let fields_path = &segs[1..];
+                    let field = fields_path.join(".").to_ascii_lowercase();
                     let id = self
                         .sig_id(&base)
                         .or_else(|| self.names.get(&format!("__const_{}", base)).copied());
                     if let Some(id) = id {
                         if let Some(tn) = self.sig_rec.get(&id).cloned() {
-                            if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
-                                let total: usize = fields.iter().map(|f| f.1).sum();
-                                let mut run = 0usize;
-                                for (fn_, w, _) in fields {
-                                    let lsb = total - run - w;
-                                    if *fn_ == field {
-                                        return Expr::Sel {
-                                            e: Box::new(Expr::Sig(id)),
-                                            msb: Box::new(Expr::Lit(Value::from_u64(
-                                                32,
-                                                (lsb + w - 1) as u64,
-                                            ))),
-                                            lsb: Box::new(Expr::Lit(Value::from_u64(
-                                                32, lsb as u64,
-                                            ))),
-                                        };
-                                    }
-                                    run += w;
-                                }
+                            let path: Vec<String> =
+                                fields_path.iter().map(|s| s.to_ascii_lowercase()).collect();
+                            let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                            if let Some((lsb, w)) = self.record_field_offset(&tn, &path_refs) {
+                                return Expr::Sel {
+                                    e: Box::new(Expr::Sig(id)),
+                                    msb: Box::new(Expr::Lit(Value::from_u64(
+                                        32,
+                                        (lsb + w - 1) as u64,
+                                    ))),
+                                    lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                                };
                             }
                         }
                     } else if id.is_none() {
@@ -4486,6 +4642,56 @@ impl<'a> Lower<'a> {
                         name: "$now".into(),
                         args: Vec::new(),
                     };
+                }
+                // Xilinx implicit globals (unisim references bare `GSR` etc.).
+                if matches!(key.as_str(), "gsr" | "grestore" | "gts") {
+                    return Expr::Sig(self.ensure_global_sig(base));
+                }
+                // Enclosing function scope (nested functions see outer
+                // parameters/locals).
+                if let Some(id) = self.names_stack.iter().rev().find_map(|m| {
+                    m.get(&key).copied().or_else(|| {
+                        m.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .map(|(_, v)| *v)
+                    })
+                }) {
+                    return Expr::Sig(id);
+                }
+                // 3+ part selected name `lib.pkg.item` / `work.pkg.item`:
+                // resolve the item inside the named package.
+                {
+                    let parts: Vec<&str> = name.split('.').collect();
+                    if parts.len() >= 3 {
+                        let pkg = parts[parts.len() - 2].to_ascii_lowercase();
+                        let item = parts[parts.len() - 1].to_ascii_lowercase();
+                        if let Some(p) = self.pkgs.get(&pkg).cloned() {
+                            if let Some((_, v)) = p.consts.iter().find(|(n, _)| *n == item) {
+                                return Expr::Lit(v.clone());
+                            }
+                            if let Some(f) = p
+                                .functions
+                                .iter()
+                                .find(|f| f.name.to_ascii_lowercase() == item)
+                            {
+                                return Expr::Call {
+                                    name: f.name.clone(),
+                                    args: vec![Expr::Lit(Value::x(32)); f.args.len()],
+                                };
+                            }
+                            if p.types.iter().any(|(n, _)| *n == item) {
+                                return Expr::Lit(Value::x(32));
+                            }
+                        }
+                    }
+                }
+                // Bare physical unit name (`ns`, `ps`, …) as a literal of one
+                // unit, in femtoseconds.
+                if matches!(
+                    key.as_str(),
+                    "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "s" | "min" | "hr"
+                ) {
+                    return Expr::Lit(Value::from_u64(32, time_unit_fs(&key)));
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
@@ -4770,7 +4976,11 @@ impl<'a> Lower<'a> {
         // (`__const_<name>`); index it like a signal.
         let base_id = self
             .sig_id(&name)
-            .or_else(|| self.names.get(&format!("__const_{}", fname)).copied());
+            .or_else(|| self.names.get(&format!("__const_{}", fname)).copied())
+            .or_else(|| match self.aliases.get(&fname) {
+                Some(Expr::Sig(id)) => Some(*id),
+                _ => None,
+            });
         if base_id.is_none() && !args.is_empty() {
             if let Some(e) = self.lower_const_array_index(&fname, &args) {
                 return e;
