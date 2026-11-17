@@ -33,7 +33,7 @@
   "vhdl/neorv32_cpu_lsu.vhd": "clean",
   "vhdl/neorv32_cpu_pmp.vhd": "clean",
   "vhdl/neorv32_cpu_regfile.vhd": "clean",
-  "vhdl/neorv32_cpu_trace.vhd": "diags",
+  "vhdl/neorv32_cpu_trace.vhd": "clean",
   "vhdl/neorv32_debug_auth.vhd": "clean",
   "vhdl/neorv32_debug_dm.vhd": "clean",
   "vhdl/neorv32_debug_dtm.vhd": "clean",

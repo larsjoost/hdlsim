@@ -224,7 +224,19 @@ impl Simulator {
                 .signals
                 .iter()
                 .map(|s| match s.mem {
-                    Some(depth) => vec![Value::x(s.width.max(1)); depth],
+                    // A memory with an initializer: element 0 is the most
+                    // significant part of the flat init value (aggregates pack
+                    // parts[0] at the top).
+                    Some(depth) => match &s.init {
+                        Some(v) if v.width() >= s.width.max(1) * depth => {
+                            let w = s.width.max(1);
+                            let total = v.width();
+                            (0..depth)
+                                .map(|i| v.slice(total - 1 - i * w, total - (i + 1) * w))
+                                .collect()
+                        }
+                        _ => vec![Value::x(s.width.max(1)); depth],
+                    },
                     None => Vec::new(),
                 })
                 .collect(),
@@ -2253,6 +2265,23 @@ impl Simulator {
                 return Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64);
             }
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
+            // `$const_idx(val, i, w)`: element `i` (MSB-first) of a flat
+            // constant array value with element width `w`.
+            "$const_idx" if args.len() == 3 => {
+                let v = self.eval_expr(&args[0], locals);
+                let a = self.eval_expr(&args[1], locals).to_u64().unwrap_or(0) as usize;
+                let w = self
+                    .eval_expr(&args[2], locals)
+                    .to_u64()
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let total = v.width();
+                return if total >= (a + 1) * w && a * w < total {
+                    v.slice(total - 1 - a * w, total - (a + 1) * w)
+                } else {
+                    Value::x(w)
+                };
+            }
             // Array size: `$array_size(arr)` (foreach) or `q.size()`.
             "$array_size" => {
                 if let Some(Expr::Sig(sig)) = args.first() {
