@@ -23,7 +23,9 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 | `ieee.std_logic_arith` | ✅ | package resolves; `conv_*` conversions and shift/rotate builtins simulated | `tests/vhdl_std_arith.rs`, `tests/vhdl_shifts.rs` |
 | `ieee.std_logic_signed` / `std_logic_unsigned` | ◐ | same: decls resolve, common ops builtin | `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_textio` | ✅ | its `write`/`read` on `line` share the std.textio runtime (vector args print decimal/hex, see `std.textio`) | `tests/vhdl_textio.rs`, parse via `tests/corpus.rs` |
-| `ieee.fixed_pkg`, `float_pkg`, `vital_*` | ❌ | | |
+| `ieee.fixed_pkg` | ✅ | embedded subset: `ufixed`/`sfixed` simulated as f64 `real` (bounds not modeled); `to_ufixed`/`to_sfixed`/`to_real`/`resize` + arithmetic/comparison via real ops | `tests/vhdl_real.rs` |
+| `ieee.float_pkg` | ✅ | embedded subset: `float` as f64 `real`; `to_float`/`to_real`/`to_integer`/`resize` | `tests/vhdl_real.rs` |
+| `ieee.vital_*` | ❌ | | |
 
 A `use lib.unit.all;` that resolves nowhere now warns (`W0501`) instead of
 being silently ignored (`tests/vhdl_std_arith.rs`).
@@ -55,7 +57,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | functions/procedures with bodies, `return` | ✅ runtime calls incl. package functions via `use` (registered at elab; for-loops in bodies supported); ✅ const-eval in constant initializers; functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |
 | `alias name is target` (whole signal / bit / slice, read+write); attribute decl / file objects | ◐ alias ✅ lowered; attr decl parsed only; `file f : text open … is "path"` ✅ bound to its path for textio | `tests/vhdl_alias.rs`, `tests/vhdl_textio.rs`, parser tests |
-| `real` | ❌ (literals → X) | lowerer warning |
+| `real` (and fixed/float `ufixed`/`sfixed`/`float`) | ✅ | f64 simulation: literals incl. exponents (`2.5e1`, `1.5E-2`), real physical literals (`2.5 ns`), `+ - * / mod`, comparisons, unary `-`, `integer(r)` (round to nearest, ties away from zero), `to_real`, `real'image`, mixed real/integer arithmetic | `tests/vhdl_real.rs`, `tests/analog.rs` |
 
 ## Statements
 

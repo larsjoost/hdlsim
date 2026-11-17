@@ -2136,6 +2136,14 @@ impl Simulator {
             }
             Expr::ToInt(e) => {
                 let v = self.eval_expr(e, locals);
+                // Real operand (`integer(r)`, `to_integer(r)`): round to the
+                // nearest integer, ties away from zero (VHDL LRM).
+                if self.expr_real(e, locals) {
+                    return match v.to_f64() {
+                        Some(f) => Value::from_u64(32, (f.round() as i64) as u64),
+                        None => Value::x(32),
+                    };
+                }
                 match v.to_u64() {
                     Some(n) => {
                         // Signed operand (e.g. `to_integer(signed_val)`): decode

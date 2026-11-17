@@ -2126,7 +2126,13 @@ impl<'a> Lower<'a> {
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "range")
         {
-            self.types.insert(name, TypeInfo::Integer { signed: false });
+            // The ieee fixed/float types (`type ufixed is range <>;`) map to
+            // real; plain integer ranges stay integer.
+            if matches!(name.as_str(), "ufixed" | "sfixed" | "float") {
+                self.types.insert(name, TypeInfo::Real);
+            } else {
+                self.types.insert(name, TypeInfo::Integer { signed: false });
+            }
         }
     }
 
@@ -3833,9 +3839,16 @@ impl<'a> Lower<'a> {
             "falling_edge" if args.len() == 1 => {
                 Expr::Falling(Box::new(args.into_iter().next().unwrap()))
             }
-            "to_integer" | "conv_integer" if args.len() == 1 => {
+            "to_integer" | "conv_integer" | "integer" | "natural" | "positive"
+                if args.len() == 1 =>
+            {
                 Expr::ToInt(Box::new(args.into_iter().next().unwrap()))
             }
+            // Real/fixed/float conversions: `x * 1.0` (real-typed f64).
+            "to_real" | "to_ufixed" | "to_sfixed" | "to_float" if !args.is_empty() => {
+                as_real(args.into_iter().next().unwrap())
+            }
+            "resize" if args.len() == 3 => as_real(args.into_iter().next().unwrap()),
             "to_unsigned" | "conv_unsigned" | "conv_std_logic_vector" if args.len() == 2 => {
                 let w = self
                     .ce_env(&args[1], env)
@@ -3880,7 +3893,7 @@ impl<'a> Lower<'a> {
             "signed" if args.len() == 1 => Expr::Signed(Box::new(args.into_iter().next().unwrap())),
             // Other type conversions are bit-identical.
             "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "bit_vector" | "std_logic"
-            | "bit" | "integer" | "natural" | "boolean" | "string" | "char" | "real"
+            | "bit" | "boolean" | "string" | "char" | "real"
                 if args.len() == 1 =>
             {
                 args.into_iter().next().unwrap()
@@ -4108,11 +4121,17 @@ impl<'a> Lower<'a> {
                 unit.trim().to_ascii_lowercase().as_str(),
                 "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "s" | "min" | "hr"
             ) {
-                let v = self
-                    .parse_int_literal(num.trim())
-                    .and_then(|v| v.to_u64())
-                    .unwrap_or(0);
-                return Expr::Lit(Value::from_u64(32, v * time_unit_fs(unit.trim())));
+                // Integer physical (`100 ps`) or real physical (`2.5 ns`,
+                // VHDL-2008) \u2014 the value is femtoseconds.
+                let fs = match self.parse_int_literal(num.trim()).and_then(|v| v.to_u64()) {
+                    Some(n) => n * time_unit_fs(unit.trim()),
+                    None => num
+                        .trim()
+                        .parse::<f64>()
+                        .map(|f| (f * time_unit_fs(unit.trim()) as f64) as u64)
+                        .unwrap_or(0),
+                };
+                return Expr::Lit(Value::from_u64(32, fs));
             }
         }
         // Bit string literal: x"FF" / b"01" / o"7".
@@ -4318,6 +4337,17 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// VHDL time unit → femtoseconds.
+/// Real-valued conversion (`to_real(x)`, `to_ufixed(x, ...)`, `to_float(x)`,
+/// 3-arg `resize`): lowered as `x * 1.0`, which the simulator evaluates as a
+/// real-typed (f64) expression. Fixed/float bounds are not modeled.
+fn as_real(e: Expr) -> Expr {
+    Expr::Bin {
+        op: BinOp::Mul,
+        l: Box::new(e),
+        r: Box::new(Expr::Real(1.0)),
+    }
+}
+
 fn time_unit_fs(unit: &str) -> u64 {
     match unit {
         "fs" => 1,

@@ -1173,10 +1173,12 @@ impl<'a> Parser<'a> {
         // (`natural range <>`), so check both positions.
         if self.at_kw("range") {
             self.bump();
-            if self.peek_text() == "<" && self.peek2_text() == ">" {
-                self.bump();
-                self.bump(); // <>
-            }
+        }
+        // Box `<>` may also follow a `range` keyword already consumed by the
+        // caller (type/subtype declarations bump `range` themselves).
+        if self.peek_text() == "<" && self.peek2_text() == ">" {
+            self.bump();
+            self.bump(); // <>
             return;
         }
         self.parse_expression();

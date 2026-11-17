@@ -48,6 +48,8 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
                     "std_logic_textio",
                     include_str!("../stdlib/ieee/std_logic_textio.vhd"),
                 ),
+                ("fixed_pkg", include_str!("../stdlib/ieee/fixed_pkg.vhd")),
+                ("float_pkg", include_str!("../stdlib/ieee/float_pkg.vhd")),
             ],
         ),
     ]
@@ -108,6 +110,8 @@ mod tests {
             "std_logic_signed",
             "std_logic_unsigned",
             "std_logic_textio",
+            "fixed_pkg",
+            "float_pkg",
         ] {
             assert!(units.contains(&u.to_string()), "{:?}", units);
         }

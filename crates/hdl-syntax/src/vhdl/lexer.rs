@@ -201,7 +201,8 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
         }
-        if real || self.exponent() {
+        let exp = self.exponent();
+        if real || exp {
             self.emit_from(TokenKind::RealLiteral, start);
         } else {
             self.emit_from(TokenKind::IntLiteral, start);
@@ -268,6 +269,18 @@ mod tests {
         assert_eq!(k[4], (TokenKind::IntLiteral, "1_000".to_string()));
         assert_eq!(k[5], (TokenKind::RealLiteral, "3.14".to_string()));
         assert_eq!(k[6], (TokenKind::IntLiteral, "2#101#E1".to_string()));
+    }
+
+    #[test]
+    fn lexes_real_exponents() {
+        // Exponent after a fractional part (`2.5e1`), plain exponent (`1e3`),
+        // and signed exponent (`1.5E-2`) are all single RealLiteral tokens.
+        let k = kinds("2.5e1 1e3 1.5E-2 100 ps");
+        assert_eq!(k[0], (TokenKind::RealLiteral, "2.5e1".to_string()));
+        assert_eq!(k[1], (TokenKind::RealLiteral, "1e3".to_string()));
+        assert_eq!(k[2], (TokenKind::RealLiteral, "1.5E-2".to_string()));
+        assert_eq!(k[3], (TokenKind::IntLiteral, "100".to_string()));
+        assert_eq!(k[4], (TokenKind::Ident, "ps".to_string()));
     }
 
     #[test]

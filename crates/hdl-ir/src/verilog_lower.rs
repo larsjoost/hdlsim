@@ -2939,6 +2939,29 @@ pub fn const_eval_f(
     ce_impl(e, env, funcs, None)
 }
 
+/// Whether a const-evaluated expression is real-typed (mirrors the
+/// simulator's `expr_real`): literals and arithmetic propagate realness.
+fn ce_real(e: &Expr) -> bool {
+    match e {
+        Expr::Real(_) => true,
+        Expr::Bin { op, l, r } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                ce_real(l) || ce_real(r)
+            }
+            _ => false,
+        },
+        Expr::Un { op, e } => matches!(op, UnOp::Neg | UnOp::Pos) && ce_real(e),
+        Expr::Resize { e, .. } | Expr::Signed(e) => ce_real(e),
+        Expr::Cond { c, t, e } => ce_real(c) || ce_real(t) || ce_real(e),
+        _ => false,
+    }
+}
+
+/// Const-eval one operand of a real-typed binop as f64.
+fn ce_f64(v: &Value) -> Option<f64> {
+    v.to_f64().or_else(|| v.to_u64().map(|n| n as f64))
+}
+
 /// `Some(slots)` while interpreting a function body: `Expr::Sig(i)` then
 /// reads slot `i` (slot 0 = return value, then args, then locals) instead of
 /// failing.
@@ -2963,11 +2986,44 @@ fn ce_impl(
             }
             None => None,
         },
-        Expr::Bin { op, l, r } => Some(
-            ce_impl(l, env, funcs, slots.as_deref_mut())?
-                .binop(*op, &ce_impl(r, env, funcs, slots.as_deref_mut())?),
-        ),
-        Expr::Un { op, e } => Some(ce_impl(e, env, funcs, slots.as_deref_mut())?.unop(*op)),
+        Expr::Bin { op, l, r } => {
+            let lv = ce_impl(l, env, funcs, slots.as_deref_mut())?;
+            let rv = ce_impl(r, env, funcs, slots.as_deref_mut())?;
+            if ce_real(l) || ce_real(r) {
+                let a = ce_f64(&lv);
+                let b = ce_f64(&rv);
+                match (a, b) {
+                    (Some(x), Some(y)) => Some(match op {
+                        BinOp::Add => Value::from_f64(x + y),
+                        BinOp::Sub => Value::from_f64(x - y),
+                        BinOp::Mul => Value::from_f64(x * y),
+                        BinOp::Div => Value::from_f64(x / y),
+                        BinOp::Mod => Value::from_f64(x % y),
+                        BinOp::Lt => Value::from_u64(1, (x < y) as u64),
+                        BinOp::Le => Value::from_u64(1, (x <= y) as u64),
+                        BinOp::Gt => Value::from_u64(1, (x > y) as u64),
+                        BinOp::Ge => Value::from_u64(1, (x >= y) as u64),
+                        BinOp::Eq => Value::from_u64(1, (x == y) as u64),
+                        BinOp::Ne => Value::from_u64(1, (x != y) as u64),
+                        _ => return None,
+                    }),
+                    _ => None,
+                }
+            } else {
+                Some(lv.binop(*op, &rv))
+            }
+        }
+        Expr::Un { op, e } => {
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            if ce_real(e) {
+                return match (op, ce_f64(&v)) {
+                    (UnOp::Neg, Some(x)) => Some(Value::from_f64(-x)),
+                    (UnOp::Pos, Some(x)) => Some(Value::from_f64(x)),
+                    _ => None,
+                };
+            }
+            Some(v.unop(*op))
+        }
         Expr::Cond { c, t, e } => {
             if ce_impl(c, env, funcs, slots.as_deref_mut())?.to_u64()? != 0 {
                 ce_impl(t, env, funcs, slots.as_deref_mut())
