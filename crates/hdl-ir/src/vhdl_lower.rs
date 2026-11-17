@@ -692,6 +692,128 @@ impl<'a> Lower<'a> {
         self.types.insert("character".into(), TypeInfo::Char);
         self.types
             .insert("string".into(), TypeInfo::Vector { signed: false });
+        // std.standard control-character literals (VHDL is case-insensitive):
+        // `LF`, `CR`, `HT`, `NUL`, ... are enum literals of type character.
+        const CHAR_LITS: &[(&str, u8)] = &[
+            ("nul", 0),
+            ("soh", 1),
+            ("stx", 2),
+            ("etx", 3),
+            ("eot", 4),
+            ("enq", 5),
+            ("ack", 6),
+            ("bel", 7),
+            ("bs", 8),
+            ("ht", 9),
+            ("lf", 10),
+            ("vt", 11),
+            ("ff", 12),
+            ("cr", 13),
+            ("so", 14),
+            ("si", 15),
+            ("dle", 16),
+            ("dc1", 17),
+            ("dc2", 18),
+            ("dc3", 19),
+            ("dc4", 20),
+            ("nak", 21),
+            ("syn", 22),
+            ("etb", 23),
+            ("can", 24),
+            ("em", 25),
+            ("sub", 26),
+            ("esc", 27),
+            ("fs", 28),
+            ("gs", 29),
+            ("rs", 30),
+            ("us", 31),
+            ("del", 127),
+        ];
+        for (n, c) in CHAR_LITS {
+            self.consts
+                .insert(n.to_string(), Value::from_u64(8, *c as u64));
+        }
+        // std.standard file_open_kind / file_open_status (VHDL-2008).
+        for (n, v) in [
+            ("read_mode", 0u64),
+            ("write_mode", 1),
+            ("append_mode", 2),
+            ("open_ok", 0),
+            ("status_error", 1),
+            ("name_error", 2),
+            ("mode_error", 3),
+        ] {
+            self.consts.insert(n.to_string(), Value::from_u64(32, v));
+        }
+        self.types.insert("file_open_kind".into(), TypeInfo::Scalar);
+        self.types
+            .insert("file_open_status".into(), TypeInfo::Scalar);
+        self.types.insert("severity_level".into(), TypeInfo::Scalar);
+        // std.env (VHDL-2008): resolution_limit and the tool/version constants,
+        // as packed strings (MSB-first, 8 bits per char).
+        self.consts
+            .insert("resolution_limit".into(), Value::from_u64(64, 1));
+        for (n, s) in [
+            ("vhdl_version", "2019"),
+            ("tool_type", "simulator"),
+            ("tool_vendor", "hdlsim"),
+            ("tool_name", "hdlsim"),
+            ("tool_edition", ""),
+            ("tool_version", env!("CARGO_PKG_VERSION")),
+        ] {
+            let mut bits = Vec::with_capacity(s.len() * 8);
+            for b in s.bytes() {
+                for i in (0..8).rev() {
+                    bits.push(if b >> i & 1 == 1 { V1 } else { V0 });
+                }
+            }
+            self.consts.insert(n.to_string(), Value { bits });
+        }
+        // std.env assert API (VHDL-2008) — stubs so `alias x is std.env.f[...]`
+        // resolves.
+        for (n, ret) in [
+            ("to_string", 32usize),
+            ("isvhdlassertfailed", 1usize),
+            ("getvhdlassertcount", 32),
+            ("clearvhdlassert", 1),
+            ("setvhdlassertenable", 1),
+            ("getvhdlassertenable", 1),
+            ("setvhdlassertformat", 1),
+            ("getvhdlassertformat", 32),
+            ("setvhdlreadseverity", 1),
+            ("getvhdlreadseverity", 32),
+        ] {
+            self.funcs.insert(
+                n.to_string(),
+                FuncIr {
+                    name: n.to_string(),
+                    ret_width: ret,
+                    args: Vec::new(),
+                    locals: Vec::new(),
+                    body: Stmt::Null,
+                },
+            );
+        }
+        // std.standard delay_length and the VHDL-2019 vector types.
+        self.types
+            .insert("delay_length".into(), TypeInfo::Integer { signed: false });
+        self.types
+            .insert("integer_vector".into(), TypeInfo::Vector { signed: false });
+        self.types
+            .insert("real_vector".into(), TypeInfo::Vector { signed: false });
+        self.types
+            .insert("time_vector".into(), TypeInfo::Vector { signed: false });
+        self.types
+            .insert("boolean_vector".into(), TypeInfo::Vector { signed: false });
+        // ieee.std_logic_1164 (VHDL-2019) unresolved vector types.
+        self.types.insert(
+            "unresolved_unsigned".into(),
+            TypeInfo::Vector { signed: false },
+        );
+        self.types.insert(
+            "unresolved_signed".into(),
+            TypeInfo::Vector { signed: true },
+        );
         // std.textio: `line` is a string buffer (simulated as a wide vector,
         // see resolve_type); `text` is a file object (its name is bound to the
         // file path by lower_file_decl, not a signal).
@@ -1012,7 +1134,14 @@ impl<'a> Lower<'a> {
     }
 
     fn sig_id(&self, name: &str) -> Option<SigId> {
-        self.names.get(name).copied()
+        // VHDL is case-insensitive: fall back to a case-insensitive scan
+        // (`delay` must find a parameter declared as `Delay`).
+        self.names.get(name).copied().or_else(|| {
+            self.names
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| *v)
+        })
     }
 
     /// Const-eval in the lowerer's constant scope, with visible package
@@ -1130,6 +1259,17 @@ impl<'a> Lower<'a> {
                         .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
                         .cloned()
                 });
+            // Generic *type* parameter: `type ExpectedType;` — register an
+            // opaque placeholder so uses of the name resolve.
+            if dk
+                .iter()
+                .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "type")
+            {
+                for n in &names {
+                    self.types.insert(n.to_ascii_lowercase(), TypeInfo::Scalar);
+                }
+                continue;
+            }
             let span = d.span();
             let (width, signed, _, _) = match type_mark {
                 Some(tm) => self.resolve_type(tm, constraint, span),
@@ -1365,8 +1505,7 @@ impl<'a> Lower<'a> {
         // Package declarations: constants, types, and function bodies become
         // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
-        let consts_before: std::collections::HashSet<String> =
-            self.consts.keys().cloned().collect();
+        let consts_before: std::collections::HashMap<String, Value> = self.consts.clone();
         // VHDL-2008 generic clause first, so constants/types declared after it
         // see the generic values (`generic map` overrides win over defaults).
         let mut generics: Vec<(String, Value)> = Vec::new();
@@ -1422,14 +1561,17 @@ impl<'a> Lower<'a> {
             .filter(|(k, _)| !types_before.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        // Single-character consts are char-type enum literals ('U', '0', ...);
-        // they are never referenced as bare names (char literals lex as
-        // CharLiteral) and merging them would shadow same-named signals (e.g. a
-        // signal `u` vs std_ulogic's 'U'), so keep them file-local.
+        // Single-character consts are usually char-type enum literals ('U',
+        // '0', ...); they stay harmless in the package because name resolution
+        // checks signals before constants.
+        // A package's own declarations must be exported even when a `use`d
+        // package already brought a same-named const into scope (e.g. an enum
+        // label like ENABLED vs OsvvmOptionsType's) — keep new or overridden
+        // entries.
         let consts = self
             .consts
             .iter()
-            .filter(|(k, _)| !consts_before.contains(*k) && k.chars().count() > 1)
+            .filter(|(k, v)| consts_before.get(*k).map_or(true, |old| old != *v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         PackageIr {
@@ -2168,11 +2310,19 @@ impl<'a> Lower<'a> {
                 .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
                 .cloned(),
         };
-        let Some(init) = init else { return };
         let env = self.consts.clone();
         let width = type_mark
             .map(|tm| self.resolve_type(tm, None, d.span()).0)
             .unwrap_or(32);
+        // No initializer (`constant c : t;` — value assigned in the package
+        // body): bind the name to X so uses resolve.
+        let Some(init) = init else {
+            for n in &names {
+                self.consts
+                    .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
+            }
+            return;
+        };
         // Record-typed constant: order named aggregate fields by the record.
         let ex = match type_mark {
             Some(tm)
@@ -2223,6 +2373,25 @@ impl<'a> Lower<'a> {
             return;
         };
         let name = self.kw(name_node);
+        // Incomplete type `type t;` — completed later in a package body;
+        // register a placeholder so uses of the name resolve.
+        if !kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "is")
+        {
+            self.types.insert(name, TypeInfo::Scalar);
+            return;
+        }
+        // Protected type: `type t is protected ... end protected [body];` —
+        // register an opaque placeholder; method calls (`x.m(...)`) lower as
+        // plain calls.
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "protected")
+        {
+            self.types.insert(name, TypeInfo::Scalar);
+            return;
+        }
         // Record: `type t is record f : typ [constraint]; ... end record;`
         // (checked before enum: field constraints contain `(` too).
         if kids
@@ -2271,15 +2440,24 @@ impl<'a> Lower<'a> {
             return;
         }
         // Enum: `type t is (a, b, c);`
-        let enum_lits: Vec<String> = kids
+        let enum_kids: Vec<&SyntaxNode> = kids
             .iter()
             .skip_while(|k| !(k.kind() == SyntaxKind::Punct && self.text(k) == "("))
             .filter(|k| k.kind() == SyntaxKind::Ident || k.kind() == SyntaxKind::CharLiteral)
+            .collect();
+        let enum_lits: Vec<String> = enum_kids
+            .iter()
             .map(|k| self.text(k).trim_matches('\'').to_ascii_lowercase())
             .collect();
         if !enum_lits.is_empty() {
-            for (i, l) in enum_lits.iter().enumerate() {
-                self.consts.insert(l.clone(), Value::from_u64(32, i as u64));
+            for (i, k) in enum_kids.iter().enumerate() {
+                // Char-literal labels ('U', '0', ...) lex as CharLiteral, never
+                // as bare names — registering them as consts would shadow
+                // same-named signals (e.g. a signal `u` vs std_ulogic's 'U').
+                if k.kind() == SyntaxKind::Ident {
+                    self.consts
+                        .insert(enum_lits[i].clone(), Value::from_u64(32, i as u64));
+                }
             }
             self.types.insert(name, TypeInfo::Enum(enum_lits));
             return;
@@ -2432,6 +2610,7 @@ impl<'a> Lower<'a> {
         let mut ret_mark: Option<SyntaxNode> = None;
         let mut param_decls: Vec<SyntaxNode> = Vec::new();
         let mut local_decls: Vec<SyntaxNode> = Vec::new();
+        let mut extra_decls: Vec<SyntaxNode> = Vec::new();
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
         let mut seen_return = false;
         let mut seen_begin = false;
@@ -2445,9 +2624,18 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::PortDecl if !seen_begin => param_decls.push(k.clone()),
                 SyntaxKind::VariableDecl if !seen_begin => local_decls.push(k.clone()),
-                // Function-local constants stay in `consts` (the body lowers in
-                // slot space); runtime indexing of them lowers to `$const_idx`.
-                SyntaxKind::ConstantDecl if !seen_begin => self.lower_constant_decl(k),
+                // Constants/aliases/types/subtypes may reference the parameters
+                // (`constant pos : time := ifelse(T >= 0 ns, T, -T);`), so they
+                // are lowered after the slot map is installed below.
+                SyntaxKind::ConstantDecl
+                | SyntaxKind::AliasDecl
+                | SyntaxKind::TypeDecl
+                | SyntaxKind::SubtypeDecl
+                | SyntaxKind::FileDecl
+                    if !seen_begin =>
+                {
+                    extra_decls.push(k.clone())
+                }
                 _ if seen_begin && is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
             }
@@ -2461,6 +2649,7 @@ impl<'a> Lower<'a> {
         };
         // Params: PortDecl `a, b : integer [range]` — names before ':', type after.
         let mut args: Vec<(String, usize)> = Vec::new();
+        let mut arg_types: Vec<(String, String)> = Vec::new();
         for pd in &param_decls {
             let pk = real_children(pd);
             let colon = pk
@@ -2482,11 +2671,36 @@ impl<'a> Lower<'a> {
                 None => (32, false, None, false),
             };
             for n in names {
+                if let Some(tm) = &tmark {
+                    arg_types.push((n.clone(), self.kw(tm)));
+                }
                 args.push((n, w));
+            }
+        }
+        // Lower the body in slot space (slot 0 = return value). Install the
+        // return + parameter slots first so function-local constants can
+        // reference parameters (`constant pos : time := ifelse(T >= 0 ns, T, -T);`).
+        let saved_names = std::mem::take(&mut self.names);
+        let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
+        slots.extend(args.iter().cloned());
+        self.names = slots
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i as SigId))
+            .collect();
+        for k in &extra_decls {
+            match k.kind() {
+                SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(k),
+                SyntaxKind::TypeDecl => self.lower_type_decl(k),
+                SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
+                SyntaxKind::FileDecl => self.lower_file_decl(k),
+                _ => {}
             }
         }
         // Local variables.
         let mut locals: Vec<SignalIr> = Vec::new();
+        let mut local_types: Vec<(String, String)> = Vec::new();
         for d in &local_decls {
             let dk = real_children(d);
             let Some(colon) = dk
@@ -2511,6 +2725,9 @@ impl<'a> Lower<'a> {
                 None => (32, false, None, false),
             };
             for n in names {
+                if let Some(tm) = &tmark {
+                    local_types.push((n.clone(), self.kw(tm)));
+                }
                 locals.push(SignalIr {
                     name: n,
                     width: w,
@@ -2521,16 +2738,26 @@ impl<'a> Lower<'a> {
                 });
             }
         }
-        // Lower the body in slot space (slot 0 = return value).
-        let saved_names = std::mem::take(&mut self.names);
-        let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
-        slots.extend(args.iter().cloned());
         slots.extend(locals.iter().map(|l| (l.name.clone(), l.width)));
         self.names = slots
             .iter()
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Record-typed parameters: remember the record type so `arg.field`
+        // resolves to a field select.
+        for (i, (n, _)) in slots.iter().enumerate() {
+            let tn = arg_types
+                .iter()
+                .chain(local_types.iter())
+                .find(|(an, _)| an == n)
+                .map(|(_, tn)| tn.clone());
+            if let Some(tn) = tn {
+                if matches!(self.types.get(&tn), Some(TypeInfo::Record { .. })) {
+                    self.sig_rec.insert(i as SigId, tn);
+                }
+            }
+        }
         // Loop variables allocated while lowering the body get slots after the
         // declared ones (they are appended to `locals` below so the runtime and
         // const-eval slot space matches).
@@ -3657,7 +3884,17 @@ impl<'a> Lower<'a> {
                 }
             }
             SyntaxKind::Name => {
-                let name = self.text(e);
+                let text = self.text(e);
+                // VHDL-2008 `.all` dereference of an access object: lower the
+                // prefix (`Buf.all` -> `Buf`).
+                let name = if text.len() > 4
+                    && text.as_bytes()[text.len() - 4] == b'.'
+                    && text[text.len() - 3..].eq_ignore_ascii_case("all")
+                {
+                    text[..text.len() - 4].to_string()
+                } else {
+                    text
+                };
                 // `arr(i).field` — the parser folds this into one Name node
                 // wrapping a Call plus `.field`. Lower the call, then select
                 // the record field inside the element (slice of the memory
@@ -3806,19 +4043,31 @@ impl<'a> Lower<'a> {
                 if let Some(a) = self.aliases.get(&key) {
                     return a.clone();
                 }
-                // Parameterless function called without parentheses: `c_hi`.
+                // Function referenced by name (parameterless call `c_hi`, or an
+                // alias target `alias a is f[...];`): resolve to a call — with
+                // placeholder args for parameterized functions, which are only
+                // legal as alias targets anyway.
                 if let Some(f) = self.funcs.get(&key) {
-                    if f.args.is_empty() {
-                        return Expr::Call {
-                            name: f.name.clone(),
-                            args: Vec::new(),
-                        };
-                    }
+                    return Expr::Call {
+                        name: f.name.clone(),
+                        args: vec![Expr::Lit(Value::x(32)); f.args.len()],
+                    };
                 }
                 // `open` (reserved word) in a port/generic map association:
                 // an unconnected port — X, no diagnostic.
                 if key == "open" {
                     return Expr::Lit(Value::x(1));
+                }
+                // A type name used as a value (`alias t2 is t1;`) — placeholder.
+                if self.types.contains_key(&key) {
+                    return Expr::Lit(Value::x(32));
+                }
+                // std.standard `now` — current simulation time (sim: `$now`).
+                if key == "now" {
+                    return Expr::Call {
+                        name: "$now".into(),
+                        args: Vec::new(),
+                    };
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
@@ -4085,6 +4334,20 @@ impl<'a> Lower<'a> {
             .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
             .map(|(_, k)| self.lower_expr(k, env))
             .collect();
+        // `.all(i)` dereference of an access-to-array: `L.all(i)` -> L(i).
+        if fname == "all"
+            && name.len() > 4
+            && name.as_bytes()[name.len() - 4] == b'.'
+            && !args.is_empty()
+        {
+            let prefix = &name[..name.len() - 4];
+            if let Some(id) = self.sig_id(prefix) {
+                return Expr::Idx {
+                    e: Box::new(Expr::Sig(id)),
+                    i: Box::new(args[0].clone()),
+                };
+            }
+        }
         // A record/array-typed constant is materialized as a hidden signal
         // (`__const_<name>`); index it like a signal.
         let base_id = self
@@ -4226,6 +4489,21 @@ impl<'a> Lower<'a> {
                 if args.len() == 1 =>
             {
                 args.into_iter().next().unwrap()
+            }
+            // Alias to a subprogram: `alias a is f[...];` — calls to `a(...)`
+            // become calls to the target `f(...)`.
+            _ if self
+                .aliases
+                .get(&fname)
+                .is_some_and(|a| matches!(a, Expr::Call { .. })) =>
+            {
+                match self.aliases.get(&fname).unwrap() {
+                    Expr::Call { name: target, .. } => Expr::Call {
+                        name: target.clone(),
+                        args,
+                    },
+                    _ => unreachable!(),
+                }
             }
             _ => Expr::Call { name: fname, args },
         }
@@ -4563,6 +4841,10 @@ impl<'a> Lower<'a> {
             return Expr::Lit(Value::x(32));
         }
         let _ = env;
+        // `null` — the null access value (access types are not simulated).
+        if t.eq_ignore_ascii_case("null") {
+            return Expr::Lit(Value::x(64));
+        }
         self.err(e.span(), format!("unsupported literal '{}'", t));
         Expr::Lit(Value::x(1))
     }

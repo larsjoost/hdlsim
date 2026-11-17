@@ -2266,6 +2266,8 @@ impl Simulator {
                 return Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64);
             }
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
+            // std.standard `now` — current simulation time in fs.
+            "$now" => return Value::from_u64(64, self.time),
             // `$const_idx(val, i, w)`: element `i` (MSB-first) of a flat
             // constant array value with element width `w`.
             "$const_idx" if args.len() == 3 => {

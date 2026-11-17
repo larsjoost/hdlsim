@@ -38,4 +38,8 @@ package std_logic_1164 is
     function to_bitvector       (s : std_logic_vector) return bit_vector;
     function to_x01             (s : std_ulogic) return std_ulogic;
 
+    -- VHDL-2019: unresolved vector types (base of resolved vector subtypes).
+    type unresolved_unsigned is array (natural range <>) of std_ulogic;
+    type unresolved_signed is array (natural range <>) of std_ulogic;
+
 end package std_logic_1164;
