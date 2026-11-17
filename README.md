@@ -18,7 +18,10 @@ the graphical wave display are all implemented here.
   directories (`hdlsim.ini` — created by `hdlsim init` — plus `-L name=dir` flags);
   undefined modules, `` `include `` files, and `use`-clause packages
   (`use lib.pkg.all;`) are found and compiled on demand in dependency order,
-  with an in-session compile cache. `std` and `ieee` are built in
+  with an in-session compile cache. Works out of the box: with no `hdlsim.ini`
+  and no `-L`, the current directory is indexed as `work`, and any unit still
+  missing is found by searching the project tree (with a warning pointing at
+  `hdlsim init` / `-L` to make it instant). `std` and `ieee` are built in
   as real VHDL source files (`crates/hdl-lib/stdlib/`), embedded into the binary
   with `include_str!` and parsed by the same front-end, so they always resolve —
   no on-disk stdlib needed. They are searched last so `-L ieee=...` overrides them;
@@ -103,7 +106,7 @@ cargo test              # unit + integration tests
 ## Usage
 
 ```
-hdlsim init                                  # create a starter hdlsim.ini
+hdlsim init                                  # scan the project, write hdlsim.ini (indexed resolution)
 hdlsim check file.v ...                      # parse + lower + resolve, report diagnostics
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us --seed 42
@@ -252,6 +255,12 @@ code — every file must lex/parse cleanly and compile through the lowerer
 work = .
 mylib = libs/mylib
 ```
+
+Run `hdlsim init` in a project to generate it: `work = .` indexes the whole
+tree, and each `library X;` clause found in the sources gets a `X = <dir>`
+line. Without any config, hdlsim already indexes the current directory as
+`work` and falls back to searching the project for unknown units (warning
+`W0502`/`W0501` tells you to run `hdlsim init` or add `-L name=dir`).
 
 ## License
 

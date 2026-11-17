@@ -119,6 +119,11 @@ impl UnitProvider for DirProvider {
     }
 }
 
+/// Directory names never searched for sources (VCS dirs, build output, caches).
+fn is_skip_dir(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "target" | "node_modules")
+}
+
 fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -127,6 +132,11 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
     entries.sort(); // deterministic scan order
     for p in entries {
         if p.is_dir() {
+            if p.file_name()
+                .map_or(false, |n| is_skip_dir(&n.to_string_lossy()))
+            {
+                continue;
+            }
             walk(&p, exts, out);
         } else if p
             .extension()
@@ -138,6 +148,14 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
             }
         }
     }
+}
+
+/// Walk `dir` recursively for source files of any known extension (skipping
+/// hidden dirs, `target`, `node_modules`); returns `(unit, file)` pairs.
+pub fn walk_sources(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    walk(dir, &["v", "sv", "vhd", "vhdl"], &mut out);
+    out
 }
 
 /// Design-unit names defined by one source file. Verilog: `module` names.

@@ -191,11 +191,22 @@ pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Optio
             default.is_file().then_some(default)
         }
     };
+    let mut config_loaded = false;
     if root.is_none() {
         if let Some(c) = &config {
             mgr.load_config(c).map_err(anyhow::Error::msg)?;
+            config_loaded = true;
         }
     }
+    // Out of the box: with no config file and no -L mappings, index the
+    // current directory as library `work` (recursively), so `use work.foo.all;`
+    // and `entity work.foo` resolve in any project without setup.
+    if root.is_none() && !config_loaded && opts.libs.is_empty() {
+        mgr.add_library_dir("work", Path::new("."));
+    }
+    // The project root (cwd, or the bundle extraction root) is always a
+    // fallback search root for units no library maps.
+    mgr.add_search_root(root.clone().unwrap_or_else(|| PathBuf::from(".")));
     for (name, path) in &opts.libs {
         // With a bundle, relative -L paths resolve inside the extraction root.
         let p = match &root {
