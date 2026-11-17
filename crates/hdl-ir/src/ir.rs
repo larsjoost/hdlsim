@@ -21,6 +21,10 @@ pub struct Design {
     /// can make them visible with `use lib.pkg.all;` (see
     /// [`crate::vhdl_lower`]).
     pub packages: HashMap<String, crate::vhdl_lower::PackageIr>,
+    /// Lowered configuration declarations by unit name, so instantiations
+    /// (`label : configuration work.cfg`) and `--top cfg` resolve (see
+    /// [`crate::vhdl_lower::ConfigIr`]).
+    pub configurations: HashMap<String, crate::vhdl_lower::ConfigIr>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +149,10 @@ pub struct InstIr {
     pub name: String,
     pub param_overrides: Vec<(String, Expr)>,
     pub conns: Vec<Conn>,
+    /// Configuration bound to this instance (`configuration work.cfg` or a
+    /// `for label : comp use configuration ...;` specification); elaboration
+    /// applies its block bindings to this instance's subtree.
+    pub config: Option<String>,
 }
 
 #[derive(Clone, Debug)]

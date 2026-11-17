@@ -150,15 +150,40 @@ pub fn elaborate_with(
 }
 
 fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
-    let top_id = design
-        .modules
-        .iter()
-        .position(|m| m.name == top)
-        .ok_or_else(|| ElabError::Message(format!("top module '{}' not found", top)))?;
+    // The top may be a configuration declaration: elaborate its bound entity
+    // with the configuration's block bindings applied at the top scope.
+    let (top_id, top_cfg) = if let Some(pos) = design.modules.iter().position(|m| m.name == top) {
+        (pos, None)
+    } else if let Some(c) = design.configurations.get(&top.to_ascii_lowercase()) {
+        let ent = c.entity.clone();
+        let pos = design
+            .modules
+            .iter()
+            .position(|m| m.name == ent || m.name.starts_with(&format!("{ent}/")))
+            .ok_or_else(|| {
+                ElabError::Message(format!(
+                    "configuration '{top}' binds unknown entity '{ent}'"
+                ))
+            })?;
+        (pos, Some(top.to_ascii_lowercase()))
+    } else {
+        return Err(ElabError::Message(format!(
+            "top module '{}' not found",
+            top
+        )));
+    };
     let mut f = Flat::default();
     let root = f.new_scope("", None);
     f.top_scope = root;
-    f.instantiate(design, top_id, root, "", &HashMap::new(), &[])?;
+    f.instantiate(
+        design,
+        top_id,
+        root,
+        "",
+        &HashMap::new(),
+        &[],
+        top_cfg.as_deref(),
+    )?;
     // Package function bodies (visible via `use lib.pkg.all;`) are callable
     // at runtime too — register them like module functions. Bodies live in
     // slot space, so they are cloned without remapping. Unbound generic
@@ -230,8 +255,15 @@ impl Flat {
         prefix: &str,
         params: &HashMap<String, Value>,
         conns: &[Conn],
+        cfg: Option<&str>,
     ) -> Result<Vec<FlatSigId>, ElabError> {
         let m = &design.modules[mod_id];
+        // A configuration bound to this instance rewrites the child instance
+        // list (block configurations) before recursion.
+        let child_instances: Vec<InstIr> = match cfg.and_then(|c| design.configurations.get(c)) {
+            Some(c) => apply_config_blocks(c, &m.instances),
+            None => m.instances.clone(),
+        };
         let where_ = if prefix.is_empty() {
             m.name.clone()
         } else {
@@ -362,7 +394,7 @@ impl Flat {
         }
 
         // Child instances, recursively.
-        for inst in &m.instances {
+        for inst in &child_instances {
             let child_id = design
                 .modules
                 .iter()
@@ -399,11 +431,73 @@ impl Flat {
                 &child_prefix,
                 &child_params,
                 &child_conns,
+                inst.config.as_deref(),
             )?;
         }
 
         Ok(map)
     }
+}
+
+/// Apply a configuration's block bindings to an instance list: `for label :
+/// comp use ...`, `for all : comp use ...`, `for others : comp use ...`.
+fn apply_config_blocks(cfg: &crate::vhdl_lower::ConfigIr, instances: &[InstIr]) -> Vec<InstIr> {
+    use crate::vhdl_lower::Binding;
+    let mut out: Vec<InstIr> = instances.to_vec();
+    let mut named_matched: Vec<usize> = Vec::new();
+    let mut apply = |inst: &mut InstIr, blk: &crate::vhdl_lower::BlockCfg| match &blk.binding {
+        Binding::Entity {
+            name,
+            arch,
+            generic_map,
+            port_map,
+        } => {
+            inst.module = match arch {
+                Some(a) => format!("{name}/{a}"),
+                None => name.clone(),
+            };
+            inst.param_overrides.extend(generic_map.clone());
+            if !port_map.is_empty() {
+                inst.conns = port_map.clone();
+            }
+        }
+        Binding::Configuration { name } => {
+            inst.config = Some(name.clone());
+        }
+    };
+    for blk in &cfg.blocks {
+        if blk.others {
+            continue; // after the named blocks
+        }
+        for (i, inst) in out.iter_mut().enumerate() {
+            let hit = if blk.all {
+                true
+            } else {
+                !blk.path.is_empty()
+                    && blk.path[0].eq_ignore_ascii_case(&inst.name)
+                    && (blk.path.len() == 1 || blk.path[1].eq_ignore_ascii_case(&inst.module))
+            };
+            if hit {
+                named_matched.push(i);
+                apply(inst, blk);
+            }
+        }
+    }
+    for blk in &cfg.blocks {
+        if !blk.others {
+            continue;
+        }
+        for (i, inst) in out.iter_mut().enumerate() {
+            if named_matched.contains(&i) {
+                continue;
+            }
+            if blk.path.len() >= 2 && !blk.path[1].eq_ignore_ascii_case(&inst.module) {
+                continue;
+            }
+            apply(inst, blk);
+        }
+    }
+    out
 }
 
 fn conn_for<'a>(conns: &'a [Conn], ports: &[PortIr], i: usize) -> Option<&'a Expr> {
@@ -617,6 +711,7 @@ mod tests {
                 name: "u0".into(),
                 param_overrides: vec![],
                 conns: vec![Conn::Named("q".into(), Expr::Sig(0))],
+                config: None,
             }],
             time_unit_fs: 1000,
         };
@@ -624,7 +719,64 @@ mod tests {
             modules: vec![top, child],
             top: Some("top".into()),
             packages: Default::default(),
+            configurations: Default::default(),
         }
+    }
+
+    #[test]
+    fn configuration_as_top_applies_block_bindings() {
+        // top instantiates "child" as u0; `configuration cfg of top` binds
+        // `for u0 : child use entity work.other(rtl);` — elaborating the
+        // configuration as top must instantiate other/rtl under u0.
+        use crate::vhdl_lower::{Binding, BlockCfg, ConfigIr};
+        let mut d = two_module_design();
+        let mut other = ModuleIr {
+            name: "other/rtl".into(),
+            params: vec![],
+            ports: vec![PortIr {
+                name: "q".into(),
+                dir: Dir::Out,
+                sig: 0,
+            }],
+            signals: vec![sig("q", 8, SigKind::Output)],
+            assigns: vec![],
+            processes: vec![],
+            functions: vec![],
+            instances: vec![],
+            time_unit_fs: 1000,
+        };
+        other.assigns.push(AssignIr {
+            lhs: Expr::Sig(0),
+            rhs: Expr::Lit(Value::from_u64(8, 7)),
+        });
+        d.modules.push(other);
+        d.configurations.insert(
+            "cfg".into(),
+            ConfigIr {
+                name: "cfg".into(),
+                entity: "top".into(),
+                arch: None,
+                blocks: vec![BlockCfg {
+                    path: vec!["u0".into(), "child".into()],
+                    all: false,
+                    others: false,
+                    binding: Binding::Entity {
+                        name: "other".into(),
+                        arch: Some("rtl".into()),
+                        generic_map: vec![],
+                        port_map: vec![],
+                    },
+                }],
+            },
+        );
+        let f = elaborate(&d, "cfg").unwrap();
+        let scope_names: Vec<&str> = f.scopes.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            scope_names.contains(&"other/rtl"),
+            "block binding not applied: {:?}",
+            scope_names
+        );
+        assert!(!scope_names.contains(&"child"), "{:?}", scope_names);
     }
 
     #[test]

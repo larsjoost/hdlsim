@@ -162,4 +162,4 @@ Merged PRs (main @ c7feea8, 2026-11-16):
 | (direct) | SV classes: `new`/ctor, fields, methods, tasks, `randomize()` + constraints; class-body/endclass parser fixes |
 | (direct) | `examples/features/`: 22 self-checking PASS designs (14 SV, 8 VHDL) wired into `tests/examples.rs`; fixes they exposed (32-bit unsized literals, concat/replicate parse, logical-not/reduction ops, `Stmt::Return`, `#(...)` instancing, generate blocks, block decls, VHDL functions/returns/exit-when/for-var, solver boundary values) |
 
-Remaining, in suggested order: UVM-lite / broader SV coverage (interfaces, clocking blocks, covergroups), VHDL packages & configurations, synthesis-oriented subsets.
+Remaining, in suggested order: UVM-lite / broader SV coverage (interfaces, clocking blocks, covergroups), synthesis-oriented subsets. (VHDL configurations done: configuration declarations incl. block configs / `for all` / `for others` / generic+port maps in bindings, configuration specifications `for label : comp use ...;`, `configuration work.cfg` instantiations, `--top <configuration>`.)
