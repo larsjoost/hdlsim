@@ -309,16 +309,24 @@ impl LibraryManager {
     pub fn compile_files(&mut self, design: &mut Design, paths: &[PathBuf]) {
         // Compile Verilog files that declare a `package` first, so `pkg::name`
         // references resolve no matter what order the files were given in.
+        // Likewise VHDL package declarations before package bodies, so a body
+        // in its own file sees the declaration's types/constants.
         let mut pkgs: Vec<&PathBuf> = Vec::new();
         let mut rest: Vec<&PathBuf> = Vec::new();
         for p in paths {
-            let is_verilog_pkg = matches!(
-                p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
-                Some(ref e) if e == "v" || e == "sv"
-            ) && std::fs::read_to_string(p)
-                .map(|t| t.lines().any(|l| l.trim_start().starts_with("package ")))
-                .unwrap_or(false);
-            if is_verilog_pkg {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            let is_verilog_pkg = matches!(ext.as_deref(), Some("v") | Some("sv"))
+                && text.lines().any(|l| l.trim_start().starts_with("package "));
+            let is_vhdl_pkg_decl = matches!(ext.as_deref(), Some("vhd") | Some("vhdl"))
+                && text.lines().any(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("package ") && !t.starts_with("package body")
+                });
+            if is_verilog_pkg || is_vhdl_pkg_decl {
                 pkgs.push(p);
             } else {
                 rest.push(p);

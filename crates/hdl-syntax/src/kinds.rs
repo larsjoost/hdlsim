@@ -205,6 +205,8 @@ pub enum SyntaxKind {
     AttrDecl,
     /// `attribute a of target : label is expr;` specification.
     AttrSpec,
+    /// `disconnect sig_list : type_mark [after expr];` specification.
+    DisconnectSpec,
     /// File object declaration: `file f : text open read_mode is "x";`.
     FileDecl,
     /// Component configuration specification: `for lbl : comp use ...;`.
@@ -362,6 +364,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::AliasDecl,
     SyntaxKind::AttrDecl,
     SyntaxKind::AttrSpec,
+    SyntaxKind::DisconnectSpec,
     SyntaxKind::FileDecl,
     SyntaxKind::ForSpec,
     SyntaxKind::SelectedAssign,
@@ -576,7 +579,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 124);
+        assert_eq!(ALL.len(), 125);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));
