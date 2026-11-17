@@ -342,6 +342,25 @@ impl<'a> Parser<'a> {
             }
             self.timescale = Some(parts.trim().to_string());
         } else {
+            // A macro invocation: skip a balanced `(...)` argument list first
+            // (it may span lines), then the rest of the line.
+            if self.at_punct('(') {
+                let mut depth = 0;
+                while self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('(') {
+                        depth += 1;
+                        self.bump();
+                    } else if self.at_punct(')') {
+                        depth -= 1;
+                        self.bump();
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        self.bump();
+                    }
+                }
+            }
             // Skip the rest of the line.
             let line = self.src.line_col(d.span.start).0;
             while self.peek().kind != TokenKind::Eof
@@ -377,6 +396,12 @@ impl<'a> Parser<'a> {
             self.parse_module_item();
         }
         if self.eat_kw("endmodule") {
+            // Optional label: `endmodule : name`.
+            if self.eat_punct(':') {
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                }
+            }
         } else {
             self.error_here("expected `endmodule`");
         }
@@ -428,6 +453,12 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // Optional user type name: `input data_t d_i` / `input data_t [7:0] d_i`.
+        if self.peek().kind == TokenKind::Ident
+            && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
+        {
+            self.bump();
+        }
         self.parse_optional_range();
         if self.peek().kind == TokenKind::Ident {
             self.builder.start_node(SyntaxKind::Name);
@@ -437,6 +468,39 @@ impl<'a> Parser<'a> {
             self.error_here("expected port name");
         }
         self.builder.finish_node();
+    }
+
+    /// Consume a run of type keywords (`int unsigned`, `logic`, `signed`, ...)
+    /// as in `parameter int unsigned W = 1` or `function longint unsigned f`.
+    fn eat_type_words(&mut self) -> bool {
+        let mut any = false;
+        while self.peek().kind == TokenKind::Ident
+            && matches!(
+                self.peek_text(),
+                "type"
+                    | "integer"
+                    | "real"
+                    | "realtime"
+                    | "shortreal"
+                    | "time"
+                    | "int"
+                    | "shortint"
+                    | "longint"
+                    | "byte"
+                    | "bit"
+                    | "logic"
+                    | "reg"
+                    | "wire"
+                    | "string"
+                    | "chandle"
+                    | "signed"
+                    | "unsigned"
+            )
+        {
+            self.bump();
+            any = true;
+        }
+        any
     }
 
     /// `#( parameter W = 8, ... )` in a module header: each entry becomes a
@@ -451,7 +515,16 @@ impl<'a> Parser<'a> {
             }
             if self.at_kw("type") {
                 self.bump();
-            } else if self.at_kw("integer") || self.at_kw("real") || self.at_kw("time") {
+                if self.peek().kind == TokenKind::Ident {
+                    // `parameter type data_t = logic` declares a type param.
+                    self.user_types.insert(self.peek_text().to_string());
+                }
+            }
+            self.eat_type_words();
+            // Optional user type name: `parameter data_t P = ...`.
+            if self.peek().kind == TokenKind::Ident
+                && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
+            {
                 self.bump();
             }
             // Optional range: `parameter [0:0] PRE_REGISTER = 1`.
@@ -697,7 +770,30 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// Skip `(* ... *)` attribute blocks (e.g. `(* dont_touch = "true" *)`).
+    fn eat_attributes(&mut self) {
+        while self.at_punct('(') && self.peek2_text() == "*" {
+            self.bump();
+            self.bump();
+            let mut depth = 1;
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('(') && self.peek2_text() == "*" {
+                    depth += 1;
+                    self.bump();
+                    self.bump();
+                } else if self.at_punct('*') && self.peek2_text() == ")" {
+                    depth -= 1;
+                    self.bump();
+                    self.bump();
+                } else {
+                    self.bump();
+                }
+            }
+        }
+    }
+
     fn parse_module_item(&mut self) {
+        self.eat_attributes();
         let t = self.peek().clone();
         let text = self.peek_text().to_string();
         match t.kind {
@@ -721,6 +817,9 @@ impl<'a> Parser<'a> {
                 "import" => self.parse_import(false),
                 "export" => self.parse_import(true),
                 "generate" => self.parse_generate(),
+                // Implicit generate regions: `if (...) begin ... end`,
+                // `for (...) ...`, `case (...) ...`, `begin : name ... end`.
+                "if" | "for" | "case" | "casez" | "casex" | "begin" => self.parse_gen_item(),
                 "assert" | "assume" | "cover" => self.parse_sva_property(text.as_str()),
                 // `endmodule` here means the enclosing construct was never
                 // closed — report and skip so no loop can spin on it.
@@ -743,7 +842,9 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Declaration with a user type: `word_t w;` / `C obj;`.
-                    if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident {
+                    if self.user_types.contains(&text)
+                        && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
+                    {
                         self.parse_decl();
                     } else if self.peek2().kind == TokenKind::Ident
                         || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "#")
@@ -756,6 +857,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             },
+            TokenKind::SysTask => self.parse_statement(),
+            // Macro invocation / compiler directive inside the module body:
+            // skipped (unexpanded or handled by the preprocessor).
+            TokenKind::Directive => self.parse_directive(),
             _ => {
                 self.error_here("unexpected token in module body");
                 self.bump();
@@ -780,6 +885,13 @@ impl<'a> Parser<'a> {
     fn parse_port_decl_stmt(&mut self) {
         self.builder.start_node(SyntaxKind::Port);
         self.bump(); // direction
+        self.eat_type_words(); // `input logic`, `input int unsigned`, ...
+                               // Optional user type name: `input data_t d_i;`.
+        if self.peek().kind == TokenKind::Ident
+            && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
+        {
+            self.bump();
+        }
         self.parse_optional_range();
         loop {
             if self.peek().kind == TokenKind::Ident {
@@ -815,7 +927,9 @@ impl<'a> Parser<'a> {
         while self.at_kw("signed") || self.at_kw("unsigned") {
             self.bump();
         }
-        self.parse_optional_range();
+        while self.at_punct('[') {
+            self.parse_optional_range(); // multi-dimensional: `logic [A][B] x;`
+        }
         loop {
             if self.peek().kind == TokenKind::Ident {
                 self.builder.start_node(SyntaxKind::Name);
@@ -825,7 +939,9 @@ impl<'a> Parser<'a> {
                 self.error_here("expected a name in declaration");
                 break;
             }
-            self.parse_optional_range();
+            while self.at_punct('[') {
+                self.parse_optional_range(); // per-name unpacked dims: `x [3:0]`
+            }
             if self.eat_punct('=') {
                 self.parse_expression();
             }
@@ -841,24 +957,16 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::ParamDecl);
         self.bump(); // parameter/localparam
         if self.at_kw("type") {
-            self.bump(); // `parameter type T = ...`
-        } else if self.peek().kind == TokenKind::Ident
-            && matches!(
-                self.peek_text(),
-                "integer"
-                    | "real"
-                    | "time"
-                    | "int"
-                    | "longint"
-                    | "shortint"
-                    | "byte"
-                    | "bit"
-                    | "logic"
-                    | "reg"
-                    | "wire"
-                    | "string"
-                    | "chandle"
-            )
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                // `parameter type data_t = logic` declares a type param.
+                self.user_types.insert(self.peek_text().to_string());
+            }
+        }
+        self.eat_type_words(); // `parameter int unsigned W`, ...
+                               // Optional user type name: `localparam cb_seed_t [2:0] X = ...`.
+        if self.peek().kind == TokenKind::Ident
+            && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
         {
             self.bump();
         }
@@ -1058,21 +1166,8 @@ impl<'a> Parser<'a> {
         if self.eat_kw("automatic") {}
         if self.at_kw("void") {
             self.bump();
-        } else if self.at_kw("integer")
-            || self.at_kw("reg")
-            || self.at_kw("logic")
-            || self.at_kw("wire")
-            || self.at_kw("real")
-            || self.at_kw("time")
-            || self.at_kw("bit")
-            || self.at_kw("byte")
-            || self.at_kw("shortint")
-            || self.at_kw("int")
-            || self.at_kw("longint")
-            || self.at_kw("string")
-            || self.at_kw("chandle")
-        {
-            self.bump();
+        } else {
+            self.eat_type_words(); // `longint unsigned`, `logic`, ...
         }
         self.parse_optional_range();
         if self.peek().kind == TokenKind::Ident {
@@ -1154,6 +1249,10 @@ impl<'a> Parser<'a> {
             "parameter" | "localparam" => self.parse_param_decl(),
             "import" => self.parse_import(false),
             "export" => self.parse_import(true),
+            "automatic" | "static" => {
+                self.bump();
+                self.parse_decl_or_stmt();
+            }
             _ if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident => {
                 self.parse_decl()
             }
@@ -1325,9 +1424,14 @@ impl<'a> Parser<'a> {
             while self.at_kw("rand") || self.at_kw("randc") || self.at_kw("const") {
                 self.bump();
             }
-            if self.peek().kind == TokenKind::Ident {
-                self.bump(); // field type
-            } else {
+            self.eat_type_words(); // `int unsigned`, `logic`, ...
+                                   // Optional user type name for the field.
+            if self.peek().kind == TokenKind::Ident
+                && (self.peek2().kind == TokenKind::Ident || self.peek2_text() == "[")
+            {
+                self.bump();
+            }
+            if self.peek().kind != TokenKind::Ident && !self.at_punct('[') {
                 self.error_here("expected a field type");
                 break;
             }
@@ -1401,22 +1505,29 @@ impl<'a> Parser<'a> {
             && !self.at_kw("endmodule")
             && self.peek().kind != TokenKind::Eof
         {
-            if self.at_kw("for") {
-                self.parse_gen_for();
-            } else if self.at_kw("if") {
-                self.parse_gen_if();
-            } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
-                self.parse_gen_case();
-            } else if self.at_kw("begin") {
-                self.parse_gen_block();
-            } else {
-                self.parse_module_item();
-            }
+            self.parse_gen_item();
         }
         if !self.eat_kw("endgenerate") {
             self.error_here("expected `endgenerate`");
         }
         self.builder.finish_node();
+    }
+
+    /// One generate-region item: a begin-block, nested for/if/case, or a
+    /// module item. Also used for implicit generate regions at module level
+    /// (`if (...) begin ... end` without the `generate` keyword).
+    fn parse_gen_item(&mut self) {
+        if self.at_kw("begin") {
+            self.parse_gen_block();
+        } else if self.at_kw("for") {
+            self.parse_gen_for();
+        } else if self.at_kw("if") {
+            self.parse_gen_if();
+        } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
+            self.parse_gen_case();
+        } else {
+            self.parse_module_item();
+        }
     }
 
     /// `begin : name module-items end` inside a generate region.
@@ -1435,17 +1546,7 @@ impl<'a> Parser<'a> {
             && !self.at_kw("endmodule")
             && self.peek().kind != TokenKind::Eof
         {
-            if self.at_kw("for") {
-                self.parse_gen_for();
-            } else if self.at_kw("if") {
-                self.parse_gen_if();
-            } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
-                self.parse_gen_case();
-            } else if self.at_kw("begin") {
-                self.parse_gen_block();
-            } else {
-                self.parse_module_item();
-            }
+            self.parse_gen_item();
         }
         if !self.eat_kw("end") {
             self.error_here("expected `end`");
@@ -1525,13 +1626,14 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::GenFor);
         self.bump(); // for
         self.expect_punct('(', "after `for`");
+        self.eat_kw("genvar"); // `for (genvar j = 0; ...)`
         self.parse_assign_no_semi(); // init
         self.expect_punct(';', "in for header");
         self.parse_expression(); // condition
         self.expect_punct(';', "in for header");
         self.parse_assign_no_semi(); // step
         self.expect_punct(')', "to close the for header");
-        self.parse_statement();
+        self.parse_gen_item();
         self.builder.finish_node();
     }
 
@@ -1541,9 +1643,9 @@ impl<'a> Parser<'a> {
         self.expect_punct('(', "after `if`");
         self.parse_expression();
         self.expect_punct(')', "to close the if condition");
-        self.parse_statement();
+        self.parse_gen_item();
         if self.eat_kw("else") {
-            self.parse_statement();
+            self.parse_gen_item();
         }
         self.builder.finish_node();
     }
@@ -1636,6 +1738,7 @@ impl<'a> Parser<'a> {
     // ---- grammar: statements -------------------------------------------------
 
     fn parse_statement(&mut self) {
+        self.eat_attributes();
         let text = self.peek_text().to_string();
         match self.peek().kind {
             // `assign` is legal inside generate blocks (module item as statement).
@@ -1649,6 +1752,27 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.parse_expression();
                 self.expect_punct(';', "to end the statement");
+            }
+            // `x++;` / `x--;` / `++x;` / `--x;`.
+            TokenKind::Ident
+                if self.peek2_text() == "+" && self.peek3_text() == "+"
+                    || self.peek2_text() == "-" && self.peek3_text() == "-" =>
+            {
+                self.builder.start_node(SyntaxKind::StmtAssign);
+                self.parse_postfix(); // consumes the postfix `++`/`--` too
+                self.builder.finish_node();
+                self.expect_punct(';', "to end the increment/decrement");
+            }
+            TokenKind::Punct
+                if text == "+" && self.peek2_text() == "+"
+                    || text == "-" && self.peek2_text() == "-" =>
+            {
+                self.builder.start_node(SyntaxKind::StmtAssign);
+                self.bump();
+                self.bump();
+                self.parse_postfix();
+                self.builder.finish_node();
+                self.expect_punct(';', "to end the increment/decrement");
             }
             TokenKind::Ident if text == "force" => {
                 self.bump();
@@ -1982,6 +2106,29 @@ impl<'a> Parser<'a> {
 
     /// Consume `=` (blocking) or `<=` (non-blocking). Returns false if neither.
     fn parse_assign_op(&mut self) -> bool {
+        // Two/three-char operators lex as separate puncts; match on raw text.
+        let t2 = format!("{}{}", self.peek_text(), self.peek2_text());
+        let t3 = format!(
+            "{}{}{}",
+            self.peek_text(),
+            self.peek2_text(),
+            self.peek3_text()
+        );
+        for op in ["<<<=", ">>>="] {
+            if t3 == op {
+                self.bump();
+                self.bump();
+                self.bump();
+                return true;
+            }
+        }
+        for op in ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="] {
+            if t2 == op {
+                self.bump();
+                self.bump();
+                return true;
+            }
+        }
         if self.peek_op2().as_deref() == Some("<=") {
             self.bump();
             self.bump();
@@ -1997,8 +2144,16 @@ impl<'a> Parser<'a> {
     /// `lhs = expr` without a trailing semicolon (for-loop init/step).
     fn parse_assign_no_semi(&mut self) {
         self.builder.start_node(SyntaxKind::StmtAssign);
+        self.eat_type_words(); // `for (int i = 0; ...)`
+                               // `for (...; i++)` step: a bare inc/dec needs no assignment operator.
+        let is_incdec = (self.peek2_text() == "+" && self.peek3_text() == "+")
+            || (self.peek2_text() == "-" && self.peek3_text() == "-");
         self.parse_postfix();
         if !self.parse_assign_op() {
+            if is_incdec {
+                self.builder.finish_node();
+                return;
+            }
             self.error_here("expected `=` or `<=` in for-loop assignment");
         }
         self.parse_expression();
@@ -2169,6 +2324,28 @@ impl<'a> Parser<'a> {
         let mark = self.builder.mark();
         self.parse_primary();
         loop {
+            // Size cast: `Width'(expr)` / `type'(value)`.
+            if self.at_punct('\'') && self.peek2_text() == "(" {
+                self.builder.start_node_at(mark, SyntaxKind::ParenExpr);
+                self.bump(); // '
+                self.bump(); // (
+                if !self.at_punct(')') {
+                    self.parse_expression();
+                }
+                self.expect_punct(')', "to close the cast");
+                self.builder.finish_node();
+                continue;
+            }
+            // Postfix `x++` / `x--`.
+            if self.peek_text() == "+" && self.peek2_text() == "+"
+                || self.peek_text() == "-" && self.peek2_text() == "-"
+            {
+                self.builder.start_node_at(mark, SyntaxKind::UnaryExpr);
+                self.bump();
+                self.bump();
+                self.builder.finish_node();
+                continue;
+            }
             if self.at_punct('[') {
                 // Index or part-select.
                 let is_part = {
@@ -2265,6 +2442,12 @@ impl<'a> Parser<'a> {
             }
         }
         let t = self.peek().clone();
+        if t.kind == TokenKind::Ident
+            && (self.peek_text() == "struct" || self.peek_text() == "union")
+        {
+            self.parse_struct_type();
+            return;
+        }
         match t.kind {
             TokenKind::IntLiteral | TokenKind::RealLiteral | TokenKind::StrLiteral => {
                 self.builder.start_node(SyntaxKind::Literal);
@@ -2833,6 +3016,48 @@ endmodule
 endmodule
 "#);
         assert_eq!(sexp.matches("(Decl").count(), 6, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_common_cells_constructs() {
+        // Constructs from pulp-platform/common_cells: typed parameters,
+        // user-typed ports/params, struct types, implicit generate regions,
+        // inc/dec, compound assigns, size casts, multi-dim ranges, attributes,
+        // labeled endmodule, and (dropped) macro invocations incl. multi-line.
+        let sexp = ok(r#"module m #(
+    parameter int unsigned Width = 1,
+    parameter type data_t = logic
+) (
+    input  data_t d_i,
+    output data_t d_o
+);
+  localparam cb_seed_t [2:0] Seeds = '{1'b0, 1'b1, 1'b0};
+  typedef struct packed {
+    int unsigned PermuteSeed;
+    int unsigned XorSeed;
+  } cb_seed_t;
+  (* dont_touch = "true" *) logic async_req;
+  data_t [Width-1:0] mem_n, mem_q;
+  logic [Width-1:0][3:0] sum;
+  if (Width > 1) begin : gen_wide
+    assign d_o = d_i;
+  end else begin : gen_narrow
+    assign d_o = '0;
+  end
+  for (genvar j = 0; j < Width; j++) begin : gen_j
+    always_comb begin
+      sum[j] += data_t'(j);
+      mem_q[j]++;
+    end
+  end
+  `ASSERT(lock, req_o && !gnt_i,
+    "multi line message")
+endmodule : m
+"#);
+        assert!(sexp.contains("(ParamDecl"), "{}", sexp);
+        assert!(sexp.contains("(StructType"), "{}", sexp);
+        assert!(sexp.contains("(GenIf"), "{}", sexp);
+        assert!(sexp.contains("(GenFor"), "{}", sexp);
     }
 
     #[test]
