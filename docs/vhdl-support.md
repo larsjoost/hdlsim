@@ -17,11 +17,12 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 |---|---|---|---|
 | `std.standard` | ✅ | boolean/bit/character/integer/… types; `true`/`false`; `severity_level` literals `note`/`warning`/`error`/`failure` | `tests/vhdl_std_ulogic.rs`, `tests/vhdl_severity.rs`, corpus |
 | `std.env` | ✅ | `finish`/`stop` are simulator builtins | `tests/fixtures/tb_pass.vhd`, `tests/vhdl_std_arith.rs` |
+| `std.textio` | ✅ | simulated: `line` buffer, `write`/`read` (string/integer/vector), `readline`/`writeline`, `endfile`; `file f : text open … is "path"` reads/writes real files, `input`=stdin, `output`=stdout | `tests/vhdl_textio.rs` |
 | `ieee.std_logic_1164` | ✅ | 9-value logic as 1-bit scalar, vectors, logic ops, `rising_edge`/`falling_edge`, `to_x01` | `tests/vhdl_std_ulogic.rs`, examples |
 | `ieee.numeric_std` | ✅ | `unsigned`/`signed` arithmetic, comparisons, `resize`, `to_integer`, `to_unsigned`/`to_signed` | `tests/vhdl_signed.rs`, `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_arith` | ✅ | package resolves; `conv_*` conversions and shift/rotate builtins simulated | `tests/vhdl_std_arith.rs`, `tests/vhdl_shifts.rs` |
 | `ieee.std_logic_signed` / `std_logic_unsigned` | ◐ | same: decls resolve, common ops builtin | `tests/vhdl_std_arith.rs` |
-| `ieee.std_logic_textio` | ◐ | declarations only — no text I/O simulated | parse via `tests/corpus.rs` |
+| `ieee.std_logic_textio` | ✅ | its `write`/`read` on `line` share the std.textio runtime (vector args print decimal/hex, see `std.textio`) | `tests/vhdl_textio.rs`, parse via `tests/corpus.rs` |
 | `ieee.fixed_pkg`, `float_pkg`, `vital_*` | ❌ | | |
 
 A `use lib.unit.all;` that resolves nowhere now warns (`W0501`) instead of
@@ -53,7 +54,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
 | functions/procedures with bodies, `return` | ✅ runtime calls incl. package functions via `use` (registered at elab; for-loops in bodies supported); ✅ const-eval in constant initializers; functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |
-| `alias name is target` (whole signal / bit / slice, read+write); attribute decl / file objects | ◐ alias ✅ lowered; attr decl & file objects parsed only | `tests/vhdl_alias.rs`, parser tests |
+| `alias name is target` (whole signal / bit / slice, read+write); attribute decl / file objects | ◐ alias ✅ lowered; attr decl parsed only; `file f : text open … is "path"` ✅ bound to its path for textio | `tests/vhdl_alias.rs`, `tests/vhdl_textio.rs`, parser tests |
 | `real` | ❌ (literals → X) | lowerer warning |
 
 ## Statements

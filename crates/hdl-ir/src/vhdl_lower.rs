@@ -16,6 +16,21 @@ use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::source::{FileId, SourceDb, Span};
+
+/// Capacity of a simulated std.textio `line` buffer, in bytes.
+pub const TEXTIO_LINE_CAP: usize = 1024;
+
+/// std.textio procedure names that lower to simulated `$textio_*` syscalls
+/// (statement position). Their arguments may be plain names (`output`, `l`).
+pub(crate) const TEXTIO_PROCS: &[&str] = &[
+    "write",
+    "read",
+    "readline",
+    "writeline",
+    "endfile",
+    "file_open",
+    "file_close",
+];
 use std::collections::HashMap;
 
 /// Lower one parsed VHDL file into modules (entities with their architectures
@@ -578,6 +593,13 @@ impl<'a> Lower<'a> {
         self.types.insert("character".into(), TypeInfo::Char);
         self.types
             .insert("string".into(), TypeInfo::Vector { signed: false });
+        // std.textio: `line` is a string buffer (simulated as a wide vector,
+        // see resolve_type); `text` is a file object (its name is bound to the
+        // file path by lower_file_decl, not a signal).
+        self.types
+            .insert("line".into(), TypeInfo::Vector { signed: false });
+        self.types
+            .insert("text".into(), TypeInfo::Vector { signed: false });
         self.types
             .insert("time".into(), TypeInfo::Integer { signed: false });
     }
@@ -609,10 +631,17 @@ impl<'a> Lower<'a> {
         };
         match base {
             TypeInfo::Vector { signed } => {
+                // An unconstrained `line` (std.textio) is a string buffer of
+                // up to TEXTIO_LINE_CAP bytes.
+                if name == "line" && constraint.is_none() {
+                    return (TEXTIO_LINE_CAP * 8, signed, None, false);
+                }
                 let w = constraint
                     .map(|c| self.constraint_width(c))
                     .unwrap_or(1)
                     .max(1);
+                // Strings pack 8 bits per character (like string literals).
+                let w = if name == "string" { w * 8 } else { w };
                 (w, signed, None, false)
             }
             TypeInfo::Integer { signed } => (32, signed, None, false),
@@ -1094,6 +1123,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
                 SyntaxKind::UseClause => self.merge_use_clause(&d),
                 SyntaxKind::PackageInst => self.register_package_inst(&d),
+                SyntaxKind::FileDecl => self.lower_file_decl(&d),
                 SyntaxKind::Function => {
                     if self.function_locals_use_params(&d) {
                         // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
@@ -1321,6 +1351,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
+                SyntaxKind::FileDecl => self.lower_file_decl(d),
                 _ => {}
             }
         }
@@ -1442,6 +1473,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
+                SyntaxKind::FileDecl => self.lower_file_decl(d),
                 _ => {}
             }
         }
@@ -1785,6 +1817,37 @@ impl<'a> Lower<'a> {
                 }
             }
             self.names.insert(n.clone(), id);
+        }
+    }
+
+    /// `file f [, g] : text [open <mode> is "path"];` — bind each file name to
+    /// its path as a string constant (`input`/`output` default to the
+    /// stdin/stdout markers), so textio syscalls can find the file at runtime.
+    fn lower_file_decl(&mut self, d: &SyntaxNode) {
+        let kids = real_children(d);
+        let Some(colon) = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+        else {
+            return;
+        };
+        let names: Vec<String> = kids[..colon]
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.kw(k))
+            .collect();
+        let path = kids[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Literal)
+            .map(|k| self.text(k).trim_matches('"').to_string());
+        for n in names {
+            let p = match &path {
+                Some(p) => p.clone(),
+                None if n == "input" => "stdin".to_string(),
+                None if n == "output" => "stdout".to_string(),
+                None => String::new(),
+            };
+            self.consts.insert(n, string_value(&p));
         }
     }
 
@@ -2188,6 +2251,7 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::UseClause => self.merge_use_clause(k),
                 SyntaxKind::PackageInst => self.register_package_inst(k),
+                SyntaxKind::FileDecl => self.lower_file_decl(k),
                 _ if is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
             }
@@ -2750,20 +2814,36 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::CallStmt => {
                 let kids = real_children(s);
-                let name = kids
+                // `foo(a, b);` parses as CallStmt(Call(Name foo, (, args…)));
+                // `foo;` as CallStmt(Name foo). Unwrap the Call so the callee
+                // and the real arguments are found in both forms.
+                let src: Vec<SyntaxNode> = match kids.first() {
+                    Some(c) if c.kind() == SyntaxKind::Call => real_children(c),
+                    _ => kids.clone(),
+                };
+                let name_pos = src.iter().position(|k| k.kind() == SyntaxKind::Name);
+                let raw = name_pos.map(|i| self.text(&src[i])).unwrap_or_default();
+                let fname = raw
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(raw.as_str())
+                    .to_ascii_lowercase();
+                let is_textio = TEXTIO_PROCS.contains(&fname.as_str());
+                // textio arguments are frequently plain names (`output`, `l`);
+                // for other calls keep skipping bare names (named associations).
+                let args: Vec<Expr> = src
                     .iter()
-                    .find(|k| k.kind() == SyntaxKind::Name)
-                    .map(|k| self.text(k))
-                    .map(|n| n.rsplit('.').next().unwrap_or(n.as_str()).to_string());
-                let args: Vec<Expr> = kids
-                    .iter()
-                    .filter(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
-                    .map(|k| self.lower_expr(k, &self.consts.clone()))
+                    .enumerate()
+                    .filter(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()))
+                    .filter(|(_, k)| is_textio || k.kind() != SyntaxKind::Name)
+                    .map(|(_, k)| self.lower_expr(k, &self.consts.clone()))
                     .collect();
-                Stmt::SysCall {
-                    name: name.unwrap_or_default(),
-                    args,
-                }
+                let name = if is_textio {
+                    format!("$textio_{fname}")
+                } else {
+                    fname
+                };
+                Stmt::SysCall { name, args }
             }
             _ => Stmt::Null,
         }
