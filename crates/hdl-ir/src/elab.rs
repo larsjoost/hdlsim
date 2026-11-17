@@ -161,8 +161,18 @@ fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
     f.instantiate(design, top_id, root, "", &HashMap::new(), &[])?;
     // Package function bodies (visible via `use lib.pkg.all;`) are callable
     // at runtime too — register them like module functions. Bodies live in
-    // slot space, so they are cloned without remapping.
-    for p in design.packages.values() {
+    // slot space, so they are cloned without remapping. Unbound generic
+    // packages (still carrying generics) are skipped: in VHDL they are only
+    // usable through an instantiation, whose bound copy is registered under
+    // its own name. Sorted order keeps the registration deterministic when
+    // several packages export the same function name.
+    let mut pkg_names: Vec<&String> = design.packages.keys().collect();
+    pkg_names.sort();
+    for pn in pkg_names {
+        let p = &design.packages[pn];
+        if !p.generics.is_empty() {
+            continue;
+        }
         for func in &p.functions {
             let mut slots: Vec<usize> = vec![func.ret_width.max(1)];
             slots.extend(func.args.iter().map(|(_, w)| *w));

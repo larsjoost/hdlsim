@@ -32,8 +32,9 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | Construct | Status | Test |
 |---|---|---|
 | `entity` / `architecture` (same or separate files, any order) | ✅ | `tests/vhdl_arch_unknown_entity.rs` |
-| `package` + cross-file `use lib.pkg.all;` visibility | ✅ | `tests/vhdl_use_clause.rs` |
-| `package … is new …` (VHDL-2008 instantiation) | ◐ parsed | parser tests |
+| `package` + `use lib.pkg.all;` visibility (cross-file **and same-file**) | ✅ | `tests/vhdl_use_clause.rs`, `tests/vhdl_genpkg.rs` |
+| generic packages: `generic (…)` clause + `package p is new g generic map (…)` (design-unit or declarative part) | ✅ re-lowers the generic package with the map values as overrides; constants/types/functions all see them | `tests/vhdl_genpkg.rs` + parser test `parses_generic_package_declaration` |
+| parameterless function call without parentheses (`c_hi`) | ✅ | `tests/vhdl_genpkg.rs` |
 | `configuration` (top-level `for <arch>`) + `entity lib.unit(arch)` instantiation | ✅ per-arch variant modules `unit/arch`; default = configuration choice else last analyzed (IEEE rule) | `tests/vhdl_arch_select.rs` |
 | nested block configurations (`for … use entity …`) | ◐ parsed, not wired | parser tests |
 | `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501) | `tests/vhdl_std_arith.rs` |

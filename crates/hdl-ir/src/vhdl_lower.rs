@@ -51,6 +51,15 @@ pub struct PackageIr {
     /// Function bodies declared in the package — lets constant initializers
     /// const-eval calls like `sel_natural_f(cond, a, b)`.
     pub functions: Vec<FuncIr>,
+    /// Generic interface of a VHDL-2008 generic package:
+    /// `(name, default value)` per generic, used when the package is
+    /// instantiated (`package p is new g generic map (...)`).
+    pub generics: Vec<(String, Value)>,
+    /// The package's own declaration node and the design-file root that
+    /// declared it — retained so a package instantiation can re-lower the
+    /// generic package with the `generic map` values as overrides.
+    pub decl: Option<SyntaxNode>,
+    pub src: Option<SyntaxNode>,
 }
 
 /// Unit names referenced by the context clauses (`use lib.pkg...;`,
@@ -95,11 +104,45 @@ pub fn lower_file(
     let _ = file;
     let mut lx = Lower::new(db, diags);
     lx.register_builtin_types();
-    lx.apply_context_clauses(root, pkgs);
+    lx.file_root = Some(root.clone());
+    lx.pkgs = pkgs
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+    lx.apply_context_clauses(root);
     let mut modules: Vec<ModuleIr> = Vec::new();
     let mut entities: HashMap<String, usize> = HashMap::new();
     let mut packages: Vec<PackageIr> = Vec::new();
     let mut pending: Vec<PendingArch> = Vec::new();
+    // Pass 0: packages and package instantiations, before anything that may
+    // `use` them — so `use work.my_pkg.all;` also resolves when `my_pkg` is
+    // declared in this same file.
+    for child in real_children(root) {
+        match child.kind() {
+            SyntaxKind::Package => {
+                let p = lx.lower_package(&child, root, &HashMap::new());
+                // First (declaration) wins in `pkgs`; decl+body merge happens
+                // on the design, like for cross-file packages.
+                lx.pkgs
+                    .entry(p.name.to_ascii_lowercase())
+                    .or_insert_with(|| p.clone());
+                packages.push(p);
+            }
+            SyntaxKind::PackageInst => {
+                if let Some(p) = lx.lower_package_inst(&child) {
+                    // The instantiation's items win over the generic
+                    // package's defaults that pass 0 put into scope.
+                    lx.merge_package(&p, None, true);
+                    lx.pkgs.insert(p.name.to_ascii_lowercase(), p.clone());
+                    packages.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Re-apply the context clauses now that same-file packages (plain and
+    // instantiated) are in `pkgs`.
+    lx.apply_context_clauses(root);
     // Pass 1: entities (interfaces).
     for child in real_children(root) {
         if child.kind() == SyntaxKind::Entity {
@@ -108,16 +151,15 @@ pub fn lower_file(
             modules.push(m);
         }
     }
-    // Pass 2: packages (constants/types into scope), configurations (default
-    // architecture bindings) and architectures (bodies). An architecture whose
-    // entity is not declared in this file is deferred (`pending`): the entity
-    // may live in a file compiled later, so binding happens design-wide in
+    // Pass 2: configurations (default architecture bindings) and
+    // architectures (bodies). An architecture whose entity is not declared in
+    // this file is deferred (`pending`): the entity may live in a file
+    // compiled later, so binding happens design-wide in
     // `lower_pending_architectures`.
     let mut last_arch: HashMap<String, String> = HashMap::new();
     let mut config_defaults: HashMap<String, String> = HashMap::new();
     for child in real_children(root) {
         match child.kind() {
-            SyntaxKind::Package => packages.push(lx.lower_package(&child)),
             SyntaxKind::ConfigDecl => {
                 if let Some((ent, arch)) = config_default(&child, db) {
                     config_defaults.insert(ent, arch);
@@ -144,6 +186,8 @@ pub fn lower_file(
         }
     }
     apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults);
+    // Package instantiations from declarative parts (registered on the fly).
+    packages.extend(lx.inst_packages.drain(..));
     Lowered {
         modules,
         packages,
@@ -226,7 +270,12 @@ pub fn lower_pending_architectures(
     for p in pending {
         let mut lx = Lower::new(db, diags);
         lx.register_builtin_types();
-        lx.apply_context_clauses(&p.root, pkgs);
+        lx.file_root = Some(p.root.clone());
+        lx.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lx.apply_context_clauses(&p.root);
         match lx.lower_architecture(&p.arch, modules, &entities) {
             Some((ent, arch)) => {
                 last_arch.insert(ent, arch);
@@ -269,6 +318,18 @@ pub(crate) fn real_children(n: &SyntaxNode) -> Vec<SyntaxNode> {
     n.children()
         .filter(|c| !matches!(c.kind(), SyntaxKind::Whitespace | SyntaxKind::Comment))
         .collect()
+}
+
+/// Package declaration name: the first ident that is not a keyword —
+/// `package NAME is …` and `package body NAME is …` both yield NAME (a naive
+/// nth(1) would return "body" for package bodies).
+fn package_decl_name(p: &SyntaxNode, db: &SourceDb) -> String {
+    real_children(p)
+        .iter()
+        .filter(|k| k.kind() == SyntaxKind::Ident)
+        .map(|k| db.span_text(k.span()).trim().to_ascii_lowercase())
+        .find(|w| !matches!(w.as_str(), "package" | "body" | "is" | "end"))
+        .unwrap_or_default()
 }
 
 fn is_expr_node(k: SyntaxKind) -> bool {
@@ -378,6 +439,18 @@ struct Lower<'a> {
     /// aliases can't be a plain SigId). Whole-signal aliases are additionally
     /// inserted into `names`.
     aliases: HashMap<String, Expr>,
+    /// All packages visible while lowering this file (library packages from
+    /// other files plus same-file ones), keyed by lowercased unit name —
+    /// backs `use lib.pkg...;` inside declarative parts and package
+    /// instantiations.
+    pkgs: HashMap<String, PackageIr>,
+    /// The design file currently being lowered (for re-applying its context
+    /// clauses when re-lowering a generic package at an instantiation site).
+    file_root: Option<SyntaxNode>,
+    /// Packages instantiated inside declarative parts (architecture/process/
+    /// generate/package bodies) — returned with the file so they register on
+    /// the design (their functions are needed at runtime).
+    inst_packages: Vec<PackageIr>,
 }
 
 impl<'a> Lower<'a> {
@@ -399,31 +472,39 @@ impl<'a> Lower<'a> {
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
             aliases: HashMap::new(),
+            pkgs: HashMap::new(),
+            file_root: None,
+            inst_packages: Vec::new(),
         }
     }
 
     /// Merge the packages named in the file's context clauses into scope
     /// (`use lib.pkg.all;` merges everything, `use lib.pkg.item;` just that item).
-    fn apply_context_clauses(&mut self, root: &SyntaxNode, pkgs: &HashMap<String, PackageIr>) {
+    fn apply_context_clauses(&mut self, root: &SyntaxNode) {
         for child in real_children(root) {
             if matches!(
                 child.kind(),
                 SyntaxKind::ContextClause | SyntaxKind::UseClause
             ) {
-                for n in real_children(&child) {
-                    if n.kind() == SyntaxKind::Name {
-                        let text = self.db.span_text(n.span()).trim();
-                        let parts: Vec<&str> = text.split('.').collect();
-                        let (unit, item) = match parts.len() {
-                            n if n >= 3 => (parts[n - 2], parts[n - 1]),
-                            2 => (parts[0], parts[1]),
-                            _ => continue,
-                        };
-                        if let Some(p) = pkgs.get(&unit.to_ascii_lowercase()) {
-                            let item = item.to_ascii_lowercase();
-                            self.merge_package(p, if item == "all" { None } else { Some(&item) });
-                        }
-                    }
+                self.merge_use_clause(&child);
+            }
+        }
+    }
+
+    /// Merge one `use lib.pkg.item;` / `context lib.pkg;` clause into scope.
+    fn merge_use_clause(&mut self, u: &SyntaxNode) {
+        for n in real_children(u) {
+            if n.kind() == SyntaxKind::Name {
+                let text = self.db.span_text(n.span()).trim();
+                let parts: Vec<&str> = text.split('.').collect();
+                let (unit, item) = match parts.len() {
+                    n if n >= 3 => (parts[n - 2], parts[n - 1]),
+                    2 => (parts[0], parts[1]),
+                    _ => continue,
+                };
+                if let Some(p) = self.pkgs.get(&unit.to_ascii_lowercase()).cloned() {
+                    let item = item.to_ascii_lowercase();
+                    self.merge_package(&p, if item == "all" { None } else { Some(&item) }, false);
                 }
             }
         }
@@ -737,35 +818,69 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_generic_clause(&mut self, module: &mut ModuleIr, g: &SyntaxNode) {
+        for (name, def) in self.lower_generic_decls(g, &HashMap::new()) {
+            module.params.push(ParamIr { name, default: def });
+        }
+    }
+
+    /// Lower the `GenericDecl`s of a generic clause into `consts` (so later
+    /// declarations see the generic names) and return `(name, value)` per
+    /// generic. `overrides` (from a `generic map` at a package instantiation)
+    /// replaces the declared default values.
+    fn lower_generic_decls(
+        &mut self,
+        g: &SyntaxNode,
+        overrides: &HashMap<String, Value>,
+    ) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
         for d in real_children(g)
             .into_iter()
             .filter(|k| k.kind() == SyntaxKind::GenericDecl)
         {
+            // `name [, name...] : type_mark [constraint] [:= default]` — the
+            // declared names are the Name children before the first `:`.
             let dk = real_children(&d);
-            let mut names = Vec::new();
-            let mut type_mark = None;
-            let mut constraint = None;
-            let mut default = None;
-            let mut i = 0;
-            while i < dk.len() {
-                match dk[i].kind() {
-                    SyntaxKind::Name => names.push(self.text(&dk[i])),
-                    SyntaxKind::Range => constraint = Some(dk[i].clone()),
-                    _ if is_expr_node(dk[i].kind()) => default = Some(dk[i].clone()),
-                    _ => {}
-                }
-                // type mark is the Name that is not a declared name... find by elimination below
-                i += 1;
-            }
-            // The type mark is the Name child that is not one of the declared names.
-            for k in &dk {
-                if k.kind() == SyntaxKind::Name && !names.contains(&self.text(k)) {
-                    type_mark = Some(k.clone());
-                }
-            }
+            let colon = dk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+            let (names, after) = match colon {
+                Some(c) => (
+                    dk[..c]
+                        .iter()
+                        .filter(|k| k.kind() == SyntaxKind::Name)
+                        .map(|k| self.text(k))
+                        .collect::<Vec<_>>(),
+                    &dk[c + 1..],
+                ),
+                None => (
+                    dk.iter()
+                        .filter(|k| k.kind() == SyntaxKind::Name)
+                        .map(|k| self.text(k))
+                        .collect::<Vec<_>>(),
+                    &dk[..],
+                ),
+            };
+            let type_mark = after.iter().find(|k| k.kind() == SyntaxKind::Name);
+            let constraint = after.iter().find(|k| k.kind() == SyntaxKind::Range);
+            let eq = after
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+            let default = eq
+                .and_then(|e| {
+                    after[e + 1..]
+                        .iter()
+                        .find(|k| is_expr_node(k.kind()))
+                        .cloned()
+                })
+                .or_else(|| {
+                    after
+                        .iter()
+                        .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
+                        .cloned()
+                });
             let span = d.span();
-            let (width, signed, _, _) = match &type_mark {
-                Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
+            let (width, signed, _, _) = match type_mark {
+                Some(tm) => self.resolve_type(tm, constraint, span),
                 None => (32, false, None, false),
             };
             let def = default
@@ -776,15 +891,15 @@ impl<'a> Lower<'a> {
                 })
                 .flatten()
                 .unwrap_or(Value::x(width.max(1)));
+            let _ = (width, signed);
             for n in &names {
-                self.consts.insert(n.to_ascii_lowercase(), def.clone());
-                module.params.push(ParamIr {
-                    name: n.clone(),
-                    default: def.clone(),
-                });
-                let _ = (width, signed);
+                let key = n.to_ascii_lowercase();
+                let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
+                self.consts.insert(key, val.clone());
+                out.push((n.clone(), val));
             }
         }
+        out
     }
 
     fn lower_port_clause(&mut self, module: &mut ModuleIr, p: &SyntaxNode) {
@@ -897,19 +1012,30 @@ impl<'a> Lower<'a> {
     /// Built-in type marks win (`or_insert`), so e.g. `std_logic` keeps the
     /// 1-bit scalar model even though ieee.std_logic_1164 declares it as a
     /// resolved 9-state subtype.
-    fn merge_package(&mut self, p: &PackageIr, item: Option<&str>) {
+    /// With `force`, an instantiated package's items override existing ones
+    /// (e.g. the generic package's own defaults that leaked into scope while
+    /// it was lowered); otherwise built-ins and earlier bindings win.
+    fn merge_package(&mut self, p: &PackageIr, item: Option<&str>, force: bool) {
         for (tname, tinfo) in &p.types {
             if item.is_none_or(|i| i == tname) {
-                self.types
-                    .entry(tname.clone())
-                    .or_insert_with(|| tinfo.clone());
+                if force {
+                    self.types.insert(tname.clone(), tinfo.clone());
+                } else {
+                    self.types
+                        .entry(tname.clone())
+                        .or_insert_with(|| tinfo.clone());
+                }
             }
         }
         for (cname, cval) in &p.consts {
             if item.is_none_or(|i| i == cname) {
-                self.consts
-                    .entry(cname.clone())
-                    .or_insert_with(|| cval.clone());
+                if force {
+                    self.consts.insert(cname.clone(), cval.clone());
+                } else {
+                    self.consts
+                        .entry(cname.clone())
+                        .or_insert_with(|| cval.clone());
+                }
             }
         }
         for f in &p.functions {
@@ -921,22 +1047,44 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn lower_package(&mut self, p: &SyntaxNode) -> PackageIr {
+    /// Register a `package p is new g generic map (...);` found in a
+    /// declarative part: instantiate it, make its items visible in the
+    /// current scope (overriding the generic package's defaults), and add it
+    /// to the known-package map so a following `use work.p.all;` resolves.
+    fn register_package_inst(&mut self, d: &SyntaxNode) {
+        if let Some(q) = self.lower_package_inst(d) {
+            let key = q.name.to_ascii_lowercase();
+            self.merge_package(&q, None, true);
+            self.pkgs.insert(key.clone(), q.clone());
+            self.inst_packages.push(q);
+        }
+    }
+
+    fn lower_package(
+        &mut self,
+        p: &SyntaxNode,
+        root: &SyntaxNode,
+        overrides: &HashMap<String, Value>,
+    ) -> PackageIr {
         // Package name: the first ident that is not a keyword — `package NAME
         // is …` and `package body NAME is …` both yield NAME (a naive nth(1)
         // would return "body" for package bodies).
-        let kids = real_children(p);
-        let name = kids
-            .iter()
-            .filter(|k| k.kind() == SyntaxKind::Ident)
-            .map(|k| self.kw(k))
-            .find(|w| !matches!(w.as_str(), "package" | "body" | "is" | "end"))
-            .unwrap_or_default();
+        let name = package_decl_name(p, self.db);
         // Package declarations: constants, types, and function bodies become
         // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
         let consts_before: std::collections::HashSet<String> =
             self.consts.keys().cloned().collect();
+        // VHDL-2008 generic clause first, so constants/types declared after it
+        // see the generic values (`generic map` overrides win over defaults).
+        let mut generics: Vec<(String, Value)> = Vec::new();
+        for d in real_children(p) {
+            if d.kind() == SyntaxKind::GenericClause {
+                for (n, v) in self.lower_generic_decls(&d, overrides) {
+                    generics.push((n.to_ascii_lowercase(), v));
+                }
+            }
+        }
         let mut functions: Vec<FuncIr> = Vec::new();
         for d in real_children(p) {
             match d.kind() {
@@ -944,6 +1092,8 @@ impl<'a> Lower<'a> {
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
+                SyntaxKind::UseClause => self.merge_use_clause(&d),
+                SyntaxKind::PackageInst => self.register_package_inst(&d),
                 SyntaxKind::Function => {
                     if self.function_locals_use_params(&d) {
                         // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
@@ -990,7 +1140,123 @@ impl<'a> Lower<'a> {
             types,
             consts,
             functions,
+            generics,
+            decl: Some(p.clone()),
+            src: Some(root.clone()),
         }
+    }
+
+    /// Lower a VHDL-2008 package instantiation
+    /// (`package p is new g generic map (X => v);`): re-lower the generic
+    /// package `g` in a fresh scope with the `generic map` values overriding
+    /// the generic defaults, and register the result under the new name `p`.
+    fn lower_package_inst(&mut self, node: &SyntaxNode) -> Option<PackageIr> {
+        let kids = real_children(node);
+        let inst_name = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .find(|w| !matches!(w.as_str(), "package" | "is" | "new" | "generic" | "map"))
+            .unwrap_or_default();
+        let target = kids.iter().find(|k| k.kind() == SyntaxKind::Name)?;
+        let target_text = self.text(target);
+        let db = self.db;
+        let unit = target_text
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let Some(tp) = self.pkgs.get(&unit).cloned() else {
+            let candidates: Vec<String> = self.pkgs.keys().cloned().collect();
+            self.diags.push(Diagnostic {
+                code: "E0401",
+                severity: Severity::Error,
+                span: Some(target.span()),
+                message: format!("unknown package '{unit}' in package instantiation"),
+                help: did_you_mean(&unit, candidates.iter())
+                    .map(|s| format!("did you mean '{s}'?")),
+            });
+            return None;
+        };
+        // Without the generic package's source we can't re-lower it; the
+        // already-lowered items are still correct, so alias them under the
+        // new name.
+        let Some(src_root) = tp.src.clone() else {
+            let mut p = tp.clone();
+            p.name = inst_name;
+            return Some(p);
+        };
+        // All declaration units of the generic package in its source file
+        // (declaration carries the generic clause, body the subprograms).
+        let decl_nodes: Vec<SyntaxNode> = real_children(&src_root)
+            .into_iter()
+            .filter(|c| c.kind() == SyntaxKind::Package && package_decl_name(c, db) == unit)
+            .collect();
+        if decl_nodes.is_empty() {
+            let mut p = tp.clone();
+            p.name = inst_name;
+            return Some(p);
+        }
+        // Fresh scope: builtins + this file's and the generic package's own
+        // context clauses + all known packages.
+        let file_root = self.file_root.clone();
+        let mut lx2 = Lower::new(self.db, self.diags);
+        lx2.register_builtin_types();
+        lx2.pkgs = self.pkgs.clone();
+        if let Some(r) = &file_root {
+            lx2.apply_context_clauses(r);
+        }
+        lx2.apply_context_clauses(&src_root);
+        // `generic map` associations: PortConn children with a leading Name.
+        let mut overrides: HashMap<String, Value> = HashMap::new();
+        for k in real_children(node) {
+            if k.kind() != SyntaxKind::PortConn {
+                continue;
+            }
+            let ck = real_children(&k);
+            let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+            let assoc = name_pos.map(|i| db.span_text(ck[i].span()).trim().to_ascii_lowercase());
+            let expr = ck
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, c)| Some(*i) != name_pos && is_expr_node(c.kind()))
+                .map(|(_, c)| c);
+            if let (Some(n), Some(e)) = (assoc, expr) {
+                let ex = lx2.lower_expr(e, &lx2.consts.clone());
+                match lx2.ce_env(&ex, &HashMap::new()) {
+                    Some(v) => {
+                        overrides.insert(n, v);
+                    }
+                    None => lx2.warn(
+                        e.span(),
+                        format!(
+                            "generic '{n}' has a non-constant value in the package instantiation; keeping its default"
+                        ),
+                    ),
+                }
+            }
+        }
+        let mut pkg = PackageIr {
+            name: inst_name,
+            ..Default::default()
+        };
+        for dn in &decl_nodes {
+            let part = lx2.lower_package(dn, &src_root, &overrides);
+            pkg.types.extend(part.types);
+            pkg.consts.extend(part.consts);
+            pkg.functions.extend(part.functions);
+            if pkg.generics.is_empty() {
+                pkg.generics = part.generics;
+            }
+        }
+        // The instance is fully bound (no longer generic); a further
+        // instantiation of THIS package re-lowers the same generic source
+        // with its own overrides (decl/src chain below).
+        pkg.generics = Vec::new();
+        pkg.decl = tp.decl.clone();
+        pkg.src = tp.src.clone();
+        Some(pkg)
     }
 
     /// Lower an architecture body onto its entity's module. Returns false
@@ -1053,6 +1319,8 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ComponentDecl => {} // components resolve to entities by name
                 SyntaxKind::Function => self.lower_function_decl(module, d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::UseClause => self.merge_use_clause(d),
+                SyntaxKind::PackageInst => self.register_package_inst(d),
                 _ => {}
             }
         }
@@ -1172,6 +1440,8 @@ impl<'a> Lower<'a> {
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::UseClause => self.merge_use_clause(d),
+                SyntaxKind::PackageInst => self.register_package_inst(d),
                 _ => {}
             }
         }
@@ -1532,9 +1802,22 @@ impl<'a> Lower<'a> {
         let type_mark = kids[colon + 1..]
             .iter()
             .find(|k| k.kind() == SyntaxKind::Name);
-        let init = kids[colon + 1..]
+        // The initializer follows `:=`; it may be a bare name (e.g. a generic
+        // reference `constant c_w : natural := WIDTH;`), so look past the
+        // `=` rather than skipping Name nodes.
+        let eq = kids[colon + 1..]
             .iter()
-            .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+        let init = match eq {
+            Some(e) => kids[colon + 1 + e + 1..]
+                .iter()
+                .find(|k| is_expr_node(k.kind()))
+                .cloned(),
+            None => kids[colon + 1..]
+                .iter()
+                .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
+                .cloned(),
+        };
         let Some(init) = init else { return };
         let env = self.consts.clone();
         let width = type_mark
@@ -1551,9 +1834,9 @@ impl<'a> Lower<'a> {
             {
                 let tn = self.text(tm).to_ascii_lowercase();
                 let fields = self.record_fields_of_type(&tn);
-                self.lower_record_aggregate(init, &fields, &env)
+                self.lower_record_aggregate(&init, &fields, &env)
             }
-            _ => self.lower_expr(init, &env),
+            _ => self.lower_expr(&init, &env),
         };
         match self.ce_env(&ex, &env) {
             Some(v) => {
@@ -1903,6 +2186,8 @@ impl<'a> Lower<'a> {
                         _ => {}
                     }
                 }
+                SyntaxKind::UseClause => self.merge_use_clause(k),
+                SyntaxKind::PackageInst => self.register_package_inst(k),
                 _ if is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
             }
@@ -2869,6 +3154,15 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(a) = self.aliases.get(&key) {
                     return a.clone();
+                }
+                // Parameterless function called without parentheses: `c_hi`.
+                if let Some(f) = self.funcs.get(&key) {
+                    if f.args.is_empty() {
+                        return Expr::Call {
+                            name: f.name.clone(),
+                            args: Vec::new(),
+                        };
+                    }
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
