@@ -424,11 +424,17 @@ struct Lower<'a> {
     diags: &'a mut Vec<Diagnostic>,
     /// Compile-time constants in scope (enum literals, constants, generics).
     consts: HashMap<String, Value>,
+    /// Constant name -> type mark, so record/array-typed constants can be
+    /// materialized as hidden signals for runtime indexing (`c(i).field`).
+    const_types: HashMap<String, String>,
     /// User function bodies in scope (package functions via `use`), for
     /// const-evaluating calls in constant initializers.
     funcs: HashMap<String, FuncIr>,
     /// Type marks in scope (built-ins + user type/subtype decls).
     types: HashMap<String, TypeInfo>,
+    /// Subtype name -> constrained width, so `signal x : my_subtype` (no
+    /// constraint at the use site) keeps the subtype's width.
+    type_widths: HashMap<String, usize>,
     /// Signal/variable name → signal id in the current module.
     names: HashMap<String, SigId>,
     /// Signal id → memory depth (for `name'range` loops over arrays).
@@ -497,8 +503,10 @@ impl<'a> Lower<'a> {
             db,
             diags,
             consts: HashMap::new(),
+            const_types: HashMap::new(),
             funcs: HashMap::new(),
             types: HashMap::new(),
+            type_widths: HashMap::new(),
             names: HashMap::new(),
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
@@ -703,7 +711,7 @@ impl<'a> Lower<'a> {
                 }
                 let w = constraint
                     .map(|c| self.constraint_width(c))
-                    .unwrap_or(1)
+                    .unwrap_or_else(|| self.type_widths.get(&name).copied().unwrap_or(1))
                     .max(1);
                 // Strings pack 8 bits per character (like string literals).
                 let w = if name == "string" { w * 8 } else { w };
@@ -852,6 +860,129 @@ impl<'a> Lower<'a> {
             }
         }
         dims
+    }
+
+    /// Materialize a record/array-typed constant as a hidden signal holding
+    /// its value, so runtime selection works: `c(i)`, `c(i).field`, `c.field`
+    /// on a constant lower to Idx/Sel over `__const_<name>`.
+    fn materialize_const(&mut self, module: &mut ModuleIr, d: &SyntaxNode) {
+        let kids = real_children(d);
+        let Some(colon) = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+        else {
+            return;
+        };
+        let names: Vec<String> = kids[..colon]
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k).to_ascii_lowercase())
+            .collect();
+        for n in names {
+            let hidden = format!("__const_{}", n);
+            if self.names.contains_key(&hidden) {
+                continue;
+            }
+            let Some(tn) = self.const_types.get(&n).cloned() else {
+                continue;
+            };
+            let Some(ti) = self.types.get(&tn).cloned() else {
+                continue;
+            };
+            let Some(val) = self.consts.get(&n).cloned() else {
+                continue;
+            };
+            match ti {
+                TypeInfo::Array {
+                    elem,
+                    depth,
+                    dims,
+                    elem_name,
+                } => {
+                    let id = module.signals.len() as SigId;
+                    module.signals.push(SignalIr {
+                        name: hidden.clone(),
+                        width: elem.max(1),
+                        kind: SigKind::Wire,
+                        init: Some(val),
+                        mem: Some(depth.max(1)),
+                        signed: false,
+                    });
+                    self.names.insert(hidden, id);
+                    self.mems.insert(id, depth.max(1));
+                    self.sig_width.insert(id, elem.max(1));
+                    if !dims.is_empty() {
+                        self.sig_dims.insert(id, dims);
+                    }
+                    if let Some(en) = elem_name {
+                        if matches!(self.types.get(&en), Some(TypeInfo::Record { .. })) {
+                            self.sig_elem_rec.insert(id, en);
+                        }
+                    }
+                }
+                TypeInfo::Record { fields } => {
+                    let width = fields.iter().map(|f| f.1).sum::<usize>().max(1);
+                    let id = module.signals.len() as SigId;
+                    module.signals.push(SignalIr {
+                        name: hidden.clone(),
+                        width,
+                        kind: SigKind::Wire,
+                        init: Some(val),
+                        mem: None,
+                        signed: false,
+                    });
+                    self.names.insert(hidden, id);
+                    self.sig_width.insert(id, width);
+                    self.sig_rec.insert(id, tn);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `c(i)` where `c` is an array-typed constant (e.g. a function-local
+    /// constant, which cannot be a module signal because function bodies lower
+    /// in slot space): lower to a `$const_idx` system call over the literal
+    /// value — args are [flat value, flat index, element width].
+    fn lower_const_array_index(&mut self, fname: &str, args: &[Expr]) -> Option<Expr> {
+        let tn = self.const_types.get(fname)?;
+        let TypeInfo::Array { elem, dims, .. } = self.types.get(tn)? else {
+            return None;
+        };
+        let val = self.consts.get(fname)?.clone();
+        let flat = if !dims.is_empty() && dims.len() == args.len() {
+            let mut flat: Option<Expr> = None;
+            for (arg, (lo, n)) in args.iter().zip(dims.iter()) {
+                let a = Expr::Bin {
+                    op: BinOp::Sub,
+                    l: Box::new(arg.clone()),
+                    r: Box::new(Expr::Lit(Value::from_u64(32, *lo as u64))),
+                };
+                flat = Some(match flat {
+                    None => a,
+                    Some(f) => Expr::Bin {
+                        op: BinOp::Add,
+                        l: Box::new(Expr::Bin {
+                            op: BinOp::Mul,
+                            l: Box::new(f),
+                            r: Box::new(Expr::Lit(Value::from_u64(32, *n as u64))),
+                        }),
+                        r: Box::new(a),
+                    },
+                });
+            }
+            flat?
+        } else {
+            args.first()?.clone()
+        };
+        Some(Expr::Call {
+            name: "$const_idx".into(),
+            args: vec![
+                Expr::Lit(val),
+                flat,
+                Expr::Lit(Value::from_u64(32, *elem as u64)),
+            ],
+        })
     }
 
     fn sig_id(&self, name: &str) -> Option<SigId> {
@@ -1428,7 +1559,10 @@ impl<'a> Lower<'a> {
         for d in &decls {
             match d.kind() {
                 SyntaxKind::SignalDecl => self.lower_signal_decl(module, d),
-                SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
+                SyntaxKind::ConstantDecl => {
+                    self.lower_constant_decl(d);
+                    self.materialize_const(module, d);
+                }
                 SyntaxKind::VariableDecl => self.lower_signal_decl(module, d), // rare at arch level
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
@@ -1553,7 +1687,10 @@ impl<'a> Lower<'a> {
                 SyntaxKind::SignalDecl | SyntaxKind::VariableDecl => {
                     self.lower_signal_decl(module, d)
                 }
-                SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
+                SyntaxKind::ConstantDecl => {
+                    self.lower_constant_decl(d);
+                    self.materialize_const(module, d);
+                }
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
@@ -1998,6 +2135,12 @@ impl<'a> Lower<'a> {
             }
             _ => self.lower_expr(&init, &env),
         };
+        if let Some(tm) = &type_mark {
+            let tn = self.text(tm).to_ascii_lowercase();
+            for n in &names {
+                self.const_types.insert(n.to_ascii_lowercase(), tn.clone());
+            }
+        }
         match self.ce_env(&ex, &env) {
             Some(v) => {
                 for n in &names {
@@ -2163,11 +2306,22 @@ impl<'a> Lower<'a> {
             .cloned();
         if let Some(base) = base {
             let span = d.span();
+            let base_name = self.kw(&base);
             let (w, signed, mem, _r) = self.resolve_type(&base, constraint.as_ref(), span);
             let _ = mem;
-            // Register as a vector type with the constrained width.
-            let _ = w;
-            self.types.insert(name, TypeInfo::Vector { signed });
+            // Keep record/array base types as-is; vectors remember the
+            // constrained width for use sites without their own constraint.
+            match self.types.get(&base_name).cloned() {
+                Some(ti @ (TypeInfo::Record { .. } | TypeInfo::Array { .. })) => {
+                    self.types.insert(name, ti);
+                }
+                _ => {
+                    if constraint.is_some() {
+                        self.type_widths.insert(name.clone(), w.max(1));
+                    }
+                    self.types.insert(name, TypeInfo::Vector { signed });
+                }
+            }
         }
     }
 
@@ -2238,6 +2392,9 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::PortDecl if !seen_begin => param_decls.push(k.clone()),
                 SyntaxKind::VariableDecl if !seen_begin => local_decls.push(k.clone()),
+                // Function-local constants stay in `consts` (the body lowers in
+                // slot space); runtime indexing of them lowers to `$const_idx`.
+                SyntaxKind::ConstantDecl if !seen_begin => self.lower_constant_decl(k),
                 _ if seen_begin && is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
             }
@@ -2245,7 +2402,7 @@ impl<'a> Lower<'a> {
         if name.is_empty() {
             return None;
         }
-        let (ret_width, _, _, _) = match &ret_mark {
+        let (mut ret_width, _, _, _) = match &ret_mark {
             Some(tm) => self.resolve_type(tm, None, f.span()),
             None => (32, false, None, false),
         };
@@ -2336,6 +2493,20 @@ impl<'a> Lower<'a> {
         }
         self.extra_base = 0;
         self.names = saved_names;
+        // Unconstrained vector/string return type (`return bit_vector` /
+        // `return string`): take the width of the returned expressions.
+        let ret_is_uncon_vector = ret_mark
+            .as_ref()
+            .map(|tm| self.kw(tm))
+            .and_then(|tn| self.types.get(&tn))
+            .is_some_and(|ti| matches!(ti, TypeInfo::Vector { .. }));
+        if ret_is_uncon_vector {
+            let mut rets = Vec::new();
+            collect_return_exprs(&body, &mut rets);
+            for r in &rets {
+                ret_width = ret_width.max(self.expr_width_est(r));
+            }
+        }
         Some(FuncIr {
             name,
             ret_width: ret_width.max(1),
@@ -2343,6 +2514,44 @@ impl<'a> Lower<'a> {
             locals,
             body,
         })
+    }
+
+    /// Estimated bit width of a lowered expression (lowerer-side; used to give
+    /// unconstrained return types the width of what is actually returned).
+    fn expr_width_est(&self, e: &Expr) -> usize {
+        match e {
+            Expr::Lit(v) => v.width(),
+            Expr::Real(_) => 64,
+            Expr::Sig(s) => self.sig_width.get(s).copied().unwrap_or(32).max(1),
+            Expr::Bin { l, r, .. } => self.expr_width_est(l).max(self.expr_width_est(r)),
+            Expr::Un { e, .. } => self.expr_width_est(e),
+            Expr::Cond { t, e, .. } => self.expr_width_est(t).max(self.expr_width_est(e)),
+            Expr::Concat(parts) => parts
+                .iter()
+                .map(|p| self.expr_width_est(p))
+                .sum::<usize>()
+                .max(1),
+            Expr::Sel { msb, lsb, .. } => {
+                let a = self.ce(msb).and_then(|v| v.to_u64()).unwrap_or(0) as usize;
+                let b = self.ce(lsb).and_then(|v| v.to_u64()).unwrap_or(0) as usize;
+                a.abs_diff(b) + 1
+            }
+            Expr::Idx { e, .. } => self.expr_width_est(e),
+            Expr::Call { name, .. } => self
+                .funcs
+                .get(&name.to_ascii_lowercase())
+                .map(|f| f.ret_width)
+                .unwrap_or(32)
+                .max(1),
+            Expr::Replicate { count, e } => {
+                self.ce(count).and_then(|v| v.to_u64()).unwrap_or(1) as usize
+                    * self.expr_width_est(e)
+            }
+            Expr::Resize { width, .. } => *width,
+            Expr::Signed(e) => self.expr_width_est(e),
+            Expr::ToString(_) => 8 * 12,
+            _ => 32,
+        }
     }
 
     fn lower_process(&mut self, module: &mut ModuleIr, p: &SyntaxNode, idx: usize) -> ProcessIr {
@@ -2364,7 +2573,10 @@ impl<'a> Lower<'a> {
                         SyntaxKind::VariableDecl => {
                             self.lower_process_var(module, k, idx);
                         }
-                        SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
+                        SyntaxKind::ConstantDecl => {
+                            self.lower_constant_decl(k);
+                            self.materialize_const(module, k);
+                        }
                         SyntaxKind::TypeDecl => self.lower_type_decl(k),
                         SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
                         SyntaxKind::AliasDecl => self.lower_alias_decl(k),
@@ -3420,6 +3632,30 @@ impl<'a> Lower<'a> {
                             .get(id)
                             .or_else(|| self.sig_elem_rec.get(id))
                             .cloned(),
+                        // `const_arr(i).field` lowered via `$const_idx`: the
+                        // element record type comes from the constant's type.
+                        Expr::Call { name, .. } if name == "$const_idx" => {
+                            let ck = real_children(&call);
+                            let cn = ck
+                                .iter()
+                                .find(|k| k.kind() == SyntaxKind::Name)
+                                .map(|k| self.text(k))
+                                .unwrap_or_default();
+                            let cn = cn
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or(cn.as_str())
+                                .to_ascii_lowercase();
+                            self.const_types
+                                .get(&cn)
+                                .and_then(|tn| match self.types.get(tn) {
+                                    Some(TypeInfo::Array {
+                                        elem_name: Some(en),
+                                        ..
+                                    }) => Some(en.clone()),
+                                    _ => None,
+                                })
+                        }
                         _ => None,
                     };
                     if let Some(tn) = rec_name {
@@ -3448,7 +3684,10 @@ impl<'a> Lower<'a> {
                 if let Some(dot) = name.find('.') {
                     let base = name[..dot].to_ascii_lowercase();
                     let field = name[dot + 1..].to_ascii_lowercase();
-                    if let Some(id) = self.sig_id(&base) {
+                    let id = self
+                        .sig_id(&base)
+                        .or_else(|| self.names.get(&format!("__const_{}", base)).copied());
+                    if let Some(id) = id {
                         if let Some(tn) = self.sig_rec.get(&id).cloned() {
                             if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
                                 let total: usize = fields.iter().map(|f| f.1).sum();
@@ -3469,6 +3708,30 @@ impl<'a> Lower<'a> {
                                     }
                                     run += w;
                                 }
+                            }
+                        }
+                    } else if let (Some(v), Some(tn)) = (
+                        self.consts.get(&base).cloned(),
+                        self.const_types.get(&base).cloned(),
+                    ) {
+                        // `rec_const.field` on a record-typed constant: slice the
+                        // literal value directly.
+                        if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                            let total: usize = fields.iter().map(|f| f.1).sum();
+                            let mut run = 0usize;
+                            for (fn_, w, _) in fields {
+                                let lsb = total - run - w;
+                                if *fn_ == field {
+                                    return Expr::Sel {
+                                        e: Box::new(Expr::Lit(v)),
+                                        msb: Box::new(Expr::Lit(Value::from_u64(
+                                            32,
+                                            (lsb + w - 1) as u64,
+                                        ))),
+                                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                                    };
+                                }
+                                run += w;
                             }
                         }
                     }
@@ -3769,11 +4032,21 @@ impl<'a> Lower<'a> {
             .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
             .map(|(_, k)| self.lower_expr(k, env))
             .collect();
+        // A record/array-typed constant is materialized as a hidden signal
+        // (`__const_<name>`); index it like a signal.
+        let base_id = self
+            .sig_id(&name)
+            .or_else(|| self.names.get(&format!("__const_{}", fname)).copied());
+        if base_id.is_none() && !args.is_empty() {
+            if let Some(e) = self.lower_const_array_index(&fname, &args) {
+                return e;
+            }
+        }
         match fname.as_str() {
             // Indexed write/read of a signal: v(i) → Idx; multi-dimensional
             // v(i, j, …) → flat index ((i-lo0)*n1 + (j-lo1))*… via sig_dims.
-            _ if self.sig_id(&name).is_some() && !args.is_empty() => {
-                let base = self.sig_id(&name).unwrap();
+            _ if base_id.is_some() && !args.is_empty() => {
+                let base = base_id.unwrap();
                 if let Some(dims) = self.sig_dims.get(&base).cloned() {
                     if dims.len() == args.len() {
                         let mut flat: Option<Expr> = None;
@@ -4340,6 +4613,44 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// VHDL time unit → femtoseconds.
+/// Collect the expressions of all `return` statements in a lowered body.
+fn collect_return_exprs(s: &Stmt, out: &mut Vec<Expr>) {
+    match s {
+        Stmt::Return(e) => out.push((**e).clone()),
+        // `return e` may also lower to a plain assign to the function-name
+        // slot (slot 0).
+        Stmt::Assign {
+            lhs: Expr::Sig(0),
+            rhs,
+            ..
+        } => out.push(rhs.clone()),
+        Stmt::Block(ss) => {
+            for s in ss {
+                collect_return_exprs(s, out);
+            }
+        }
+        Stmt::If { then, els, .. } => {
+            collect_return_exprs(then, out);
+            if let Some(e) = els {
+                collect_return_exprs(e, out);
+            }
+        }
+        Stmt::Case { items, default, .. } => {
+            for (_, st) in items {
+                collect_return_exprs(st, out);
+            }
+            if let Some(d) = default {
+                collect_return_exprs(d, out);
+            }
+        }
+        Stmt::For { body, .. } | Stmt::Repeat { body, .. } | Stmt::Delay { stmt: body, .. } => {
+            collect_return_exprs(body, out)
+        }
+        Stmt::Spanned { inner, .. } => collect_return_exprs(inner, out),
+        _ => {}
+    }
+}
+
 /// Real-valued conversion (`to_real(x)`, `to_ufixed(x, ...)`, `to_float(x)`,
 /// 3-arg `resize`): lowered as `x * 1.0`, which the simulator evaluates as a
 /// real-typed (f64) expression. Fixed/float bounds are not modeled.
