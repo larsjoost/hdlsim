@@ -374,6 +374,10 @@ struct Lower<'a> {
     /// — their width is only known after port connection, so static
     /// attributes on them lower to runtime `Expr::SigAttr`.
     uncon_ports: std::collections::HashSet<SigId>,
+    /// `alias name is <expr>;` — name → lowered expression (slice/index
+    /// aliases can't be a plain SigId). Whole-signal aliases are additionally
+    /// inserted into `names`.
+    aliases: HashMap<String, Expr>,
 }
 
 impl<'a> Lower<'a> {
@@ -394,6 +398,7 @@ impl<'a> Lower<'a> {
             extra_base: 0,
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -938,6 +943,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
                 SyntaxKind::Function => {
                     if self.function_locals_use_params(&d) {
                         // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
@@ -1036,6 +1042,7 @@ impl<'a> Lower<'a> {
             Some(b) => kids[..b].iter().collect(),
             None => kids.iter().collect(),
         };
+        self.aliases.clear();
         for d in &decls {
             match d.kind() {
                 SyntaxKind::SignalDecl => self.lower_signal_decl(module, d),
@@ -1045,16 +1052,22 @@ impl<'a> Lower<'a> {
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::ComponentDecl => {} // components resolve to entities by name
                 SyntaxKind::Function => self.lower_function_decl(module, d),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 _ => {}
             }
         }
-        // Rebuild names (signals added).
+        // Rebuild names (signals added); re-apply whole-signal aliases.
         self.names = module
             .signals
             .iter()
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
+        for (n, a) in &self.aliases {
+            if let Expr::Sig(id) = a {
+                self.names.insert(n.clone(), *id);
+            }
+        }
         // Concurrent statements: after `begin`.
         let stmts: Vec<&SyntaxNode> = match begin_pos {
             Some(b) => kids[b + 1..].iter().collect(),
@@ -1158,6 +1171,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 _ => {}
             }
         }
@@ -1399,6 +1413,37 @@ impl<'a> Lower<'a> {
     }
 
     // ---- declarations ------------------------------------------------------------
+
+    /// `alias name is target;` — a whole-signal target is bound in `names`
+    /// (so sensitivity lists etc. see it), a constant target in `consts`,
+    /// anything else (slice/index select) in the expression-alias table.
+    fn lower_alias_decl(&mut self, d: &SyntaxNode) {
+        let kids = real_children(d);
+        let Some(name_pos) = kids.iter().position(|k| k.kind() == SyntaxKind::Name) else {
+            return;
+        };
+        let name = self.text(&kids[name_pos]).to_ascii_lowercase();
+        let Some(is_pos) = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "is")
+        else {
+            return;
+        };
+        let Some(target) = kids[is_pos + 1..].iter().find(|k| is_expr_node(k.kind())) else {
+            return;
+        };
+        let e = self.lower_expr(target, &self.consts.clone());
+        match &e {
+            Expr::Sig(id) => {
+                self.names.insert(name.clone(), *id);
+            }
+            Expr::Lit(v) => {
+                self.consts.insert(name.clone(), v.clone());
+            }
+            _ => {}
+        }
+        self.aliases.insert(name, e);
+    }
 
     fn lower_signal_decl(&mut self, module: &mut ModuleIr, d: &SyntaxNode) {
         let kids = real_children(d);
@@ -1854,6 +1899,7 @@ impl<'a> Lower<'a> {
                         SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
                         SyntaxKind::TypeDecl => self.lower_type_decl(k),
                         SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
+                        SyntaxKind::AliasDecl => self.lower_alias_decl(k),
                         _ => {}
                     }
                 }
@@ -2820,6 +2866,9 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(v) = self.consts.get(&key) {
                     return Expr::Lit(v.clone());
+                }
+                if let Some(a) = self.aliases.get(&key) {
+                    return a.clone();
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
