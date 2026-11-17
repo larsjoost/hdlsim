@@ -2734,7 +2734,7 @@ impl<'a> Lower<'a> {
                     let field = &name[dot + 1..];
                     if self.sig_id(root).is_none() {
                         if let Some(conns) = self.inst_conns.get(root) {
-                            if let Some(Conn::Named(n, ex)) = conns
+                            if let Some(Conn::Named(_, ex)) = conns
                                 .iter()
                                 .find(|c| matches!(c, Conn::Named(n, _) if n == field))
                             {

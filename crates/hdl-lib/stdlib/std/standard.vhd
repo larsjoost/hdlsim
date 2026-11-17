@@ -67,4 +67,18 @@ package standard is
 
     subtype delay_length is time range 0 fs to time'high;
 
+    type real is range -1.0e308 to 1.0e308;
+
+    -- VHDL-2008: file open kinds/status moved to std.standard.
+    type file_open_kind is (read_mode, write_mode, append_mode);
+    type file_open_status is (open_ok, status_error, name_error, mode_error);
+
+    -- VHDL-2019 unconstrained vector types.
+    type integer_vector is array (natural range <>) of integer;
+    type real_vector is array (natural range <>) of real;
+    type time_vector is array (natural range <>) of time;
+    type boolean_vector is array (natural range <>) of boolean;
+
+    function now return time;
+
 end package standard;
