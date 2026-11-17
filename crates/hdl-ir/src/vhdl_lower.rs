@@ -1785,11 +1785,20 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Loop variables allocated while lowering the body get slots after the
+        // declared ones (they are appended to `locals` below so the runtime and
+        // const-eval slot space matches).
+        self.extra_base = slots.len();
+        self.extra_signals.clear();
         let body = if stmt_nodes.len() == 1 {
             self.lower_seq_stmt(&stmt_nodes[0])
         } else {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
         };
+        for sig in self.extra_signals.drain(..) {
+            locals.push(sig);
+        }
+        self.extra_base = 0;
         self.names = saved_names;
         Some(FuncIr {
             name,
