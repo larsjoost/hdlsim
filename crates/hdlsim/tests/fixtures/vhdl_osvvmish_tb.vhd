@@ -15,7 +15,16 @@ package osvvmish_pkg is
   type incomplete_t;
   type prot_t is protected
     procedure poke;
+    function get return integer;
   end protected;
+  type ptr_t is access incomplete_t;
+  type rec2_t is record
+    started : integer;
+    done    : integer;
+  end record;
+  signal pkg_sig : rec2_t;
+  shared variable shared_var : prot_t;
+  alias field_alias is pkg_sig.started;
   function double(x : integer) return integer;
   alias dbl is double [integer return integer];
 end package;
@@ -24,6 +33,7 @@ package body osvvmish_pkg is
   type incomplete_t is record id : integer; end record;
   type prot_t is protected body
     procedure poke is begin null; end procedure;
+    function get return integer is begin return 0; end function;
   end protected body;
   function double(x : integer) return integer is
     constant two_x : integer := 2 * x;  -- function-local const referencing a param (lowers; not const-evaluable)

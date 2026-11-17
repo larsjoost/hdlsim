@@ -469,6 +469,10 @@ struct Lower<'a> {
     sig_signed: HashMap<SigId, bool>,
     /// Signal id → record type name (for `sig.field` selects), if record-typed.
     sig_rec: HashMap<SigId, String>,
+    /// Package-level signal / shared variable name → type mark, so that
+    /// `name.field` (record field) and `name.method(...)` (protected type)
+    /// resolve when lowering package bodies.
+    pkg_sig_types: HashMap<String, String>,
     /// Signal id → element record type name for arrays of records, so
     /// `arr(i).field` lowers to a slice of the memory element.
     sig_elem_rec: HashMap<SigId, String>,
@@ -537,6 +541,7 @@ impl<'a> Lower<'a> {
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
             sig_rec: HashMap::new(),
+            pkg_sig_types: HashMap::new(),
             sig_elem_rec: HashMap::new(),
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
@@ -1530,6 +1535,29 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::PackageInst => self.register_package_inst(&d),
                 SyntaxKind::FileDecl => self.lower_file_decl(&d),
+                // Package-level signal / shared variable: remember name →
+                // type so `name.field` / `name.method(...)` resolve in the
+                // package body (not simulated).
+                SyntaxKind::SignalDecl | SyntaxKind::VariableDecl => {
+                    let dk = real_children(&d);
+                    let colon = dk
+                        .iter()
+                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+                    if let Some(c) = colon {
+                        let names: Vec<String> = dk[..c]
+                            .iter()
+                            .filter(|k| k.kind() == SyntaxKind::Name)
+                            .map(|k| self.kw(k))
+                            .collect();
+                        let tmark = dk[c + 1..].iter().find(|k| k.kind() == SyntaxKind::Name);
+                        if let Some(tm) = tmark {
+                            let tn = self.kw(tm);
+                            for n in names {
+                                self.pkg_sig_types.insert(n, tn.clone());
+                            }
+                        }
+                    }
+                }
                 SyntaxKind::Function => {
                     if self.function_locals_use_params(&d) {
                         // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
@@ -2366,6 +2394,66 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Register one protected-type method as a stub `FuncIr` (signature only,
+    /// empty body) so calls `obj.method(...)` resolve at lower time.
+    fn protected_method_stub(&mut self, f: &SyntaxNode) {
+        let kids = real_children(f);
+        let mut name = String::new();
+        let mut ret_mark: Option<SyntaxNode> = None;
+        let mut param_decls: Vec<SyntaxNode> = Vec::new();
+        let mut seen_return = false;
+        let mut seen_begin = false;
+        for k in &kids {
+            match k.kind() {
+                SyntaxKind::Ident if self.kw(k) == "return" => seen_return = true,
+                SyntaxKind::Ident if self.kw(k) == "begin" => seen_begin = true,
+                SyntaxKind::Name if !seen_return && name.is_empty() => name = self.text(k),
+                SyntaxKind::Name if seen_return && !seen_begin && ret_mark.is_none() => {
+                    ret_mark = Some(k.clone())
+                }
+                SyntaxKind::PortDecl if !seen_begin => param_decls.push(k.clone()),
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            return;
+        }
+        let ret_width = ret_mark
+            .map(|tm| self.resolve_type(&tm, None, f.span()).0)
+            .unwrap_or(32);
+        let mut args: Vec<(String, usize)> = Vec::new();
+        for pd in &param_decls {
+            let pk = real_children(pd);
+            let colon = pk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+            let names: Vec<String> = pk[..colon.unwrap_or(pk.len())]
+                .iter()
+                .filter(|k| k.kind() == SyntaxKind::Name)
+                .map(|k| self.text(k))
+                .collect();
+            let tmark = colon
+                .and_then(|c| pk.get(c + 1))
+                .filter(|k| k.kind() == SyntaxKind::Name);
+            let w = tmark
+                .map(|tm| self.resolve_type(tm, None, pd.span()).0)
+                .unwrap_or(32);
+            for n in names {
+                args.push((n, w));
+            }
+        }
+        self.funcs.insert(
+            name.to_ascii_lowercase(),
+            FuncIr {
+                name,
+                ret_width: ret_width.max(1),
+                args,
+                locals: Vec::new(),
+                body: Stmt::Null,
+            },
+        );
+    }
+
     fn lower_type_decl(&mut self, d: &SyntaxNode) {
         let kids = real_children(d);
         // kids[0] is the `type` keyword; the name is the next ident.
@@ -2382,14 +2470,32 @@ impl<'a> Lower<'a> {
             self.types.insert(name, TypeInfo::Scalar);
             return;
         }
+        // Access type: `type p is access t;` — opaque handle placeholder
+        // (`.all` deref is handled at the use site).
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "access")
+        {
+            self.types.insert(name, TypeInfo::Scalar);
+            return;
+        }
         // Protected type: `type t is protected ... end protected [body];` —
-        // register an opaque placeholder; method calls (`x.m(...)`) lower as
-        // plain calls.
+        // register an opaque placeholder type and stub functions for the
+        // methods, so `obj.method(...)` and alias targets resolve. Method
+        // bodies are not simulated (calls return X).
         if kids
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "protected")
         {
             self.types.insert(name, TypeInfo::Scalar);
+            for k in &kids {
+                match k.kind() {
+                    // Inner type declarations (e.g. inside a protected body).
+                    SyntaxKind::TypeDecl => self.lower_type_decl(k),
+                    SyntaxKind::Function => self.protected_method_stub(k),
+                    _ => {}
+                }
+            }
             return;
         }
         // Record: `type t is record f : typ [constraint]; ... end record;`
@@ -4000,7 +4106,20 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                    } else if let (Some(v), Some(tn)) = (
+                    } else if id.is_none() {
+                        // Package-level signal / shared variable: record-field
+                        // select lowers to a placeholder (not simulated).
+                        if let Some(tn) = self.pkg_sig_types.get(&base).cloned() {
+                            if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                                if let Some((_, w, _)) =
+                                    fields.iter().find(|(fn_, _, _)| *fn_ == field)
+                                {
+                                    return Expr::Lit(Value::x((*w).max(1)));
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(v), Some(tn)) = (
                         self.consts.get(&base).cloned(),
                         self.const_types.get(&base).cloned(),
                     ) {
