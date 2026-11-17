@@ -52,7 +52,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
 | functions/procedures with bodies, `return` | ✅ runtime calls incl. package functions via `use` (registered at elab; for-loops in bodies supported); ✅ const-eval in constant initializers; functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |
-| alias / attribute decl / file objects | ◐ parsed | parser tests |
+| `alias name is target` (whole signal / bit / slice, read+write); attribute decl / file objects | ◐ alias ✅ lowered; attr decl & file objects parsed only | `tests/vhdl_alias.rs`, parser tests |
 | `real` | ❌ (literals → X) | lowerer warning |
 
 ## Statements
