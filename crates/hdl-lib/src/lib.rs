@@ -602,6 +602,7 @@ pub fn compile_one(
                         if e.generics.is_empty() {
                             e.generics = p.generics;
                         }
+                        e.uses.extend(p.uses);
                         if e.decl.is_none() {
                             e.decl = p.decl;
                         }

@@ -40,7 +40,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | parameterless function call without parentheses (`c_hi`) | ✅ | `tests/vhdl_genpkg.rs` |
 | `configuration` (top-level `for <arch>`) + `entity lib.unit(arch)` instantiation | ✅ per-arch variant modules `unit/arch`; default = configuration choice else last analyzed (IEEE rule) | `tests/vhdl_arch_select.rs` |
 | nested block configurations (`for … use entity …`) | ◐ parsed, not wired | parser tests |
-| `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501) | `tests/vhdl_std_arith.rs` |
+| `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501); `use lib.pkg.all;` is transitive through packages (what `pkg` itself used is visible too), as in VHDL | `tests/vhdl_std_arith.rs`, corpus OSVVM files |
 
 ## Declarations
 
@@ -65,9 +65,9 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 |---|---|---|
 | concurrent: process (sensitivity list / `all`), assigns, conditional (`when/else`), selected (`with/select`) | ✅ (no `after` delays) | examples, `tests/loops.rs` |
 | conditional expressions `v := a when c else b;` and conditional signal assignments in processes; for-loop bounds `t'left to t'right`, attribute arithmetic `input'length-1 downto 0`; `open` in port/generic maps | ✅ | parser tests `parses_vhdl2008_constructs`, `parses_for_loop_range_expressions`, corpus `neorv32_cpu_frontend.vhd` |
-| VHDL-2008 parsing: `pure`/`impure` functions, `type T` + subprogram generics in generic clauses, protected types + bodies, incomplete types (`type T;`), alias signatures `f[T1, T2]`, aggregate range choices `(1 to N => x)`, qualified aggregates `t'(a, b)` / `t'(f => v)`, parenthesized targets `(a, b) := f()`, `end record/function <name>` | ✅ parsed (protected-type bodies not simulated) | parser test `parses_vhdl2008_constructs`, corpus OSVVM files |
+| VHDL-2008 parsing: `pure`/`impure` functions, `type T` + subprogram generics in generic clauses, protected types + bodies, incomplete types (`type T;`), alias signatures `f[T1, T2]`, aggregate range choices `(1 to N => x)`, qualified aggregates `t'(a, b)` / `t'(f => v)`, parenthesized targets `(a, b) := f()`, `end record/function <name>`, `??` condition operator, `abs`, `wait on/until/for` in any order, resolution-function subtypes (`subtype s is (resolved_f) t`) | ✅ parsed (protected-type bodies not simulated); `??` lowers to identity, `abs` simulated | parser tests `parses_vhdl2008_constructs`, `parses_vhdl2008_wait_and_condition_operator`, corpus OSVVM files |
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
-| sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs` |
+| sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for` in any order, e.g. `wait on clk until rising_edge(clk)`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs`, parser test `parses_vhdl2008_wait_and_condition_operator` |
 | `assert … report … severity …` (sequential and concurrent) | ✅ concurrent → always-process on the condition's signals; severity drives exit codes | `tests/exit_code.rs`, `tests/vhdl_gaps.rs` |
 | generate (for/if/case, incl. `elsif`/`else`, declarative parts, nesting), blocks | ✅ unrolled/selected at lower time (loop var as constant) | parser tests, `tests/vhdl_generate.rs` |
 | port modes `in`/`out`/`inout`/`buffer` (incl. out/inout ports connected to bit slices or slices, bridged through an implicit wire) | ✅ | `tests/vhdl_generate.rs` |

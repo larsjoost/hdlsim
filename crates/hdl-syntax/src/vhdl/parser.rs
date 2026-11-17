@@ -1027,10 +1027,17 @@ impl<'a> Parser<'a> {
         self.bump(); // subtype
         self.expect_ident("for the subtype name");
         self.expect_kw("is", "after the subtype name");
-        // Optional resolution function: `subtype s is resolved std_logic;`
-        // or `subtype s is my_resolver std_logic;`
+        // Optional resolution function: `subtype s is resolved std_logic;`,
+        // `subtype s is my_resolver std_logic;`, or the parenthesized form
+        // `subtype s is (my_resolver) std_logic;`.
         if self.at_kw("resolved") {
             self.bump();
+        } else if self.at_punct('(') {
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                self.bump();
+            }
+            self.expect_punct(')', "to close the resolution function");
         } else if self.peek().kind == TokenKind::Ident
             && self.peek2().kind == TokenKind::Ident
             && !self.peek2_text().eq_ignore_ascii_case("range")
@@ -1937,24 +1944,34 @@ impl<'a> Parser<'a> {
     fn parse_wait(&mut self) {
         self.start(SyntaxKind::Wait);
         self.bump(); // wait
-        if self.eat_kw("until") {
-            self.parse_expression();
-        }
-        if self.eat_kw("on") {
-            self.start(SyntaxKind::SensList);
-            loop {
-                self.parse_name();
-                if !self.eat_punct(',') {
-                    break;
+                     // `wait [on sens] [until cond] [for time];` — the clauses may appear
+                     // in any order (VHDL-2008 allows `wait on clk until rising_edge(clk)`).
+        let mut seen_until = false;
+        let mut seen_on = false;
+        let mut seen_for = false;
+        loop {
+            if !seen_until && self.eat_kw("until") {
+                seen_until = true;
+                self.parse_expression();
+            } else if !seen_on && self.eat_kw("on") {
+                seen_on = true;
+                self.start(SyntaxKind::SensList);
+                loop {
+                    self.parse_name();
+                    if !self.eat_punct(',') {
+                        break;
+                    }
                 }
-            }
-            self.builder.finish_node();
-        }
-        if self.eat_kw("for") {
-            self.parse_expression();
-            // Physical literal unit: `10 ns` — the unit is a bare identifier.
-            if self.peek().kind == TokenKind::Ident {
-                self.bump();
+                self.builder.finish_node();
+            } else if !seen_for && self.eat_kw("for") {
+                seen_for = true;
+                self.parse_expression();
+                // Physical literal unit: `10 ns` — the unit is a bare identifier.
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                }
+            } else {
+                break;
             }
         }
         self.expect_punct(';', "to end the wait statement");
@@ -2162,6 +2179,13 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) {
         if self.at_punct('-') || self.at_punct('+') {
             self.start(SyntaxKind::UnaryExpr);
+            self.bump();
+            self.parse_unary();
+            self.builder.finish_node();
+        } else if self.peek_text() == "?" && self.peek2_text() == "?" {
+            // VHDL-2008 condition operator `??x` (boolean conversion).
+            self.start(SyntaxKind::UnaryExpr);
+            self.bump();
             self.bump();
             self.parse_unary();
             self.builder.finish_node();
@@ -2621,6 +2645,30 @@ package p is new ieee.std_logic_1164.all generic map (W => 8);
 "#,
         );
         assert!(sexp.contains("(PackageInst"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_vhdl2008_wait_and_condition_operator() {
+        // `wait on ... until ...` clause order, `??` condition operator, and a
+        // parenthesized resolution function in a subtype declaration.
+        let sexp = ok(r#"package p is
+  subtype slv_max is (resolved_max) std_ulogic_vector;
+end package p;
+entity e is end entity;
+architecture a of e is
+  signal clk : bit := '0';
+  signal en : boolean := true;
+begin
+  process
+  begin
+    wait on clk until (??(clk = '1')) and en;
+    wait until ??en for 10 ns;
+    wait;
+  end process;
+end architecture;
+"#);
+        assert!(sexp.contains("(Wait"), "{}", sexp);
+        assert!(sexp.contains("(UnaryExpr"), "{}", sexp);
     }
 
     #[test]

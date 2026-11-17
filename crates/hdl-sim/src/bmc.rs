@@ -1697,6 +1697,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                     UnOp::BNot => not_bits(&v.bits),
                     UnOp::Neg => sub_bits(b, &vec![b.false_lit(); w], &v.bits, w),
                     UnOp::Pos => v.bits.clone(),
+                    // `abs` in BMC: approximated as identity (sign handling is
+                    // not modeled symbolically).
+                    UnOp::Abs => v.bits.clone(),
                     UnOp::RedAnd => vec![and_bits(b, &v.bits)],
                     UnOp::RedOr => vec![or_bits(b, &v.bits)],
                     UnOp::RedXor => {
@@ -2137,6 +2140,23 @@ fn const_unop(op: UnOp, a: &[bool]) -> Option<Vec<bool>> {
             (0..w).map(|i| (x.wrapping_neg() >> i) & 1 == 1).collect()
         }
         UnOp::Pos => a.to_vec(),
+        UnOp::Abs => {
+            // two's-complement absolute value
+            let sign = a.last().copied().unwrap_or(false);
+            if sign {
+                let mut x = 0u64;
+                for (i, &b) in a.iter().enumerate() {
+                    if i < 64 && b {
+                        x |= 1 << i;
+                    }
+                }
+                (0..a.len())
+                    .map(|i| (x.wrapping_neg() >> i) & 1 == 1)
+                    .collect()
+            } else {
+                a.to_vec()
+            }
+        }
         UnOp::RedAnd => vec![a.iter().all(|&b| b)],
         UnOp::RedOr => vec![a.iter().any(|&b| b)],
         UnOp::RedXor => vec![a.iter().fold(false, |acc, &b| acc != b)],
