@@ -62,6 +62,8 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | Construct | Status | Test |
 |---|---|---|
 | concurrent: process (sensitivity list / `all`), assigns, conditional (`when/else`), selected (`with/select`) | ✅ (no `after` delays) | examples, `tests/loops.rs` |
+| conditional expressions `v := a when c else b;` and conditional signal assignments in processes; for-loop bounds `t'left to t'right`; `open` in port/generic maps | ✅ | parser test `parses_vhdl2008_constructs`, corpus `neorv32_cpu_frontend.vhd` |
+| VHDL-2008 parsing: `pure`/`impure` functions, `type T` + subprogram generics in generic clauses, protected types + bodies, incomplete types (`type T;`), alias signatures `f[T1, T2]`, aggregate range choices `(1 to N => x)`, qualified aggregates `t'(a, b)` / `t'(f => v)`, parenthesized targets `(a, b) := f()`, `end record/function <name>` | ✅ parsed (protected-type bodies not simulated) | parser test `parses_vhdl2008_constructs`, corpus OSVVM files |
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
 | sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs` |
 | `assert … report … severity …` (sequential and concurrent) | ✅ concurrent → always-process on the condition's signals; severity drives exit codes | `tests/exit_code.rs`, `tests/vhdl_gaps.rs` |
@@ -75,7 +77,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 |---|---|---|
 | arithmetic/relational operators, `mod`/`rem`, `**` (saturating), `abs`/`not` | ✅ | `tests/vhdl_counter.rs`, `vhdl_signed.rs`, `tests/vhdl_pow.rs` |
 | logical `and/or/xor/…` on std_logic/vectors | ✅ (via 1164 operator functions) | examples |
-| concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
+| concatenation `&`, aggregates (positional, `others =>`, named `f => v`, choice lists `1 | 2 => v`, range choices `1 to N => v`), slices `v(a downto b)`, indexing `v(i)` | ✅ | `tests/vhdl_array_enum.rs`, `tests/vhdl_record.rs`, parser tests |
 | attributes | ◐ `'event`, `'last_value`, `'stable` on scalar signals; `'length`/`'high`/`'low`/`'left`/`'right` static — on unconstrained array ports (`port (a : in std_ulogic_vector)`) lowered to runtime `Expr::SigAttr`; `'range` in for-loops; `'image`/`to_string`; others → X with diagnostic | `tests/vhdl_event.rs`, `tests/vhdl_lastval.rs`, `tests/vhdl_gaps.rs`, `tests/loops.rs`, `tests/vhdl_unconport.rs` |
 | builtin function calls (`rising_edge`, `to_integer`, `resize`, `conv_*`, `to_unsigned/signed`, …) | ✅ | `tests/vhdl_std_arith.rs` |
 | shifts/rotates `sll`/`srl`/`sla`/`sra`/`rol`/`ror` + function forms `shift_left`/`shift_right`/`rotate_left`/`rotate_right` | ✅ (signed `sra`/`to_integer` decode signed; rotates keep operand width; not in `prove`/BMC) | `tests/vhdl_shifts.rs`, value unit tests |

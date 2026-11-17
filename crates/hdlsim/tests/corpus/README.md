@@ -13,6 +13,7 @@ Fetched 2026-11 from raw.githubusercontent.com:
 | `vhdl/neorv32_cpu_alu.vhd`, `vhdl/neorv32_imem.vhd`, `vhdl/neorv32_package.vhd`, `vhdl/neorv32_imem_image.vhd` | [stnolting/neorv32](https://github.com/stnolting/neorv32) — RISC-V SoC in VHDL (the two `neorv32_*` files are the entities' package dependencies, so cross-file `use neorv32.…all;` resolves) | BSD-3-Clause |
 | `vhdl/neorv32_bus.vhd`, `vhdl/neorv32_cache.vhd`, `vhdl/neorv32_clint.vhd`, `vhdl/neorv32_cpu_control.vhd`, `vhdl/neorv32_cpu_pmp.vhd`, `vhdl/neorv32_cpu_regfile.vhd`, `vhdl/neorv32_dmem.vhd`, `vhdl/neorv32_gpio.vhd` | same project — more `rtl/core` units (arrays of records, record ports, generics without defaults, multi-entity files) | BSD-3-Clause |
 | `vhdl/unisim_{BUFG,IBUF,ODDR,FD}.vhd` | [deuskane/xilinx-primitive-unisim](https://github.com/deuskane/xilinx-primitive-unisim) — mirror of the Xilinx UNISIM VHDL component models (Copyright Xilinx, Inc.; used here as parse fixtures) | see upstream |
+| `vhdl/IfElsePkg.vhd`, `vhdl/RandomPkg.vhd`, `vhdl/AlertLogPkg.vhd`, `vhdl/ScoreboardGenericPkg.vhd` | [OSVVM/OSVVM](https://github.com/OSVVM/OSVVM) — VHDL verification library (VHDL-2008: generic packages, protected types, textio-heavy) | MIT |
 
 The tests assert: every file lexes and parses without errors (the CST is
 lossless), and a full `check` (parse + lower + resolve) runs to completion
