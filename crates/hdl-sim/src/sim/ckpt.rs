@@ -345,6 +345,11 @@ fn w_expr(w: &mut W, e: &Expr) {
             w.u8(16);
             w.u64(x.to_bits());
         }
+        Expr::SigAttr { sig, attr } => {
+            w.u8(18);
+            w.u32(*sig);
+            w.str(attr);
+        }
     }
 }
 
@@ -414,6 +419,18 @@ fn r_expr(r: &mut R) -> Result<Expr, String> {
         },
         15 => Expr::Signed(Box::new(r_expr(r)?)),
         16 => Expr::Real(f64::from_bits(r.u64()?)),
+        18 => {
+            let sig = r.u32()?;
+            let attr = match r.str()?.as_str() {
+                "length" => "length",
+                "high" => "high",
+                "low" => "low",
+                "left" => "left",
+                "right" => "right",
+                other => return Err(format!("bad SigAttr attr {other}")),
+            };
+            Expr::SigAttr { sig, attr }
+        }
         t => return Err(format!("bad Expr tag {}", t)),
     })
 }

@@ -3011,6 +3011,7 @@ fn ce_impl(
             }
         }
         Expr::Signed(e) => ce_impl(e, env, funcs, slots.as_deref_mut()),
+        Expr::SigAttr { .. } => None, // width only known after port connection
         Expr::Call { name, args } => {
             let f = funcs.get(&name.to_ascii_lowercase())?;
             let mut argv = Vec::with_capacity(args.len());

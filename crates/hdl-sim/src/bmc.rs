@@ -1592,6 +1592,9 @@ impl<'e, 'a> Exec<'e, 'a> {
 
     fn eval(&mut self, e: &Expr) -> Result<Val, String> {
         match e {
+            Expr::SigAttr { .. } => Err(
+                "prove: runtime sig'length/'high on unconstrained ports unsupported".to_string(),
+            ),
             Expr::Real(_) => {
                 Err("prove: real-typed expressions are unsupported in BMC".to_string())
             }
@@ -2154,6 +2157,7 @@ fn sig_root(e: &Expr) -> Result<FlatSigId, String> {
 /// Does this expression contain a don't-care ('-') literal bit?
 fn expr_has_dash(e: &Expr) -> bool {
     match e {
+        Expr::SigAttr { .. } => false,
         Expr::Lit(v) => v.bits.iter().any(|&b| b == hdl_ir::value::VDASH),
         Expr::Bin { l, r, .. } => expr_has_dash(l) || expr_has_dash(r),
         Expr::Un { e, .. } => expr_has_dash(e),
