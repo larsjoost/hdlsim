@@ -64,7 +64,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | Construct | Status | Test |
 |---|---|---|
 | concurrent: process (sensitivity list / `all`), assigns, conditional (`when/else`), selected (`with/select`) | ✅ (no `after` delays) | examples, `tests/loops.rs` |
-| conditional expressions `v := a when c else b;` and conditional signal assignments in processes; for-loop bounds `t'left to t'right`; `open` in port/generic maps | ✅ | parser test `parses_vhdl2008_constructs`, corpus `neorv32_cpu_frontend.vhd` |
+| conditional expressions `v := a when c else b;` and conditional signal assignments in processes; for-loop bounds `t'left to t'right`, attribute arithmetic `input'length-1 downto 0`; `open` in port/generic maps | ✅ | parser tests `parses_vhdl2008_constructs`, `parses_for_loop_range_expressions`, corpus `neorv32_cpu_frontend.vhd` |
 | VHDL-2008 parsing: `pure`/`impure` functions, `type T` + subprogram generics in generic clauses, protected types + bodies, incomplete types (`type T;`), alias signatures `f[T1, T2]`, aggregate range choices `(1 to N => x)`, qualified aggregates `t'(a, b)` / `t'(f => v)`, parenthesized targets `(a, b) := f()`, `end record/function <name>` | ✅ parsed (protected-type bodies not simulated) | parser test `parses_vhdl2008_constructs`, corpus OSVVM files |
 | signal `<=` (NBA/delta) vs variable `:=` (blocking) | ✅ | `tests/vhdl_counter.rs` |
 | sequential: if/case/for/while/loop, `exit`/`next`, `null`, `wait` | ✅ (`wait until`/`on`/`for`; `clk'event` idiom) | `tests/loops.rs`, `tests/vhdl2008.rs`, `tests/vhdl_event.rs` |
