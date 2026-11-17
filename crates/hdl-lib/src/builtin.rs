@@ -50,6 +50,7 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
                 ),
                 ("fixed_pkg", include_str!("../stdlib/ieee/fixed_pkg.vhd")),
                 ("float_pkg", include_str!("../stdlib/ieee/float_pkg.vhd")),
+                ("math_real", include_str!("../stdlib/ieee/math_real.vhd")),
             ],
         ),
     ]
