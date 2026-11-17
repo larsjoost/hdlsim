@@ -1919,6 +1919,19 @@ impl<'a> Parser<'a> {
                 };
                 self.builder.start_node_at(mark, kind);
                 self.builder.finish_node();
+            } else if self.at_punct('.') {
+                // `arr(i).field` — a selected name after a suffix: fold the
+                // whole `name(args).field` into one Name node (the Call stays
+                // nested inside it, so the lowerer can see both parts).
+                self.bump();
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                } else {
+                    self.error_here("expected a name after '.'");
+                    break;
+                }
+                self.builder.start_node_at(mark, SyntaxKind::Name);
+                self.builder.finish_node();
             } else if self.at_punct('\'') {
                 if self.peek2().kind == TokenKind::Punct && self.peek2_text() == "(" {
                     // Qualified expression: `type_mark'(expr)`

@@ -50,7 +50,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | 1-D arrays (range- or enum-indexed), `(others => x)` aggregates | ✅ | `tests/vhdl_array_enum.rs` |
 | multi-dimensional arrays `array (a to b, c to d) of …`, `m(i, j)` | ✅ (flat index, first dim = MSB) | `tests/vhdl_gaps.rs` |
 | unconstrained box index `range <>` (multi-dim index lists too) | ✅ dims come from the signal's own constraint; `'length`/`'high`/`'low` use the element count / first-dim left | `tests/vhdl_boxarray.rs` |
-| records (flat vector + `r.field` select + named/positional aggregates) | ✅ | `tests/vhdl_record.rs` |
+| records (flat vector + `r.field` select + named/positional aggregates), comma-separated fields (`a, b : t`), record-typed ports/variables, **arrays of records `arr(i).field`** (read+write), field slices `r.f(a downto b)`, dotted names in sensitivity lists | ✅ | `tests/vhdl_record.rs`, `tests/vhdl_arr_rec.rs`, corpus `neorv32_bus.vhd` |
 | subtypes, type conversions (`signed(x)`, `std_logic_vector(x)`, …) | ✅ | `tests/vhdl_signed.rs` |
 | functions/procedures with bodies, `return` | ✅ runtime calls incl. package functions via `use` (registered at elab; for-loops in bodies supported); ✅ const-eval in constant initializers; functions with parameter-dependent local widths are skipped with a warning | `tests/vhdl2008.rs`, `tests/vhdl_constfn.rs` |
 | component declarations + `entity work.x(rtl)` / component instantiation with generic/port map | ✅ | `tests/vhdl_use_clause.rs`, user repro |

@@ -406,10 +406,13 @@ pub enum TypeInfo {
     Enum(Vec<String>),
     /// Array type: element width + total depth (memories) + per-index
     /// dimensions [(low, size), …] for multi-dimensional flat indexing.
+    /// `elem_name` is the element type mark (for arrays of records, so
+    /// `arr(i).field` can be lowered).
     Array {
         elem: usize,
         depth: usize,
         dims: Vec<(i64, usize)>,
+        elem_name: Option<String>,
     },
     /// Record type: fields as (name, width, signed) in declaration order.
     /// Lowered as one flat vector; the first declared field is the MSB.
@@ -434,6 +437,9 @@ struct Lower<'a> {
     sig_signed: HashMap<SigId, bool>,
     /// Signal id → record type name (for `sig.field` selects), if record-typed.
     sig_rec: HashMap<SigId, String>,
+    /// Signal id → element record type name for arrays of records, so
+    /// `arr(i).field` lowers to a slice of the memory element.
+    sig_elem_rec: HashMap<SigId, String>,
     /// Signal id → width in bits (for `'length`/`'high`/… attributes).
     sig_width: HashMap<SigId, usize>,
     /// Signal id → array dimensions [(low, size), …] (for `m(i, j)` flat index).
@@ -466,6 +472,23 @@ struct Lower<'a> {
     /// generate/package bodies) — returned with the file so they register on
     /// the design (their functions are needed at runtime).
     inst_packages: Vec<PackageIr>,
+    /// Per-entity snapshot of the signal-id → metadata maps. `SigId` is
+    /// module-relative, so with several entities per file the maps would
+    /// otherwise leak across entities; the architecture of entity E installs
+    /// E's snapshot (see lower_architecture).
+    entity_maps: HashMap<String, SigMaps>,
+}
+
+/// Per-module signal metadata (`SigId` is relative to one module).
+#[derive(Default, Clone)]
+struct SigMaps {
+    mems: HashMap<SigId, usize>,
+    sig_signed: HashMap<SigId, bool>,
+    sig_rec: HashMap<SigId, String>,
+    sig_elem_rec: HashMap<SigId, String>,
+    sig_width: HashMap<SigId, usize>,
+    sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
+    uncon_ports: std::collections::HashSet<SigId>,
 }
 
 impl<'a> Lower<'a> {
@@ -480,6 +503,7 @@ impl<'a> Lower<'a> {
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
             sig_rec: HashMap::new(),
+            sig_elem_rec: HashMap::new(),
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
             extra_signals: Vec::new(),
@@ -490,7 +514,45 @@ impl<'a> Lower<'a> {
             pkgs: HashMap::new(),
             file_root: None,
             inst_packages: Vec::new(),
+            entity_maps: HashMap::new(),
         }
+    }
+
+    /// Snapshot the current signal maps (called after an entity's ports are
+    /// lowered) and clear them so the next entity starts fresh.
+    fn snapshot_entity_maps(&mut self, entity: &str) {
+        self.entity_maps.insert(
+            entity.to_string(),
+            SigMaps {
+                mems: self.mems.clone(),
+                sig_signed: self.sig_signed.clone(),
+                sig_rec: self.sig_rec.clone(),
+                sig_elem_rec: self.sig_elem_rec.clone(),
+                sig_width: self.sig_width.clone(),
+                sig_dims: self.sig_dims.clone(),
+                uncon_ports: self.uncon_ports.clone(),
+            },
+        );
+        self.mems.clear();
+        self.sig_signed.clear();
+        self.sig_rec.clear();
+        self.sig_elem_rec.clear();
+        self.sig_width.clear();
+        self.sig_dims.clear();
+        self.uncon_ports.clear();
+    }
+
+    /// Install the signal maps of the entity whose architecture is being
+    /// lowered (SigId is module-relative).
+    fn install_entity_maps(&mut self, entity: &str) {
+        let m = self.entity_maps.get(entity).cloned().unwrap_or_default();
+        self.mems = m.mems;
+        self.sig_signed = m.sig_signed;
+        self.sig_rec = m.sig_rec;
+        self.sig_elem_rec = m.sig_elem_rec;
+        self.sig_width = m.sig_width;
+        self.sig_dims = m.sig_dims;
+        self.uncon_ports = m.uncon_ports;
     }
 
     /// Merge the packages named in the file's context clauses into scope
@@ -843,6 +905,7 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
+        self.snapshot_entity_maps(&module.name);
         module
     }
 
@@ -1021,11 +1084,30 @@ impl<'a> Lower<'a> {
                     self.mems.insert(id, d);
                 }
                 self.sig_signed.insert(id, signed);
+                self.sig_width.insert(id, width);
                 if let Some(tm) = &type_mark {
-                    if let Some(TypeInfo::Record { .. }) =
-                        self.types.get(&self.text(tm).to_ascii_lowercase())
-                    {
-                        self.sig_rec.insert(id, self.text(tm).to_ascii_lowercase());
+                    let tn = self.text(tm).to_ascii_lowercase();
+                    match self.types.get(&tn) {
+                        Some(TypeInfo::Record { .. }) => {
+                            self.sig_rec.insert(id, tn);
+                        }
+                        Some(TypeInfo::Array {
+                            dims, elem_name, ..
+                        }) => {
+                            if let Some(en) = elem_name {
+                                if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
+                                    self.sig_elem_rec.insert(id, en.clone());
+                                }
+                            }
+                            if !dims.is_empty() {
+                                let d = match &constraint {
+                                    Some(c) => self.constraint_dims(c),
+                                    None => dims.clone(),
+                                };
+                                self.sig_dims.insert(id, d);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 module.ports.push(PortIr {
@@ -1330,6 +1412,7 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
+        self.install_entity_maps(&entity_name);
         // Declarative part: everything before `begin`.
         let begin_pos = kids
             .iter()
@@ -1804,14 +1887,25 @@ impl<'a> Lower<'a> {
                     Some(TypeInfo::Record { .. }) => {
                         self.sig_rec.insert(id, tn.clone());
                     }
-                    // Array dims come from the signal's own constraint if
-                    // present, else from the array type declaration.
-                    Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
-                        let d = match constraint {
-                            Some(c) => self.constraint_dims(c),
-                            None => dims.clone(),
-                        };
-                        self.sig_dims.insert(id, d);
+                    // Array: remember the element record type for
+                    // `arr(i).field` selects (arrays of records), and the
+                    // dims from the signal's own constraint if present, else
+                    // from the array type declaration.
+                    Some(TypeInfo::Array {
+                        dims, elem_name, ..
+                    }) => {
+                        if let Some(en) = elem_name {
+                            if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
+                                self.sig_elem_rec.insert(id, en.clone());
+                            }
+                        }
+                        if !dims.is_empty() {
+                            let d = match constraint {
+                                Some(c) => self.constraint_dims(c),
+                                None => dims.clone(),
+                            };
+                            self.sig_dims.insert(id, d);
+                        }
                     }
                     _ => {}
                 }
@@ -1936,21 +2030,38 @@ impl<'a> Lower<'a> {
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "record")
         {
+            // Fields: `name [, name...] : type [constraint];` — comma-separated
+            // field names share one type mark.
             let mut fields: Vec<(String, usize, bool)> = Vec::new();
             let mut i = 0;
             while i < kids.len() {
-                let is_field = kids[i].kind() == SyntaxKind::Name
-                    && kids
-                        .get(i + 1)
-                        .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ":")
-                        .unwrap_or(false);
-                if is_field {
-                    if let Some(tm) = kids.get(i + 2).filter(|k| k.kind() == SyntaxKind::Name) {
-                        let constraint = kids.get(i + 3).filter(|k| k.kind() == SyntaxKind::Range);
-                        let (w, signed, _, _) = self.resolve_type(tm, constraint, d.span());
-                        fields.push((self.text(&kids[i]).to_ascii_lowercase(), w.max(1), signed));
-                        i += 3;
-                        continue;
+                if kids[i].kind() == SyntaxKind::Name {
+                    let mut j = i;
+                    let mut names: Vec<String> = Vec::new();
+                    while j < kids.len() && kids[j].kind() == SyntaxKind::Name {
+                        names.push(self.text(&kids[j]).to_ascii_lowercase());
+                        j += 1;
+                        if kids.get(j).map_or(false, |p| {
+                            p.kind() == SyntaxKind::Punct && self.text(p) == ","
+                        }) {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if kids.get(j).map_or(false, |p| {
+                        p.kind() == SyntaxKind::Punct && self.text(p) == ":"
+                    }) {
+                        if let Some(tm) = kids.get(j + 1).filter(|k| k.kind() == SyntaxKind::Name) {
+                            let constraint =
+                                kids.get(j + 2).filter(|k| k.kind() == SyntaxKind::Range);
+                            let (w, signed, _, _) = self.resolve_type(tm, constraint, d.span());
+                            for n in names {
+                                fields.push((n, w.max(1), signed));
+                            }
+                            i = j + 2;
+                            continue;
+                        }
                     }
                 }
                 i += 1;
@@ -1994,6 +2105,7 @@ impl<'a> Lower<'a> {
             } else {
                 dims.iter().map(|d| d.1).product::<usize>().max(1)
             };
+            let elem_name = elem.as_ref().map(|e| self.text(e).to_ascii_lowercase());
             let (ew, _, _, _) = match elem {
                 Some(e) => self.resolve_type(&e, elem_constraint, d.span()),
                 None => (8, false, None, false),
@@ -2004,6 +2116,7 @@ impl<'a> Lower<'a> {
                     elem: ew,
                     depth,
                     dims,
+                    elem_name,
                 },
             );
             return;
@@ -2306,6 +2419,7 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
         let span = d.span();
+        let type_name = type_mark.map(|tm| self.text(tm).to_ascii_lowercase());
         let (width, signed, _, real) = match type_mark {
             Some(tm) => self.resolve_type(tm, constraint, span),
             None => (32, false, None, false),
@@ -2325,6 +2439,31 @@ impl<'a> Lower<'a> {
                 signed,
             });
             self.sig_signed.insert(id, signed);
+            self.sig_width.insert(id, width);
+            if let Some(tn) = &type_name {
+                match self.types.get(tn) {
+                    Some(TypeInfo::Record { .. }) => {
+                        self.sig_rec.insert(id, tn.clone());
+                    }
+                    Some(TypeInfo::Array {
+                        dims, elem_name, ..
+                    }) => {
+                        if let Some(en) = elem_name {
+                            if matches!(self.types.get(en), Some(TypeInfo::Record { .. })) {
+                                self.sig_elem_rec.insert(id, en.clone());
+                            }
+                        }
+                        if !dims.is_empty() {
+                            let dd = match constraint {
+                                Some(c) => self.constraint_dims(c),
+                                None => dims.clone(),
+                            };
+                            self.sig_dims.insert(id, dd);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             self.names.insert(n.clone(), id);
         }
     }
@@ -2338,7 +2477,15 @@ impl<'a> Lower<'a> {
                 if name == "all" {
                     return Sens::All;
                 }
-                if let Some(id) = self.sig_id(&name) {
+                // Selected names (`bus_req_i.addr`, `arr(i).stb`) — sensitive to
+                // the whole base signal.
+                let base_name = name
+                    .split(['.', '('])
+                    .next()
+                    .unwrap_or(name.as_str())
+                    .to_string();
+                let lookup = if base_name != name { &base_name } else { &name };
+                if let Some(id) = self.sig_id(lookup) {
                     edges.push(Edge {
                         sig: id,
                         kind: EdgeKind::Any,
@@ -3188,6 +3335,56 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::Name => {
                 let name = self.text(e);
+                // `arr(i).field` — the parser folds this into one Name node
+                // wrapping a Call plus `.field`. Lower the call, then select
+                // the record field inside the element (slice of the memory
+                // element for arrays of records).
+                let ekids = real_children(e);
+                if let Some(call) = ekids.iter().find(|k| k.kind() == SyntaxKind::Call).cloned() {
+                    let field = ekids
+                        .iter()
+                        .filter(|k| k.kind() == SyntaxKind::Ident)
+                        .last()
+                        .map(|k| self.kw(k))
+                        .unwrap_or_default();
+                    let base = self.lower_expr(&call, env);
+                    let rec_name = match &base {
+                        Expr::Idx { e: be, .. } => match &**be {
+                            Expr::Sig(id) => self
+                                .sig_elem_rec
+                                .get(id)
+                                .or_else(|| self.sig_rec.get(id))
+                                .cloned(),
+                            _ => None,
+                        },
+                        Expr::Sig(id) => self
+                            .sig_rec
+                            .get(id)
+                            .or_else(|| self.sig_elem_rec.get(id))
+                            .cloned(),
+                        _ => None,
+                    };
+                    if let Some(tn) = rec_name {
+                        if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                            let total: usize = fields.iter().map(|f| f.1).sum();
+                            let mut run = 0usize;
+                            for (fn_, w, _) in fields {
+                                let lsb = total - run - w;
+                                if *fn_ == field {
+                                    return Expr::Sel {
+                                        e: Box::new(base),
+                                        msb: Box::new(Expr::Lit(Value::from_u64(
+                                            32,
+                                            (lsb + w - 1) as u64,
+                                        ))),
+                                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                                    };
+                                }
+                                run += w;
+                            }
+                        }
+                    }
+                }
                 // Record field select: `r.field` on a record-typed signal →
                 // slice of the flat record vector (first field = MSB).
                 if let Some(dot) = name.find('.') {
