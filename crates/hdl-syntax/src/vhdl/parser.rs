@@ -300,9 +300,9 @@ impl<'a> Parser<'a> {
             && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
     }
 
-    /// Parameter class keyword (signal/constant/variable) — precedes the names.
+    /// Parameter class keyword (signal/constant/variable/file) — precedes the names.
     fn at_param_class_kw(&self) -> bool {
-        const KWS: &[&str] = &["signal", "constant", "variable"];
+        const KWS: &[&str] = &["signal", "constant", "variable", "file"];
         self.peek().kind == TokenKind::Ident
             && KWS.contains(&self.peek_text().to_ascii_lowercase().as_str())
     }

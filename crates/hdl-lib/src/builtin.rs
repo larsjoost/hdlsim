@@ -18,6 +18,7 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
             &[
                 ("standard", include_str!("../stdlib/std/standard.vhd")),
                 ("env", include_str!("../stdlib/std/env.vhd")),
+                ("textio", include_str!("../stdlib/std/textio.vhd")),
             ],
         ),
         EmbeddedProvider::new(
@@ -100,6 +101,7 @@ mod tests {
         for u in [
             "standard",
             "env",
+            "textio",
             "std_logic_1164",
             "numeric_std",
             "std_logic_arith",

@@ -193,6 +193,9 @@ pub struct Simulator {
     /// Live class objects: class name → one word per allocated object.
     /// RefCell so field writes work from &self (function bodies) too.
     objs: std::cell::RefCell<HashMap<String, Vec<Value>>>,
+    /// std.textio read positions: file path → lines already consumed by
+    /// `readline` (RefCell so `endfile` can peek from &self expression eval).
+    textio_pos: std::cell::RefCell<HashMap<String, usize>>,
     /// Current object handle while executing a class method (`$this`).
     cur_obj: std::cell::Cell<u64>,
     /// External stop request (e.g. the live wave window's Stop button):
@@ -246,6 +249,7 @@ impl Simulator {
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             objmem,
             objs: std::cell::RefCell::new(HashMap::new()),
+            textio_pos: std::cell::RefCell::new(HashMap::new()),
             cur_obj: std::cell::Cell::new(u64::MAX),
             stop_flag: None,
             monitor: Vec::new(),
@@ -1319,15 +1323,181 @@ impl Simulator {
                     }
                 }
             }
-            _ => {
-                self.emit(SimEvent::Message {
-                    text: format!(
-                        "warning: unsupported system task ${} at t={}",
-                        name, self.time
-                    ),
-                    time_fs: self.time,
-                });
+            // std.textio: `write(l, v)` appends the formatted value to the
+            // line buffer (right-aligned: first char in the highest used byte).
+            "$textio_write" => {
+                if let (Some(Expr::Sig(sig)), Some(v)) = (args.first(), args.get(1)) {
+                    let sig = *sig as FlatSigId;
+                    let w = self.flat.signals[sig as usize].width.max(1);
+                    let text = self.fmt_text_value(&self.eval_expr(v, None));
+                    let add = text.as_bytes().len().min(w / 8);
+                    if add == 0 {
+                        return;
+                    }
+                    let shift = add * 8;
+                    let old = self.vals[sig as usize].bits.clone();
+                    let mut nb = vec![V0; w];
+                    for i in 0..w.saturating_sub(shift) {
+                        nb[i + shift] = old[i];
+                    }
+                    for (bi, &b) in text.as_bytes()[..add].iter().enumerate() {
+                        for j in 0..8 {
+                            nb[(add - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
+                        }
+                    }
+                    self.vals[sig as usize] = Value { bits: nb };
+                }
             }
+            // `writeline(f, l)` — print the line (stdout) or append to the file.
+            "$textio_writeline" => {
+                let path = args
+                    .first()
+                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .unwrap_or_else(|| "stdout".to_string());
+                let text = match args.get(1) {
+                    Some(Expr::Sig(sig)) => string_of(&self.vals[*sig as usize]),
+                    Some(e) => string_of(&self.eval_expr(e, None)),
+                    None => String::new(),
+                };
+                if path == "stdout" || path.is_empty() {
+                    self.emit(SimEvent::Message {
+                        text: format!("{}\n", text),
+                        time_fs: self.time,
+                    });
+                } else {
+                    use std::io::Write;
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        Ok(mut f) => {
+                            let _ = f.write_all(format!("{}\n", text).as_bytes());
+                        }
+                        Err(_) => self.emit(SimEvent::Message {
+                            text: format!(
+                                "error: cannot write textio file '{}' at t={}\n",
+                                path, self.time
+                            ),
+                            time_fs: self.time,
+                        }),
+                    }
+                }
+            }
+            // `readline(f, l)` — read the next line of the file into `l`.
+            "$textio_readline" => {
+                let path = args
+                    .first()
+                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .unwrap_or_else(|| "stdin".to_string());
+                let line = self.textio_read_line(&path);
+                if let (Some(Expr::Sig(sig)), Some(text)) = (args.get(1), line) {
+                    let sig = *sig as FlatSigId;
+                    let w = self.flat.signals[sig as usize].width.max(1);
+                    self.vals[sig as usize] = pack_str_value(&text).resize(w);
+                }
+            }
+            // `read(l, v)` — parse the first whitespace-delimited token of the
+            // line into `v` (decimal integer, or string for wide targets).
+            "$textio_read" => {
+                if let (Some(Expr::Sig(lsig)), Some(Expr::Sig(vsig))) = (args.first(), args.get(1))
+                {
+                    let lsig = *lsig as FlatSigId;
+                    let vsig = *vsig as FlatSigId;
+                    let content = string_of(&self.vals[lsig as usize]);
+                    let (tok, rest) = match content.find(char::is_whitespace) {
+                        Some(i) => (
+                            content[..i].to_string(),
+                            content[i..].trim_start().to_string(),
+                        ),
+                        None => (content.clone(), String::new()),
+                    };
+                    let lw = self.flat.signals[lsig as usize].width.max(1);
+                    self.vals[lsig as usize] = pack_str_value(&rest).resize(lw);
+                    let vw = self.flat.signals[vsig as usize].width.max(1);
+                    let v = match tok.parse::<u64>() {
+                        Ok(n) => Value::from_u64(vw, n),
+                        Err(_) => match tok.parse::<i64>() {
+                            Ok(n) => Value::from_u64(vw, n as u64),
+                            // Not a number: read it as a string into a
+                            // byte-multiple target.
+                            Err(_) if vw % 8 == 0 => pack_str_value(&tok).resize(vw),
+                            Err(_) => Value::x(vw),
+                        },
+                    };
+                    self.vals[vsig as usize] = v;
+                }
+            }
+            _ => {
+                // User procedure called as a statement, if registered.
+                if let Some(fi) = self.funcs.get(name).copied() {
+                    self.run_func(fi, &args, None);
+                } else {
+                    self.emit(SimEvent::Message {
+                        text: format!(
+                            "warning: unsupported system task ${} at t={}",
+                            name, self.time
+                        ),
+                        time_fs: self.time,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Read the next line of a textio file (`stdin` marker → process stdin),
+    /// advancing the stored read position. None at end of file.
+    fn textio_read_line(&self, path: &str) -> Option<String> {
+        if path == "stdin" {
+            use std::io::BufRead;
+            let mut lock = std::io::stdin().lock();
+            let mut s = String::new();
+            let n = lock.read_line(&mut s).ok()?;
+            if n == 0 {
+                return None;
+            }
+            return Some(s.trim_end_matches(['\n', '\r']).to_string());
+        }
+        let mut pos = self.textio_pos.borrow_mut();
+        let n = pos.entry(path.to_string()).or_insert(0);
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.lines().nth(*n).map(|l| l.to_string());
+        if line.is_some() {
+            *n += 1;
+        }
+        line
+    }
+
+    /// Format a value for textio `write(l, v)`: byte-multiple all-printable →
+    /// the string itself; ≤32 bits → decimal; wider → hex.
+    fn fmt_text_value(&self, v: &Value) -> String {
+        let w = v.width();
+        if w > 0 && w % 8 == 0 && w <= 8 * 1024 {
+            let bytes: Vec<u8> = v
+                .bits
+                .chunks(8)
+                .rev()
+                .map(|c| {
+                    let mut b = 0u8;
+                    for (j, &x) in c.iter().enumerate() {
+                        if x == V1 {
+                            b |= 1 << j;
+                        }
+                    }
+                    b
+                })
+                .collect();
+            if bytes
+                .iter()
+                .all(|&b| b != 0 && (b.is_ascii_graphic() || b == b' '))
+            {
+                return String::from_utf8_lossy(&bytes).into_owned();
+            }
+        }
+        match v.to_u64() {
+            Some(n) if w <= 32 => n.to_string(),
+            Some(n) => format!("0x{:x}", n),
+            None => "X".to_string(),
         }
     }
 
@@ -2099,6 +2269,21 @@ impl Simulator {
                 return pack_str_value(&s);
             }
             "time" | "realtime" => return Value::from_u64(64, self.time),
+            // std.textio `endfile(f)`: peek at the file position (stdin: no EOF).
+            "endfile" => {
+                let path = args
+                    .first()
+                    .map(|a| string_of(&self.eval_expr(a, locals)))
+                    .unwrap_or_default();
+                if path == "stdin" {
+                    return Value::from_u64(1, 0);
+                }
+                let pos = self.textio_pos.borrow().get(&path).copied().unwrap_or(0);
+                let total = std::fs::read_to_string(&path)
+                    .map(|t| t.lines().count())
+                    .unwrap_or(0);
+                return Value::from_u64(1, if pos >= total { 1 } else { 0 });
+            }
             "random" | "urandom" => return Value::from_u64(32, self.next_random() as u64),
             "urandom_range" => {
                 // $urandom_range(max) -> 0..=max, $urandom_range(min, max).
