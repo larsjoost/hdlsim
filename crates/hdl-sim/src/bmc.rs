@@ -211,6 +211,7 @@ pub fn wrap_top(design: &mut hdl_ir::Design, top: &str) -> Result<(), String> {
             name: "dut".to_string(),
             param_overrides: Vec::new(),
             conns,
+            config: None,
         }],
         time_unit_fs: m.time_unit_fs,
     };
@@ -2225,6 +2226,7 @@ mod tests {
             modules,
             top: Some(top.to_string()),
             packages: Default::default(),
+            configurations: Default::default(),
         }
     }
 

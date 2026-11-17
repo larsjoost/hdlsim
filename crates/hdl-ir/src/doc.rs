@@ -503,6 +503,7 @@ mod tests {
             name: "dut".to_string(),
             param_overrides: Vec::new(),
             conns: Vec::new(),
+            config: None,
         });
         let mut design = Design::default();
         design.modules.push(top);

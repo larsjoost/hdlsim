@@ -371,6 +371,7 @@ impl LibraryManager {
             &self.db,
             &mut lower_diags,
             &design.packages,
+            &design.configurations,
             &mut design.modules,
             pending,
             emit_errors,
@@ -615,10 +616,14 @@ pub fn compile_one(
                 &mut lower_diags,
                 1_000_000,
                 &design.packages,
+                &design.configurations,
             );
             diags.extend(lower_diags);
             design.modules.extend(lowered.modules);
             pending_archs.extend(lowered.pending);
+            for c in lowered.configurations {
+                design.configurations.insert(c.name.to_ascii_lowercase(), c);
+            }
             for p in lowered.packages {
                 // `package p` and `package body p` arrive as two entries with
                 // the same name — merge their items instead of last-wins.

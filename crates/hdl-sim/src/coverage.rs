@@ -275,6 +275,7 @@ mod tests {
         let design = Design {
             top: None,
             packages: Default::default(),
+            configurations: Default::default(),
             modules: vec![ModuleIr {
                 name: "m".into(),
                 params: vec![],

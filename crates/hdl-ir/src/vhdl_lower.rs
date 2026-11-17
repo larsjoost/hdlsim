@@ -42,6 +42,8 @@ use std::collections::HashMap;
 pub struct Lowered {
     pub modules: Vec<ModuleIr>,
     pub packages: Vec<PackageIr>,
+    /// Configuration declarations of this file, registered design-wide.
+    pub configurations: Vec<ConfigIr>,
     /// Architectures whose entity was not declared in the same file; bound
     /// design-wide later via [`lower_pending_architectures`].
     pub pending: Vec<PendingArch>,
@@ -79,6 +81,45 @@ pub struct PackageIr {
     /// clauses — use clauses are transitive through packages in VHDL, so
     /// `use work.p.all` also exposes what `p` used.
     pub uses: Vec<String>,
+}
+
+/// A lowered configuration declaration: `configuration cfg of ent is ... end;`.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigIr {
+    pub name: String,
+    /// Bound entity (unit name, lowercased).
+    pub entity: String,
+    /// Top-level `for arch ... end for;` — the default architecture binding.
+    pub arch: Option<String>,
+    /// Block configurations (`for label : comp use ...;`, `for all : ...`,
+    /// nested `for` blocks flattened into `path`).
+    pub blocks: Vec<BlockCfg>,
+}
+
+/// One block configuration inside a configuration declaration.
+#[derive(Clone, Debug)]
+pub struct BlockCfg {
+    /// Block specification path: `[arch]`, `[label, comp]`; `all`/`others`
+    /// set for the `for all : comp` / `for others : comp` forms.
+    pub path: Vec<String>,
+    pub all: bool,
+    pub others: bool,
+    pub binding: Binding,
+}
+
+/// A binding indication: `use entity lib.e(arch) [maps]` or
+/// `use configuration lib.cfg`.
+#[derive(Clone, Debug)]
+pub enum Binding {
+    Entity {
+        name: String,
+        arch: Option<String>,
+        generic_map: Vec<(String, Expr)>,
+        port_map: Vec<Conn>,
+    },
+    Configuration {
+        name: String,
+    },
 }
 
 /// Unit names referenced by the context clauses (`use lib.pkg...;`,
@@ -141,6 +182,7 @@ pub fn lower_file(
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
     pkgs: &HashMap<String, PackageIr>,
+    cfgs: &HashMap<String, ConfigIr>,
 ) -> Lowered {
     let _ = file;
     let mut lx = Lower::new(db, diags);
@@ -150,10 +192,15 @@ pub fn lower_file(
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
+    lx.cfgs = cfgs
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
     lx.apply_context_clauses(root);
     let mut modules: Vec<ModuleIr> = Vec::new();
     let mut entities: HashMap<String, usize> = HashMap::new();
     let mut packages: Vec<PackageIr> = Vec::new();
+    let mut configurations: Vec<ConfigIr> = Vec::new();
     let mut pending: Vec<PendingArch> = Vec::new();
     // Pass 0: packages and package instantiations, before anything that may
     // `use` them — so `use work.my_pkg.all;` also resolves when `my_pkg` is
@@ -192,20 +239,26 @@ pub fn lower_file(
             modules.push(m);
         }
     }
-    // Pass 2: configurations (default architecture bindings) and
-    // architectures (bodies). An architecture whose entity is not declared in
-    // this file is deferred (`pending`): the entity may live in a file
-    // compiled later, so binding happens design-wide in
-    // `lower_pending_architectures`.
-    let mut last_arch: HashMap<String, String> = HashMap::new();
+    // Configurations first, so `configuration work.cfg` instantiations and
+    // `use configuration` bindings resolve regardless of declaration order.
     let mut config_defaults: HashMap<String, String> = HashMap::new();
     for child in real_children(root) {
-        match child.kind() {
-            SyntaxKind::ConfigDecl => {
-                if let Some((ent, arch)) = config_default(&child, db) {
-                    config_defaults.insert(ent, arch);
-                }
+        if child.kind() == SyntaxKind::ConfigDecl {
+            let cfg = lx.lower_config_decl(&child);
+            if let Some(arch) = &cfg.arch {
+                config_defaults.insert(cfg.entity.clone(), arch.clone());
             }
+            lx.cfgs.insert(cfg.name.to_ascii_lowercase(), cfg.clone());
+            configurations.push(cfg);
+        }
+    }
+    // Pass 2: architectures (bodies). An architecture whose entity is not
+    // declared in this file is deferred (`pending`): the entity may live in a
+    // file compiled later, so binding happens design-wide in
+    // `lower_pending_architectures`.
+    let mut last_arch: HashMap<String, String> = HashMap::new();
+    for child in real_children(root) {
+        match child.kind() {
             SyntaxKind::Architecture => {
                 let known = arch_entity(&child, db)
                     .map(|(_, name)| entities.contains_key(&name))
@@ -232,32 +285,204 @@ pub fn lower_file(
     Lowered {
         modules,
         packages,
+        configurations,
         pending,
     }
 }
 
-/// `configuration cfg of ENT is for ARCH ... end for;` → (entity, arch).
-fn config_default(c: &SyntaxNode, db: &SourceDb) -> Option<(String, String)> {
-    let kids = real_children(c);
-    let ent = kids
-        .iter()
-        .skip_while(|k| db.span_text(k.span()).trim().to_ascii_lowercase() != "of")
-        .nth(1)
-        .filter(|k| k.kind() == SyntaxKind::Name)
-        .map(|k| db.span_text(k.span()).trim().to_string())?;
-    let ent = ent.rsplit('.').next().unwrap_or("").to_string();
-    let fs = kids.iter().find(|k| k.kind() == SyntaxKind::ForSpec)?;
-    let arch = real_children(fs)
-        .iter()
-        .filter(|k| k.kind() == SyntaxKind::Ident)
-        .map(|k| db.span_text(k.span()).trim().to_ascii_lowercase())
-        .find(|w| {
-            !matches!(
-                w.as_str(),
-                "for" | "end" | "use" | "entity" | "configuration"
-            )
-        })?;
-    Some((ent, arch))
+impl<'a> Lower<'a> {
+    /// Lower a configuration declaration into a [`ConfigIr`].
+    fn lower_config_decl(&mut self, c: &SyntaxNode) -> ConfigIr {
+        let kids = real_children(c);
+        let name = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .find(|w| !matches!(w.as_str(), "configuration" | "of" | "is" | "end"))
+            .unwrap_or_default();
+        let entity = kids
+            .iter()
+            .skip_while(|k| self.kw(k) != "of")
+            .nth(1)
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))
+            .unwrap_or_default();
+        let entity = entity.rsplit('.').next().unwrap_or("").to_string();
+        let mut cfg = ConfigIr {
+            name,
+            entity,
+            arch: None,
+            blocks: Vec::new(),
+        };
+        for k in &kids {
+            if k.kind() == SyntaxKind::ForSpec {
+                self.lower_config_for(k, &mut cfg, Vec::new());
+            }
+        }
+        cfg
+    }
+
+    /// One `for <block spec> ... end for;` inside a configuration declaration.
+    /// A bare top-level `for arch ... end for;` (no binding) sets the default
+    /// architecture; nested blocks under it are recorded relative to the top.
+    fn lower_config_for(&mut self, fs: &SyntaxNode, cfg: &mut ConfigIr, mut path: Vec<String>) {
+        let kids = real_children(fs);
+        let mut all = false;
+        let mut others = false;
+        for k in &kids {
+            if k.kind() == SyntaxKind::Ident {
+                let w = self.kw(k);
+                if w == "all" {
+                    all = true;
+                } else if w == "others" {
+                    others = true;
+                } else if w == "use" || w == "end" {
+                    break;
+                }
+            } else if k.kind() == SyntaxKind::Name {
+                path.push(self.text(k).to_ascii_lowercase());
+            } else if k.kind() == SyntaxKind::Punct {
+                continue; // `:` between label and component name
+            } else {
+                break;
+            }
+        }
+        // If this for-block has a binding use directly, record it.
+        let has_binding = kids.iter().any(|k| k.kind() == SyntaxKind::UseClause);
+        if !has_binding && path.len() == 1 && !all && !others {
+            // `for arch ... end for;` — default architecture binding.
+            cfg.arch = Some(path[0].clone());
+        }
+        let child_base = if !has_binding && path.len() == 1 && !all && !others {
+            Vec::new() // relative to the configuration's top
+        } else {
+            path.clone()
+        };
+        for k in &kids {
+            match k.kind() {
+                SyntaxKind::ForSpec => self.lower_config_for(k, cfg, child_base.clone()),
+                SyntaxKind::UseClause => {
+                    let binding = self.lower_binding_kids(&real_children(k));
+                    cfg.blocks.push(BlockCfg {
+                        path: child_base.clone(),
+                        all,
+                        others,
+                        binding,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A binding indication's children (a UseClause node in a configuration, or
+    /// the inline tail of a for-specification): `use [entity|configuration]
+    /// name [(arch)] [generic map (...)] [port map (...)]`.
+    fn lower_binding_kids(&mut self, kids: &[SyntaxNode]) -> Binding {
+        let is_config = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "configuration");
+        // `name` or `name(arch)` — the latter parses as Call(Name, "(", arch, ")").
+        let (name, arch) = match kids.iter().find(|k| k.kind() == SyntaxKind::Call) {
+            Some(call) => {
+                let ck = real_children(call);
+                let un = ck
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k))
+                    .unwrap_or_default();
+                let arch = ck
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "(")
+                    .and_then(|p| ck.get(p + 1))
+                    .filter(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.kw(k));
+                (un, arch)
+            }
+            None => (
+                kids.iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
+        let unit = name.rsplit('.').next().unwrap_or("").to_string();
+        if is_config {
+            return Binding::Configuration {
+                name: unit.to_ascii_lowercase(),
+            };
+        }
+        let mut generic_map = Vec::new();
+        let mut port_map = Vec::new();
+        let mut in_generic = false;
+        for k in kids {
+            if k.kind() == SyntaxKind::Ident {
+                let w = self.kw(k);
+                if w == "generic" {
+                    in_generic = true;
+                } else if w == "port" {
+                    in_generic = false;
+                }
+            } else if k.kind() == SyntaxKind::PortConn {
+                let ck = real_children(k);
+                let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+                let assoc = name_pos.map(|i| self.text(&ck[i]));
+                let expr = ck
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(i, c)| Some(*i) != name_pos && is_expr_node(c.kind()))
+                    .map(|(_, c)| c);
+                let Some(e) = expr else { continue };
+                let ex = self.lower_expr(e, &self.consts.clone());
+                match assoc {
+                    Some(n) if in_generic => generic_map.push((n, ex)),
+                    Some(n) => port_map.push(Conn::Named(n, ex)),
+                    None => port_map.push(Conn::Positional(ex)),
+                }
+            }
+        }
+        Binding::Entity {
+            name: unit,
+            arch,
+            generic_map,
+            port_map,
+        }
+    }
+
+    /// Apply a binding indication to an instance (configuration
+    /// specification `for label : comp use ...;` or a block configuration).
+    fn apply_binding(&mut self, inst: &mut InstIr, binding: &Binding, span: Span) {
+        match binding {
+            Binding::Entity {
+                name,
+                arch,
+                generic_map,
+                port_map,
+            } => {
+                inst.module = match arch {
+                    Some(a) => format!("{name}/{a}"),
+                    None => name.clone(),
+                };
+                inst.param_overrides.extend(generic_map.iter().cloned());
+                if !port_map.is_empty() {
+                    inst.conns = port_map.clone();
+                }
+            }
+            Binding::Configuration { name } => {
+                if let Some(cfg) = self.cfgs.get(&name.to_ascii_lowercase()).cloned() {
+                    inst.module = match &cfg.arch {
+                        Some(a) => format!("{}/{}", cfg.entity, a),
+                        None => cfg.entity.clone(),
+                    };
+                    inst.config = Some(name.clone());
+                } else {
+                    self.err(span, format!("unknown configuration '{name}' in binding"));
+                }
+            }
+        }
+    }
 }
 
 /// Give each plain entity module the body of its default architecture:
@@ -293,6 +518,7 @@ pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     pkgs: &HashMap<String, PackageIr>,
+    cfgs: &HashMap<String, ConfigIr>,
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
     emit_errors: bool,
@@ -313,6 +539,10 @@ pub fn lower_pending_architectures(
         lx.register_builtin_types();
         lx.file_root = Some(p.root.clone());
         lx.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lx.cfgs = cfgs
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
@@ -501,6 +731,10 @@ struct Lower<'a> {
     /// backs `use lib.pkg...;` inside declarative parts and package
     /// instantiations.
     pkgs: HashMap<String, PackageIr>,
+    /// Configurations visible while lowering this file (design-wide, from
+    /// other files plus same-file ones) — backs `configuration work.cfg`
+    /// instantiations and `use configuration` binding indications.
+    cfgs: HashMap<String, ConfigIr>,
     /// The design file currently being lowered (for re-applying its context
     /// clauses when re-lowering a generic package at an instantiation site).
     file_root: Option<SyntaxNode>,
@@ -551,6 +785,7 @@ impl<'a> Lower<'a> {
             uncon_ports: std::collections::HashSet::new(),
             aliases: HashMap::new(),
             pkgs: HashMap::new(),
+            cfgs: HashMap::new(),
             file_root: None,
             inst_packages: Vec::new(),
             entity_maps: HashMap::new(),
@@ -1779,6 +2014,7 @@ impl<'a> Lower<'a> {
             None => kids.iter().collect(),
         };
         self.aliases.clear();
+        let mut config_specs: Vec<&SyntaxNode> = Vec::new();
         for d in &decls {
             match d.kind() {
                 SyntaxKind::SignalDecl => self.lower_signal_decl(module, d),
@@ -1795,6 +2031,8 @@ impl<'a> Lower<'a> {
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
+                // Configuration specification: `for label : comp use ...;`
+                SyntaxKind::ForSpec => config_specs.push(d),
                 _ => {}
             }
         }
@@ -1818,6 +2056,29 @@ impl<'a> Lower<'a> {
         let mut proc_idx = 0;
         for s in &stmts {
             self.lower_conc_stmt(module, s, &mut proc_idx);
+        }
+        // Configuration specifications rebind the matching instance label.
+        for fs in &config_specs {
+            let fk = real_children(fs);
+            let Some(label) = fk
+                .iter()
+                .find(|k| k.kind() == SyntaxKind::Name)
+                .map(|k| self.text(k))
+            else {
+                continue;
+            };
+            let Some(use_pos) = fk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "use")
+            else {
+                continue;
+            };
+            let binding = self.lower_binding_kids(&fk[use_pos + 1..]);
+            for inst in &mut module.instances {
+                if inst.name.eq_ignore_ascii_case(&label) {
+                    self.apply_binding(inst, &binding, fs.span());
+                }
+            }
         }
         modules.push(module_owned);
         Some((entity_name, arch_name))
@@ -3367,6 +3628,18 @@ impl<'a> Lower<'a> {
 
     fn lower_inst(&mut self, s: &SyntaxNode) -> Option<InstIr> {
         let kids = real_children(s);
+        // Instance label: `u :` — an Ident child right before the `:` punct
+        // (the parser wraps `label :` into the Inst node).
+        let label = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+            .and_then(|p| p.checked_sub(1).and_then(|i| kids.get(i)))
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.text(k));
+        // `label : configuration lib.cfg ...` — the unit is a configuration.
+        let is_config = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "configuration");
         // `entity lib.unit(arch)` parses as Call(Name "lib.unit", "(", Name
         // "arch", ")"); without an arch it is a plain Name child.
         let (unit_text, arch) = match kids.iter().find(|k| k.kind() == SyntaxKind::Call) {
@@ -3393,11 +3666,36 @@ impl<'a> Lower<'a> {
         };
         // `entity work.counter` — drop the library prefix; the unit name is
         // the last selected component. With `(arch)`, select the `unit/arch`
-        // variant module (see lower_architecture).
+        // variant module (see lower_architecture). A `configuration work.cfg`
+        // instantiation resolves through the design-wide configuration map.
         let unit = unit_text.rsplit('.').next().unwrap_or("").to_string();
-        let name = match arch {
-            Some(a) => format!("{unit}/{a}"),
-            None => unit,
+        let mut config = None;
+        let name = if is_config {
+            let key = unit.to_ascii_lowercase();
+            match self.cfgs.get(&key).cloned() {
+                Some(cfg) => {
+                    config = Some(key);
+                    match &cfg.arch {
+                        Some(a) => format!("{}/{}", cfg.entity, a),
+                        None => cfg.entity.clone(),
+                    }
+                }
+                None => {
+                    self.err(
+                        kids.iter()
+                            .find(|k| k.kind() == SyntaxKind::Name)
+                            .map(|k| k.span())
+                            .unwrap_or(s.span()),
+                        format!("unknown configuration '{unit}'"),
+                    );
+                    unit
+                }
+            }
+        } else {
+            match arch {
+                Some(a) => format!("{unit}/{a}"),
+                None => unit,
+            }
         };
         let mut param_overrides = Vec::new();
         let mut conns = Vec::new();
@@ -3435,9 +3733,10 @@ impl<'a> Lower<'a> {
         }
         Some(InstIr {
             module: name,
-            name: String::new(), // label handled by elaboration naming
+            name: label.unwrap_or_default(),
             param_overrides,
             conns,
+            config,
         })
     }
 

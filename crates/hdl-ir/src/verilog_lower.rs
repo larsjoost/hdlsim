@@ -2713,6 +2713,7 @@ impl<'a> Lower<'a> {
             name: inst_name,
             param_overrides,
             conns,
+            config: None,
         });
     }
 

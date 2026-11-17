@@ -442,25 +442,25 @@ impl<'a> Parser<'a> {
     }
 
     /// One `for <block spec> ... end for;` inside a configuration declaration.
+    /// Block spec: `arch_name`, `label : comp`, `all : comp`, `others : comp`.
     fn parse_config_for(&mut self) {
         self.start(SyntaxKind::ForSpec);
         self.bump(); // for
+        if self.at_kw("all") || self.at_kw("others") {
+            self.bump();
+        } else if self.peek().kind == TokenKind::Ident {
+            self.parse_name();
+        } else {
+            self.error_here("expected a block specification in the block configuration");
+        }
+        if self.eat_punct(':') {
+            self.parse_name(); // component name
+        }
         while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
             if self.at_kw("for") {
                 self.parse_config_for(); // nested block configuration
             } else if self.at_kw("use") {
-                self.bump();
-                if self.at_kw("entity") || self.at_kw("configuration") {
-                    self.bump();
-                }
-                self.parse_name(); // lib.ent / configuration name
-                if self.eat_punct('(') {
-                    if self.peek().kind == TokenKind::Ident {
-                        self.bump(); // architecture name
-                    }
-                    self.expect_punct(')', "to close the architecture selection");
-                }
-                self.expect_punct(';', "to end the `use` clause in a configuration");
+                self.parse_config_binding();
             } else {
                 self.bump();
             }
@@ -468,6 +468,35 @@ impl<'a> Parser<'a> {
         self.expect_kw("end", "to close the configuration for-block");
         self.eat_kw("for");
         self.expect_punct(';', "to end the configuration for-block");
+        self.builder.finish_node();
+    }
+
+    /// Binding indication inside a configuration declaration:
+    /// `use [entity|configuration] name [(arch)] [generic map (...)] [port map (...)];`
+    fn parse_config_binding(&mut self) {
+        self.start(SyntaxKind::UseClause);
+        self.bump(); // use
+        if self.at_kw("entity") || self.at_kw("configuration") {
+            self.bump();
+        }
+        self.parse_name(); // lib.unit / configuration name
+        if self.eat_punct('(') {
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // architecture name
+            }
+            self.expect_punct(')', "to close the architecture selection");
+        }
+        if self.at_kw("generic") {
+            self.bump();
+            self.expect_kw("map", "after generic in a binding indication");
+            self.parse_assoc_list();
+        }
+        if self.at_kw("port") {
+            self.bump();
+            self.expect_kw("map", "after port in a binding indication");
+            self.parse_assoc_list();
+        }
+        self.expect_punct(';', "to end the binding indication");
         self.builder.finish_node();
     }
 
@@ -906,6 +935,16 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct(')', "to close the architecture selection");
         }
+        if self.at_kw("generic") {
+            self.bump();
+            self.expect_kw("map", "after generic in a configuration specification");
+            self.parse_assoc_list();
+        }
+        if self.at_kw("port") {
+            self.bump();
+            self.expect_kw("map", "after port in a configuration specification");
+            self.parse_assoc_list();
+        }
         self.expect_punct(';', "to end the for-specification");
         self.builder.finish_node();
     }
@@ -1313,11 +1352,17 @@ impl<'a> Parser<'a> {
     // ---- concurrent statements -----------------------------------------------------
 
     fn parse_concurrent_stmt(&mut self) {
-        // Optional label: `ident :`
-        if self.at_label() {
+        // Optional label: `ident :`. For instantiations the label is wrapped
+        // INTO the Inst node (so the lowerer can match configuration
+        // specifications by label); other statements keep it as a sibling.
+        let label_mark = if self.at_label() {
+            let m = self.builder.mark();
             self.bump(); // label
             self.bump(); // ':'
-        }
+            Some(m)
+        } else {
+            None
+        };
         // VHDL-2008 `postponed process`
         if self.at_kw("postponed") {
             self.bump();
@@ -1341,7 +1386,7 @@ impl<'a> Parser<'a> {
             || self.at_kw("configuration")
             || (self.peek().kind == TokenKind::Ident && self.peek2().kind == TokenKind::Ident)
         {
-            self.parse_instantiation();
+            self.parse_instantiation(label_mark);
         } else {
             // Concurrent signal assignment `target <= waveform ;` or a
             // concurrent procedure call `p(args);` — decided after the target
@@ -1658,8 +1703,12 @@ impl<'a> Parser<'a> {
     }
 
     /// `label : comp [generic map (...)] port map (...);` or `entity lib.name(arch) ...`.
-    fn parse_instantiation(&mut self) {
-        self.start(SyntaxKind::Inst);
+    fn parse_instantiation(&mut self, label: Option<crate::cst::Mark>) {
+        match label {
+            // Wrap the already-bumped `label :` into the Inst node.
+            Some(m) => self.builder.start_node_at(m, SyntaxKind::Inst),
+            None => self.start(SyntaxKind::Inst),
+        }
         if self.eat_kw("entity") {
             self.parse_name(); // lib.entity
             if self.eat_punct('(') {
@@ -3088,5 +3137,53 @@ end package body;
 "#);
         assert!(sexp.contains("Punct \"'\" Ident \"element\""), "{}", sexp);
         assert!(sexp.contains("(UnaryExpr Ident \"or\""), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_block_configurations_and_specifications() {
+        let sexp = ok(r#"configuration cfg of top is
+  for rtl
+    for u0 : comp
+      use entity work.other(sim) generic map (W => 4) port map (a => x);
+    end for;
+    for all : leaf use configuration work.leaf_cfg;
+    end for;
+    for others : leaf use entity work.dflt(rtl);
+    end for;
+  end for;
+end configuration;
+entity e is end entity;
+architecture rtl of e is
+  for u0 : comp use entity work.other(sim);
+begin
+end architecture;
+"#);
+        assert!(sexp.contains("(ConfigDecl"), "{}", sexp);
+        assert!(sexp.matches("(UseClause").count() >= 3, "{}", sexp);
+        assert!(sexp.matches("(ForSpec").count() >= 5, "{}", sexp);
+    }
+
+    #[test]
+    fn instantiation_label_is_inside_the_inst_node() {
+        let sexp = ok(r#"entity e is end entity;
+architecture rtl of e is
+begin
+  u0 : entity work.dut(rtl) port map (a => x);
+  u1 : configuration work.cfg port map (a => x);
+end architecture;
+"#);
+        let insts: Vec<&str> = sexp.split("(Inst").skip(1).collect();
+        assert_eq!(insts.len(), 2, "{}", sexp);
+        assert!(
+            insts[0].contains("Ident \"u0\" Punct \":\""),
+            "{}",
+            insts[0]
+        );
+        assert!(
+            insts[1].contains("Ident \"u1\" Punct \":\""),
+            "{}",
+            insts[1]
+        );
+        assert!(insts[1].contains("Ident \"configuration\""), "{}", insts[1]);
     }
 }

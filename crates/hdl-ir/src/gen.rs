@@ -266,6 +266,7 @@ mod tests {
             modules: vec![m],
             top: None,
             packages: Default::default(),
+            configurations: Default::default(),
         }
     }
 
