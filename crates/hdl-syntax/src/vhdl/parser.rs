@@ -355,7 +355,13 @@ impl<'a> Parser<'a> {
             } else if self.at_kw("configuration") {
                 self.parse_configuration();
             } else if self.at_kw("context") {
-                self.parse_context_clause();
+                // `context name;` is a context reference clause;
+                // `context name is ... end context;` is a context declaration.
+                if self.peek3_text().eq_ignore_ascii_case("is") {
+                    self.parse_context_decl();
+                } else {
+                    self.parse_context_clause();
+                }
             } else {
                 self.error_here(
                     "expected a design unit (entity/architecture/package) or context clause",
@@ -380,6 +386,33 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(';', "to end the context clause");
+        self.builder.finish_node();
+    }
+
+    /// Context declaration: `context name is <context clause items> end [context] [name];`
+    fn parse_context_decl(&mut self) {
+        self.start(SyntaxKind::ContextDecl);
+        self.bump(); // context
+        self.expect_ident("for the context name");
+        self.expect_kw("is", "in the context declaration");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("library") {
+                self.parse_library_clause();
+            } else if self.at_kw("use") {
+                self.parse_use_clause();
+            } else if self.at_kw("context") {
+                self.parse_context_clause();
+            } else {
+                self.error_here("expected a context clause item in the context declaration");
+                self.skip_to_semicolon();
+            }
+        }
+        self.expect_kw("end", "to close the context declaration");
+        self.eat_kw("context");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional context name
+        }
+        self.expect_punct(';', "to end the context declaration");
         self.builder.finish_node();
     }
 
@@ -590,9 +623,31 @@ impl<'a> Parser<'a> {
             }
         }
         // `type T;` — a type generic has no mode or type mark.
+        // VHDL-2019: `type T is <subtype indication>` (e.g.
+        // `type V is array (type is range <>) of type is private`).
         if class.as_deref() == Some("type") && !self.at_punct(':') {
-            while self.peek().kind != TokenKind::Eof && !self.at_punct(';') {
+            if self.at_kw("is") {
                 self.bump();
+                // Skip the subtype indication, tracking bracket/paren depth so
+                // the closing `)` of the generic list stays for the caller.
+                let mut depth = 0;
+                while self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('(') || self.at_punct('[') {
+                        depth += 1;
+                    } else if self.at_punct(')') || self.at_punct(']') {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    } else if depth == 0 && self.at_punct(';') {
+                        break;
+                    }
+                    self.bump();
+                }
+            } else {
+                while self.peek().kind != TokenKind::Eof && !self.at_punct(';') {
+                    self.bump();
+                }
             }
             self.builder.finish_node();
             return;
@@ -769,6 +824,19 @@ impl<'a> Parser<'a> {
         self.expect_kw("of", "in the attribute specification");
         loop {
             self.parse_name();
+            // Subprogram signature in the target: `f[ string return T ]`.
+            if self.at_punct('[') {
+                self.bump();
+                let mut depth = 1;
+                while depth > 0 && self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('[') {
+                        depth += 1;
+                    } else if self.at_punct(']') {
+                        depth -= 1;
+                    }
+                    self.bump();
+                }
+            }
             if !self.eat_punct(',') {
                 break;
             }
@@ -1045,6 +1113,16 @@ impl<'a> Parser<'a> {
             self.bump(); // resolution function name
         }
         self.parse_type_mark();
+        // Type attribute in the indication: `subtype E is V'element;` /
+        // `subtype I is V'index;` (VHDL-2019).
+        if self.at_punct('\'') {
+            self.bump();
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // attribute name
+            } else {
+                self.error_here("expected an attribute name after the tick");
+            }
+        }
         if self.at_punct('(') {
             self.parse_constraint();
         } else if self.at_kw("range") {
@@ -1751,7 +1829,7 @@ impl<'a> Parser<'a> {
                 self.builder.start_node_at(mark, SyntaxKind::SeqAssign);
                 self.bump();
                 self.bump();
-                self.parse_expression();
+                self.parse_waveform_elements();
                 self.expect_punct(';', "to end the assignment");
                 self.builder.finish_node();
             } else {
@@ -1766,21 +1844,7 @@ impl<'a> Parser<'a> {
                 self.builder.start_node_at(mark, SyntaxKind::SeqAssign);
                 self.bump();
                 self.bump();
-                self.parse_expression();
-                if self.at_kw("after") {
-                    self.bump();
-                    self.parse_expression();
-                }
-                // Conditional waveform: `x <= a when c else b;` (flat tokens,
-                // lowered like the concurrent form).
-                loop {
-                    if self.at_kw("when") || self.at_kw("else") {
-                        self.bump();
-                        self.parse_expression();
-                        continue;
-                    }
-                    break;
-                }
+                self.parse_waveform_elements();
                 self.expect_punct(';', "to end the signal assignment");
                 self.builder.finish_node();
             } else if self.peek_op2().as_deref() == Some(":=") {
@@ -2176,6 +2240,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Waveform elements of a signal assignment: `expr [after t] {, expr
+    /// [after t]}`, optionally followed by the conditional form
+    /// `when cond else expr ...`.
+    fn parse_waveform_elements(&mut self) {
+        self.parse_expression();
+        loop {
+            if self.at_kw("after") {
+                self.bump();
+                self.parse_expression();
+            }
+            // Conditional waveform: `x <= a when c else b;` (flat tokens,
+            // lowered like the concurrent form).
+            if self.at_kw("when") || self.at_kw("else") {
+                self.bump();
+                self.parse_expression();
+                continue;
+            }
+            if self.eat_punct(',') {
+                self.parse_expression();
+                continue;
+            }
+            break;
+        }
+    }
+
     fn parse_unary(&mut self) {
         if self.at_punct('-') || self.at_punct('+') {
             self.start(SyntaxKind::UnaryExpr);
@@ -2189,7 +2278,14 @@ impl<'a> Parser<'a> {
             self.bump();
             self.parse_unary();
             self.builder.finish_node();
-        } else if self.at_kw("not") || self.at_kw("abs") {
+        } else if self.at_kw("not")
+            || self.at_kw("abs")
+            // Prefix reduction operators: `and x`, `or x`, `xor x`, ...
+            || matches!(
+                self.peek_text().to_ascii_lowercase().as_str(),
+                "and" | "or" | "xor" | "nand" | "nor" | "xnor"
+            )
+        {
             self.start(SyntaxKind::UnaryExpr);
             self.bump();
             self.parse_unary();
@@ -2937,5 +3033,60 @@ end;
         ] {
             let _ = parse_str(src);
         }
+    }
+
+    #[test]
+    fn parses_context_declaration() {
+        let sexp = ok(r#"library ieee;
+context OsvvmContext is
+  library OSVVM ;
+  use OSVVM.IfElsePkg.all ;
+end context OsvvmContext;
+entity e is end entity;
+"#);
+        assert!(sexp.contains("(ContextDecl"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_attribute_spec_with_signature() {
+        let sexp = ok(r#"package p is
+  impure function f(name: string) return integer;
+  attribute foreign of f[string return integer]: function is "VHPI systf; f";
+end package;
+"#);
+        assert!(sexp.contains("(AttrSpec"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_multi_element_waveform_with_after() {
+        let sexp = ok(r#"entity e is end entity;
+architecture rtl of e is
+  signal clk : bit := '0';
+begin
+  process
+  begin
+    clk <= '1', '0' after 5 ns, '1' after 10 ns;
+    wait;
+  end process;
+end architecture;
+"#);
+        assert!(sexp.contains("(SeqAssign"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_2019_generic_array_type_and_prefix_reduction() {
+        let sexp = ok(r#"package p is
+  generic (type VectorType is array (type is range <>) of type is private);
+  subtype ElementType is VectorType'element;
+end package;
+package body p is
+  function f(a : integer_vector) return bit is
+  begin
+    return (or a) and '1';
+  end;
+end package body;
+"#);
+        assert!(sexp.contains("Punct \"'\" Ident \"element\""), "{}", sexp);
+        assert!(sexp.contains("(UnaryExpr Ident \"or\""), "{}", sexp);
     }
 }
