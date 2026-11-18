@@ -4,6 +4,7 @@
 
 use super::{parse_with, Command};
 use clap::Parser;
+use hdl_lib::providers::library_name_from_dir;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -14,41 +15,27 @@ fn prefer_dir(current: &Path, candidate: &Path) -> bool {
     candidate.components().count() < current.components().count()
 }
 
-/// Guess a logical library name from a directory name: lowercase, invalid
-/// identifier chars become `_`, and a non-identifier start gets a `lib_`
-/// prefix (e.g. `scint_scan_integrator` stays as-is, `2nd` -> `lib_2nd`).
-fn library_name_from_dir(dir: &Path) -> Option<String> {
-    let raw = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
-    let mut name: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if name.is_empty() {
-        return None;
-    }
-    if !name
-        .chars()
-        .next()
-        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
-    {
-        name = format!("lib_{name}");
-    }
-    // Reserved / built-in names are not user libraries.
-    if matches!(name.as_str(), "work" | "std" | "ieee" | "ieee_proposed") {
-        return None;
-    }
-    Some(name)
-}
-
 #[derive(Parser)]
 #[command(
-    about = "scan the project and write an hdlsim.ini library config in the current directory"
+    about = "scan the project and write an hdlsim.ini library config in the current directory",
+    long_about = "Scan the project tree and write ./hdlsim.ini with a [Library] section.\n\
+\n\
+Each directory containing VHDL sources maps to a logical library named after\n\
+the directory's last path component (one line per name; if several dirs share\n\
+a name, the shallowest path wins, so build-tree copies under vivado/... lose\n\
+to the real source dir). The project root itself is `work = .`, which indexes\n\
+the whole tree recursively. `library X;` clauses in the sources are NOT used\n\
+for naming \u{2014} they are often stale copy-paste.\n\
+\n\
+Vendor library roots (--lib-root, or $HDLSIM_XILINX_LIBS / $XILINX_VIVADO and\n\
+$XILINX_HLS `data/vhdl/src`) are persisted as absolute `name = path` lines, so\n\
+e.g. Xilinx unisim/unimacro/secureip resolve without manual -L flags.\n\
+\n\
+Examples:\n  \
+  hdlsim init                          # write ./hdlsim.ini\n  \
+  hdlsim init --progress               # show scan progress on stderr\n  \
+  hdlsim init --root ~/proj --force    # scan another tree, overwrite\n  \
+  hdlsim init --lib-root $XILINX_VIVADO/data/vhdl/src"
 )]
 struct InitArgs {
     /// Overwrite an existing hdlsim.ini.
@@ -60,6 +47,11 @@ struct InitArgs {
     /// Print scan progress to stderr.
     #[arg(long)]
     progress: bool,
+    /// Persist each subdirectory of DIR as a library named after the subdir
+    /// (e.g. --lib-root $XILINX_VIVADO/data/vhdl/src maps unisim, unimacro, ...).
+    /// Repeatable. Env fallback: HDLSIM_XILINX_LIBS, XILINX_VIVADO, XILINX_HLS.
+    #[arg(long, value_name = "DIR")]
+    lib_root: Vec<PathBuf>,
 }
 
 pub struct Init;
@@ -131,6 +123,17 @@ impl Command for Init {
                         lib_dirs.insert(name, dir);
                     }
                 }
+            }
+        }
+        // Vendor library roots (--lib-root, plus Xilinx env auto-detection):
+        // persist each subdir with sources as an absolute `name = path` line.
+        // Project-local mappings win on name collisions.
+        let mut lib_roots = a.lib_root.clone();
+        lib_roots.extend(hdl_lib::providers::xilinx_lib_roots_from_env());
+        for lr in &lib_roots {
+            let lr = lr.canonicalize().unwrap_or_else(|_| lr.clone());
+            for (name, dir) in hdl_lib::providers::lib_root_libraries(&lr) {
+                lib_dirs.entry(name).or_insert(dir);
             }
         }
         // `work = .` indexes the whole tree recursively; the per-library lines

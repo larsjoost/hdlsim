@@ -111,6 +111,7 @@ cargo test              # unit + integration tests
 ```
 hdlsim init                                  # scan the project, write hdlsim.ini (indexed resolution)
 hdlsim init --progress                       # same, with live scan progress on stderr
+hdlsim help <command>                        # detailed help for any command (e.g. hdlsim help init)
 hdlsim check file.v ...                      # parse + lower + resolve, report diagnostics
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us --seed 42
@@ -269,10 +270,19 @@ mylib = libs/mylib
 ```
 
 Run `hdlsim init` in a project to generate it: `work = .` indexes the whole
-tree, and each `library X;` clause found in the sources gets a `X = <dir>`
-line. Without any config, hdlsim already indexes the current directory as
-`work` and falls back to searching the project for unknown units (warning
+tree, and each directory containing VHDL sources gets a one-line mapping named
+after the directory (`processor = hw/hdl/sccore/processor`; if several dirs
+share a name, the shallowest path wins so build-tree copies lose). Vendor
+library roots are persisted too: `--lib-root DIR` (each subdir of DIR becomes
+a library named after it) and Xilinx auto-detection via `HDLSIM_XILINX_LIBS`,
+`XILINX_VIVADO`/`XILINX_HLS` (`data/vhdl/src` -> unisim, unimacro, secureip,
+...). Without any config, hdlsim already indexes the current directory as
+`work`, auto-detects those Xilinx roots, and falls back to searching the
+project (plus any `-S DIR` search roots) for unknown units (warning
 `W0502`/`W0501` tells you to run `hdlsim init` or add `-L name=dir`).
+Resolution is by design-unit name across all libraries, so `library X;`
+clauses in sources never need to match the ini names. See
+`hdlsim help init` and `hdlsim help check`.
 
 ## License
 
