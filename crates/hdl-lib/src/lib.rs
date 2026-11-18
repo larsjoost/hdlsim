@@ -154,6 +154,15 @@ impl LibraryManager {
         self.add_provider(Box::new(DirProvider::mixed(name, path)));
     }
 
+    /// Add a "library root" (e.g. `$XILINX_VIVADO/data/vhdl/src`): each
+    /// immediate subdirectory containing sources becomes a logical library
+    /// named after the subdir.
+    pub fn add_lib_root(&mut self, root: &Path) {
+        for (name, dir) in providers::lib_root_libraries(root) {
+            self.add_library_dir(&name, &dir);
+        }
+    }
+
     /// Add an include search directory for `` `include ``.
     pub fn add_incdir(&mut self, path: PathBuf) {
         self.incdirs.push(path);

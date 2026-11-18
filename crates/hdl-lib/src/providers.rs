@@ -290,4 +290,110 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn lib_root_libraries_maps_subdirs_with_sources() {
+        let root = std::env::temp_dir().join(format!("hdlsim_libroot_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("unisim")).unwrap();
+        std::fs::create_dir_all(root.join("empty_lib")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("unisim/vcomponents.vhd"), "package v is end;").unwrap();
+        std::fs::write(root.join(".hidden/x.vhd"), "").unwrap();
+        std::fs::write(root.join("README.md"), "").unwrap();
+
+        let libs = lib_root_libraries(&root);
+        assert_eq!(libs, vec![("unisim".to_string(), root.join("unisim"))]);
+        assert_eq!(
+            library_name_from_dir(&root.join("2nd-gen")),
+            Some("lib_2nd_gen".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Guess a logical library name from a directory name: lowercase, invalid
+/// identifier chars become `_`, and a non-identifier start gets a `lib_`
+/// prefix (e.g. `scint_scan_integrator` stays as-is, `2nd` -> `lib_2nd`).
+/// Returns `None` for the project root or reserved/built-in names.
+pub fn library_name_from_dir(dir: &Path) -> Option<String> {
+    let raw = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+    {
+        name = format!("lib_{name}");
+    }
+    // Reserved / built-in names are not user libraries.
+    if matches!(name.as_str(), "work" | "std" | "ieee" | "ieee_proposed") {
+        return None;
+    }
+    Some(name)
+}
+
+/// A "library root" (e.g. `$XILINX_VIVADO/data/vhdl/src`): each immediate
+/// subdirectory containing sources becomes a logical library named after the
+/// subdir. Returns `(name, dir)` pairs in sorted order.
+pub fn lib_root_libraries(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name()
+            .map_or(false, |n| is_skip_dir(&n.to_string_lossy()))
+        {
+            continue;
+        }
+        if walk_source_files(&p).is_empty() {
+            continue;
+        }
+        if let Some(name) = library_name_from_dir(&p) {
+            out.push((name, p));
+        }
+    }
+    out
+}
+
+/// Xilinx vendor library roots from the environment: `HDLSIM_XILINX_LIBS`
+/// (explicit root whose subdirs are libraries), else
+/// `$XILINX_VIVADO/data/vhdl/src` and `$XILINX_HLS/data/vhdl/src` if those
+/// directories exist.
+pub fn xilinx_lib_roots_from_env() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(v) = std::env::var("HDLSIM_XILINX_LIBS") {
+        if !v.is_empty() {
+            roots.push(PathBuf::from(v));
+        }
+    }
+    for var in ["XILINX_VIVADO", "XILINX_HLS"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let p = Path::new(&v).join("data/vhdl/src");
+                if p.is_dir() {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots
 }

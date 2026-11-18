@@ -60,12 +60,21 @@ impl Command for Help {
             env!("CARGO_PKG_VERSION")
         );
         println!("usage: hdlsim <command> [args]");
+        println!("       hdlsim help <command>   detailed help for one command");
         for c in COMMANDS {
             println!("  {:<12} {}", c.name(), c.about());
         }
         println!("common flags: -L name=path   map a logical library to a directory");
         println!("              --config FILE  library config (default: ./hdlsim.ini if present)");
         println!("              -I DIR         add an `include search directory");
+        println!("              -S DIR         add DIR to the on-demand project search roots");
+        println!(
+            "              --lib-root DIR treat each subdir of DIR as a library named after it"
+        );
+        println!(
+            "                             (Xilinx auto-detect: HDLSIM_XILINX_LIBS, XILINX_VIVADO,"
+        );
+        println!("                              XILINX_HLS -> data/vhdl/src)");
         println!("              --bundle FILE  read the whole project from a reproducer .tar");
         println!();
         println!("  Global flags (before or after the command):");
@@ -89,6 +98,11 @@ pub struct CommonOpts {
     pub libs: Vec<(String, PathBuf)>,
     pub config: Option<PathBuf>,
     pub incdirs: Vec<PathBuf>,
+    /// `--lib-root DIR`: each subdirectory of DIR becomes a library named
+    /// after the subdir.
+    pub lib_roots: Vec<PathBuf>,
+    /// `-S DIR`: extra on-demand project search roots (no library name).
+    pub search_dirs: Vec<PathBuf>,
     /// `--bundle repro.tar`: extract this reproducer bundle to a temp dir and
     /// resolve the whole project (config, libraries, include dirs) from there.
     pub bundle: Option<PathBuf>,
@@ -107,6 +121,15 @@ pub struct CommonArgs {
     /// Add an `include search directory.
     #[arg(long, short = 'I')]
     pub incdir: Vec<PathBuf>,
+    /// Treat each subdirectory of DIR as a logical library named after the
+    /// subdir (e.g. --lib-root $XILINX_VIVADO/data/vhdl/src maps unisim,
+    /// unimacro, secureip, ...). Repeatable.
+    #[arg(long, value_name = "DIR")]
+    pub lib_root: Vec<PathBuf>,
+    /// Add DIR to the on-demand project search roots (no library name).
+    /// Repeatable.
+    #[arg(long, short = 'S', value_name = "DIR")]
+    pub search_dir: Vec<PathBuf>,
     /// Read the whole project from a reproducer .tar.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
@@ -121,6 +144,8 @@ impl CommonArgs {
         }
         opts.config = self.config;
         opts.incdirs = self.incdir;
+        opts.lib_roots = self.lib_root;
+        opts.search_dirs = self.search_dir;
         opts.bundle = self.bundle;
         Ok(opts)
     }
@@ -227,6 +252,18 @@ pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Optio
         };
         mgr.add_incdir(p);
     }
+    // Library roots (--lib-root and Xilinx env auto-detection): each subdir
+    // with sources becomes a library named after the subdir. Explicit ini/-L
+    // mappings come first, so they win on unit-name collisions.
+    for lr in &opts.lib_roots {
+        mgr.add_lib_root(lr);
+    }
+    for xr in hdl_lib::providers::xilinx_lib_roots_from_env() {
+        mgr.add_lib_root(&xr);
+    }
+    for d in &opts.search_dirs {
+        mgr.add_search_root(d.clone());
+    }
     Ok((mgr, root))
 }
 
@@ -262,9 +299,72 @@ pub fn parse_time(s: &str) -> anyhow::Result<u64> {
     Ok((v * mult) as u64)
 }
 
+/// `hdlsim help <command>` — detailed per-command documentation.
+struct HelpCmd;
+
+impl Command for HelpCmd {
+    fn name(&self) -> &'static str {
+        "help"
+    }
+    fn about(&self) -> &'static str {
+        "show detailed help for a command: hdlsim help <command>"
+    }
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
+        let Some(name) = args.first() else {
+            println!("usage: hdlsim help <command>\n");
+            return Help.run(&[]);
+        };
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.name() == name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("unknown command '{name}' (try 'hdlsim --help')"))?;
+        println!("hdlsim {} — {}", cmd.name(), cmd.about());
+        if let Some(long) = command_long_help(cmd.name()) {
+            println!("\n{long}");
+        }
+        println!(
+            "\nflags (`hdlsim {} --help` shows the same list):",
+            cmd.name()
+        );
+        cmd.run(&["--help".to_string()])
+    }
+}
+
+/// Detailed long-form documentation per command, shown by `hdlsim help <cmd>`.
+fn command_long_help(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "run" => "Compile the given sources and simulate the testbench --top until it\nstops (or --max-time). Waves: --vcd/--hwf/--fst files, --wave/--live HTML\nviewer. --seed N makes $random reproducible. Common library flags apply:\n-L name=path, --config, -I, -S, --lib-root (see `hdlsim help check`).",
+        "check" => "Parse + lower + resolve the given files and print rustc-style\ndiagnostics (errors/warnings) without simulating. Fast way to validate a\nproject. Library resolution: ./hdlsim.ini (written by `hdlsim init`) or\n--config FILE, then -L name=path mappings, then --lib-root DIR trees (each\nsubdir of DIR becomes a library named after it; Xilinx unisim/unimacro/...\nare auto-detected via HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS),\nthen -S DIR on-demand search roots, then `work = .` recursive scan of the\ncwd. Unit lookup is by design-unit name across all libraries (first match\nwins), so `use unisim.vcomponents.all;` works once unisim's dir is mapped.",
+        "wave" => "Render a .hwf (hdlsim binary) or .fst wave file to a standalone HTML\nviewer with -o out.html; without -o it prints the viewer path/serves it.",
+        "ast" => "Parse one file and print its lossless CST as an s-expression — the\nreusable syntax tree the lowerer consumes. Useful when debugging parser\nissues; spans are file:line:col.",
+        "init" => "Scan the project and write ./hdlsim.ini with a [Library] section.\nEach directory containing VHDL sources maps to a logical library named after\nthe directory's last component (one line per name; if several dirs share a\nname the shallowest path wins, so build-tree copies under vivado/... lose to\nthe real source dir). The project root is `work = .`. `library X;` clauses in\nsources are not used for naming (often stale). Vendor roots (--lib-root DIR,\nor HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS `data/vhdl/src`) are\npersisted as absolute `name = path` lines so e.g. Xilinx unisim resolves.\nUse --force to overwrite, --progress to watch the scan.",
+        "project" => "Emit a project file for an external tool: --format vivado writes a Tcl\nscript (add_files + vlog/vcom per library dir from hdlsim.ini/-L), --format\njson writes a machine-readable manifest of files, libraries and units.\n--top/--sim-top pick the elaboration/testbench tops.",
+        "prove" => "Bounded model checking over the elaborated IR with the built-in CDCL SAT\nsolver: hdlsim prove --top dut [--bmc N] files... explores up to N steps and\nreports a counterexample trace on failure.",
+        "debug" => "Interactive/one-shot debug of a simulation: --dump prints signal values at\nthe end, --watch sig prints every change of sig, --mem name dumps a memory,\n--all dumps everything, --max-time/--seed bound the run.",
+        "bundle" => "Pack the project (sources, hdlsim.ini, include dirs) into one .tar\nreproducer for a bug report: hdlsim bundle --out repro.tar [--top tb]\n[files...]. Re-open elsewhere with `--bundle repro.tar` on any command.",
+        "regress" => "Run a set of testbenches and emit JUnit XML (--junit out.xml):\n--list tests.txt reads tops from a file, --max-time bounds each, --coverage\nadds coverage info. Exit code reflects pass/fail.",
+        "lsp" => "Language-server on stdio: initialize advertises full document sync,\ncompletion, hover and go-to-definition over the project libraries.",
+        "fmt" => "Format Verilog/VHDL sources in place with -w, or print formatted output\nto stdout; --check exits non-zero if anything would change (CI gate).",
+        "lint" => "Lint sources (style + common-mistake rules); --fix applies safe fixes,\nexit code 1 if any finding remains. Codes are explained by `hdlsim explain`.",
+        "do" => "Run a mini-Tcl do-file (examine/force/run/quit/...) against a compiled\ndesign: hdlsim do script.do --top tb [files...].",
+        "deps" => "List every file the top unit transitively depends on (libraries resolved\nvia hdlsim.ini/-L/--lib-root), in compile order — useful for build scripts.",
+        "assist" => "Map a natural-language prompt to an hdlsim task (local router, --yes to\nskip confirmation): hdlsim assist \"why does tb.v fail\".",
+        "explain" => "Explain a diagnostic/lint code (E0301, W0502, ...): what it means, an\nexample, and how to fix it. No argument lists all codes.",
+        "gen" => "Generate a testbench skeleton from the design's top entity:\nhdlsim gen tb --top m [--lang verilog|vhdl] [-o out] [files...].",
+        "analyze" => "Static heuristics on the compiled design: undriven (W0501) / unread\n(W0502) signals and related warnings per module.",
+        "doc" => "Generate cross-linked HTML documentation from the sources into\nhtml-docs/ (--out DIR to change), linking entities, packages and instances.",
+        "doctor" => "Check the environment: embedded stdlib present, hdlsim.ini readable and\nits dirs existing, -L dirs existing, include dirs, cache dir writable.\nExit code reflects the worst finding.",
+        "completions" => "Print a shell completion script for bash/zsh/fish:\nhdlsim completions bash >> ~/.bashrc",
+        "help" => "Show detailed help for a command: hdlsim help <command>.\nWith no argument, prints the top-level help.",
+        "--help" => "Top-level help: command list plus the common flags.",
+        _ => return None,
+    })
+}
+
 /// Registry of all subcommands. Add one line per new command.
 pub const COMMANDS: &[&dyn Command] = &[
     &Help,
+    &HelpCmd,
     &run::Run,
     &wave::Wave,
     &check::Check,
@@ -349,6 +449,24 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         assert_eq!(dispatch(&["--help".to_string()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn help_command_shows_per_command_docs() {
+        assert_eq!(dispatch(&["help".to_string()]).unwrap(), 0);
+        assert_eq!(
+            dispatch(&["help".to_string(), "init".to_string()]).unwrap(),
+            0
+        );
+        assert!(dispatch(&["help".to_string(), "frobnicate".to_string()]).is_err());
+        // Every registered command has long-form docs.
+        for c in COMMANDS {
+            assert!(
+                command_long_help(c.name()).is_some(),
+                "missing long help for {}",
+                c.name()
+            );
+        }
     }
 
     #[test]
