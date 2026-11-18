@@ -124,7 +124,12 @@ fn is_skip_dir(name: &str) -> bool {
     name.starts_with('.') || matches!(name, "target" | "node_modules")
 }
 
-fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
+fn walk_paths(
+    dir: &Path,
+    exts: &[&str],
+    out: &mut Vec<PathBuf>,
+    on_dir: &mut dyn FnMut(&Path, usize),
+) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -137,9 +142,39 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
             {
                 continue;
             }
-            walk(&p, exts, out);
+            walk_paths(&p, exts, out, on_dir);
         } else if p
             .extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |e| exts.contains(&e))
+        {
+            out.push(p);
+        }
+    }
+    on_dir(dir, out.len());
+}
+
+/// Walk `dir` recursively for source file paths of any known extension
+/// (skipping hidden dirs, `target`, `node_modules`) without parsing them;
+/// `on_dir` fires after each directory with (dir, files found so far), so
+/// callers can render progress.
+pub fn walk_source_files_with(dir: &Path, on_dir: impl FnMut(&Path, usize)) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut on_dir = on_dir;
+    walk_paths(dir, &["v", "sv", "vhd", "vhdl"], &mut out, &mut on_dir);
+    out
+}
+
+/// Walk `dir` recursively for source file paths (no parsing) — for callers
+/// that only need the files, not their design units.
+pub fn walk_source_files(dir: &Path) -> Vec<PathBuf> {
+    walk_source_files_with(dir, |_, _| {})
+}
+
+fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
+    let files = walk_source_files_with(dir, |_, _| {});
+    for p in files {
+        if p.extension()
             .and_then(|e| e.to_str())
             .map_or(false, |e| exts.contains(&e))
         {
@@ -223,4 +258,36 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
                 .map(|n| db.span_text(n.span()).trim().to_string())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_source_files_skips_hidden_and_build_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("hdlsim_walk_test_{}_{}", std::process::id(), "a"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("a.vhd"), "entity e is end;").unwrap();
+        std::fs::write(root.join("sub/b.sv"), "module m; endmodule").unwrap();
+        std::fs::write(root.join(".hidden/c.vhd"), "").unwrap();
+        std::fs::write(root.join("target/d.vhd"), "").unwrap();
+        std::fs::write(root.join("note.txt"), "").unwrap();
+
+        let mut dirs_seen = Vec::new();
+        let files = walk_source_files_with(&root, |dir, _n| dirs_seen.push(dir.to_path_buf()));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.vhd".to_string(), "b.sv".to_string()]);
+        assert!(dirs_seen.contains(&root));
+        assert!(dirs_seen.contains(&root.join("sub")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -110,6 +110,7 @@ cargo test              # unit + integration tests
 
 ```
 hdlsim init                                  # scan the project, write hdlsim.ini (indexed resolution)
+hdlsim init --progress                       # same, with live scan progress on stderr
 hdlsim check file.v ...                      # parse + lower + resolve, report diagnostics
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us --seed 42
