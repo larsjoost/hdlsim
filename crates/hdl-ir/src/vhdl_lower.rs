@@ -5682,7 +5682,10 @@ impl<'a> Lower<'a> {
             let n = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
             if n > 0
                 && t.len() > n
-                && matches!(t.as_bytes()[n], b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
+                && matches!(
+                    t.as_bytes()[n],
+                    b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
+                )
             {
                 &t[n..]
             } else {
@@ -5690,17 +5693,22 @@ impl<'a> Lower<'a> {
             }
         };
         if t.len() >= 2
-            && matches!(t.as_bytes()[0], b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
+            && matches!(
+                t.as_bytes()[0],
+                b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
+            )
             && t.as_bytes()[1] == b'"'
         {
             let base = match t.as_bytes()[0].to_ascii_lowercase() {
                 b'x' => 16,
                 b'o' => 8,
+                b'd' => 10,
                 _ => 2,
             };
             let digits = t[2..t.len() - 1].replace('_', "");
             let digit_bits = match base {
                 16 => 4,
+                10 => 4, // decimal digit in a D bit string: 4 bits (BCD-style)
                 8 => 3,
                 _ => 1,
             };
