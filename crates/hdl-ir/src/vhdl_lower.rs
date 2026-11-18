@@ -82,6 +82,9 @@ pub struct PackageIr {
     /// clauses — use clauses are transitive through packages in VHDL, so
     /// `use work.p.all` also exposes what `p` used.
     pub uses: Vec<String>,
+    /// User-defined attribute names declared in this package
+    /// (`attribute a : T;`), made visible by `use` clauses like other items.
+    pub attr_decls: Vec<String>,
 }
 
 /// A lowered configuration declaration: `configuration cfg of ent is ... end;`.
@@ -789,6 +792,9 @@ struct Lower<'a> {
     /// otherwise leak across entities; the architecture of entity E installs
     /// E's snapshot (see lower_architecture).
     entity_maps: HashMap<String, SigMaps>,
+    /// User-defined attribute names in scope (`attribute a : T;` in this file
+    /// or a `use`d package) — `x'a` lowers to X silently for these.
+    attr_decls: std::collections::HashSet<String>,
 }
 
 /// Per-module signal metadata (`SigId` is relative to one module).
@@ -834,6 +840,7 @@ impl<'a> Lower<'a> {
             file_root: None,
             inst_packages: Vec::new(),
             entity_maps: HashMap::new(),
+            attr_decls: std::collections::HashSet::new(),
         }
     }
 
@@ -932,6 +939,18 @@ impl<'a> Lower<'a> {
 
     fn kw(&self, n: &SyntaxNode) -> String {
         self.text(n).to_ascii_lowercase()
+    }
+
+    /// `attribute name : type;` — register the attribute name as user-defined
+    /// so `x'name` lowers to X without a warning. Returns the name.
+    fn register_attr_decl(&mut self, d: &SyntaxNode) -> Option<String> {
+        let name = real_children(d)
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .find(|w| w != "attribute")?;
+        self.attr_decls.insert(name.clone());
+        Some(name)
     }
 
     fn register_builtin_types(&mut self) {
@@ -1568,6 +1587,9 @@ impl<'a> Lower<'a> {
             match k.kind() {
                 SyntaxKind::GenericClause => self.lower_generic_clause(&mut module, k),
                 SyntaxKind::PortClause => self.lower_port_clause(&mut module, k),
+                SyntaxKind::AttrDecl => {
+                    self.register_attr_decl(k);
+                }
                 _ => {}
             }
             for sig in self.extra_signals.drain(..) {
@@ -1852,6 +1874,11 @@ impl<'a> Lower<'a> {
                 self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
             }
         }
+        for a in &p.attr_decls {
+            if item.is_none_or(|i| i == a) {
+                self.attr_decls.insert(a.clone());
+            }
+        }
         // Use clauses are transitive through packages: `use work.p.all` also
         // exposes what `p` itself made visible via `use lib.q.all;`.
         if item.is_none() && visited.insert(p.name.to_ascii_lowercase()) {
@@ -1915,12 +1942,18 @@ impl<'a> Lower<'a> {
         }
         let mut functions: Vec<FuncIr> = Vec::new();
         let mut uses: Vec<String> = Vec::new();
+        let mut attr_decls: Vec<String> = Vec::new();
         for d in real_children(p) {
             match d.kind() {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
+                SyntaxKind::AttrDecl => {
+                    if let Some(a) = self.register_attr_decl(&d) {
+                        attr_decls.push(a);
+                    }
+                }
                 SyntaxKind::UseClause => {
                     uses.extend(use_clause_units(&d, self.db));
                     self.merge_use_clause(&d);
@@ -2003,6 +2036,7 @@ impl<'a> Lower<'a> {
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
+            attr_decls,
         }
     }
 
@@ -2111,6 +2145,7 @@ impl<'a> Lower<'a> {
             pkg.consts.extend(part.consts);
             pkg.functions.extend(part.functions);
             pkg.uses.extend(part.uses);
+            pkg.attr_decls.extend(part.attr_decls);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -2200,6 +2235,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ComponentDecl => {} // components resolve to entities by name
                 SyntaxKind::Function => self.lower_function_decl(module, d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::AttrDecl => {
+                    self.register_attr_decl(d);
+                }
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
@@ -2363,6 +2401,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::AttrDecl => {
+                    self.register_attr_decl(d);
+                }
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
@@ -3195,6 +3236,7 @@ impl<'a> Lower<'a> {
                 | SyntaxKind::VariableDecl
                 | SyntaxKind::ConstantDecl
                 | SyntaxKind::AliasDecl
+                | SyntaxKind::AttrDecl
                 | SyntaxKind::TypeDecl
                 | SyntaxKind::SubtypeDecl
                 | SyntaxKind::FileDecl
@@ -3283,6 +3325,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
+                SyntaxKind::AttrDecl => {
+                    self.register_attr_decl(d);
+                }
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
                 SyntaxKind::VariableDecl => {
                     let dk = real_children(d);
@@ -3452,6 +3497,9 @@ impl<'a> Lower<'a> {
                         SyntaxKind::TypeDecl => self.lower_type_decl(k),
                         SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
                         SyntaxKind::AliasDecl => self.lower_alias_decl(k),
+                        SyntaxKind::AttrDecl => {
+                            self.register_attr_decl(k);
+                        }
                         _ => {}
                     }
                 }
@@ -4301,6 +4349,52 @@ impl<'a> Lower<'a> {
         let (lo, hi, downto) = match range.map(|r| r.kind()) {
             Some(SyntaxKind::Range) => {
                 let rk = real_children(range.unwrap());
+                // `for i in s'range loop` — the range is a Range node holding an
+                // Attr child; resolve the bounds from the signal's dims.
+                if let Some(at) = rk.iter().find(|k| k.kind() == SyntaxKind::Attr) {
+                    let ak = real_children(at);
+                    let attr = ak
+                        .iter()
+                        .filter(|k| k.kind() == SyntaxKind::Ident)
+                        .last()
+                        .map(|k| self.kw(k))
+                        .unwrap_or_default();
+                    if attr == "range" || attr == "reverse_range" {
+                        if let Some(b) = ak.iter().find(|k| k.kind() == SyntaxKind::Name) {
+                            let bn = self.text(b);
+                            let dims = self
+                                .sig_id(&bn)
+                                .and_then(|id| self.sig_dims.get(&id).cloned())
+                                .or_else(|| {
+                                    self.types.get(&bn.to_ascii_lowercase()).and_then(|t| {
+                                        if let TypeInfo::Array { dims, .. } = t {
+                                            Some(dims.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                });
+                            if let Some(dims) = dims {
+                                if let Some(&(lo, n)) = dims.first() {
+                                    let hi = lo + n as i64 - 1;
+                                    let (a, b, dt) = if attr == "reverse_range" {
+                                        (hi, lo, true)
+                                    } else {
+                                        (lo, hi, false)
+                                    };
+                                    let body = self.lower_seq_block(s);
+                                    return self.make_for(
+                                        var_id,
+                                        Expr::Lit(Value::from_u64(32, a as u64)),
+                                        Expr::Lit(Value::from_u64(32, b as u64)),
+                                        dt,
+                                        body,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 let exprs: Vec<&SyntaxNode> =
                     rk.iter().filter(|k| is_expr_node(k.kind())).collect();
                 let dir = rk
@@ -4937,8 +5031,44 @@ impl<'a> Lower<'a> {
                             };
                             return Expr::Lit(Value::from_u64(32, v));
                         }
-                        Expr::Lit(Value::x(32))
+                        // Type marks and subtypes: `integer'high`, `my_arr'length`, ...
+                        return self.type_attr(&bn, &attr);
                     }
+                    // `s'range` in expression position is only meaningful in a
+                    // for-spec (handled there); as a value it is X.
+                    "range" | "reverse_range" => return Expr::Lit(Value::x(32)),
+                    // Report/simulation attributes: placeholder, no warning.
+                    "path_name" | "instance_name" | "last_event" | "image" | "reverse_image"
+                    | "encoding" | "max_wire_delay" | "subtype" | "simple_name" => {
+                        return Expr::Lit(Value::x(32));
+                    }
+                    // `sig'quiet` = no event this delta; `sig'active` = event.
+                    "quiet" => {
+                        if let Some(id) = self.sig_id(&bn) {
+                            let s = || Box::new(Expr::Sig(id));
+                            return Expr::Un {
+                                op: UnOp::Not,
+                                e: Box::new(Expr::Bin {
+                                    op: BinOp::LogOr,
+                                    l: Box::new(Expr::Rising(s())),
+                                    r: Box::new(Expr::Falling(s())),
+                                }),
+                            };
+                        }
+                        return Expr::Lit(Value::x(1));
+                    }
+                    "active" | "transaction" => {
+                        if let Some(id) = self.sig_id(&bn) {
+                            let s = || Box::new(Expr::Sig(id));
+                            return Expr::Bin {
+                                op: BinOp::LogOr,
+                                l: Box::new(Expr::Rising(s())),
+                                r: Box::new(Expr::Falling(s())),
+                            };
+                        }
+                        return Expr::Lit(Value::x(1));
+                    }
+                    "ascending" => return Expr::Lit(Value::from_u64(1, 1)),
                     // `sig'last_value` — value before the current delta.
                     "last_value" => {
                         if let Some(id) = self.sig_id(&bn) {
@@ -4990,6 +5120,11 @@ impl<'a> Lower<'a> {
                         }
                     }
                     _ => {
+                        // User-declared attributes (`attribute a : T;`) have no
+                        // tracked value; X without a warning.
+                        if self.attr_decls.contains(&attr) {
+                            return Expr::Lit(Value::x(32));
+                        }
                         self.warn(
                             e.span(),
                             format!("attribute '{}\'{}' not supported; X", bn, attr),
@@ -5004,6 +5139,34 @@ impl<'a> Lower<'a> {
                 Expr::Lit(Value::x(1))
             }
         }
+    }
+
+    /// `T'length` / `T'high` / `T'low` / `T'left` / `T'right` for a type mark
+    /// or subtype name (no signal involved), e.g. `integer'high`, `my_arr'length`.
+    fn type_attr(&self, name: &str, attr: &str) -> Expr {
+        let n = name.to_ascii_lowercase();
+        let bounds: Option<(i64, i64)> = match n.as_str() {
+            "integer" => Some((i32::MIN as i64, i32::MAX as i64)),
+            "natural" | "positive" => Some((0, i32::MAX as i64)),
+            "boolean" | "bit" | "std_logic" | "std_ulogic" => Some((0, 1)),
+            _ => match self.types.get(&n) {
+                Some(TypeInfo::Integer { .. }) => Some((i32::MIN as i64, i32::MAX as i64)),
+                Some(TypeInfo::Enum(lits)) => Some((0, lits.len() as i64 - 1)),
+                Some(TypeInfo::Array { dims, .. }) => {
+                    dims.first().map(|(l, sz)| (*l, *l + *sz as i64 - 1))
+                }
+                _ => None,
+            },
+        };
+        let Some((lo, hi)) = bounds else {
+            return Expr::Lit(Value::x(32)); // unconstrained vector etc.
+        };
+        let v = match attr {
+            "length" => (hi - lo + 1).max(0) as u64,
+            "high" | "left" => hi.max(0) as u64,
+            _ => lo.max(0) as u64, // low | right
+        };
+        Expr::Lit(Value::from_u64(32, v))
     }
 
     fn lower_call(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
