@@ -1,4 +1,4 @@
-# hdlsim — plan
+| (direct) | VHDL corpus round 3: `billowitch/disputed` + `ashenden/non_compliant` + `sanity/` as `ghdl4_*.vhd` — **25/25 kept files fully `clean`** (corpus 2686/2686 clean, 0 diags; vhdl 2605). Parser fixes: VHDL-2008 `parameter` subprogram keyword, sized bit-strings `32D".."`/`32SB".."`. Excluded: unit collisions, negative tests, VHDL-AMS `ams08`, `all08` (conditional expressions unsupported) | # hdlsim — plan
 
 Self-contained VHDL + Verilog simulator. Std-only Rust, zero external crates, no
 wrapping of GHDL/Icarus/Verilator (including as test oracles).

@@ -1295,6 +1295,9 @@ impl<'a> Parser<'a> {
         } else {
             self.error_here("expected a subprogram name");
         }
+        // VHDL-2008: `procedure p parameter (x : t);` — the interface list may
+        // be introduced by the `parameter` keyword.
+        self.eat_kw("parameter");
         if self.eat_punct('(') {
             while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
                 self.parse_interface_decl(SyntaxKind::PortDecl);
@@ -2704,19 +2707,22 @@ impl<'a> Parser<'a> {
                     && self.peek_text().len() >= 2
                     && matches!(
                         self.peek_text().as_bytes()[0],
-                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O'
+                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
                     )
                     && self.peek_text().as_bytes()[1] == b'"'
                 {
                     self.bump();
                 }
-                // Sized bit-string literal: `32X"0"` — the size integer is
-                // directly followed by the base letter + string.
+                // Sized bit-string literal: `32X"0"`, `32SB"1"` — the size
+                // integer is directly followed by an optional `s` (signed),
+                // the base letter, and the string.
                 if self.peek().kind == TokenKind::Ident
-                    && self.peek_text().len() == 1
+                    && (self.peek_text().len() == 1
+                        || (self.peek_text().len() == 2
+                            && matches!(self.peek_text().as_bytes()[0], b's' | b'S')))
                     && matches!(
-                        self.peek_text().as_bytes()[0],
-                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O'
+                        self.peek_text().as_bytes()[self.peek_text().len() - 1],
+                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
                     )
                     && self.peek2().kind == TokenKind::StrLiteral
                 {
@@ -2800,7 +2806,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident
                 if matches!(
                     self.peek_text().to_ascii_lowercase().as_str(),
-                    "x" | "b" | "o"
+                    "x" | "b" | "o" | "d"
                 ) && self.peek2().kind == TokenKind::StrLiteral =>
             {
                 // Bit string literal: x"FF" / b"01" / o"17".
@@ -2956,6 +2962,21 @@ end architecture;
     }
 
     #[test]
+    #[test]
+    fn parses_vhdl2008_parameter_keyword_and_sized_bitstrings() {
+        let src = r#"package p is
+    procedure check parameter (filename : string);
+    function f return integer;
+end package;
+package body p is
+    procedure check parameter (filename : string) is begin null; end procedure;
+    function f return integer is begin return 32D"1" + 32SB"1" + 16X"ff"; end function;
+end package body;
+"#;
+        let (p, db) = parse_str(src);
+        no_errors(&p, &db);
+    }
+
     fn parses_block_header_sized_bitstring_and_misc() {
         let src = r#"entity t is
     generic (g_w : natural := 32X"0" & "00");
