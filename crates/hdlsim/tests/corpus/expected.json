@@ -2586,6 +2586,7 @@
   "vhdl/ghdl4_sanity_000hello_hello.vhdl": "clean",
   "vhdl/ghdl4_sanity_001hello87_hello.vhdl": "clean",
   "vhdl/ghdl4_sanity_002hello2008_hello.vhdl": "clean",
+  "vhdl/ghdl4_sanity_004all08_all08.vhdl": "clean",
   "vhdl/ghdl4_sanity_008coverage_ecounter.vhdl": "clean",
   "vhdl/ghdl4_vests_vhdl-93_ashenden_non_compliant_ch_03_ch_03_09.vhd": "clean",
   "vhdl/ghdl4_vests_vhdl-93_ashenden_non_compliant_ch_04_ch_04_03.vhd": "clean",

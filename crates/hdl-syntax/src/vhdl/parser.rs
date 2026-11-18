@@ -40,6 +40,7 @@ pub fn parse_file(file: FileId, src: &SourceFile) -> ParsedFile {
         pos: 0,
         builder: TreeBuilder::new(file),
         diags: lex_diags,
+        in_waveform: 0,
     };
     p.parse_design_file();
     let root = p.builder.finish();
@@ -55,6 +56,10 @@ struct Parser<'a> {
     pos: usize,
     builder: TreeBuilder,
     diags: Vec<Diagnostic>,
+    /// >0 while parsing a waveform value, where `when`/`else` belongs to the
+    /// waveform (conditional signal assignment), not to a conditional
+    /// expression.
+    in_waveform: u32,
 }
 
 /// Keyword operators, by precedence level (see parse_binops).
@@ -862,6 +867,18 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("is", "in the alias declaration");
         self.parse_name();
+        if self.eat_punct('[') {
+            // Subprogram signature after the name: `alias a is f[T, boolean return boolean];`
+            let mut depth = 1;
+            while depth > 0 && self.peek().kind != TokenKind::Eof {
+                if self.at_punct('[') {
+                    depth += 1;
+                } else if self.at_punct(']') {
+                    depth -= 1;
+                }
+                self.bump();
+            }
+        }
         // Optional signature on the target: `alias a is f[T1, T2];`
         if self.at_punct('[') {
             let mut depth = 1;
@@ -1480,6 +1497,24 @@ impl<'a> Parser<'a> {
             self.parse_gen_if();
         } else if self.at_kw("case") {
             self.parse_gen_case();
+        } else if self.at_kw("begin") {
+            // VHDL-2008 bare block as a generate-alternative body:
+            // `begin concurrent-stmts end [label] ;` (checked before the
+            // two-idents instantiation heuristic: `begin q <= ...`).
+            match label_mark {
+                Some(m) => self.builder.start_node_at(m, SyntaxKind::Block),
+                None => self.start(SyntaxKind::Block),
+            }
+            self.bump(); // begin
+            while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                self.parse_concurrent_stmt();
+            }
+            self.expect_kw("end", "to close the block");
+            if self.peek().kind == TokenKind::Ident {
+                self.bump(); // optional label
+            }
+            self.expect_punct(';', "to end the block");
+            self.builder.finish_node();
         } else if self.at_kw("entity")
             || self.at_kw("component")
             || self.at_kw("configuration")
@@ -1504,6 +1539,12 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_punct(')', "to close the aggregate target");
             } else {
+                self.parse_name();
+            }
+            // Concurrent configuration instantiation:
+            // `lbl : configuration lib.cfg [generic map (...)] [port map (...)];`
+            if self.at_kw("configuration") {
+                self.bump();
                 self.parse_name();
             }
             // Component instantiation with a selected name:
@@ -1536,27 +1577,27 @@ impl<'a> Parser<'a> {
                          // Waveform: `expr [after t] {, expr [after t]}`, and conditional
                          // form `expr when cond [else expr when cond]... [else expr]`.
             self.eat_delay_mechanism();
-            self.parse_expression();
+            self.parse_waveform_value();
             if self.at_kw("after") {
                 self.bump();
-                self.parse_expression();
+                self.parse_waveform_value();
             }
             loop {
                 if self.at_kw("when") || self.at_kw("else") {
                     self.bump();
-                    self.parse_expression();
+                    self.parse_waveform_value();
                     if self.at_kw("after") {
                         self.bump();
-                        self.parse_expression();
+                        self.parse_waveform_value();
                     }
                     continue;
                 }
                 if self.eat_punct(',') {
                     self.eat_delay_mechanism();
-                    self.parse_expression();
+                    self.parse_waveform_value();
                     if self.at_kw("after") {
                         self.bump();
-                        self.parse_expression();
+                        self.parse_waveform_value();
                     }
                     continue;
                 }
@@ -1595,10 +1636,10 @@ impl<'a> Parser<'a> {
             self.error_here("expected '<=' in the selected signal assignment");
         }
         loop {
-            self.parse_expression(); // waveform value
+            self.parse_waveform_value(); // waveform value
             if self.at_kw("after") {
                 self.bump();
-                self.parse_expression();
+                self.parse_waveform_value();
             }
             self.expect_kw("when", "before the selection choices");
             if self.at_kw("others") {
@@ -1607,7 +1648,7 @@ impl<'a> Parser<'a> {
                 self.builder.finish_node();
             } else {
                 loop {
-                    self.parse_expression();
+                    self.parse_waveform_value(); // choice
                     if !self.eat_punct('|') {
                         break; // a following `,` separates waveforms, not choices
                     }
@@ -1634,11 +1675,21 @@ impl<'a> Parser<'a> {
             }
             self.expect_kw("when", "before a case-generate alternative");
             self.start(SyntaxKind::CaseItem);
+            let mut labeled = false;
             if self.at_kw("others") {
                 self.start(SyntaxKind::Others);
                 self.bump();
                 self.builder.finish_node();
             } else {
+                // VHDL-2008 alternative label: `when lbl : choice =>`.
+                if self.peek().kind == TokenKind::Ident
+                    && self.peek2_text() == ":"
+                    && self.peek3_text() != "="
+                {
+                    self.bump();
+                    self.bump();
+                    labeled = true;
+                }
                 loop {
                     self.parse_expression();
                     if self.eat_punct('|') {
@@ -1655,9 +1706,28 @@ impl<'a> Parser<'a> {
             } else {
                 self.error_here("expected '=>' in a case-generate alternative");
             }
-            self.parse_gen_decl_part();
-            while !self.at_kw("when") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
-                self.parse_concurrent_stmt();
+            if labeled && self.at_kw("begin") {
+                // VHDL-2008 labeled alternative with a bare block body:
+                // `when lbl : choice => begin concurrent-stmts end lbl;`
+                self.start(SyntaxKind::Block);
+                self.bump(); // begin
+                while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+                    self.parse_concurrent_stmt();
+                }
+                self.expect_kw("end", "to close the block");
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump(); // alternative label
+                }
+                self.expect_punct(';', "to end the block");
+                self.builder.finish_node();
+            } else {
+                self.parse_gen_decl_part();
+                while !self.at_kw("when")
+                    && !self.at_kw("end")
+                    && self.peek().kind != TokenKind::Eof
+                {
+                    self.parse_concurrent_stmt();
+                }
             }
             self.builder.finish_node();
         }
@@ -2500,16 +2570,38 @@ impl<'a> Parser<'a> {
         self.parse_expr_prec(1);
     }
 
+    /// Parse an expression in waveform position, where a following
+    /// `when`/`else` belongs to the waveform, not to a conditional expression.
+    fn parse_waveform_value(&mut self) {
+        self.in_waveform += 1;
+        self.parse_expression();
+        self.in_waveform -= 1;
+    }
+
     fn parse_expr_prec(&mut self, min_prec: u8) {
         let mark = self.builder.mark();
         self.parse_unary();
         self.parse_binops(mark, min_prec);
+        if min_prec != 1 {
+            return;
+        }
         // VHDL-2008 conditional operator `??` (lowest precedence, right-assoc).
-        if min_prec == 1 && self.peek_text() == "?" && self.peek2_text() == "?" {
+        if self.peek_text() == "?" && self.peek2_text() == "?" {
             self.builder.start_node_at(mark, SyntaxKind::CondExpr);
             self.bump();
             self.bump();
             self.parse_expr_prec(1);
+            self.builder.finish_node();
+            return;
+        }
+        // VHDL-2008 conditional expression: `v when c else e [when c2 else e2]`.
+        // Not in waveform position (there `when` starts a conditional waveform).
+        if self.in_waveform == 0 && self.at_kw("when") {
+            self.builder.start_node_at(mark, SyntaxKind::CondExpr);
+            self.bump(); // when
+            self.parse_expr_prec(1); // condition
+            self.expect_kw("else", "in the conditional expression");
+            self.parse_expr_prec(1); // else branch (chains further when/else)
             self.builder.finish_node();
         }
     }
@@ -2597,22 +2689,22 @@ impl<'a> Parser<'a> {
 
     fn parse_waveform_elements(&mut self) {
         self.eat_delay_mechanism();
-        self.parse_expression();
+        self.parse_waveform_value();
         loop {
             if self.at_kw("after") {
                 self.bump();
-                self.parse_expression();
+                self.parse_waveform_value();
             }
             // Conditional waveform: `x <= a when c else b;` (flat tokens,
             // lowered like the concurrent form).
             if self.at_kw("when") || self.at_kw("else") {
                 self.bump();
-                self.parse_expression();
+                self.parse_waveform_value();
                 continue;
             }
             if self.eat_punct(',') {
                 self.eat_delay_mechanism();
-                self.parse_expression();
+                self.parse_waveform_value();
                 continue;
             }
             break;
@@ -2729,7 +2821,8 @@ impl<'a> Parser<'a> {
                     self.bump();
                     self.bump();
                 }
-                // Physical literal: `100 ps` — a number followed by a time unit.
+                // Physical literal: `100 ps`, `1.5 cm` — a number followed by a
+                // physical unit (time, length, frequency).
                 if self.peek().kind == TokenKind::Ident
                     && matches!(
                         self.peek_text().to_ascii_lowercase().as_str(),
@@ -2742,6 +2835,12 @@ impl<'a> Parser<'a> {
                             | "min"
                             | "hr"
                             | "um"
+                            | "mm"
+                            | "cm"
+                            | "m"
+                            | "km"
+                            | "nm"
+                            | "pm"
                             | "hz"
                             | "khz"
                             | "mhz"
@@ -3589,5 +3688,65 @@ end architecture;
             insts[1]
         );
         assert!(insts[1].contains("Ident \"configuration\""), "{}", insts[1]);
+    }
+
+    #[test]
+    fn parses_vhdl2008_conditional_expression() {
+        // `when/else` in a pure expression position (here: an if-condition)
+        // is a CondExpr; in a waveform it stays a flat conditional waveform.
+        let sexp = ok(r#"entity e is end entity;
+architecture rtl of e is
+    signal v, y, a, b : bit;
+begin
+    y <= a when v = '1' else b;
+    process(v)
+    begin
+        if (a when v = '1' else b) = '1' then
+            y <= '1';
+        end if;
+    end process;
+end architecture;
+"#);
+        let n_cond = sexp.matches("(CondExpr").count();
+        assert_eq!(n_cond, 1, "{}", sexp);
+    }
+
+    #[test]
+    fn parses_case_generate_labeled_alternative_bare_block() {
+        // VHDL-2008: `when lbl : choice => begin ... end lbl;`
+        let sexp = ok(r#"architecture rtl of e is
+begin
+    g4 : case conf generate
+        when g4_1 : 1 | 2 =>
+            begin
+                cmp : configuration work.reg_conf1
+                    generic map (width => 1)
+                    port map (clk => clk, q => do);
+            end g4_1;
+        when others =>
+    end generate g4;
+end architecture;
+"#);
+        assert!(sexp.contains("(GenCase"), "{}", sexp);
+        assert_eq!(sexp.matches("(CaseItem").count(), 2, "{}", sexp);
+        assert!(sexp.contains("(Block"), "{}", sexp);
+        assert!(sexp.contains("Ident \"configuration\""), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_alias_with_signature_and_sized_signed_bitstring() {
+        let sexp = ok(r#"package p is
+    type text_file is file of string;
+    function is_eof (file t : text_file; fake : boolean) return boolean;
+    alias iseof is is_eof [text_file, boolean return boolean];
+    constant c : bit_vector := 32SB"1010";
+end package;
+"#);
+        assert!(sexp.contains("(AliasDecl"), "{}", sexp);
+        assert!(
+            sexp.contains("(Literal IntLiteral \"32\" Ident \"SB\" StrLiteral"),
+            "{}",
+            sexp
+        );
     }
 }
