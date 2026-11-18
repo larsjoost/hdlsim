@@ -69,6 +69,9 @@ impl Command for Help {
         println!("              -I DIR         add an `include search directory");
         println!("              -S DIR         add DIR to the on-demand project search roots");
         println!(
+            "              --progress     show library indexing / resolution progress on stderr"
+        );
+        println!(
             "              --lib-root DIR treat each subdir of DIR as a library named after it"
         );
         println!(
@@ -103,6 +106,8 @@ pub struct CommonOpts {
     pub lib_roots: Vec<PathBuf>,
     /// `-S DIR`: extra on-demand project search roots (no library name).
     pub search_dirs: Vec<PathBuf>,
+    /// Print indexing/resolution progress to stderr.
+    pub progress: bool,
     /// `--bundle repro.tar`: extract this reproducer bundle to a temp dir and
     /// resolve the whole project (config, libraries, include dirs) from there.
     pub bundle: Option<PathBuf>,
@@ -130,6 +135,9 @@ pub struct CommonArgs {
     /// Repeatable.
     #[arg(long, short = 'S', value_name = "DIR")]
     pub search_dir: Vec<PathBuf>,
+    /// Print library indexing / unit-resolution progress to stderr.
+    #[arg(long)]
+    pub progress: bool,
     /// Read the whole project from a reproducer .tar.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
@@ -146,6 +154,7 @@ impl CommonArgs {
         opts.incdirs = self.incdir;
         opts.lib_roots = self.lib_root;
         opts.search_dirs = self.search_dir;
+        opts.progress = self.progress;
         opts.bundle = self.bundle;
         Ok(opts)
     }
@@ -187,6 +196,7 @@ pub fn parse_lib_mapping(v: &str) -> anyhow::Result<(String, PathBuf)> {
 pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Option<PathBuf>)> {
     let mut mgr = LibraryManager::new();
     mgr.use_env_cache(); // `.hdlsim-cache/` unless HDLSIM_NO_CACHE / HDLSIM_CACHE_DIR
+    mgr.set_progress(opts.progress);
     let mut root: Option<PathBuf> = None;
     if let Some(b) = &opts.bundle {
         let bytes =
@@ -348,10 +358,10 @@ impl Command for HelpCmd {
 fn command_long_help(name: &str) -> Option<&'static str> {
     Some(match name {
         "run" => "Compile the given sources and simulate the testbench --top until it\nstops (or --max-time). Waves: --vcd/--hwf/--fst files, --wave/--live HTML\nviewer. --seed N makes $random reproducible. Common library flags apply:\n-L name=path, --config, -I, -S, --lib-root (see `hdlsim help check`).",
-        "check" => "Parse + lower + resolve the given files and print rustc-style\ndiagnostics (errors/warnings) without simulating. Fast way to validate a\nproject. Library resolution: ./hdlsim.ini (written by `hdlsim init`) or\n--config FILE, then -L name=path mappings, then --lib-root DIR trees (each\nsubdir of DIR becomes a library named after it; Xilinx unisim/unimacro/...\nare auto-detected via HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS),\nthen -S DIR on-demand search roots, then `work = .` recursive scan of the\ncwd. Unit lookup is by design-unit name across all libraries (first match\nwins), so `use unisim.vcomponents.all;` works once unisim's dir is mapped.
+        "check" => "Parse + lower + resolve the given files and print rustc-style\ndiagnostics (errors/warnings) without simulating. Fast way to validate a\nproject; --progress shows library indexing / unit resolution on stderr.\nLibrary resolution: ./hdlsim.ini (written by `hdlsim init`) or\n--config FILE, then -L name=path mappings, then --lib-root DIR trees (each\nsubdir of DIR becomes a library named after it; Xilinx unisim/unimacro/...\nare auto-detected via HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS),\nthen -S DIR on-demand search roots, then `work = .` recursive scan of the\ncwd. Unit lookup is by design-unit name across all libraries (first match\nwins), so `use unisim.vcomponents.all;` works once unisim's dir is mapped.
 Library-wide `use lib.all;` compiles every unit of library `lib`.
 The default config is found by walking up from the cwd (like git),
-so running from a project subdirectory still loads the root hdlsim.ini.",
+so running from a project subdirectory still loads the root hdlsim.ini.\nIndexing is lazy: libraries are indexed by file name without parsing;\nfiles are parsed only when a unit name does not match its file name.",
         "wave" => "Render a .hwf (hdlsim binary) or .fst wave file to a standalone HTML\nviewer with -o out.html; without -o it prints the viewer path/serves it.",
         "ast" => "Parse one file and print its lossless CST as an s-expression — the\nreusable syntax tree the lowerer consumes. Useful when debugging parser\nissues; spans are file:line:col.",
         "init" => "Scan the project and write ./hdlsim.ini with a [Library] section.\nEach directory containing VHDL sources maps to a logical library named after\nthe directory's last component (one line per name; if several dirs share a\nname the shallowest path wins, so build-tree copies under vivado/... lose to\nthe real source dir). The project root is `work = .`. `library X;` clauses in\nsources are not used for naming (often stale). Vendor roots (--lib-root DIR,\nor HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS `data/vhdl/src`) are\npersisted as absolute `name = path` lines so e.g. Xilinx unisim resolves.\nUse --force to overwrite, --progress to watch the scan.",
