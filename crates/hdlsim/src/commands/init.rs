@@ -5,8 +5,39 @@
 use super::{parse_with, Command};
 use clap::Parser;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
+
+/// Guess a logical library name from a directory name: lowercase, invalid
+/// identifier chars become `_`, and a non-identifier start gets a `lib_`
+/// prefix (e.g. `scint_scan_integrator` stays as-is, `2nd` -> `lib_2nd`).
+fn library_name_from_dir(dir: &Path) -> Option<String> {
+    let raw = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+    {
+        name = format!("lib_{name}");
+    }
+    // Reserved / built-in names are not user libraries.
+    if matches!(name.as_str(), "work" | "std" | "ieee" | "ieee_proposed") {
+        return None;
+    }
+    Some(name)
+}
 
 #[derive(Parser)]
 #[command(
@@ -45,9 +76,11 @@ impl Command for Init {
                 "hdlsim.ini already exists (use --force to overwrite)"
             ));
         }
-        // Scan the project for source files (paths only — no parsing, so the
-        // walk itself is fast); collect the logical library names the VHDL
-        // files declare and the directories they live in.
+        // Scan the project for source files (paths only — no parsing and no
+        // file reads, so the scan itself is fast). Each directory holding
+        // VHDL sources becomes a logical library named after the directory's
+        // last component (`library X;` clauses in the files are often stale
+        // copy-paste and not reliable); the root is covered by `work = .`.
         let progress = a.progress;
         let files = if progress {
             hdl_lib::providers::walk_source_files_with(&root, |dir, n| {
@@ -63,7 +96,7 @@ impl Command for Init {
         let mut n_vhdl = 0usize;
         let mut n_verilog = 0usize;
         let n_files = files.len();
-        for (i, file) in files.iter().enumerate() {
+        for file in &files {
             let ext = file
                 .extension()
                 .and_then(|e| e.to_str())
@@ -76,60 +109,25 @@ impl Command for Init {
             if !matches!(ext.as_deref(), Some("vhd") | Some("vhdl")) {
                 continue;
             }
-            if progress && i % 64 == 0 {
-                eprint!(
-                    "\r  scanning libraries: {} ({}/{})   ",
-                    file.display(),
-                    i + 1,
-                    n_files
-                );
+            let dir = file
+                .parent()
+                .and_then(|p| p.strip_prefix(&root).ok())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            if dir.as_os_str().is_empty() || dir == Path::new(".") {
+                continue; // project root is covered by `work = .`
             }
-            // Stream the file line by line instead of reading it whole (a
-            // file holds several design units, each with its own context
-            // clause, so all lines are scanned).
-            let Ok(f) = std::fs::File::open(file) else {
-                continue;
-            };
-            for line in std::io::BufReader::new(f).lines() {
-                let Ok(line) = line else { break };
-                let t = line.trim();
-                let lower = t.to_ascii_lowercase();
-                let rest = match lower.strip_prefix("library") {
-                    Some(r) => r.trim_start(),
-                    None => continue,
-                };
-                for name in rest.split(',') {
-                    let name = name.trim().trim_end_matches(';').trim();
-                    if name.is_empty()
-                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        || !name
-                            .chars()
-                            .next()
-                            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
-                    {
-                        continue;
-                    }
-                    let dir = file
-                        .parent()
-                        .and_then(|p| p.strip_prefix(&root).ok())
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    lib_dirs
-                        .entry(name.to_ascii_lowercase())
-                        .or_default()
-                        .insert(dir);
-                }
+            if let Some(name) = library_name_from_dir(&dir) {
+                lib_dirs.entry(name).or_default().insert(dir);
             }
         }
         // `work = .` indexes the whole tree recursively; the per-library lines
-        // additionally map each `library X;` clause to the dirs declaring it.
+        // additionally map each source directory to a logical library named
+        // after the directory.
         let mut ini = String::from(
             "# hdlsim library configuration (generated by `hdlsim init`)\n[Library]\nwork = .\n",
         );
         for (lib, dirs) in &lib_dirs {
-            if lib == "work" {
-                continue;
-            }
             for d in dirs {
                 let rel = if d.as_os_str().is_empty() || d == Path::new(".") {
                     ".".to_string()
@@ -141,9 +139,6 @@ impl Command for Init {
         }
         std::fs::write(path, &ini)
             .map_err(|e| anyhow::anyhow!("cannot write hdlsim.ini: {}", e))?;
-        if progress {
-            eprintln!();
-        }
         println!(
             "created hdlsim.ini — {} source files ({} VHDL, {} Verilog) under {}, {} logical librar{}",
             n_files,
@@ -154,7 +149,7 @@ impl Command for Init {
             if lib_dirs.len() == 1 { "y" } else { "ies" }
         );
         if lib_dirs.is_empty() {
-            println!("no `library X;` clauses found; `work = .` covers the whole tree");
+            println!("no VHDL sub-directories found; `work = .` covers the whole tree");
         } else {
             println!("libraries: {}", {
                 let mut v: Vec<&String> = lib_dirs.keys().collect();
@@ -167,5 +162,29 @@ impl Command for Init {
         }
         println!("resolution is now indexed — no on-demand search needed");
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_name_from_dir_uses_last_component() {
+        assert_eq!(
+            library_name_from_dir(Path::new("hw/hdl/sccore/processor")),
+            Some("processor".to_string())
+        );
+        assert_eq!(
+            library_name_from_dir(Path::new("hw/Hdl/SCInt")),
+            Some("scint".to_string())
+        );
+        assert_eq!(
+            library_name_from_dir(Path::new("hw/2nd-gen")),
+            Some("lib_2nd_gen".to_string())
+        );
+        assert_eq!(library_name_from_dir(Path::new(".")), None);
+        assert_eq!(library_name_from_dir(Path::new("ieee")), None);
+        assert_eq!(library_name_from_dir(Path::new("work")), None);
     }
 }
