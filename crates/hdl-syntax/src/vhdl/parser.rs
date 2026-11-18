@@ -148,32 +148,6 @@ impl<'a> Parser<'a> {
         t.kind == TokenKind::Punct && t.span.len() == 1 && self.peek_text() == c.to_string()
     }
 
-    /// Two adjacent punct tokens forming a two-char operator (`<=`, `:=`, `=>`, `/=`, `**`, `<>`),
-    /// starting `ahead` non-trivia tokens from the current position.
-    fn peek_op2_at(&self, ahead: usize) -> Option<String> {
-        let mut i0 = self.skip_trivia_from(self.pos);
-        for _ in 0..ahead {
-            i0 = self.skip_trivia_from(i0 + 1);
-        }
-        let i1 = self.skip_trivia_from(i0 + 1);
-        if i0 >= self.tokens.len() || i1 >= self.tokens.len() {
-            return None;
-        }
-        let (a, b) = (&self.tokens[i0], &self.tokens[i1]);
-        if a.kind != TokenKind::Punct || b.kind != TokenKind::Punct {
-            return None;
-        }
-        let t = format!(
-            "{}{}",
-            &self.src.text()[a.span.start as usize..a.span.end as usize],
-            &self.src.text()[b.span.start as usize..b.span.end as usize]
-        );
-        match t.as_str() {
-            "<=" | ":=" | "=>" | "/=" | "**" | "<>" | ">=" | "?=" | "?/=" | "?<" | "?>" => Some(t),
-            _ => None,
-        }
-    }
-
     /// Three adjacent punct tokens forming a three-char operator (`?<=`, `?>=`).
     fn peek_op3(&self) -> Option<String> {
         let i0 = self.skip_trivia_from(self.pos);
