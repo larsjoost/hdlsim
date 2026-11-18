@@ -126,6 +126,33 @@ pub enum Binding {
     },
 }
 
+/// Library names referenced by a library-wide use clause (`use lib.all;`,
+/// `context lib.all;`) at the top of a design file — e.g. `use math.all`
+/// yields `math`. The library manager compiles every unit of that library.
+pub fn context_libraries(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in real_children(root) {
+        match child.kind() {
+            SyntaxKind::ContextClause | SyntaxKind::UseClause => {
+                for n in real_children(&child) {
+                    if n.kind() == SyntaxKind::Name {
+                        let text = db.span_text(n.span()).trim();
+                        let parts: Vec<&str> = text.split('.').collect();
+                        if parts.len() == 2 && parts[1].eq_ignore_ascii_case("all") {
+                            let lib = parts[0].to_ascii_lowercase();
+                            if !lib.is_empty() && !out.contains(&lib) {
+                                out.push(lib);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Unit names referenced by the context clauses (`use lib.pkg...;`,
 /// `context lib.pkg...;`) at the top of a design file — e.g.
 /// `use ieee.std_logic_1164.all` yields `std_logic_1164`. The library manager
@@ -6072,6 +6099,21 @@ fn value_from_u128(width: usize, v: u128) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_libraries_collects_library_wide_uses() {
+        let src = "library math;\nuse math.all;\nuse math.math.elog2;\nuse ieee.std_logic_1164.all;\nentity t is end;\n";
+        let mut db = SourceDb::new();
+        let id = db.add_file("t.vhd".to_string(), src.to_string()).unwrap();
+        let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+        assert_eq!(
+            context_libraries(&db, &parsed.root),
+            vec!["math".to_string()]
+        );
+        // 3-part names still yield unit names, not libraries.
+        assert!(context_units(&db, &parsed.root).contains(&"math".to_string()));
+        assert!(context_units(&db, &parsed.root).contains(&"std_logic_1164".to_string()));
+    }
 
     #[test]
     fn did_you_mean_prefers_close_names() {

@@ -281,8 +281,10 @@ a library named after it) and Xilinx auto-detection via `HDLSIM_XILINX_LIBS`,
 project (plus any `-S DIR` search roots) for unknown units (warning
 `W0502`/`W0501` tells you to run `hdlsim init` or add `-L name=dir`).
 Resolution is by design-unit name across all libraries, so `library X;`
-clauses in sources never need to match the ini names. See
-`hdlsim help init` and `hdlsim help check`.
+clauses in sources never need to match the ini names. Library-wide
+`use lib.all;` compiles every unit of library `lib`. The config is found by
+walking up from the cwd (like git), so running from a project subdirectory
+still loads the root `hdlsim.ini`. See `hdlsim help init` and `hdlsim help check`.
 
 ## License
 
