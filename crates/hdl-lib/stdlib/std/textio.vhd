@@ -7,6 +7,9 @@ package textio is
     type text is file of string;
     type line is access string;
 
+    type side is (right, left);  -- for justifying output data within fields
+    subtype width is natural;    -- for specifying widths of output fields
+
     file input : text open read_mode is "stdin";
     file output : text open write_mode is "stdout";
 

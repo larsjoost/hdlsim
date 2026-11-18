@@ -7,6 +7,13 @@ package fixed_pkg is
     type ufixed is range <>;
     type sfixed is range <>;
 
+    -- Unresolved (array) forms from the 1076.3 package, referenced by some
+    -- user code (`unresolved_ufixed`, `u_sfixed`).
+    type unresolved_ufixed is array (natural range <>) of std_logic;
+    type unresolved_sfixed is array (natural range <>) of std_logic;
+    subtype u_sfixed is unresolved_sfixed;
+    subtype u_ufixed is unresolved_ufixed;
+
     function to_ufixed (arg : real; left_index, right_index : in integer) return ufixed;
     function to_ufixed (arg : ufixed; left_index, right_index : in integer) return ufixed;
     function to_ufixed (arg : unsigned; left_index, right_index : in integer) return ufixed;

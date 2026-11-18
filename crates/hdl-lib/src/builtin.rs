@@ -50,7 +50,39 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
                 ),
                 ("fixed_pkg", include_str!("../stdlib/ieee/fixed_pkg.vhd")),
                 ("float_pkg", include_str!("../stdlib/ieee/float_pkg.vhd")),
+                (
+                    "fixed_float_types",
+                    include_str!("../stdlib/ieee/fixed_float_types.vhd"),
+                ),
+                (
+                    "fixed_generic_pkg",
+                    include_str!("../stdlib/ieee/fixed_generic_pkg.vhd"),
+                ),
+                (
+                    "float_generic_pkg",
+                    include_str!("../stdlib/ieee/float_generic_pkg.vhd"),
+                ),
                 ("math_real", include_str!("../stdlib/ieee/math_real.vhd")),
+            ],
+        ),
+        // Pre-2008 name of the same packages (`library ieee_proposed`).
+        EmbeddedProvider::new(
+            "ieee_proposed",
+            &[
+                ("fixed_pkg", include_str!("../stdlib/ieee/fixed_pkg.vhd")),
+                ("float_pkg", include_str!("../stdlib/ieee/float_pkg.vhd")),
+                (
+                    "fixed_float_types",
+                    include_str!("../stdlib/ieee/fixed_float_types.vhd"),
+                ),
+                (
+                    "fixed_generic_pkg",
+                    include_str!("../stdlib/ieee/fixed_generic_pkg.vhd"),
+                ),
+                (
+                    "float_generic_pkg",
+                    include_str!("../stdlib/ieee/float_generic_pkg.vhd"),
+                ),
             ],
         ),
     ]
@@ -68,7 +100,7 @@ fn stdlib_providers_from(custom: Option<PathBuf>) -> Vec<Box<dyn UnitProvider>> 
     if let Some(root) = custom {
         if root.is_dir() {
             let mut out: Vec<Box<dyn UnitProvider>> = Vec::new();
-            for name in ["std", "ieee"] {
+            for name in ["std", "ieee", "ieee_proposed"] {
                 let dir = root.join(name);
                 if dir.is_dir() {
                     out.push(Box::new(DirProvider::vhdl(name, &dir)));
@@ -96,7 +128,7 @@ mod tests {
         // No env var set: the embedded tree is used, no disk access needed.
         let providers = stdlib_providers();
         let names: Vec<&str> = providers.iter().map(|p| p.name()).collect();
-        assert_eq!(names, vec!["std", "ieee"]);
+        assert_eq!(names, vec!["std", "ieee", "ieee_proposed"]);
         let units: Vec<String> = providers
             .iter()
             .flat_map(|p| p.scan().into_iter().map(|(u, _)| u))
@@ -113,6 +145,9 @@ mod tests {
             "std_logic_textio",
             "fixed_pkg",
             "float_pkg",
+            "fixed_float_types",
+            "fixed_generic_pkg",
+            "float_generic_pkg",
         ] {
             assert!(units.contains(&u.to_string()), "{:?}", units);
         }
@@ -172,10 +207,10 @@ mod tests {
         assert_eq!(units[0].0, "std_logic_1164");
         assert!(units[0].1.starts_with(&dir));
         // Unset/invalid -> embedded tree.
-        assert_eq!(stdlib_providers_from(None).len(), 2);
+        assert_eq!(stdlib_providers_from(None).len(), 3);
         assert_eq!(
             stdlib_providers_from(Some(PathBuf::from("/nonexistent"))).len(),
-            2
+            3
         );
     }
 }
