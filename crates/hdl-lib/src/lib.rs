@@ -49,8 +49,18 @@ pub struct LibraryManager {
     diags: Diagnostics,
     /// unit name → (provider index, source file) candidates, in search order.
     /// The index counts into `providers` then `builtins` (see `all_providers`).
+    /// Only in-memory (built-in) providers are scanned eagerly; filesystem
+    /// providers land here via `full_scan_dir_providers` on a lookup miss.
     index: HashMap<String, Vec<(usize, PathBuf)>>,
     indexed: bool,
+    /// Cheap unit index from file stems (unit name == file name, the common
+    /// case) over filesystem providers — built without parsing any file.
+    stem_index: HashMap<String, Vec<(usize, PathBuf)>>,
+    stem_indexed: bool,
+    /// Whether filesystem providers have been fully scanned (parsed) yet.
+    dir_scanned: bool,
+    /// Print indexing/resolution progress to stderr (`--progress`).
+    progress: bool,
     /// Canonical paths already compiled this session.
     compiled: HashSet<PathBuf>,
     /// Persistent parse cache (`.hdlsim-cache/`); None unless enabled.
@@ -86,6 +96,10 @@ impl LibraryManager {
             diags: Diagnostics::new(),
             index: HashMap::new(),
             indexed: false,
+            stem_index: HashMap::new(),
+            stem_indexed: false,
+            dir_scanned: false,
+            progress: false,
             compiled: HashSet::new(),
             cache: None,
             cache_hits: 0,
@@ -249,8 +263,16 @@ impl LibraryManager {
         self.providers.iter().chain(self.builtins.iter())
     }
 
+    /// Enable/disable `--progress` output on stderr.
+    pub fn set_progress(&mut self, on: bool) {
+        self.progress = on;
+    }
+
     /// Build the unit-name → (provider, file) index by scanning all providers
-    /// (once): user providers first, built-ins last.
+    /// (once): user providers first, built-ins last. Filesystem providers are
+    /// NOT parsed here — only in-memory (built-in) providers are scanned;
+    /// directory providers are covered by the stem index and fully scanned
+    /// (parsed) lazily on a lookup miss (`full_scan_dir_providers`).
     pub fn ensure_index(&mut self) {
         if self.indexed {
             return;
@@ -258,19 +280,97 @@ impl LibraryManager {
         let scanned: Vec<(usize, String, PathBuf)> = self
             .all_providers()
             .enumerate()
+            .filter(|(_, p)| p.source_files().is_empty()) // in-memory providers only
             .flat_map(|(i, p)| p.scan().into_iter().map(move |(u, f)| (i, u, f)))
             .collect();
         for (i, unit, file) in scanned {
-            self.index.entry(unit).or_default().push((i, file));
+            self.index
+                .entry(unit.to_ascii_lowercase())
+                .or_default()
+                .push((i, file));
         }
         self.indexed = true;
     }
 
+    /// Build the cheap file-stem index over filesystem providers (no parsing):
+    /// `vcomponents.vhd` is assumed to define unit `vcomponents`.
+    fn ensure_stem_index(&mut self) {
+        if self.stem_indexed {
+            return;
+        }
+        let mut per_provider: Vec<(usize, String, Vec<PathBuf>)> = Vec::new();
+        for (i, p) in self.all_providers().enumerate() {
+            let files = p.source_files();
+            if !files.is_empty() {
+                per_provider.push((i, p.name().to_string(), files));
+            }
+        }
+        for (i, name, files) in per_provider {
+            if self.progress {
+                eprintln!(
+                    "  indexing library '{name}': {} files (by name)",
+                    files.len()
+                );
+            }
+            for f in files {
+                if let Some(stem) = f.file_stem().and_then(|s| s.to_str()) {
+                    let stem = stem.to_ascii_lowercase();
+                    if !stem.is_empty() {
+                        self.stem_index.entry(stem).or_default().push((i, f));
+                    }
+                }
+            }
+        }
+        self.stem_indexed = true;
+    }
+
+    /// Fully scan (parse) the filesystem providers once, on a lookup miss —
+    /// needed when a unit's name differs from its file name (multi-unit files).
+    fn full_scan_dir_providers(&mut self) {
+        if self.dir_scanned {
+            return;
+        }
+        self.dir_scanned = true;
+        let scanned: Vec<(usize, String, PathBuf)> = self
+            .all_providers()
+            .enumerate()
+            .filter(|(_, p)| !p.source_files().is_empty()) // filesystem providers
+            .flat_map(|(i, p)| {
+                if self.progress {
+                    eprintln!(
+                        "  scanning library '{}' for unit names (parsing)…",
+                        p.name()
+                    );
+                }
+                p.scan().into_iter().map(move |(u, f)| (i, u, f))
+            })
+            .collect();
+        for (i, unit, file) in scanned {
+            self.index
+                .entry(unit.to_ascii_lowercase())
+                .or_default()
+                .push((i, file));
+        }
+    }
+
     /// The file that defines `unit` according to the library index, if any.
     pub fn unit_file(&mut self, unit: &str) -> Option<PathBuf> {
+        let lunit = unit.to_ascii_lowercase();
+        self.ensure_stem_index();
+        if let Some(v) = self.stem_index.get(&lunit) {
+            if let Some((_, p)) = v.first() {
+                return Some(p.clone());
+            }
+        }
         self.ensure_index();
+        if let Some(v) = self.index.get(&lunit) {
+            if let Some((_, p)) = v.first() {
+                return Some(p.clone());
+            }
+        }
+        self.full_scan_dir_providers();
         self.index
-            .get(unit)
+            .get(&lunit)
             .and_then(|v| v.first().map(|(_, p)| p.clone()))
     }
 
@@ -455,8 +555,27 @@ impl Default for LibraryManager {
 /// indexed libraries, compile its file, and report what was searched on a miss.
 impl UnitResolver for LibraryManager {
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
+        // Staged lookup: cheap file-stem index (no parsing) → in-memory
+        // built-ins → full parse scan of directory providers → project search.
+        self.ensure_stem_index();
+        let lname = name.to_ascii_lowercase();
+        if let Some(cands) = self.stem_index.get(&lname).cloned() {
+            if self.progress {
+                eprintln!("  resolving '{name}' via library index (file-name match)");
+            }
+            if self.try_candidates(design, name, &lname, cands)? {
+                return Ok(true);
+            }
+        }
         self.ensure_index();
-        let candidates = self.index.get(name).cloned();
+        let candidates = self.index.get(&lname).cloned();
+        if candidates.is_none() {
+            // Not in the stem index or the built-ins: fully scan (parse) the
+            // directory providers once — needed when a unit's name differs
+            // from its file name (multi-unit files).
+            self.full_scan_dir_providers();
+        }
+        let candidates = self.index.get(&lname).cloned();
         if candidates.is_none() {
             // Out-of-the-box fallback: search the project roots (cwd, input
             // file dirs) for a file defining this unit.
@@ -505,21 +624,59 @@ impl UnitResolver for LibraryManager {
                 if roots.is_empty() { "<none>".to_string() } else { roots }
             ));
         }
-        for (pi, path) in candidates.unwrap() {
-            let text = self
-                .all_providers()
-                .nth(pi)
-                .and_then(|p| p.read(name, &path));
-            let Some(text) = text else {
-                continue;
-            };
-            self.compile_text(design, &path, &text)?;
-            self.retry_pending_architectures(design, false);
-            if design.modules.iter().any(|m| m.name == name) {
-                return Ok(true);
-            }
+        if let Some(cands) = candidates {
+            return self.try_candidates(design, name, &lname, cands);
         }
         Ok(false)
+    }
+}
+
+impl LibraryManager {
+    /// Try one (provider, file) candidate: compile it and check the unit is now
+    /// on the design (module or package).
+    fn try_one(
+        &mut self,
+        design: &mut Design,
+        name: &str,
+        lname: &str,
+        pi: usize,
+        path: PathBuf,
+    ) -> Result<bool, String> {
+        let text = self
+            .all_providers()
+            .nth(pi)
+            .and_then(|p| p.read(lname, &path));
+        let Some(text) = text else {
+            return Ok(false);
+        };
+        if self.progress {
+            eprintln!("  compiling {} for unit '{name}'", path.display());
+        }
+        self.compile_text(design, &path, &text)?;
+        self.retry_pending_architectures(design, false);
+        Ok(design
+            .modules
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(name))
+            || design.packages.contains_key(lname))
+    }
+
+    fn try_candidates(
+        &mut self,
+        design: &mut Design,
+        name: &str,
+        lname: &str,
+        cands: Vec<(usize, PathBuf)>,
+    ) -> Result<bool, String> {
+        // Compile ALL candidates (duplicate unit names across files): the last
+        // package registration wins, matching the historical behavior.
+        let mut found = false;
+        for (pi, path) in cands {
+            if self.try_one(design, name, lname, pi, path)? {
+                found = true;
+            }
+        }
+        Ok(found)
     }
 }
 

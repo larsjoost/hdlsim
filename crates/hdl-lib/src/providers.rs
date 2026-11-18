@@ -26,6 +26,12 @@ pub trait UnitProvider {
         let _ = unit;
         std::fs::read_to_string(file).ok()
     }
+
+    /// Source file paths without parsing them (for a cheap file-stem unit
+    /// index). Default: none (in-memory providers are scanned directly).
+    fn source_files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// A library whose sources are embedded in the binary (`include_str!`).
@@ -116,6 +122,17 @@ impl UnitProvider for DirProvider {
         let mut out = Vec::new();
         walk(&self.path, &self.extensions, &mut out);
         out
+    }
+
+    fn source_files(&self) -> Vec<PathBuf> {
+        walk_source_files(&self.path)
+            .into_iter()
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map_or(false, |e| self.extensions.contains(&e))
+            })
+            .collect()
     }
 }
 
