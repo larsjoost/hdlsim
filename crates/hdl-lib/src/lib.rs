@@ -163,6 +163,29 @@ impl LibraryManager {
         }
     }
 
+    /// True if a provider (library) with this name is registered.
+    pub fn has_library(&self, name: &str) -> bool {
+        self.all_providers()
+            .any(|p| p.name().eq_ignore_ascii_case(name))
+    }
+
+    /// All design-unit names provided by the library `lib` (for library-wide
+    /// `use lib.all;` clauses).
+    pub fn library_unit_names(&mut self, lib: &str) -> Vec<String> {
+        self.ensure_index();
+        let mut out: Vec<String> = Vec::new();
+        for p in self.all_providers() {
+            if p.name().eq_ignore_ascii_case(lib) {
+                for (u, _) in p.scan() {
+                    if !out.contains(&u) {
+                        out.push(u);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Add an include search directory for `` `include ``.
     pub fn add_incdir(&mut self, path: PathBuf) {
         self.incdirs.push(path);
@@ -277,7 +300,31 @@ impl LibraryManager {
                 .add_file(path.display().to_string(), text.to_string())
                 .map_err(|e| e.to_string())?;
             let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
+            // `use lib.all;` (library-wide) pulls in every unit of that library.
+            // `work` is skipped: it usually indexes the whole tree recursively,
+            // and bulk-pulling every unit destabilizes compile order when unit
+            // names collide across files (units still resolve by name on demand).
+            let ctx_libs = hdl_ir::vhdl_lower::context_libraries(&self.db, &parsed.root);
+            for lib in &ctx_libs {
+                if lib == "work" {
+                    continue;
+                }
+                for unit in self.library_unit_names(lib) {
+                    if !design.packages.contains_key(&unit) {
+                        if let Err(e) = self.resolve(design, &unit) {
+                            if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
+                                self.unresolved_units.push((unit, e));
+                            }
+                        }
+                    }
+                }
+            }
             for unit in hdl_ir::vhdl_lower::context_units(&self.db, &parsed.root) {
+                // A 2-part `use X.all;` where X names a (non-work) library was
+                // handled above.
+                if unit != "work" && ctx_libs.contains(&unit) && self.has_library(&unit) {
+                    continue;
+                }
                 if !design.packages.contains_key(&unit) {
                     if let Err(e) = self.resolve(design, &unit) {
                         if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
