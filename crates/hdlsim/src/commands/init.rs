@@ -5,6 +5,7 @@
 use super::{parse_with, Command};
 use clap::Parser;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -18,6 +19,9 @@ struct InitArgs {
     /// Project root to scan (default: current directory).
     #[arg(long, default_value = ".")]
     root: PathBuf,
+    /// Print scan progress to stderr.
+    #[arg(long)]
+    progress: bool,
 }
 
 pub struct Init;
@@ -41,35 +45,53 @@ impl Command for Init {
                 "hdlsim.ini already exists (use --force to overwrite)"
             ));
         }
-        // Scan the project for sources; collect the logical library names the
-        // VHDL files declare and the directories they live in.
-        let sources = hdl_lib::providers::walk_sources(&root);
+        // Scan the project for source files (paths only — no parsing, so the
+        // walk itself is fast); collect the logical library names the VHDL
+        // files declare and the directories they live in.
+        let progress = a.progress;
+        let files = if progress {
+            hdl_lib::providers::walk_source_files_with(&root, |dir, n| {
+                eprint!("\r  scanning {} ({} files)   ", dir.display(), n);
+            })
+        } else {
+            hdl_lib::providers::walk_source_files(&root)
+        };
+        if progress {
+            eprintln!();
+        }
         let mut lib_dirs: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
         let mut n_vhdl = 0usize;
         let mut n_verilog = 0usize;
-        for (_, file) in &sources {
-            match file
+        let n_files = files.len();
+        for (i, file) in files.iter().enumerate() {
+            let ext = file
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-            {
-                Some(e) if e == "vhd" || e == "vhdl" => n_vhdl += 1,
+                .map(|e| e.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("vhd") | Some("vhdl") => n_vhdl += 1,
                 Some(_) => n_verilog += 1,
                 None => {}
             }
-            let Ok(text) = std::fs::read_to_string(file) else {
-                continue;
-            };
-            if !matches!(
-                file.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .as_deref(),
-                Some("vhd") | Some("vhdl")
-            ) {
+            if !matches!(ext.as_deref(), Some("vhd") | Some("vhdl")) {
                 continue;
             }
-            for line in text.lines() {
+            if progress && i % 64 == 0 {
+                eprint!(
+                    "\r  scanning libraries: {} ({}/{})   ",
+                    file.display(),
+                    i + 1,
+                    n_files
+                );
+            }
+            // Stream the file line by line instead of reading it whole (a
+            // file holds several design units, each with its own context
+            // clause, so all lines are scanned).
+            let Ok(f) = std::fs::File::open(file) else {
+                continue;
+            };
+            for line in std::io::BufReader::new(f).lines() {
+                let Ok(line) = line else { break };
                 let t = line.trim();
                 let lower = t.to_ascii_lowercase();
                 let rest = match lower.strip_prefix("library") {
@@ -119,9 +141,12 @@ impl Command for Init {
         }
         std::fs::write(path, &ini)
             .map_err(|e| anyhow::anyhow!("cannot write hdlsim.ini: {}", e))?;
+        if progress {
+            eprintln!();
+        }
         println!(
             "created hdlsim.ini — {} source files ({} VHDL, {} Verilog) under {}, {} logical librar{}",
-            sources.len(),
+            n_files,
             n_vhdl,
             n_verilog,
             root.display(),
