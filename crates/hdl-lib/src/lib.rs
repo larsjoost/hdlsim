@@ -630,14 +630,16 @@ pub fn compile_one(
             design.modules.extend(lowered.modules);
             pending_archs.extend(lowered.pending);
             for c in lowered.configurations {
-                design.configurations.insert(c.name.to_ascii_lowercase(), c);
+                design
+                    .configurations
+                    .insert(c.name.to_ascii_lowercase(), std::rc::Rc::new(c));
             }
             for p in lowered.packages {
                 // `package p` and `package body p` arrive as two entries with
                 // the same name — merge their items instead of last-wins.
                 match design.packages.entry(p.name.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let e = e.get_mut();
+                        let e = std::rc::Rc::make_mut(e.get_mut());
                         e.types.extend(p.types);
                         e.consts.extend(p.consts);
                         e.functions.extend(p.functions);
@@ -653,7 +655,7 @@ pub fn compile_one(
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(p);
+                        v.insert(std::rc::Rc::new(p));
                     }
                 }
             }

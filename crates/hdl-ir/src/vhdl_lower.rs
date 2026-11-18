@@ -32,6 +32,7 @@ pub(crate) const TEXTIO_PROCS: &[&str] = &[
     "file_close",
 ];
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Lower one parsed VHDL file into modules (entities with their architectures
 /// attached). `time_unit_fs` is the fallback for physical literals; VHDL
@@ -198,8 +199,8 @@ pub fn lower_file(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
-    pkgs: &HashMap<String, PackageIr>,
-    cfgs: &HashMap<String, ConfigIr>,
+    pkgs: &HashMap<String, Rc<PackageIr>>,
+    cfgs: &HashMap<String, Rc<ConfigIr>>,
 ) -> Lowered {
     let _ = file;
     let mut lx = Lower::new(db, diags);
@@ -230,7 +231,7 @@ pub fn lower_file(
                 // on the design, like for cross-file packages.
                 lx.pkgs
                     .entry(p.name.to_ascii_lowercase())
-                    .or_insert_with(|| p.clone());
+                    .or_insert_with(|| Rc::new(p.clone()));
                 packages.push(p);
             }
             SyntaxKind::PackageInst => {
@@ -238,7 +239,8 @@ pub fn lower_file(
                     // The instantiation's items win over the generic
                     // package's defaults that pass 0 put into scope.
                     lx.merge_package(&p, None, true);
-                    lx.pkgs.insert(p.name.to_ascii_lowercase(), p.clone());
+                    lx.pkgs
+                        .insert(p.name.to_ascii_lowercase(), Rc::new(p.clone()));
                     packages.push(p);
                 }
             }
@@ -265,7 +267,8 @@ pub fn lower_file(
             if let Some(arch) = &cfg.arch {
                 config_defaults.insert(cfg.entity.clone(), arch.clone());
             }
-            lx.cfgs.insert(cfg.name.to_ascii_lowercase(), cfg.clone());
+            lx.cfgs
+                .insert(cfg.name.to_ascii_lowercase(), Rc::new(cfg.clone()));
             configurations.push(cfg);
         }
     }
@@ -540,8 +543,8 @@ fn apply_default_archs(
 pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
-    pkgs: &HashMap<String, PackageIr>,
-    cfgs: &HashMap<String, ConfigIr>,
+    pkgs: &HashMap<String, Rc<PackageIr>>,
+    cfgs: &HashMap<String, Rc<ConfigIr>>,
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
     emit_errors: bool,
@@ -705,7 +708,7 @@ struct Lower<'a> {
     db: &'a SourceDb,
     diags: &'a mut Vec<Diagnostic>,
     /// Compile-time constants in scope (enum literals, constants, generics).
-    consts: HashMap<String, Value>,
+    consts: Rc<HashMap<String, Value>>,
     /// Constant name -> type mark, so record/array-typed constants can be
     /// materialized as hidden signals for runtime indexing (`c(i).field`).
     const_types: HashMap<String, String>,
@@ -766,11 +769,11 @@ struct Lower<'a> {
     /// other files plus same-file ones), keyed by lowercased unit name —
     /// backs `use lib.pkg...;` inside declarative parts and package
     /// instantiations.
-    pkgs: HashMap<String, PackageIr>,
+    pkgs: HashMap<String, Rc<PackageIr>>,
     /// Configurations visible while lowering this file (design-wide, from
     /// other files plus same-file ones) — backs `configuration work.cfg`
     /// instantiations and `use configuration` binding indications.
-    cfgs: HashMap<String, ConfigIr>,
+    cfgs: HashMap<String, Rc<ConfigIr>>,
     /// The design file currently being lowered (for re-applying its context
     /// clauses when re-lowering a generic package at an instantiation site).
     file_root: Option<SyntaxNode>,
@@ -802,7 +805,7 @@ impl<'a> Lower<'a> {
         Lower {
             db,
             diags,
-            consts: HashMap::new(),
+            consts: Rc::new(HashMap::new()),
             const_types: HashMap::new(),
             funcs: HashMap::new(),
             types: HashMap::new(),
@@ -929,17 +932,17 @@ impl<'a> Lower<'a> {
     }
 
     fn register_builtin_types(&mut self) {
-        self.consts.insert("true".into(), Value { bits: vec![V1] });
-        self.consts.insert("false".into(), Value { bits: vec![V0] });
+        Rc::make_mut(&mut self.consts).insert("true".into(), Value { bits: vec![V1] });
+        Rc::make_mut(&mut self.consts).insert("false".into(), Value { bits: vec![V0] });
         // severity_level literals (std.standard) — passed to vital_*/assert
         // helper procedures as plain values, e.g. `MsgSeverity => ERROR`.
-        self.consts.insert("note".into(), Value::from_u64(32, 0));
-        self.consts.insert("warning".into(), Value::from_u64(32, 1));
-        self.consts.insert("error".into(), Value::from_u64(32, 2));
-        self.consts.insert("failure".into(), Value::from_u64(32, 3));
+        Rc::make_mut(&mut self.consts).insert("note".into(), Value::from_u64(32, 0));
+        Rc::make_mut(&mut self.consts).insert("warning".into(), Value::from_u64(32, 1));
+        Rc::make_mut(&mut self.consts).insert("error".into(), Value::from_u64(32, 2));
+        Rc::make_mut(&mut self.consts).insert("failure".into(), Value::from_u64(32, 3));
         // std.textio `justified` literals (the `write(l, v, left, 13)` form).
-        self.consts.insert("left".into(), Value::from_u64(32, 0));
-        self.consts.insert("right".into(), Value::from_u64(32, 1));
+        Rc::make_mut(&mut self.consts).insert("left".into(), Value::from_u64(32, 0));
+        Rc::make_mut(&mut self.consts).insert("right".into(), Value::from_u64(32, 1));
         self.types.insert("std_logic".into(), TypeInfo::Scalar);
         // std_ulogic is the enum from ieee.std_logic_1164; hdlsim models it as
         // a 1-bit scalar like std_logic (the `use` clause is not needed).
@@ -1009,8 +1012,7 @@ impl<'a> Lower<'a> {
             ("del", 127),
         ];
         for (n, c) in CHAR_LITS {
-            self.consts
-                .insert(n.to_string(), Value::from_u64(8, *c as u64));
+            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value::from_u64(8, *c as u64));
         }
         // std.standard file_open_kind / file_open_status (VHDL-2008).
         for (n, v) in [
@@ -1022,7 +1024,7 @@ impl<'a> Lower<'a> {
             ("name_error", 2),
             ("mode_error", 3),
         ] {
-            self.consts.insert(n.to_string(), Value::from_u64(32, v));
+            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value::from_u64(32, v));
         }
         self.types.insert("file_open_kind".into(), TypeInfo::Scalar);
         self.types
@@ -1030,8 +1032,7 @@ impl<'a> Lower<'a> {
         self.types.insert("severity_level".into(), TypeInfo::Scalar);
         // std.env (VHDL-2008): resolution_limit and the tool/version constants,
         // as packed strings (MSB-first, 8 bits per char).
-        self.consts
-            .insert("resolution_limit".into(), Value::from_u64(64, 1));
+        Rc::make_mut(&mut self.consts).insert("resolution_limit".into(), Value::from_u64(64, 1));
         for (n, s) in [
             ("vhdl_version", "2019"),
             ("tool_type", "simulator"),
@@ -1046,7 +1047,7 @@ impl<'a> Lower<'a> {
                     bits.push(if b >> i & 1 == 1 { V1 } else { V0 });
                 }
             }
-            self.consts.insert(n.to_string(), Value { bits });
+            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value { bits });
         }
         // std.env assert API (VHDL-2008) — stubs so `alias x is std.env.f[...]`
         // resolves.
@@ -1671,7 +1672,7 @@ impl<'a> Lower<'a> {
             for n in &names {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
-                self.consts.insert(key, val.clone());
+                Rc::make_mut(&mut self.consts).insert(key, val.clone());
                 out.push((n.clone(), val));
             }
         }
@@ -1833,9 +1834,9 @@ impl<'a> Lower<'a> {
         for (cname, cval) in &p.consts {
             if item.is_none_or(|i| i == cname) {
                 if force {
-                    self.consts.insert(cname.clone(), cval.clone());
+                    Rc::make_mut(&mut self.consts).insert(cname.clone(), cval.clone());
                 } else {
-                    self.consts
+                    Rc::make_mut(&mut self.consts)
                         .entry(cname.clone())
                         .or_insert_with(|| cval.clone());
                 }
@@ -1868,7 +1869,7 @@ impl<'a> Lower<'a> {
         if let Some(q) = self.lower_package_inst(d) {
             let key = q.name.to_ascii_lowercase();
             self.merge_package(&q, None, true);
-            self.pkgs.insert(key.clone(), q.clone());
+            self.pkgs.insert(key.clone(), Rc::new(q.clone()));
             self.inst_packages.push(q);
         }
     }
@@ -1898,7 +1899,7 @@ impl<'a> Lower<'a> {
         // Package declarations: constants, types, and function bodies become
         // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
-        let consts_before: std::collections::HashMap<String, Value> = self.consts.clone();
+        let consts_before = self.consts.clone();
         // VHDL-2008 generic clause first, so constants/types declared after it
         // see the generic values (`generic map` overrides win over defaults).
         let mut generics: Vec<(String, Value)> = Vec::new();
@@ -2038,7 +2039,7 @@ impl<'a> Lower<'a> {
         // already-lowered items are still correct, so alias them under the
         // new name.
         let Some(src_root) = tp.src.clone() else {
-            let mut p = tp.clone();
+            let mut p = (*tp).clone();
             p.name = inst_name;
             return Some(p);
         };
@@ -2049,7 +2050,7 @@ impl<'a> Lower<'a> {
             .filter(|c| c.kind() == SyntaxKind::Package && package_decl_name(c, db) == unit)
             .collect();
         if decl_nodes.is_empty() {
-            let mut p = tp.clone();
+            let mut p = (*tp).clone();
             p.name = inst_name;
             return Some(p);
         }
@@ -2165,7 +2166,7 @@ impl<'a> Lower<'a> {
         // Entity generics are constants in the architecture (also when the
         // architecture was deferred to a pending pass with a fresh scope).
         for prm in &modules[midx].params {
-            self.consts
+            Rc::make_mut(&mut self.consts)
                 .entry(prm.name.to_ascii_lowercase())
                 .or_insert_with(|| prm.default.clone());
         }
@@ -2414,7 +2415,7 @@ impl<'a> Lower<'a> {
         };
         for v in vals {
             if let Some(var) = &var {
-                self.consts.insert(var.clone(), Value::from_u64(32, v));
+                Rc::make_mut(&mut self.consts).insert(var.clone(), Value::from_u64(32, v));
             }
             self.lower_gen_decls(module, &decls, true);
             for k in &body {
@@ -2423,10 +2424,10 @@ impl<'a> Lower<'a> {
         }
         match (var, saved) {
             (Some(v), Some(old)) => {
-                self.consts.insert(v, old);
+                Rc::make_mut(&mut self.consts).insert(v, old);
             }
             (Some(v), None) => {
-                self.consts.remove(&v);
+                Rc::make_mut(&mut self.consts).remove(&v);
             }
             _ => {}
         }
@@ -2631,7 +2632,7 @@ impl<'a> Lower<'a> {
                 self.names.insert(name.clone(), *id);
             }
             Expr::Lit(v) => {
-                self.consts.insert(name.clone(), v.clone());
+                Rc::make_mut(&mut self.consts).insert(name.clone(), v.clone());
             }
             _ => {}
         }
@@ -2742,7 +2743,7 @@ impl<'a> Lower<'a> {
                 None if n == "output" => "stdout".to_string(),
                 None => String::new(),
             };
-            self.consts.insert(n, string_value(&p));
+            Rc::make_mut(&mut self.consts).insert(n, string_value(&p));
         }
     }
 
@@ -2784,7 +2785,7 @@ impl<'a> Lower<'a> {
         // body): bind the name to X so uses resolve.
         let Some(init) = init else {
             for n in &names {
-                self.consts
+                Rc::make_mut(&mut self.consts)
                     .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
             }
             return;
@@ -2813,7 +2814,7 @@ impl<'a> Lower<'a> {
         match self.ce_env(&ex, &env) {
             Some(v) => {
                 for n in &names {
-                    self.consts.insert(n.to_ascii_lowercase(), v.clone());
+                    Rc::make_mut(&mut self.consts).insert(n.to_ascii_lowercase(), v.clone());
                 }
             }
             None => {
@@ -2825,7 +2826,7 @@ impl<'a> Lower<'a> {
                     "constant initializer is not constant; treated as X",
                 );
                 for n in &names {
-                    self.consts
+                    Rc::make_mut(&mut self.consts)
                         .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
                 }
             }
@@ -3019,7 +3020,7 @@ impl<'a> Lower<'a> {
                 // as bare names — registering them as consts would shadow
                 // same-named signals (e.g. a signal `u` vs std_ulogic's 'U').
                 if k.kind() == SyntaxKind::Ident {
-                    self.consts
+                    Rc::make_mut(&mut self.consts)
                         .insert(enum_lits[i].clone(), Value::from_u64(32, i as u64));
                 }
             }
@@ -5648,6 +5649,11 @@ fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) ->
         return None;
     }
     let n = name.to_ascii_lowercase();
+    // Acceptance threshold (as below); the edit distance is always >= the
+    // length difference, so candidates longer/shorter than that can be
+    // skipped without running the O(n*m) Levenshtein — keeps the suggestion
+    // O(candidates) instead of O(candidates * n * m) on designs with many units.
+    let max_d = (n.len() / 3).max(3);
     let mut best: Option<(usize, &str)> = None;
     for c in candidates {
         let cl = c.to_ascii_lowercase();
@@ -5655,12 +5661,15 @@ fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) ->
             continue;
         }
         let prefix = cl.starts_with(&n) || n.starts_with(&cl);
+        if !prefix && cl.len().abs_diff(n.len()) > max_d {
+            continue;
+        }
         let d = if prefix {
             cl.len().abs_diff(n.len())
         } else {
-            levenshtein(&n, &cl)
+            levenshtein_bounded(&n, &cl, max_d)
         };
-        if prefix || d <= (n.len() / 3).max(3) {
+        if prefix || d <= max_d {
             if best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, c.as_str()));
             }
@@ -5670,7 +5679,15 @@ fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) ->
 }
 
 /// Levenshtein edit distance, counted in chars.
+#[cfg(test)]
 fn levenshtein(a: &str, b: &str) -> usize {
+    levenshtein_bounded(a, b, usize::MAX)
+}
+
+/// Levenshtein distance, but gives up (returns `max + 1`) as soon as the
+/// distance provably exceeds `max` — keeps "is it close?" cheap on long
+/// candidate lists.
+fn levenshtein_bounded(a: &str, b: &str, max: usize) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {
@@ -5682,6 +5699,9 @@ fn levenshtein(a: &str, b: &str) -> usize {
                     .min(prev[j + 1] + 1)
                     .min(cur[j] + 1),
             );
+        }
+        if cur.iter().min().copied().unwrap_or(usize::MAX) > max {
+            return max + 1;
         }
         prev = cur;
     }

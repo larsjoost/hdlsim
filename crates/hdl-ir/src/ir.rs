@@ -20,11 +20,11 @@ pub struct Design {
     /// Lowered packages by unit name (`std_logic_1164`, ...), so other files
     /// can make them visible with `use lib.pkg.all;` (see
     /// [`crate::vhdl_lower`]).
-    pub packages: HashMap<String, crate::vhdl_lower::PackageIr>,
+    pub packages: HashMap<String, std::rc::Rc<crate::vhdl_lower::PackageIr>>,
     /// Lowered configuration declarations by unit name, so instantiations
     /// (`label : configuration work.cfg`) and `--top cfg` resolve (see
     /// [`crate::vhdl_lower::ConfigIr`]).
-    pub configurations: HashMap<String, crate::vhdl_lower::ConfigIr>,
+    pub configurations: HashMap<String, std::rc::Rc<crate::vhdl_lower::ConfigIr>>,
 }
 
 #[derive(Clone, Debug)]

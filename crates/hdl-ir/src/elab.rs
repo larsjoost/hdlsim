@@ -117,13 +117,26 @@ pub fn elaborate_with(
     top: &str,
     resolver: &mut dyn UnitResolver,
 ) -> Result<Flat, ElabError> {
+    elaborate_with_opts(design, top, resolver, true)
+}
+
+/// Like [`elaborate_with`], but `register_pkg_funcs = false` skips copying all
+/// package function bodies into the result — used by `check`, which elaborates
+/// every module as a candidate top only to surface unresolved units, so the
+/// per-top O(all package bodies) clone is pure waste there.
+pub fn elaborate_with_opts(
+    design: &mut Design,
+    top: &str,
+    resolver: &mut dyn UnitResolver,
+    register_pkg_funcs: bool,
+) -> Result<Flat, ElabError> {
     // The top itself may live in a library: resolve it before elaborating.
     if !design.modules.iter().any(|m| m.name == top) {
         resolver.resolve(design, top).map_err(ElabError::Message)?;
     }
     let mut tried: Vec<String> = Vec::new();
     loop {
-        match try_elaborate(design, top) {
+        match try_elaborate(design, top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
             Err(ElabError::UnknownUnit { name, .. }) => {
                 if tried.iter().any(|t| *t == name) {
@@ -149,7 +162,7 @@ pub fn elaborate_with(
     }
 }
 
-fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
+fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result<Flat, ElabError> {
     // The top may be a configuration declaration: elaborate its bound entity
     // with the configuration's block bindings applied at the top scope.
     let (top_id, top_cfg) = if let Some(pos) = design.modules.iter().position(|m| m.name == top) {
@@ -191,6 +204,9 @@ fn try_elaborate(design: &Design, top: &str) -> Result<Flat, ElabError> {
     // usable through an instantiation, whose bound copy is registered under
     // its own name. Sorted order keeps the registration deterministic when
     // several packages export the same function name.
+    if !register_pkg_funcs {
+        return Ok(f);
+    }
     let mut pkg_names: Vec<&String> = design.packages.keys().collect();
     pkg_names.sort();
     for pn in pkg_names {
@@ -752,7 +768,7 @@ mod tests {
         d.modules.push(other);
         d.configurations.insert(
             "cfg".into(),
-            ConfigIr {
+            std::rc::Rc::new(ConfigIr {
                 name: "cfg".into(),
                 entity: "top".into(),
                 arch: None,
@@ -767,7 +783,7 @@ mod tests {
                         port_map: vec![],
                     },
                 }],
-            },
+            }),
         );
         let f = elaborate(&d, "cfg").unwrap();
         let scope_names: Vec<&str> = f.scopes.iter().map(|s| s.name.as_str()).collect();
