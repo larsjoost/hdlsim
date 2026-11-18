@@ -494,7 +494,9 @@ impl<'a> Lower<'a> {
                     .find(|(i, c)| Some(*i) != name_pos && is_expr_node(c.kind()))
                     .map(|(_, c)| c);
                 let Some(e) = expr else { continue };
+                self.suppress_err += 1;
                 let ex = self.lower_expr(e, &self.consts.clone());
+                self.suppress_err -= 1;
                 match assoc {
                     Some(n) if in_generic => generic_map.push((n, ex)),
                     Some(n) => port_map.push(Conn::Named(n, ex)),
@@ -798,6 +800,10 @@ struct Lower<'a> {
     /// aliases can't be a plain SigId). Whole-signal aliases are additionally
     /// inserted into `names`.
     aliases: HashMap<String, Expr>,
+    /// >0 while lowering binding-actual expressions in configuration
+    /// specifications: actuals name signals of the enclosing architecture,
+    /// which are not in scope design-wide, so E0401s are suppressed.
+    suppress_err: u32,
     /// All packages visible while lowering this file (library packages from
     /// other files plus same-file ones), keyed by lowercased unit name —
     /// backs `use lib.pkg...;` inside declarative parts and package
@@ -862,6 +868,7 @@ impl<'a> Lower<'a> {
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
             aliases: HashMap::new(),
+            suppress_err: 0,
             pkgs: HashMap::new(),
             cfgs: HashMap::new(),
             file_root: None,
@@ -941,6 +948,9 @@ impl<'a> Lower<'a> {
     }
 
     fn err(&mut self, span: Span, msg: impl Into<String>) {
+        if self.suppress_err > 0 {
+            return;
+        }
         self.diags.push(Diagnostic {
             code: "E0401",
             severity: Severity::Error,
@@ -2435,6 +2445,11 @@ impl<'a> Lower<'a> {
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
                 SyntaxKind::PortClause => self.lower_port_clause(module, d),
+                SyntaxKind::GenericClause => {
+                    // Block-header generics: register as constants so port
+                    // constraints see them (not module params).
+                    self.lower_generic_decls(d, &HashMap::new());
+                }
                 _ => {}
             }
         }
@@ -3003,6 +3018,14 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            self.types.insert(name, TypeInfo::Scalar);
+            return;
+        }
+        // File type: `type f is file of elem;` — opaque handle placeholder.
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "file")
+        {
             self.types.insert(name, TypeInfo::Scalar);
             return;
         }
@@ -4637,11 +4660,33 @@ impl<'a> Lower<'a> {
                     None => Expr::Lit(Value::x(1)),
                 }
             }
+            // VHDL-2008 conditional expression `v when c else e` (children:
+            // value, condition, else) or the `??` operator (children: value,
+            // condition).
+            SyntaxKind::CondExpr => {
+                let kids: Vec<SyntaxNode> = real_children(e)
+                    .into_iter()
+                    .filter(|k| is_expr_node(k.kind()))
+                    .collect();
+                match kids.as_slice() {
+                    [v, c, el] => Expr::Cond {
+                        c: Box::new(self.lower_expr(c, env)),
+                        t: Box::new(self.lower_expr(v, env)),
+                        e: Box::new(self.lower_expr(el, env)),
+                    },
+                    [v, c] => Expr::Cond {
+                        c: Box::new(self.lower_expr(c, env)),
+                        t: Box::new(self.lower_expr(v, env)),
+                        e: Box::new(Expr::Lit(Value::x(32))),
+                    },
+                    _ => Expr::Lit(Value::x(32)),
+                }
+            }
             SyntaxKind::Name => {
                 let text = self.text(e);
                 // VHDL-2008 `.all` dereference of an access object: lower the
                 // prefix (`Buf.all` -> `Buf`).
-                let name = if text.len() > 4
+                let stripped = if text.len() > 4
                     && text.as_bytes()[text.len() - 4] == b'.'
                     && text[text.len() - 3..].eq_ignore_ascii_case("all")
                 {
@@ -4649,6 +4694,12 @@ impl<'a> Lower<'a> {
                 } else {
                     text
                 };
+                // Mid-chain `.all` dereference: `res.all.chain` -> `res.chain`.
+                let name = stripped
+                    .split('.')
+                    .filter(|s| !s.eq_ignore_ascii_case("all"))
+                    .collect::<Vec<_>>()
+                    .join(".");
                 // `arr(i).field` — the parser folds this into one Name node
                 // wrapping a Call plus `.field`. Lower the call, then select
                 // the record field inside the element (slice of the memory
@@ -5066,7 +5117,8 @@ impl<'a> Lower<'a> {
                     "range" | "reverse_range" => return Expr::Lit(Value::x(32)),
                     // Report/simulation attributes: placeholder, no warning.
                     "path_name" | "instance_name" | "last_event" | "image" | "reverse_image"
-                    | "encoding" | "max_wire_delay" | "subtype" | "simple_name" => {
+                    | "encoding" | "max_wire_delay" | "subtype" | "simple_name" | "driving"
+                    | "driving_value" => {
                         return Expr::Lit(Value::x(32));
                     }
                     // `sig'quiet` = no event this delta; `sig'active` = event.
@@ -5676,10 +5728,14 @@ impl<'a> Lower<'a> {
                 return Expr::Lit(Value::from_u64(32, fs));
             }
         }
-        // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` (VHDL-2008:
-        // strip the leading decimal size).
+        // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` / signed
+        // `32SB"1"` (VHDL-2008: strip the leading decimal size and optional `S`).
         let t: &str = {
-            let n = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let mut n = digits;
+            if digits > 0 && t.len() > n && matches!(t.as_bytes()[n], b's' | b'S') {
+                n += 1;
+            }
             if n > 0
                 && t.len() > n
                 && matches!(
