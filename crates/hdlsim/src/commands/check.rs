@@ -46,7 +46,9 @@ impl Command for Check {
         // that nothing instantiates, so missing dependencies are reported too.
         let tops: Vec<String> = design.modules.iter().map(|m| m.name.clone()).collect();
         for t in &tops {
-            let _ = elab::elaborate_with(&mut design, t, &mut mgr);
+            // No simulation follows, so package function bodies need not be
+            // copied into each elaboration (O(all bodies) per top otherwise).
+            let _ = elab::elaborate_with_opts(&mut design, t, &mut mgr, false);
         }
         let diags = mgr.diags();
         if !diags.is_empty() {
