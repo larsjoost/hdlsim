@@ -461,7 +461,7 @@ fn apply_config_blocks(cfg: &crate::vhdl_lower::ConfigIr, instances: &[InstIr]) 
     use crate::vhdl_lower::Binding;
     let mut out: Vec<InstIr> = instances.to_vec();
     let mut named_matched: Vec<usize> = Vec::new();
-    let mut apply = |inst: &mut InstIr, blk: &crate::vhdl_lower::BlockCfg| match &blk.binding {
+    let apply = |inst: &mut InstIr, blk: &crate::vhdl_lower::BlockCfg| match &blk.binding {
         Binding::Entity {
             name,
             arch,

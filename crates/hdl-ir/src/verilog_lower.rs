@@ -3991,6 +3991,7 @@ endmodule
         assert_eq!(parse_real_literal("1_000.5"), Some(1000.5));
     }
 
+    #[test]
     fn parse_int_literals() {
         assert_eq!(parse_int_literal("42").unwrap().to_u64(), Some(42));
         assert_eq!(parse_int_literal("8'hFF").unwrap().to_u64(), Some(255));

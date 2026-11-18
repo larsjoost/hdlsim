@@ -4,7 +4,6 @@
 //! `foreach`, user functions with `return`, and the fixed postfix parsing of
 //! `a[i]`, `a[msb:lsb]`, and `f(x)`.
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
