@@ -2494,10 +2494,25 @@ impl<'a> Lower<'a> {
         };
         let (decls, body) = self.gen_body(&kids[gen_pos + 1..]);
         let saved = var.as_ref().and_then(|v| self.consts.get(v).cloned());
-        let vals: Vec<u64> = if downto {
-            (hi..=lo).rev().collect()
+        // Bounds may be real-typed (invalid VHDL) whose f64 bit pattern reads
+        // as a huge u64; check the iteration count before allocating.
+        let n = if downto {
+            lo.checked_sub(hi)
         } else {
-            (lo..=hi).collect()
+            hi.checked_sub(lo)
+        }
+        .and_then(|d| d.checked_add(1));
+        let Some(n) = n.filter(|&n| n <= 1 << 20) else {
+            self.warn(
+                s.span(),
+                "generate loop range is not a constant discrete range (or too large); skipped",
+            );
+            return;
+        };
+        let vals: Vec<u64> = if downto {
+            (hi..=lo).rev().take(n as usize).collect()
+        } else {
+            (lo..=hi).take(n as usize).collect()
         };
         for v in vals {
             if let Some(var) = &var {
@@ -5865,6 +5880,9 @@ impl<'a> Lower<'a> {
         let t = t.trim();
         if let Some(h) = t.find('#') {
             let base: u32 = t[..h].parse().ok()?;
+            if !(2..=36).contains(&base) {
+                return None; // invalid base (`0#...#`) must not panic
+            }
             let rest = &t[h + 1..];
             let end = rest.find('#')?;
             let digits = rest[..end].replace('_', "");
@@ -6201,5 +6219,30 @@ mod tests {
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("abc", "abc"), 0);
         assert_eq!(levenshtein("", "ab"), 2);
+    }
+
+    #[test]
+    fn invalid_generate_range_and_literal_base_do_not_panic() {
+        // Regression: a for-generate over a real range (`0.0 to 8.0`) read the
+        // f64 bit pattern as a huge u64 and overflowed the unroll Vec; a based
+        // literal with base 0 (`0#121#`) panicked in from_str_radix.
+        for src in [
+            "entity e is end;\narchitecture a of e is\nbegin\n  g : for i in 0.0 to 8.0 generate\n    null;\n  end generate g;\nend;\n",
+            "entity e is end;\narchitecture a of e is\nbegin\n  process\n    variable i : integer;\n  begin\n    i := 0#121#E2;\n    wait;\n  end process;\nend;\n",
+        ] {
+            let mut db = SourceDb::new();
+            let id = db.add_file("t.vhd".to_string(), src.to_string()).unwrap();
+            let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+            let mut diags = Vec::new();
+            let _ = lower_file(
+                id,
+                &parsed.root,
+                &db,
+                &mut diags,
+                1_000_000,
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+        }
     }
 }
