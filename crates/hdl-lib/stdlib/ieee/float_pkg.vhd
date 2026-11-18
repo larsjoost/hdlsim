@@ -5,6 +5,9 @@ package float_pkg is
 
     type float is range <>;
 
+    subtype float32 is float(8 downto -149);
+    subtype float64 is float(11 downto -1074);
+
     function to_float (arg : real) return float;
     function to_float (arg : real; exp_width, frac_width : in integer) return float;
     function to_float (arg : integer) return float;

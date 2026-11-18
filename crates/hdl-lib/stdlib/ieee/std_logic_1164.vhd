@@ -35,6 +35,7 @@ package std_logic_1164 is
 
     -- Conversions.
     function to_stdlogicvector  (s : bit_vector) return std_logic_vector;
+    function to_stdulogicvector (s : bit_vector) return std_ulogic_vector;
     function to_bitvector       (s : std_logic_vector) return bit_vector;
     function to_x01             (s : std_ulogic) return std_ulogic;
 

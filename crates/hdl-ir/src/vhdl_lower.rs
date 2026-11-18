@@ -148,9 +148,11 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                     }
                 }
             }
-            // `package p is new g generic map (...)` depends on `g` too.
+            // `package p is new g generic map (...)` depends on `g` and on any
+            // package actuals in the map (`generic map (P => work.q)`).
             SyntaxKind::PackageInst => {
-                for n in real_children(&child) {
+                let mut stack: Vec<SyntaxNode> = real_children(&child);
+                while let Some(n) = stack.pop() {
                     if n.kind() == SyntaxKind::Name {
                         let unit = db
                             .span_text(n.span())
@@ -163,6 +165,7 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                             out.push(unit);
                         }
                     }
+                    stack.extend(real_children(&n));
                 }
             }
             _ => {}
@@ -4456,7 +4459,7 @@ impl<'a> Lower<'a> {
                                     )
                                 }
                             };
-                            time_fs = Some(v * mult);
+                            time_fs = Some(v.saturating_mul(mult));
                             i += 1;
                         }
                     }
@@ -4752,6 +4755,11 @@ impl<'a> Lower<'a> {
                                 return Expr::Lit(Value::x(32));
                             }
                         }
+                        // A package used as a value (package actual in a generic
+                        // map: `generic map (P => work.my_pkg)`) — inert placeholder.
+                        if self.pkgs.contains_key(&item) {
+                            return Expr::Lit(Value::x(32));
+                        }
                     }
                 }
                 // Bare physical unit name (`ns`, `ps`, …) as a literal of one
@@ -4773,6 +4781,11 @@ impl<'a> Lower<'a> {
                         | "ghz"
                 ) {
                     return Expr::Lit(Value::from_u64(32, time_unit_fs(&key)));
+                }
+                // Package-level shared variable read from a package-body
+                // subprogram: placeholder (not simulated).
+                if self.pkg_sig_types.contains_key(&key) {
+                    return Expr::Lit(Value::x(1));
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
@@ -5461,7 +5474,9 @@ impl<'a> Lower<'a> {
                 // Integer physical (`100 ps`) or real physical (`2.5 ns`,
                 // VHDL-2008) \u2014 the value is femtoseconds.
                 let fs = match self.parse_int_literal(num.trim()).and_then(|v| v.to_u64()) {
-                    Some(n) => n * time_unit_fs(unit.trim()),
+                    // saturating: huge literals (`1e18 hr`-scale constants) must
+                    // not overflow in debug builds
+                    Some(n) => n.saturating_mul(time_unit_fs(unit.trim())),
                     None => num
                         .trim()
                         .parse::<f64>()
