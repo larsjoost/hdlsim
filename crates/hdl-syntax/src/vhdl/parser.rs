@@ -604,6 +604,15 @@ impl<'a> Parser<'a> {
                 self.parse_subprogram(); // consumes its own ';'
                 continue;
             }
+            // VHDL-2008 generic package as a generic:
+            // `package local_pkg is new g generic map (<>);`
+            if self.at_kw("package")
+                && self.peek2().kind == TokenKind::Ident
+                && self.peek3_text().eq_ignore_ascii_case("is")
+            {
+                self.parse_package_inst(); // consumes its own ';'
+                continue;
+            }
             self.parse_interface_decl(SyntaxKind::GenericDecl);
             if !self.eat_punct(';') {
                 break;
@@ -674,7 +683,20 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
             } else {
-                while self.peek().kind != TokenKind::Eof && !self.at_punct(';') {
+                // Bare `type T` box — stop at `;` or at the `)` closing the
+                // generic list (whichever comes first at depth zero).
+                let mut depth = 0;
+                while self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('(') || self.at_punct('[') {
+                        depth += 1;
+                    } else if self.at_punct(')') || self.at_punct(']') {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    } else if depth == 0 && self.at_punct(';') {
+                        break;
+                    }
                     self.bump();
                 }
             }
@@ -692,9 +714,14 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         self.parse_type_mark();
-        if self.at_punct('(') {
+        while self.at_punct('(') {
             self.parse_constraint();
-        } else if self.at_kw("range") {
+        }
+        // Port kind: `signal q : out resolved_byte bus)`.
+        if self.at_kw("bus") || self.at_kw("register") {
+            self.bump();
+        }
+        if self.at_kw("range") {
             // `natural range 1 to 3` — range constraint without parens.
             self.start(SyntaxKind::Range);
             self.bump();
@@ -748,6 +775,50 @@ impl<'a> Parser<'a> {
                 }
             }
             _ if self.at_kw("file") => self.parse_file_object_decl(),
+            _ if self.at_kw("group") => {
+                // `group name [is|: template] (...);` — parsed loosely, skipped.
+                self.bump();
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                }
+                self.eat_kw("is");
+                self.eat_punct(':');
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                }
+                if self.eat_punct('(') {
+                    let mut depth = 1;
+                    while depth > 0 && self.peek().kind != TokenKind::Eof {
+                        if self.at_punct('(') {
+                            depth += 1;
+                        } else if self.at_punct(')') {
+                            depth -= 1;
+                        }
+                        self.bump();
+                    }
+                }
+                self.expect_punct(';', "to end the group declaration");
+            }
+            _ if self.at_kw("disconnect") => {
+                // `disconnect sig_list : type_mark [after expr];`
+                self.start(SyntaxKind::DisconnectSpec);
+                self.bump(); // disconnect
+                loop {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.parse_name();
+                    }
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+                self.expect_punct(':', "in the disconnect specification");
+                self.parse_type_mark();
+                if self.eat_kw("after") {
+                    self.parse_expression();
+                }
+                self.expect_punct(';', "to end the disconnect specification");
+                self.builder.finish_node();
+            }
             _ if self.at_kw("use") => self.parse_use_clause(),
             _ if self.at_kw("for") => self.parse_for_spec(),
             _ if self.at_kw("package")
@@ -776,7 +847,7 @@ impl<'a> Parser<'a> {
             self.expect_kw("map", "after generic");
             self.parse_assoc_list();
         }
-        self.expect_punct(';', "to end the package instantiation");
+        self.eat_punct(';'); // may be absent when nested in a generic clause
         self.builder.finish_node();
     }
 
@@ -873,7 +944,21 @@ impl<'a> Parser<'a> {
         self.expect_punct(':', "before the spec label");
         self.expect_ident("for the specification label");
         self.expect_kw("is", "in the attribute specification");
-        self.parse_expression();
+        if self.at_punct('(') {
+            // Aggregate value, e.g. a physical position `( 540 um, 1200 um )`.
+            self.bump();
+            if !self.at_punct(')') {
+                loop {
+                    self.parse_expression();
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(')', "to close the aggregate attribute value");
+        } else {
+            self.parse_expression();
+        }
         self.expect_punct(';', "to end the attribute specification");
         self.builder.finish_node();
     }
@@ -892,6 +977,10 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(':', "before the file type");
         self.parse_type_mark();
+        if self.eat_kw("is") {
+            // `file f : t is "path";` — no `open` keyword.
+            self.parse_expression();
+        }
         if self.at_kw("open") {
             self.bump();
             if self.peek().kind == TokenKind::Ident {
@@ -974,13 +1063,23 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         self.parse_type_mark();
-        if self.at_punct('(') {
+        while self.at_punct('(') {
             self.parse_constraint();
-        } else if self.at_kw("range") {
+        }
+        // Port kind: `signal q : out resolved_byte bus)`.
+        if self.at_kw("bus") || self.at_kw("register") {
+            self.bump();
+        }
+        if self.at_kw("range") {
             self.start(SyntaxKind::Range);
             self.bump();
             self.parse_range();
             self.builder.finish_node();
+        }
+        // Trailing signal-kind / resolution words: `signal s : pulled_up bit bus;`
+        // (resolution function + type mark + kind) — skip stray idents.
+        while self.peek().kind == TokenKind::Ident && self.peek_op2().as_deref() != Some(":=") {
+            self.bump();
         }
         if self.peek_op2().as_deref() == Some(":=") {
             self.bump();
@@ -1034,6 +1133,12 @@ impl<'a> Parser<'a> {
             if self.at_punct('(') {
                 // Constrained element type: `... of std_logic_vector(31 downto 0)`.
                 self.parse_constraint();
+            } else if self.at_kw("range") {
+                // Range-constrained element type: `... of integer range 3 downto 0`.
+                self.start(SyntaxKind::Range);
+                self.bump();
+                self.parse_range();
+                self.builder.finish_node();
             }
         } else if self.at_kw("record") {
             // `record field {, field} : type [constraint] ; ... end record;`
@@ -1127,6 +1232,9 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("end", "to close the units declaration");
         self.eat_kw("units");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional unit name: `end units length;`
+        }
     }
 
     fn parse_subtype_decl(&mut self) {
@@ -1162,9 +1270,10 @@ impl<'a> Parser<'a> {
                 self.error_here("expected an attribute name after the tick");
             }
         }
-        if self.at_punct('(') {
+        while self.at_punct('(') {
             self.parse_constraint();
-        } else if self.at_kw("range") {
+        }
+        if self.at_kw("range") {
             self.bump();
             self.parse_range();
         }
@@ -1267,6 +1376,12 @@ impl<'a> Parser<'a> {
                 }
             }
             self.builder.finish_node();
+            // Subtype attribute as a type mark: `A'subtype` — keep the base
+            // name as the type mark, consume the tick + attribute name.
+            if self.at_punct('\'') && self.peek2().kind == TokenKind::Ident {
+                self.bump();
+                self.bump();
+            }
         } else {
             self.error_here("expected a type mark");
             self.bump();
@@ -1314,6 +1429,13 @@ impl<'a> Parser<'a> {
             if self.peek_text() == "<" && self.peek2_text() == ">" {
                 self.bump();
                 self.bump(); // <>
+            } else {
+                // `subtype_name range lo to hi` / `... range lo downto hi`.
+                self.parse_expression();
+                if self.at_kw("to") || self.at_kw("downto") {
+                    self.bump();
+                    self.parse_expression();
+                }
             }
         }
     }
@@ -1390,9 +1512,41 @@ impl<'a> Parser<'a> {
         } else {
             // Concurrent signal assignment `target <= waveform ;` or a
             // concurrent procedure call `p(args);` — decided after the target
-            // name, since `cmp_o(0) <= ...` starts like a call.
+            // name, since `cmp_o(0) <= ...` starts like a call. The target may
+            // also be an aggregate `(s1, s2, s3) <= v;`.
             let mark = self.builder.mark();
-            self.parse_name();
+            if self.at_punct('(') {
+                self.bump();
+                loop {
+                    if self.peek().kind == TokenKind::Ident {
+                        self.parse_name();
+                    }
+                    if !self.eat_punct(',') {
+                        break;
+                    }
+                }
+                self.expect_punct(')', "to close the aggregate target");
+            } else {
+                self.parse_name();
+            }
+            // Component instantiation with a selected name:
+            // `lbl: lib.pkg.comp [generic map (...)] port map (...);`
+            if self.at_kw("generic") || self.at_kw("port") {
+                self.builder.start_node_at(mark, SyntaxKind::Inst);
+                if self.at_kw("generic") {
+                    self.bump();
+                    self.expect_kw("map", "after generic");
+                    self.parse_assoc_list();
+                }
+                if self.at_kw("port") {
+                    self.bump();
+                    self.expect_kw("map", "after port");
+                    self.parse_assoc_list();
+                }
+                self.expect_punct(';', "to end the instantiation");
+                self.builder.finish_node();
+                return;
+            }
             if self.peek_op2().as_deref() != Some("<=") {
                 self.builder.start_node_at(mark, SyntaxKind::CallStmt);
                 self.expect_punct(';', "to end the concurrent procedure call");
@@ -1404,6 +1558,7 @@ impl<'a> Parser<'a> {
             self.bump(); // <=
                          // Waveform: `expr [after t] {, expr [after t]}`, and conditional
                          // form `expr when cond [else expr when cond]... [else expr]`.
+            self.eat_delay_mechanism();
             self.parse_expression();
             if self.at_kw("after") {
                 self.bump();
@@ -1420,6 +1575,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if self.eat_punct(',') {
+                    self.eat_delay_mechanism();
                     self.parse_expression();
                     if self.at_kw("after") {
                         self.bump();
@@ -1440,7 +1596,21 @@ impl<'a> Parser<'a> {
         self.bump(); // with
         self.parse_expression(); // selector
         self.expect_kw("select", "in the selected signal assignment");
-        self.parse_name(); // target
+        // Target may be an aggregate `(s1, s2, ...)`.
+        if self.at_punct('(') {
+            self.bump();
+            loop {
+                if self.peek().kind == TokenKind::Ident {
+                    self.parse_name();
+                }
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(')', "to close the aggregate target");
+        } else {
+            self.parse_name(); // target
+        }
         if self.peek_op2().as_deref() == Some("<=") {
             self.bump();
             self.bump();
@@ -1538,7 +1708,22 @@ impl<'a> Parser<'a> {
         }
         self.eat_kw("is");
         while !self.at_kw("begin") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
-            self.parse_decl();
+            // Block header (VHDL-2002+): `generic (...);` / `port (...);`
+            // and the header maps `generic map (...);` / `port map (...);`.
+            if self.at_kw("generic") && self.peek2_text() == "(" {
+                self.parse_generic_clause();
+            } else if self.at_kw("port") && self.peek2_text() == "(" {
+                self.parse_port_clause();
+            } else if (self.at_kw("generic") || self.at_kw("port"))
+                && self.peek2_text().eq_ignore_ascii_case("map")
+            {
+                self.bump(); // generic | port
+                self.bump(); // map
+                self.parse_assoc_list();
+                self.eat_punct(';');
+            } else {
+                self.parse_decl();
+            }
         }
         self.expect_kw("begin", "in block");
         while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
@@ -1694,6 +1879,7 @@ impl<'a> Parser<'a> {
             self.parse_seq_stmt();
         }
         self.expect_kw("end", "to close the process");
+        self.eat_kw("postponed"); // `end postponed process;`
         self.eat_kw("process");
         if self.peek().kind == TokenKind::Ident {
             self.bump(); // optional label
@@ -1740,14 +1926,103 @@ impl<'a> Parser<'a> {
 
     /// `( assoc {, assoc} )` where assoc is `.name => expr`, `name => expr`,
     /// or a positional expression.
+    /// Is the association at the current position named (`formal => actual`)?
+    /// The formal may be a plain name, an indexed/sliced name (`BitsA(0) =>`),
+    /// or a selected name (`x.y(2) =>`).
+    fn assoc_is_named(&self) -> bool {
+        let mut i = self.skip_trivia_from(self.pos);
+        // The formal may also be an operator symbol: `"<"(a => b, ...)`.
+        if self.tokens.get(i).map_or(false, |t| {
+            matches!(t.kind, TokenKind::Ident | TokenKind::StrLiteral)
+        }) {
+            i = self.skip_trivia_from(i + 1);
+            // Skip `(...)` / `[...]` suffixes and `.name` selects.
+            loop {
+                let Some(t) = self.tokens.get(i) else {
+                    return false;
+                };
+                let txt = &self.src.text()[t.span.start as usize..t.span.end as usize];
+                if txt == "(" || txt == "[" {
+                    let close = if txt == "(" { ")" } else { "]" };
+                    let mut depth = 0usize;
+                    loop {
+                        let Some(t2) = self.tokens.get(i) else {
+                            return false;
+                        };
+                        let x = &self.src.text()[t2.span.start as usize..t2.span.end as usize];
+                        if x == txt {
+                            depth += 1;
+                        } else if x == close {
+                            depth -= 1;
+                            if depth == 0 {
+                                i = self.skip_trivia_from(i + 1);
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                } else if txt == "." {
+                    i = self.skip_trivia_from(i + 1);
+                    if self
+                        .tokens
+                        .get(i)
+                        .map_or(false, |t| t.kind == TokenKind::Ident)
+                    {
+                        i = self.skip_trivia_from(i + 1);
+                    } else {
+                        return false;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let a = self.tokens.get(i);
+            let b = self.tokens.get(self.skip_trivia_from(i + 1));
+            return matches!((a, b), (Some(x), Some(y)) if x.kind == TokenKind::Punct && y.kind == TokenKind::Punct
+                && &self.src.text()[x.span.start as usize..x.span.end as usize] == "="
+                && &self.src.text()[y.span.start as usize..y.span.end as usize] == ">");
+        }
+        false
+    }
+
+    /// Bump the tokens of a named-association formal (`name`, possibly with
+    /// `(...)` / `.name` suffixes) without wrapping them in a node.
+    fn skip_assoc_formal(&mut self) {
+        if matches!(self.peek().kind, TokenKind::Ident | TokenKind::StrLiteral) {
+            self.bump();
+        }
+        loop {
+            let txt = self.peek_text().to_string();
+            if txt == "(" {
+                let mut depth = 0usize;
+                while self.peek().kind != TokenKind::Eof {
+                    let t = self.peek_text().to_string();
+                    self.bump();
+                    if t == "(" {
+                        depth += 1;
+                    } else if t == ")" {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            } else if txt == "." {
+                self.bump();
+                if self.peek().kind == TokenKind::Ident {
+                    self.bump();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     fn parse_assoc_list(&mut self) {
         self.expect_punct('(', "to open the association list");
         while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
             self.start(SyntaxKind::PortConn);
-            let named = self.at_punct('.')
-                || (self.peek().kind == TokenKind::Ident
-                    && self.peek2_text() == "="
-                    && self.peek3_text() == ">");
+            let named = self.at_punct('.') || self.assoc_is_named();
             if named {
                 if self.eat_punct('.') {
                     let m = self.builder.mark();
@@ -1757,10 +2032,8 @@ impl<'a> Parser<'a> {
                     self.builder.start_node_at(m, SyntaxKind::Name);
                     self.builder.finish_node();
                 } else {
-                    let m = self.builder.mark();
-                    self.bump(); // association name
-                    self.builder.start_node_at(m, SyntaxKind::Name);
-                    self.builder.finish_node();
+                    // Formal may be an indexed/sliced name: `BitsA(0) => x`.
+                    self.parse_name();
                 }
                 if self.peek_op2().as_deref() == Some("=>") {
                     self.bump();
@@ -1770,7 +2043,12 @@ impl<'a> Parser<'a> {
                 }
             }
             if !self.at_punct(')') {
-                self.parse_expression();
+                if self.peek_text() == "<" && self.peek2_text() == ">" {
+                    self.bump();
+                    self.bump(); // `<>` box (open association)
+                } else {
+                    self.parse_expression();
+                }
             }
             self.builder.finish_node();
             if !self.eat_punct(',') {
@@ -2097,12 +2375,19 @@ impl<'a> Parser<'a> {
     /// (`(msb downto lsb)`), called (`(args)`), or attributed (`'attr`) suffixes.
     fn parse_name(&mut self) {
         let mark = self.builder.mark();
-        if self.peek().kind == TokenKind::Ident {
+        if matches!(
+            self.peek().kind,
+            TokenKind::Ident | TokenKind::StrLiteral | TokenKind::CharLiteral
+        ) {
             self.start(SyntaxKind::Name);
             self.bump();
             while self.at_punct('.') {
                 self.bump();
-                if self.peek().kind == TokenKind::Ident {
+                // Selected name may be a quoted operator: `pkg."+"(a, b)`.
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::Ident | TokenKind::StrLiteral | TokenKind::CharLiteral
+                ) {
                     self.bump();
                 } else {
                     self.error_here("expected a name after '.'");
@@ -2132,10 +2417,12 @@ impl<'a> Parser<'a> {
                     // association `name => expr`; a single `expr to|downto expr`
                     // is a slice.
                     loop {
-                        if self.peek().kind == TokenKind::Ident
-                            && self.peek_op2_at(1).as_deref() == Some("=>")
-                        {
-                            self.bump(); // association name
+                        if self.assoc_is_named() {
+                            // Named association; the formal may be indexed:
+                            // `a(0) => b`. Bump the formal's tokens without
+                            // wrapping them in a Name node so the lowerer keeps
+                            // treating it as a skipped formal, not an argument.
+                            self.skip_assoc_formal();
                             self.bump();
                             self.bump(); // =>
                         }
@@ -2163,7 +2450,10 @@ impl<'a> Parser<'a> {
                 // whole `name(args).field` into one Name node (the Call stays
                 // nested inside it, so the lowerer can see both parts).
                 self.bump();
-                if self.peek().kind == TokenKind::Ident {
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::Ident | TokenKind::StrLiteral | TokenKind::CharLiteral
+                ) {
                     self.bump();
                 } else {
                     self.error_here("expected a name after '.'");
@@ -2171,6 +2461,23 @@ impl<'a> Parser<'a> {
                 }
                 self.builder.start_node_at(mark, SyntaxKind::Name);
                 self.builder.finish_node();
+            } else if self.at_punct('[') {
+                // Subprogram signature in brackets: `f[return T]'encoding`
+                // — skip the balanced `[...]`, then keep looping so a
+                // following `'attr` suffix is parsed too.
+                let mut depth = 0;
+                while self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('[') {
+                        depth += 1;
+                    } else if self.at_punct(']') {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.bump();
+                            break;
+                        }
+                    }
+                    self.bump();
+                }
             } else if self.at_punct('\'') {
                 if self.peek2().kind == TokenKind::Punct && self.peek2_text() == "(" {
                     // Qualified expression: `type_mark'(expr)`
@@ -2198,9 +2505,9 @@ impl<'a> Parser<'a> {
                     self.builder.finish_node();
                 } else {
                     self.bump(); // '
-                    if self.peek().kind == TokenKind::Ident {
+                    if matches!(self.peek().kind, TokenKind::Ident | TokenKind::CharLiteral) {
                         self.builder.start_node_at(mark, SyntaxKind::Attr);
-                        self.bump(); // attribute name
+                        self.bump(); // attribute name / char literal
                         self.builder.finish_node();
                     } else {
                         self.error_here("expected an attribute name after the tick");
@@ -2292,7 +2599,27 @@ impl<'a> Parser<'a> {
     /// Waveform elements of a signal assignment: `expr [after t] {, expr
     /// [after t]}`, optionally followed by the conditional form
     /// `when cond else expr ...`.
+    /// Optional delay mechanism prefix: `[reject t] (transport|inertial)`, and
+    /// the VHDL-93 `guarded` assignment keyword.
+    fn eat_delay_mechanism(&mut self) {
+        // `[reject t] (transport|inertial)` and `guarded` may appear in any
+        // order (`guarded reject 2 ns inertial`).
+        loop {
+            if self.at_kw("reject") {
+                self.bump();
+                self.parse_expression();
+                continue;
+            }
+            if self.at_kw("transport") || self.at_kw("inertial") || self.at_kw("guarded") {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+    }
+
     fn parse_waveform_elements(&mut self) {
+        self.eat_delay_mechanism();
         self.parse_expression();
         loop {
             if self.at_kw("after") {
@@ -2307,6 +2634,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.eat_punct(',') {
+                self.eat_delay_mechanism();
                 self.parse_expression();
                 continue;
             }
@@ -2396,11 +2724,48 @@ impl<'a> Parser<'a> {
             TokenKind::IntLiteral | TokenKind::RealLiteral => {
                 self.start(SyntaxKind::Literal);
                 self.bump();
+                // Sized bit-string literal: `32X"0"` (VHDL-2008) — number
+                // followed by a based string.
+                if self.peek().kind == TokenKind::StrLiteral
+                    && self.peek_text().len() >= 2
+                    && matches!(
+                        self.peek_text().as_bytes()[0],
+                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O'
+                    )
+                    && self.peek_text().as_bytes()[1] == b'"'
+                {
+                    self.bump();
+                }
+                // Sized bit-string literal: `32X"0"` — the size integer is
+                // directly followed by the base letter + string.
+                if self.peek().kind == TokenKind::Ident
+                    && self.peek_text().len() == 1
+                    && matches!(
+                        self.peek_text().as_bytes()[0],
+                        b'x' | b'X' | b'b' | b'B' | b'o' | b'O'
+                    )
+                    && self.peek2().kind == TokenKind::StrLiteral
+                {
+                    self.bump();
+                    self.bump();
+                }
                 // Physical literal: `100 ps` — a number followed by a time unit.
                 if self.peek().kind == TokenKind::Ident
                     && matches!(
                         self.peek_text().to_ascii_lowercase().as_str(),
-                        "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "min" | "hr"
+                        "fs" | "ps"
+                            | "ns"
+                            | "us"
+                            | "ms"
+                            | "sec"
+                            | "s"
+                            | "min"
+                            | "hr"
+                            | "um"
+                            | "hz"
+                            | "khz"
+                            | "mhz"
+                            | "ghz"
                     )
                 {
                     self.bump();
@@ -2408,9 +2773,15 @@ impl<'a> Parser<'a> {
                 self.builder.finish_node();
             }
             TokenKind::StrLiteral | TokenKind::CharLiteral => {
-                self.start(SyntaxKind::Literal);
-                self.bump();
-                self.builder.finish_node();
+                if self.peek2_text() == "(" {
+                    // Operator-symbol call: `"<"(a, b)` — parse as a name so
+                    // the argument list becomes a Call suffix.
+                    self.parse_name();
+                } else {
+                    self.start(SyntaxKind::Literal);
+                    self.bump();
+                    self.builder.finish_node();
+                }
             }
             TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("null") => {
                 // `null` literal (access value / empty waveform).
@@ -2608,6 +2979,44 @@ end architecture;
         assert!(sexp.contains("(ConcAssign"), "{}", sexp);
         assert!(sexp.contains("(If"), "{}", sexp);
         assert!(sexp.contains("(Call"), "{}", sexp); // rising_edge(...)
+    }
+
+    #[test]
+    fn parses_block_header_sized_bitstring_and_misc() {
+        let src = r#"entity t is
+    generic (g_w : natural := 32X"0" & "00");
+end entity;
+architecture a of t is
+    signal d0, fz : bit := '0';
+    disconnect bus_sig : bit after 3 ns;
+    file f : text is "data.txt";
+begin
+    b : block is
+            port ( z : out bit );
+          port map ( z => fz );
+    begin
+        z <= d0;
+    end block b;
+    with d0 select (fz, d0) <= bit_vector'("00") when "0", "01" when others;
+    p : alib.apkg.acomp port map (d0, fz);
+    assert "<"(1, 2) = '1' report "no";
+end architecture;
+"#;
+        let (p, db) = parse_str(src);
+        no_errors(&p, &db);
+        let sexp = p.root.debug_sexp(&db);
+        assert!(sexp.contains("(PortClause"), "{}", sexp);
+        assert!(sexp.contains("(DisconnectSpec"), "{}", sexp);
+        assert!(sexp.contains("(FileDecl"), "{}", sexp);
+        assert!(sexp.contains("(SelectedAssign"), "{}", sexp);
+        assert!(sexp.contains("(Inst"), "{}", sexp);
+        assert!(sexp.contains("(Call"), "{}", sexp); // "<"(1, 2)
+                                                     // sized bit-string literal: size + base letter + string in one Literal
+        assert!(
+            sexp.contains("(Literal IntLiteral \"32\" Ident \"X\" StrLiteral"),
+            "{}",
+            sexp
+        );
     }
 
     #[test]

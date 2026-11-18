@@ -444,7 +444,13 @@ impl<'a> Lower<'a> {
             } else if k.kind() == SyntaxKind::PortConn {
                 let ck = real_children(k);
                 let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
-                let assoc = name_pos.map(|i| self.text(&ck[i]));
+                // Indexed formal `i_data(0 to 1) => x`: keep the base name.
+                let assoc = name_pos.map(|i| {
+                    let t = self.text(&ck[i]);
+                    let t = t.rsplit('.').next().unwrap_or(t.as_str());
+                    let end = t.find('(').unwrap_or(t.len());
+                    t[..end].to_string()
+                });
                 let expr = ck
                     .iter()
                     .enumerate()
@@ -658,6 +664,9 @@ fn is_decl_kind(k: SyntaxKind) -> bool {
             | SyntaxKind::UseClause
             | SyntaxKind::ForSpec
             | SyntaxKind::PackageInst
+            | SyntaxKind::PortClause
+            | SyntaxKind::GenericClause
+            | SyntaxKind::DisconnectSpec
     )
 }
 
@@ -1105,6 +1114,12 @@ impl<'a> Lower<'a> {
         let name = self.kw(mark);
         let base = self.types.get(&name).cloned();
         let Some(base) = base else {
+            // `X'subtype` type mark where X is a port/signal (not a type):
+            // adopt the object's width as an anonymous vector.
+            if let Some(id) = self.sig_id(&name) {
+                let w = self.sig_width.get(&id).copied().unwrap_or(1).max(1);
+                return (w, false, None, false);
+            }
             self.diags.push(Diagnostic {
                 code: "E0401",
                 severity: Severity::Error,
@@ -1443,9 +1458,18 @@ impl<'a> Lower<'a> {
         if matches!(self.types.get(tn), Some(TypeInfo::Record { .. })) {
             return Some(tn.to_string());
         }
-        self.access_inner.get(tn).and_then(|inner| {
-            matches!(self.types.get(inner), Some(TypeInfo::Record { .. })).then(|| inner.clone())
-        })
+        if let Some(inner) = self.access_inner.get(tn) {
+            if matches!(self.types.get(inner), Some(TypeInfo::Record { .. })) {
+                return Some(inner.clone());
+            }
+        }
+        // `X'subtype` where X is a record-typed port/signal: adopt its record.
+        if let Some(id) = self.sig_id(tn) {
+            if let Some(rn) = self.sig_rec.get(&id) {
+                return Some(rn.clone());
+            }
+        }
+        None
     }
 
     /// If `tn` is (or is an access to) an array-of-records, return the element
@@ -1745,6 +1769,10 @@ impl<'a> Lower<'a> {
                 }
                 self.sig_signed.insert(id, signed);
                 self.sig_width.insert(id, width);
+                // Block-header ports must be visible to the block body (entity
+                // ports get their names map rebuilt by lower_architecture, but
+                // a block header adds signals mid-body).
+                self.names.insert(n.clone(), id);
                 if let Some(tm) = &type_mark {
                     let tn = self.text(tm).to_ascii_lowercase();
                     if let Some(rn) = self.as_record(&tn) {
@@ -1855,6 +1883,18 @@ impl<'a> Lower<'a> {
         // is …` and `package body NAME is …` both yield NAME (a naive nth(1)
         // would return "body" for package bodies).
         let name = package_decl_name(p, self.db);
+        let kids0 = real_children(p);
+        // A package body sees the package declaration's items, even when the
+        // declaration lives in another file compiled earlier: merge the
+        // already-registered declaration into scope first.
+        if kids0
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "body")
+        {
+            if let Some(decl) = self.pkgs.get(&name.to_ascii_lowercase()).cloned() {
+                self.merge_package(&decl, None, false);
+            }
+        }
         // Package declarations: constants, types, and function bodies become
         // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
@@ -2019,6 +2059,10 @@ impl<'a> Lower<'a> {
         let mut lx2 = Lower::new(self.db, self.diags);
         lx2.register_builtin_types();
         lx2.pkgs = self.pkgs.clone();
+        // The enclosing scope (entity generics, constants, types) is visible in
+        // the `generic map` associations.
+        lx2.consts = self.consts.clone();
+        lx2.types = self.types.clone();
         if let Some(r) = &file_root {
             lx2.apply_context_clauses(r);
         }
@@ -2118,6 +2162,13 @@ impl<'a> Lower<'a> {
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
         self.install_entity_maps(&entity_name);
+        // Entity generics are constants in the architecture (also when the
+        // architecture was deferred to a pending pass with a fresh scope).
+        for prm in &modules[midx].params {
+            self.consts
+                .entry(prm.name.to_ascii_lowercase())
+                .or_insert_with(|| prm.default.clone());
+        }
         // Declarative part: everything before `begin`.
         let begin_pos = kids
             .iter()
@@ -2311,6 +2362,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::UseClause => self.merge_use_clause(d),
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
+                SyntaxKind::PortClause => self.lower_port_clause(module, d),
                 _ => {}
             }
         }
@@ -2521,6 +2573,8 @@ impl<'a> Lower<'a> {
     fn lower_block(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
         let kids = real_children(s);
         let (decls, stmts) = self.gen_body(&kids);
+        // Block-header ports are handled by the PortClause arm in
+        // lower_gen_decls: they become signals of the enclosing module.
         self.lower_gen_decls(module, &decls, false);
         for st in &stmts {
             self.lower_conc_stmt(module, st, proc_idx);
@@ -3628,10 +3682,6 @@ impl<'a> Lower<'a> {
         }
         let has_cond = elems.iter().any(|e| e.cond.is_some());
         let has_delay = elems.iter().any(|e| e.delay.is_some());
-        if has_cond && has_delay {
-            self.err(s.span(), "conditional waveform with `after` is unsupported");
-            return None;
-        }
         if has_delay {
             // A delayed concurrent assignment is a one-shot process scheduling
             // each transaction; VHDL waveform delays are each relative to the
@@ -3642,15 +3692,23 @@ impl<'a> Lower<'a> {
                 let mut t = 0u64;
                 if let Some(d) = &e.delay {
                     let dv = self.lower_expr(d, &self.consts.clone());
-                    match self.ce(&dv).and_then(|v| v.to_u64()) {
-                        Some(dt) => t = dt,
+                    match self.ce(&dv) {
+                        Some(v) => t = v.to_u64().unwrap_or(0), // X (unoverridden generic) -> 0
                         None => {
                             self.err(d.span(), "waveform delay must be constant");
                             return None;
                         }
                     }
                 }
-                let val = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
+                let mut val = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
+                if let Some(c) = &e.cond {
+                    // `v after t when c` — fold the condition into the value.
+                    val = Expr::Cond {
+                        c: Box::new(self.lower_expr(c, &self.consts.clone())),
+                        t: Box::new(val),
+                        e: Box::new(Expr::Lit(Value::x(1))),
+                    };
+                }
                 let a = Stmt::Assign {
                     lhs: lhs.clone(),
                     rhs: val,
@@ -3873,7 +3931,13 @@ impl<'a> Lower<'a> {
                 SyntaxKind::PortConn => {
                     let ck = real_children(k);
                     let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
-                    let assoc_name = name_pos.map(|i| self.text(&ck[i]));
+                    // Indexed formal `i_data(0 to 1) => x`: keep the base name.
+                    let assoc_name = name_pos.map(|i| {
+                        let t = self.text(&ck[i]);
+                        let t = t.rsplit('.').next().unwrap_or(t.as_str());
+                        let end = t.find('(').unwrap_or(t.len());
+                        t[..end].to_string()
+                    });
                     let expr = ck
                         .iter()
                         .enumerate()
@@ -4658,12 +4722,16 @@ impl<'a> Lower<'a> {
                 }) {
                     return Expr::Sig(id);
                 }
-                // 3+ part selected name `lib.pkg.item` / `work.pkg.item`:
+                // 2-part `pkg.item` and 3+ part `lib.pkg.item` selected names:
                 // resolve the item inside the named package.
                 {
                     let parts: Vec<&str> = name.split('.').collect();
-                    if parts.len() >= 3 {
-                        let pkg = parts[parts.len() - 2].to_ascii_lowercase();
+                    if parts.len() >= 2 {
+                        let pkg = if parts.len() >= 3 {
+                            parts[parts.len() - 2].to_ascii_lowercase()
+                        } else {
+                            parts[0].to_ascii_lowercase()
+                        };
                         let item = parts[parts.len() - 1].to_ascii_lowercase();
                         if let Some(p) = self.pkgs.get(&pkg).cloned() {
                             if let Some((_, v)) = p.consts.iter().find(|(n, _)| *n == item) {
@@ -4689,7 +4757,19 @@ impl<'a> Lower<'a> {
                 // unit, in femtoseconds.
                 if matches!(
                     key.as_str(),
-                    "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "s" | "min" | "hr"
+                    "fs" | "ps"
+                        | "ns"
+                        | "us"
+                        | "ms"
+                        | "sec"
+                        | "s"
+                        | "min"
+                        | "hr"
+                        | "um"
+                        | "hz"
+                        | "khz"
+                        | "mhz"
+                        | "ghz"
                 ) {
                     return Expr::Lit(Value::from_u64(32, time_unit_fs(&key)));
                 }
@@ -5120,6 +5200,15 @@ impl<'a> Lower<'a> {
             }
             // Alias to a subprogram: `alias a is f[...];` — calls to `a(...)`
             // become calls to the target `f(...)`.
+            // Operator-symbol call: `"<"(a, b)`, `"+"(x, y)`.
+            _ if args.len() == 2 && vhdl_binop(fname.trim_matches('"')).is_some() => {
+                let op = vhdl_binop(fname.trim_matches('"')).unwrap();
+                Expr::Bin {
+                    op,
+                    l: Box::new(args[0].clone()),
+                    r: Box::new(args[1].clone()),
+                }
+            }
             _ if self
                 .aliases
                 .get(&fname)
@@ -5354,7 +5443,19 @@ impl<'a> Lower<'a> {
         if let Some((num, unit)) = t.split_once(char::is_whitespace) {
             if matches!(
                 unit.trim().to_ascii_lowercase().as_str(),
-                "fs" | "ps" | "ns" | "us" | "ms" | "sec" | "s" | "min" | "hr"
+                "fs" | "ps"
+                    | "ns"
+                    | "us"
+                    | "ms"
+                    | "sec"
+                    | "s"
+                    | "min"
+                    | "hr"
+                    | "um"
+                    | "hz"
+                    | "khz"
+                    | "mhz"
+                    | "ghz"
             ) {
                 // Integer physical (`100 ps`) or real physical (`2.5 ns`,
                 // VHDL-2008) \u2014 the value is femtoseconds.
@@ -5369,7 +5470,19 @@ impl<'a> Lower<'a> {
                 return Expr::Lit(Value::from_u64(32, fs));
             }
         }
-        // Bit string literal: x"FF" / b"01" / o"7".
+        // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` (VHDL-2008:
+        // strip the leading decimal size).
+        let t: &str = {
+            let n = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            if n > 0
+                && t.len() > n
+                && matches!(t.as_bytes()[n], b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
+            {
+                &t[n..]
+            } else {
+                t.as_str()
+            }
+        };
         if t.len() >= 2
             && matches!(t.as_bytes()[0], b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
             && t.as_bytes()[1] == b'"'
@@ -5635,6 +5748,11 @@ fn time_unit_fs(unit: &str) -> u64 {
         "sec" | "s" => 1_000_000_000_000_000,
         "min" => 60_000_000_000_000_000,
         "hr" => 3_600_000_000_000_000_000,
+        "um" => 1_000, // micrometre treated as ps-scale placeholder
+        "hz" => 1,
+        "khz" => 1_000,
+        "mhz" => 1_000_000,
+        "ghz" => 1_000_000_000,
         _ => 1_000_000,
     }
 }
@@ -5683,6 +5801,13 @@ fn vhdl_unop(op: &str) -> Option<UnOp> {
         // `??x` (VHDL-2008 condition operator) lexes as two `?` puncts; the
         // lowerer sees the first one — identity to boolean.
         "?" => UnOp::Pos,
+        // Reduction operators: `and x`, `or x`, ... (unary form).
+        "and" => UnOp::RedAnd,
+        "or" => UnOp::RedOr,
+        "xor" => UnOp::RedXor,
+        "nand" => UnOp::RedNand,
+        "nor" => UnOp::RedNor,
+        "xnor" => UnOp::RedXnor,
         _ => return None,
     })
 }

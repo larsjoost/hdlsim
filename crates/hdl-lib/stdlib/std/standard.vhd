@@ -67,6 +67,14 @@ package standard is
 
     subtype delay_length is time range 0 fs to time'high;
 
+    type frequency is range -9223372036854775808 to 9223372036854775807
+        units
+            Hz;
+            kHz = 1000 Hz;
+            MHz = 1000 kHz;
+            GHz = 1000 MHz;
+        end units;
+
     type real is range -1.0e308 to 1.0e308;
 
     -- VHDL-2008: file open kinds/status moved to std.standard.
