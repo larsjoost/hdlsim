@@ -72,15 +72,27 @@ impl<'a> Lexer<'a> {
                     self.emit(TokenKind::Punct, 1);
                 }
                 _ => {
+                    // Consume the whole UTF-8 char so token spans stay on char
+                    // boundaries (slicing mid-char would panic in span_text).
+                    let clen = match b {
+                        0xC0..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        _ => 4,
+                    }
+                    .min(self.text.len() - self.pos);
                     self.diags.push(
                         Diagnostic::error(
                             "E0101",
-                            Some(Span::new(self.file, self.pos as u32, self.pos as u32 + 1)),
+                            Some(Span::new(
+                                self.file,
+                                self.pos as u32,
+                                self.pos as u32 + clen as u32,
+                            )),
                             format!("unexpected non-ASCII byte 0x{:02x}", b),
                         )
                         .with_help("HDL sources are expected to be ASCII"),
                     );
-                    self.emit(TokenKind::Error, 1);
+                    self.emit(TokenKind::Error, clen as u32);
                 }
             }
         }
