@@ -81,6 +81,9 @@ pub struct PackageIr {
     /// record selects (`r.outer.inner`) resolve in files that `use` the
     /// package (the lowerer's per-file `rec_field_ty` map doesn't cross files).
     pub rec_field_tys: Vec<(String, String, String)>,
+    /// Package-level signals / shared variables `(name, type mark)` — exported
+    /// so `use work.com_pkg.all;` also exposes bare reads of `net` etc.
+    pub sig_types: Vec<(String, String)>,
     /// The package's own declaration node and the design-file root that
     /// declared it — retained so a package instantiation can re-lower the
     /// generic package with the `generic map` values as overrides.
@@ -328,6 +331,7 @@ pub fn lower_file(
                         generics: Vec::new(),
                         type_actuals: Vec::new(),
                         rec_field_tys: Vec::new(),
+                        sig_types: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
                         uses,
@@ -1638,6 +1642,11 @@ impl<'a> Lower<'a> {
             let TypeInfo::Record { fields } = self.types.get(&cur)? else {
                 return None;
             };
+            // Protected type (registered as an empty record): any member
+            // select is an opaque placeholder.
+            if fields.is_empty() {
+                return Some((0, 32));
+            }
             let total: usize = fields.iter().map(|f| f.1).sum();
             let mut run = 0usize;
             let mut found: Option<(usize, usize, Option<String>)> = None;
@@ -1818,7 +1827,13 @@ impl<'a> Lower<'a> {
             for n in &names {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
-                Rc::make_mut(&mut self.consts).insert(key, val.clone());
+                Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
+                if let Some(tm) = &type_mark {
+                    let tn = self.kw(tm);
+                    if self.as_record(&tn).is_some() {
+                        self.const_types.insert(key.clone(), tn);
+                    }
+                }
                 out.push((n.clone(), val));
             }
         }
@@ -2005,6 +2020,11 @@ impl<'a> Lower<'a> {
                 .entry((r.clone(), f.clone()))
                 .or_insert_with(|| t.clone());
         }
+        for (n, tn) in &p.sig_types {
+            self.pkg_sig_types
+                .entry(n.clone())
+                .or_insert_with(|| tn.clone());
+        }
         // Use clauses are transitive through packages: `use work.p.all` also
         // exposes what `p` itself made visible via `use lib.q.all;`.
         if item.is_none() && visited.insert(p.name.to_ascii_lowercase()) {
@@ -2073,6 +2093,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut functions: Vec<FuncIr> = Vec::new();
+        let mut sig_types: Vec<(String, String)> = Vec::new();
         let mut uses: Vec<String> = context_units(self.db, root);
         uses.retain(|u| u != &name.to_ascii_lowercase());
         let mut attr_decls: Vec<String> = Vec::new();
@@ -2111,7 +2132,8 @@ impl<'a> Lower<'a> {
                         if let Some(tm) = tmark {
                             let tn = self.kw(tm);
                             for n in names {
-                                self.pkg_sig_types.insert(n, tn.clone());
+                                self.pkg_sig_types.insert(n.clone(), tn.clone());
+                                sig_types.push((n, tn.clone()));
                             }
                         }
                     }
@@ -2175,6 +2197,7 @@ impl<'a> Lower<'a> {
             generics,
             type_actuals: Vec::new(),
             rec_field_tys,
+            sig_types,
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
@@ -2304,6 +2327,7 @@ impl<'a> Lower<'a> {
             pkg.uses.extend(part.uses);
             pkg.attr_decls.extend(part.attr_decls);
             pkg.rec_field_tys.extend(part.rec_field_tys);
+            pkg.sig_types.extend(part.sig_types);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -3219,7 +3243,11 @@ impl<'a> Lower<'a> {
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "protected")
         {
-            self.types.insert(name, TypeInfo::Scalar);
+            // Protected type: methods are stubbed below; register as an empty
+            // record so `obj.field` selects resolve to a placeholder (bodies
+            // are not simulated).
+            self.types
+                .insert(name, TypeInfo::Record { fields: Vec::new() });
             for k in &kids {
                 match k.kind() {
                     // Inner type declarations (e.g. inside a protected body).
@@ -3410,6 +3438,24 @@ impl<'a> Lower<'a> {
 
     /// True when a function's local variable declarations constrain their
     /// width with a parameter (`variable v : std_ulogic_vector(n-1 downto 0)`),
+    /// Whether a `SyntaxKind::Function` node (function or procedure
+    /// declaration) is a true function, i.e. has a `return` before `begin`.
+    /// Process-local procedures are not lowered: their bodies reference
+    /// outer-scope names (ports, process aliases) that the subprogram slot
+    /// space does not see.
+    fn subprogram_is_function(&self, f: &SyntaxNode) -> bool {
+        for k in real_children(f) {
+            if k.kind() == SyntaxKind::Ident {
+                match self.kw(&k).as_str() {
+                    "return" => return true,
+                    "begin" => return false,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
     /// which cannot be lowered without knowing the call argument.
     fn function_locals_use_params(&self, f: &SyntaxNode) -> bool {
         let kids = real_children(f);
@@ -3546,6 +3592,23 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Record-typed parameters: remember the record type so `arg.field`
+        // resolves even in declarative-item initializers (constants), which
+        // are lowered before the loop below.
+        for (i, (n, _)) in slots.iter().enumerate() {
+            let tn = arg_types
+                .iter()
+                .find(|(an, _)| an == n)
+                .map(|(_, tn)| tn.clone());
+            if let Some(tn) = tn {
+                if let Some(rn) = self.as_record(&tn) {
+                    self.sig_rec.insert(i as SigId, rn);
+                }
+                if let Some(en) = self.as_elem_record(&tn) {
+                    self.sig_elem_rec.insert(i as SigId, en);
+                }
+            }
+        }
         // Declarative items in textual order: each may reference the ones
         // before it (parameters, types, constants, locals).
         let mut locals: Vec<SignalIr> = Vec::new();
@@ -3604,12 +3667,10 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
-        // Record-typed parameters/locals: remember the record type so
-        // `arg.field` and `arr(i).field` resolve to field selects.
+        // Record-typed locals (declared in the loop above): same treatment.
         for (i, (n, _)) in slots.iter().enumerate() {
-            let tn = arg_types
+            let tn = local_types
                 .iter()
-                .chain(local_types.iter())
                 .find(|(an, _)| an == n)
                 .map(|(_, tn)| tn.clone());
             if let Some(tn) = tn {
@@ -3707,11 +3768,13 @@ impl<'a> Lower<'a> {
         let kids = real_children(p);
         let mut sens = Sens::List(Vec::new());
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
+        let mut local_fns: Vec<SyntaxNode> = Vec::new();
         for k in &kids {
             match k.kind() {
                 SyntaxKind::SensList => {
                     sens = self.lower_sens_list(k);
                 }
+                SyntaxKind::Function if self.subprogram_is_function(k) => local_fns.push(k.clone()),
                 SyntaxKind::SignalDecl
                 | SyntaxKind::VariableDecl
                 | SyntaxKind::ConstantDecl
@@ -3740,6 +3803,13 @@ impl<'a> Lower<'a> {
                 SyntaxKind::FileDecl => self.lower_file_decl(k),
                 _ if is_stmt_node(k.kind()) => stmt_nodes.push(k.clone()),
                 _ => {}
+            }
+        }
+        // Process-local functions (`function prefix return string is ...`):
+        // register them so bare parameterless calls (`prefix & "..."`) resolve.
+        for k in &local_fns {
+            if let Some(fi) = self.lower_function_node(k) {
+                self.funcs.insert(fi.name.to_ascii_lowercase(), fi);
             }
         }
         self.extra_base = module.signals.len();
@@ -4941,6 +5011,11 @@ impl<'a> Lower<'a> {
                         }
                         _ => None,
                     };
+                    if rec_name.is_none() && !field.is_empty() {
+                        // Field select on an indexed/opaque record element
+                        // (`state.actors(0).subscribers`) — placeholder.
+                        return Expr::Lit(Value::x(32));
+                    }
                     if let Some(tn) = rec_name {
                         if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
                             let total: usize = fields.iter().map(|f| f.1).sum();
@@ -5006,25 +5081,17 @@ impl<'a> Lower<'a> {
                         self.consts.get(&base).cloned(),
                         self.const_types.get(&base).cloned(),
                     ) {
-                        // `rec_const.field` on a record-typed constant: slice the
-                        // literal value directly.
-                        if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
-                            let total: usize = fields.iter().map(|f| f.1).sum();
-                            let mut run = 0usize;
-                            for (fn_, w, _) in fields {
-                                let lsb = total - run - w;
-                                if *fn_ == field {
-                                    return Expr::Sel {
-                                        e: Box::new(Expr::Lit(v)),
-                                        msb: Box::new(Expr::Lit(Value::from_u64(
-                                            32,
-                                            (lsb + w - 1) as u64,
-                                        ))),
-                                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
-                                    };
-                                }
-                                run += w;
-                            }
+                        // `rec_const.field` (nested: `c.a.b`) on a record-typed
+                        // constant/generic: slice the literal value directly.
+                        let path: Vec<String> =
+                            fields_path.iter().map(|s| s.to_ascii_lowercase()).collect();
+                        let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                        if let Some((lsb, w)) = self.record_field_offset(&tn, &path_refs) {
+                            return Expr::Sel {
+                                e: Box::new(Expr::Lit(v)),
+                                msb: Box::new(Expr::Lit(Value::from_u64(32, (lsb + w - 1) as u64))),
+                                lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                            };
                         }
                     }
                 }
@@ -5505,6 +5572,20 @@ impl<'a> Lower<'a> {
                 Some(Expr::Sig(id)) => Some(*id),
                 _ => None,
             });
+        // Dotted callee `rec.field(args)` or `pkg_var.method(args)`: if the
+        // base names a signal/record or a package-level signal, this is a
+        // method call — lower as a plain call of the field name.
+        if base_id.is_none() && name.contains('.') && !args.is_empty() {
+            let base = name.split('.').next().unwrap_or(name.as_str());
+            if self.sig_id(base).is_some()
+                || self.pkg_sig_types.contains_key(&base.to_ascii_lowercase())
+            {
+                return Expr::Call {
+                    name: fname.clone(),
+                    args,
+                };
+            }
+        }
         if base_id.is_none() && !args.is_empty() {
             if let Some(e) = self.lower_const_array_index(&fname, &args) {
                 return e;
@@ -6465,6 +6546,108 @@ mod tests {
             "{:?}",
             errs.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    fn lower_src(src: &str) -> Vec<hdl_syntax::diagnostic::Diagnostic> {
+        let mut db = SourceDb::new();
+        let id = db.add_file("t.vhd".to_string(), src.to_string()).unwrap();
+        let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+        let mut diags = Vec::new();
+        let _ = lower_file(
+            id,
+            &parsed.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        diags
+    }
+
+    fn assert_no_errors(diags: &[hdl_syntax::diagnostic::Diagnostic]) {
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "{:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn process_local_function_bare_call_resolves() {
+        // `function prefix return string` inside a process, called bare.
+        let diags = lower_src("entity top is port (q : out bit); end entity;\narchitecture rtl of top is\nbegin\n  process\n    function prefix return string is\n    begin\n      return \"x\";\n    end function prefix;\n  begin\n    report prefix & \"done\";\n    wait;\n  end process;\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn process_local_procedure_with_port_record_field_is_skipped() {
+        // A process-local *procedure* (no `return`) whose body selects a field
+        // of a record-typed entity port: procedures are not lowered (the
+        // subprogram slot space does not see outer-scope names), so this must
+        // not produce "unknown identifier" diagnostics.
+        let diags = lower_src("package p is\n  type rec_t is record readdata : std_logic_vector; writedata : std_logic_vector; end record;\nend package;\nuse work.p.all;\nentity top is\n  port (amr : inout rec_t; rdata : in std_logic_vector(31 downto 0); wdata : out std_logic_vector(31 downto 0));\nend entity;\narchitecture rtl of top is\nbegin\n  process\n    procedure wr is\n    begin\n      amr.readdata <= rdata;\n      wdata <= amr.writedata;\n    end procedure;\n  begin\n    wr;\n    wait;\n  end process;\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn record_param_field_in_call_arg_resolves() {
+        // `get(q.p_meta, 0)` — field select on a record parameter inside a
+        // constant initializer in the function's declarative part.
+        let diags = lower_src("package p is\n  type inner_t is record v : integer; end record;\n  type q_t is record p_meta : inner_t; end record;\n  function get(x : integer; i : natural) return integer;\n  function get_meta(q : q_t) return integer;\nend package;\npackage body p is\n  function get(x : integer; i : natural) return integer is begin return x; end function;\n  function get_meta(q : q_t) return integer is\n    constant head : integer := get(q.p_meta, 0);\n  begin return head; end function;\nend package body;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn protected_type_member_select_is_placeholder() {
+        // `self.data_size` on a protected-typed shared variable.
+        let diags = lower_src("package p is\n  type rec_t is protected\n    impure function get return natural;\n  end protected;\nend package;\npackage body p is\n  type rec_t is protected body\n    impure function get return natural is begin return 1; end;\n  end protected body;\nend package body;\nuse work.p.all;\nentity top is port (q : out bit); end entity;\narchitecture rtl of top is\n  shared variable self : rec_t;\nbegin\n  process begin\n    q <= bit'val(self.data_size > 0);\n    wait;\n  end process;\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn record_typed_generic_field_select_resolves() {
+        // `bus_handle.p_logger` where bus_handle is a record-typed generic.
+        let diags = lower_src("package p is\n  type logger_t is record id : integer; end record;\n  type bus_t is record p_logger : logger_t; end record;\nend package;\nuse work.p.all;\nentity top is\n  generic (bus_handle : bus_t);\n  port (q : out bit);\nend entity;\narchitecture rtl of top is\nbegin\n  q <= bit'val(bus_handle.p_logger.id = 0);\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn package_level_signal_bare_read_via_use() {
+        // `signal net : network_t` in a package; bare `net` in a using file.
+        let mut db = SourceDb::new();
+        let id1 = db.add_file("p.vhd".to_string(), "package p is\n  type network_t is record id : integer; end record;\n  signal net : network_t;\nend package;\n".to_string()).unwrap();
+        let parsed1 = hdl_syntax::vhdl::parser::parse_file(id1, db.file(id1));
+        let mut diags = Vec::new();
+        let mut pkgs = HashMap::new();
+        let lowered = lower_file(
+            id1,
+            &parsed1.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        for p in lowered.packages {
+            pkgs.insert(p.name.to_ascii_lowercase(), std::rc::Rc::new(p));
+        }
+        let id2 = db.add_file("top.vhd".to_string(), "use work.p.all;\nentity top is port (q : out bit); end entity;\narchitecture rtl of top is\nbegin\n  q <= bit'val(net.id = 0);\nend architecture;\n".to_string()).unwrap();
+        let parsed2 = hdl_syntax::vhdl::parser::parse_file(id2, db.file(id2));
+        let _ = lower_file(
+            id2,
+            &parsed2.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &pkgs,
+            &HashMap::new(),
+        );
+        assert_no_errors(&diags);
     }
 
     fn invalid_generate_range_and_literal_base_do_not_panic() {

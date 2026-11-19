@@ -78,7 +78,7 @@ pub struct LibraryManager {
     /// the "out of the box" fallback when no library maps the unit.
     search_roots: Vec<PathBuf>,
     /// Lazily built unit → file index over `search_roots` (built on first miss).
-    search_index: Option<HashMap<String, (PathBuf, bool)>>,
+    search_index: Option<HashMap<String, Vec<(PathBuf, bool)>>>,
     /// Units already reported as found-by-search (warn once per unit).
     search_warned: HashSet<String>,
     /// Cross-file Verilog library state: SV packages and their `pkg::`-qualified
@@ -124,23 +124,21 @@ impl LibraryManager {
 
     /// Build the fallback index over the search roots (once), then look up
     /// `name`. Returns the file defining the unit, if the project has it.
-    fn search_project(&mut self, name: &str) -> Option<PathBuf> {
+    /// All project files defining `name`, declaration files first (a unit's
+    /// declaration file wins over a file that only holds its body — compiling
+    /// a body before its declaration lowers it without the declaration's items
+    /// in scope). Duplicate unit names across files are all returned, matching
+    /// the library-index behavior.
+    fn search_project(&mut self, name: &str) -> Vec<PathBuf> {
         if self.search_index.is_none() {
-            // (file, is_body): a unit's declaration file wins over a file that
-            // only holds its body — compiling a body before its declaration
-            // lowers it without the declaration's items in scope.
-            let mut idx: HashMap<String, (PathBuf, bool)> = HashMap::new();
+            let mut idx: HashMap<String, Vec<(PathBuf, bool)>> = HashMap::new();
             for root in self.search_roots.clone() {
                 for (unit, path, is_body) in providers::walk_sources_tagged(&root) {
-                    match idx.entry(unit.to_ascii_lowercase()) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            if !is_body && e.get().1 {
-                                e.insert((path, false));
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert((path, is_body));
-                        }
+                    let e = idx.entry(unit.to_ascii_lowercase()).or_default();
+                    if is_body {
+                        e.push((path, true));
+                    } else {
+                        e.insert(0, (path, false));
                     }
                 }
             }
@@ -148,7 +146,9 @@ impl LibraryManager {
         }
         self.search_index
             .as_ref()
-            .and_then(|i| i.get(&name.to_ascii_lowercase()).map(|(p, _)| p.clone()))
+            .and_then(|i| i.get(&name.to_ascii_lowercase()))
+            .map(|v| v.iter().map(|(p, _)| p.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Enable the persistent parse cache in `c`.
@@ -604,7 +604,8 @@ impl UnitResolver for LibraryManager {
         if candidates.is_none() {
             // Out-of-the-box fallback: search the project roots (cwd, input
             // file dirs) for a file defining this unit.
-            if let Some(path) = self.search_project(name) {
+            let paths = self.search_project(name);
+            if !paths.is_empty() {
                 if self.search_warned.insert(name.to_ascii_lowercase()) {
                     let root = self
                         .search_roots
@@ -616,13 +617,15 @@ impl UnitResolver for LibraryManager {
                         None,
                         format!(
                             "design unit '{name}' not in any library; found by searching the project ({root}) at {} — run `hdlsim init` to write hdlsim.ini so it is indexed directly next time",
-                            path.display()
+                            paths[0].display()
                         ),
                     ));
                 }
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-                self.compile_text(design, &path, &text)?;
+                for path in &paths {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+                    self.compile_text(design, path, &text)?;
+                }
                 self.retry_pending_architectures(design, false);
                 if design.modules.iter().any(|m| m.name == name)
                     || design.packages.contains_key(&name.to_ascii_lowercase())
@@ -882,6 +885,7 @@ pub fn compile_one(
                         e.consts.extend(p.consts);
                         e.functions.extend(p.functions);
                         e.rec_field_tys.extend(p.rec_field_tys);
+                        e.sig_types.extend(p.sig_types);
                         if e.generics.is_empty() {
                             e.generics = p.generics;
                         }
