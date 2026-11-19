@@ -649,7 +649,7 @@ fn stmt_writes(s: &Stmt, out: &mut Vec<FlatSigId>) {
                 stmt_writes(d, out);
             }
         }
-        Stmt::Assign { lhs, .. } => lhs_roots(lhs, out),
+        Stmt::Assign { lhs, .. } | Stmt::AssignDelayed { lhs, .. } => lhs_roots(lhs, out),
         Stmt::Delay { stmt, .. } => stmt_writes(stmt, out),
         Stmt::Wait { body, .. } => stmt_writes(body, out),
         Stmt::For {
@@ -676,7 +676,7 @@ fn stmt_has_sva(s: &Stmt) -> bool {
             items.iter().any(|(_, b)| stmt_has_sva(b))
                 || default.as_ref().map_or(false, |d| stmt_has_sva(d))
         }
-        Stmt::Assign { .. } | Stmt::Return(_) => false,
+        Stmt::Assign { .. } | Stmt::AssignDelayed { .. } | Stmt::Return(_) => false,
         Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
         Stmt::Wait { body, .. } => stmt_has_sva(body),
         Stmt::For {
@@ -1435,6 +1435,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                 name
             )),
             Stmt::Delay { .. } => Err("prove: `#delay` is not supported".to_string()),
+            Stmt::AssignDelayed { .. } => {
+                Err("prove: delayed signal assignment (`after`) is not supported".to_string())
+            }
             Stmt::Wait { .. } => Err("prove: `@wait` is not supported in processes".to_string()),
         }
     }

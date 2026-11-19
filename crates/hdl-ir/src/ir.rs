@@ -183,6 +183,14 @@ pub enum Stmt {
         rhs: Expr,
         nba: bool,
     },
+    /// VHDL delayed signal assignment (`s <= v after t;`): the RHS and the
+    /// delay are evaluated when the statement executes, but the signal update
+    /// happens at now + delay (femtoseconds) without suspending the process.
+    AssignDelayed {
+        lhs: Expr,
+        rhs: Expr,
+        delay: Expr,
+    },
     /// `#delay stmt` — delay in femtoseconds (timescale applied at lowering).
     Delay {
         time_fs: u64,
@@ -385,6 +393,11 @@ impl Stmt {
             Stmt::Assign { lhs, rhs, .. } => {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
+            }
+            Stmt::AssignDelayed { lhs, rhs, delay } => {
+                lhs.collect_sigs(out);
+                rhs.collect_sigs(out);
+                delay.collect_sigs(out);
             }
             Stmt::Delay { stmt, .. } => stmt.collect_sigs(out),
             Stmt::Wait { sens, body } => {

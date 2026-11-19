@@ -483,6 +483,12 @@ fn w_stmt(w: &mut W, s: &Stmt) {
             w_expr(w, rhs);
             w.bool(*nba);
         }
+        Stmt::AssignDelayed { lhs, rhs, delay } => {
+            w.u8(15);
+            w_expr(w, lhs);
+            w_expr(w, rhs);
+            w_expr(w, delay);
+        }
         Stmt::Delay { time_fs, stmt } => {
             w.u8(4);
             w.u64(*time_fs);
@@ -599,6 +605,11 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             lhs: r_expr(r)?,
             rhs: r_expr(r)?,
             nba: r.bool()?,
+        },
+        15 => Stmt::AssignDelayed {
+            lhs: r_expr(r)?,
+            rhs: r_expr(r)?,
+            delay: r_expr(r)?,
         },
         4 => Stmt::Delay {
             time_fs: r.u64()?,
@@ -723,11 +734,41 @@ fn w_ev(w: &mut W, e: &Ev) {
             w.u8(0);
             w.u32(*pid);
         }
+        Ev::Nba(sig, v, drv) => {
+            w.u8(1);
+            w.u32(*sig);
+            w.value(v);
+            w.bool(drv.is_some());
+            if let Some(d) = drv {
+                w.u32(*d);
+            }
+        }
+        Ev::NbaExpr(lhs, v, drv) => {
+            w.u8(2);
+            w_expr(w, lhs);
+            w.value(v);
+            w.bool(drv.is_some());
+            if let Some(d) = drv {
+                w.u32(*d);
+            }
+        }
     }
 }
 fn r_ev(r: &mut R) -> Result<Ev, String> {
     match r.u8()? {
         0 => Ok(Ev::Resume(r.u32()?)),
+        1 => {
+            let sig = r.u32()?;
+            let v = r.value()?;
+            let drv = if r.bool()? { Some(r.u32()?) } else { None };
+            Ok(Ev::Nba(sig, v, drv))
+        }
+        2 => {
+            let lhs = r_expr(r)?;
+            let v = r.value()?;
+            let drv = if r.bool()? { Some(r.u32()?) } else { None };
+            Ok(Ev::NbaExpr(lhs, v, drv))
+        }
         t => Err(format!("bad Ev tag {}", t)),
     }
 }
@@ -1175,6 +1216,11 @@ mod tests {
                 matching: false,
             },
             a.clone(),
+            Stmt::AssignDelayed {
+                lhs: Expr::Sig(1),
+                rhs: Expr::Sig(2),
+                delay: Expr::Lit(Value::from_u64(64, 5000)),
+            },
             Stmt::Delay {
                 time_fs: 1000,
                 stmt: Box::new(a.clone()),
