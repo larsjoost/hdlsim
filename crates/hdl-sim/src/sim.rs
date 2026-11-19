@@ -2342,8 +2342,14 @@ impl Simulator {
                     "to_ostring" => vhdl_radix_string(&v, 8),
                     "to_bstring" => vhdl_radix_string(&v, 2),
                     _ => {
-                        // VHDL to_string of a vector: one char per bit.
-                        if v.width() == 1 {
+                        // VHDL to_string of a real: decimal; of a vector: one
+                        // char per bit.
+                        if self.expr_real(&args[0], locals) {
+                            match v.to_f64() {
+                                Some(f) => format!("{}", f),
+                                None => "x".to_string(),
+                            }
+                        } else if v.width() == 1 {
                             match v.bits[0] {
                                 V0 => "0".to_string(),
                                 V1 => "1".to_string(),

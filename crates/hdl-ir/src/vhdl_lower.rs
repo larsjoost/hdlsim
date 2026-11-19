@@ -6021,6 +6021,8 @@ impl<'a> Lower<'a> {
                 as_real(args.into_iter().next().unwrap())
             }
             "resize" if args.len() == 3 => as_real(args.into_iter().next().unwrap()),
+            // `to_slv(x)`: bit-identical view as std_logic_vector.
+            "to_slv" if args.len() == 1 => args.into_iter().next().unwrap(),
             "to_unsigned" | "conv_unsigned" | "conv_std_logic_vector" if args.len() == 2 => {
                 let w = self
                     .ce_env(&args[1], env)
