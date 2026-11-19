@@ -322,40 +322,62 @@ impl Flat {
         // Connect ports. `conns` are already remapped to flat (parent) signal
         // ids by the caller, so they must NOT be remapped through the child map.
         for (i, port) in m.ports.iter().enumerate() {
-            let conn = conn_for(conns, &m.ports, i);
-            let Some(conn) = conn else {
-                return Err(ElabError::Message(format!(
-                    "{}: port '{}' not connected",
-                    where_, port.name
-                )));
-            };
-            let expr = conn.clone();
-            match (&expr, port.dir) {
-                (Expr::Sig(ps), _) => {
-                    // Alias: the child port *is* the parent signal.
-                    map[port.sig as usize] = *ps;
+            match conn_for(conns, &m.ports, i) {
+                Some(expr) => {
+                    let expr = expr.clone();
+                    match (&expr, port.dir) {
+                        (Expr::Sig(ps), _) => {
+                            // Alias: the child port *is* the parent signal.
+                            map[port.sig as usize] = *ps;
+                        }
+                        _ => {
+                            let imp_name = format!("{}.{}", where_, port.name);
+                            let imp = self.new_sig(
+                                imp_name,
+                                m.signals[port.sig as usize].width.max(1),
+                                port_dir_kind(port.dir),
+                                None,
+                                scope,
+                                m.signals[port.sig as usize].signed,
+                            );
+                            map[port.sig as usize] = imp;
+                            match port.dir {
+                                Dir::In => self.assigns.push(FlatAssign {
+                                    lhs: Expr::Sig(imp),
+                                    rhs: expr,
+                                }),
+                                // A literal actual on an out/inout port (e.g. an
+                                // explicit `open`) is not an lvalue: leave the
+                                // port unconnected instead of assigning to it.
+                                Dir::Out | Dir::Inout => {
+                                    if !matches!(expr, Expr::Lit(_) | Expr::Real(_)) {
+                                        self.assigns.push(FlatAssign {
+                                            lhs: expr,
+                                            rhs: Expr::Sig(imp),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                _ => {
+                // Unassociated port (`open`, or omitted from the port map) —
+                // legal VHDL/Verilog. Give the child a private signal,
+                // initialised to the port's declared default when it has one;
+                // out/inout ports simply stay undriven.
+                None => {
+                    let psig = &m.signals[port.sig as usize];
                     let imp_name = format!("{}.{}", where_, port.name);
                     let imp = self.new_sig(
                         imp_name,
-                        m.signals[port.sig as usize].width.max(1),
+                        psig.width.max(1),
                         port_dir_kind(port.dir),
-                        None,
+                        psig.init.clone(),
                         scope,
-                        m.signals[port.sig as usize].signed,
+                        psig.signed,
                     );
+                    self.signals[imp as usize].mem = psig.mem;
                     map[port.sig as usize] = imp;
-                    match port.dir {
-                        Dir::In => self.assigns.push(FlatAssign {
-                            lhs: Expr::Sig(imp),
-                            rhs: expr,
-                        }),
-                        Dir::Out | Dir::Inout => self.assigns.push(FlatAssign {
-                            lhs: expr,
-                            rhs: Expr::Sig(imp),
-                        }),
-                    }
                 }
             }
         }
