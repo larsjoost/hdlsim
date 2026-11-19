@@ -2183,22 +2183,13 @@ impl<'a> Lower<'a> {
                     }
                 }
                 SyntaxKind::Function => {
-                    if self.function_locals_use_params(&d) {
-                        // e.g. `variable v : std_ulogic_vector(n-1 downto 0);`
-                        // — the width depends on a call argument, which is not
-                        // known at lower time; skip registering the function.
-                        let name = real_children(&d)
-                            .iter()
-                            .find(|k| k.kind() == SyntaxKind::Name)
-                            .map(|k| self.text(k))
-                            .unwrap_or_default();
-                        self.warn(
-                            d.span(),
-                            format!(
-                                "function '{name}' has parameter-dependent local declarations; not registered for constant evaluation"
-                            ),
-                        );
-                    } else if let Some(f) = self.lower_function_node(&d) {
+                    // Functions with parameter-dependent local widths (e.g.
+                    // `variable v : unsigned(a'length-1 downto 0);` in
+                    // std_logic_arith) lower fine in slot space — the width just
+                    // defaults when the constraint cannot be const-evaled. Only
+                    // constant *initializers* calling such functions fall back to
+                    // X (reported separately at the initializer).
+                    if let Some(f) = self.lower_function_node(&d) {
                         self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
                         functions.push(f);
                     }
@@ -3494,8 +3485,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// True when a function's local variable declarations constrain their
-    /// width with a parameter (`variable v : std_ulogic_vector(n-1 downto 0)`),
     /// Whether a `SyntaxKind::Function` node (function or procedure
     /// declaration) is a true function, i.e. has a `return` before `begin`.
     /// Process-local procedures are not lowered: their bodies reference
@@ -3554,41 +3543,6 @@ impl<'a> Lower<'a> {
             locals: Vec::new(),
             body: Stmt::Null,
         })
-    }
-
-    /// which cannot be lowered without knowing the call argument.
-    fn function_locals_use_params(&self, f: &SyntaxNode) -> bool {
-        let kids = real_children(f);
-        let mut params: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_begin = false;
-        for k in &kids {
-            if k.kind() == SyntaxKind::Ident && self.kw(k) == "begin" {
-                seen_begin = true;
-            }
-            if !seen_begin && k.kind() == SyntaxKind::PortDecl {
-                let pk = real_children(k);
-                if let Some(colon) = pk
-                    .iter()
-                    .position(|c| c.kind() == SyntaxKind::Punct && self.text(c) == ":")
-                {
-                    for c in &pk[..colon] {
-                        if c.kind() == SyntaxKind::Name {
-                            params.insert(self.text(c).to_ascii_lowercase());
-                        }
-                    }
-                }
-            }
-        }
-        if params.is_empty() {
-            return false;
-        }
-        kids.iter()
-            .filter(|k| k.kind() == SyntaxKind::VariableDecl)
-            .any(|d| {
-                d.descendants()
-                    .filter(|k| k.kind() == SyntaxKind::Name)
-                    .any(|k| params.contains(&self.text(&k).to_ascii_lowercase()))
-            })
     }
 
     fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
@@ -6835,6 +6789,20 @@ mod tests {
         // declarative part, called bare from a process inside the block.
         let diags = lower_src("entity top is port (clk : in bit; q : out natural); end entity;\narchitecture a of top is\n  signal outstanding : natural := 0;\nbegin\n  write_block : block\n    impure function next_outstanding return natural is\n    begin\n      return outstanding + 1;\n    end;\n  begin\n    main : process\n    begin\n      wait until rising_edge(clk);\n      outstanding <= next_outstanding;\n      q <= outstanding;\n    end process;\n  end block;\nend architecture;\n");
         assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn param_dependent_local_function_lowers_without_warning() {
+        // `variable l : bit_vector(a'length - 1 downto 0);` inside a function
+        // (as in Vivado's std_logic_arith): the function must still lower and
+        // no "parameter-dependent" warning may be emitted (issue #106).
+        let diags = lower_src("package p is\n  function f(a : bit_vector) return bit_vector;\nend package;\npackage body p is\n  function f(a : bit_vector) return bit_vector is\n    variable l : bit_vector(a'length - 1 downto 0);\n  begin\n    l := a;\n    return l;\n  end;\nend package body;\n");
+        assert_no_errors(&diags);
+        let msgs: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            msgs.iter().all(|m| !m.contains("parameter-dependent")),
+            "{msgs:?}"
+        );
     }
 
     #[test]
