@@ -2604,12 +2604,58 @@ impl<'a> FnRunner<'a> {
             }
             Stmt::Assign { lhs, rhs, .. } => {
                 let v = self.sim.eval_expr(rhs, Some(self.locals));
-                if let Expr::Sig(s) = lhs {
-                    let i = *s as usize;
-                    if i < self.locals.len() {
-                        let w = self.locals[i].width();
-                        self.locals[i] = v.resize(w.max(1));
+                match lhs {
+                    Expr::Sig(s) => {
+                        let i = *s as usize;
+                        if i < self.locals.len() {
+                            let w = self.locals[i].width();
+                            self.locals[i] = v.resize(w.max(1));
+                        }
                     }
+                    // `v(i) := x` / `v(hi downto lo) := x` on a local slot:
+                    // splice the rhs bits in at the offset, growing with X.
+                    Expr::Idx { e, i } => {
+                        if let Expr::Sig(s) = &**e {
+                            let idx = self.sim.eval_expr(i, Some(self.locals));
+                            if let Some(a) = idx.to_u64() {
+                                let s = *s as usize;
+                                let a = a as usize;
+                                if s < self.locals.len() {
+                                    let w = v.width().max(1);
+                                    if self.locals[s].bits.len() < a + w {
+                                        let mut bits = self.locals[s].bits.clone();
+                                        bits.resize(a + w, VX);
+                                        self.locals[s] = Value { bits };
+                                    }
+                                    for b in 0..w {
+                                        self.locals[s].set_bit(a + b, v.bit(b));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Expr::Sel { e, msb, lsb } => {
+                        if let Expr::Sig(s) = &**e {
+                            let m = self.sim.eval_expr(msb, Some(self.locals));
+                            let l = self.sim.eval_expr(lsb, Some(self.locals));
+                            if let (Some(m), Some(l)) = (m.to_u64(), l.to_u64()) {
+                                let s = *s as usize;
+                                let (m, l) = (m as usize, l as usize);
+                                if s < self.locals.len() {
+                                    let w = m.saturating_sub(l) + 1;
+                                    if self.locals[s].bits.len() < l + w {
+                                        let mut bits = self.locals[s].bits.clone();
+                                        bits.resize(l + w, VX);
+                                        self.locals[s] = Value { bits };
+                                    }
+                                    for b in 0..w {
+                                        self.locals[s].set_bit(l + b, v.bit(b));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             Stmt::Case {
