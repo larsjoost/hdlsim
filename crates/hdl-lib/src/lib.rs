@@ -881,6 +881,7 @@ pub fn compile_one(
                         e.types.extend(p.types);
                         e.consts.extend(p.consts);
                         e.functions.extend(p.functions);
+                        e.rec_field_tys.extend(p.rec_field_tys);
                         if e.generics.is_empty() {
                             e.generics = p.generics;
                         }

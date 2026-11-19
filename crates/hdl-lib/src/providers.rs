@@ -309,6 +309,7 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
                     | SyntaxKind::Package
                     | SyntaxKind::PackageInst
                     | SyntaxKind::ConfigDecl
+                    | SyntaxKind::ContextDecl
             )
         })
         .filter_map(|u| {
@@ -322,7 +323,7 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
                 .find(|n| {
                     !matches!(
                         db.span_text(n.span()).to_ascii_lowercase().as_str(),
-                        "entity" | "package" | "body" | "configuration"
+                        "entity" | "package" | "body" | "configuration" | "context"
                     )
                 })
                 .map(|n| (db.span_text(n.span()).trim().to_string(), is_body))

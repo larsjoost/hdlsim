@@ -77,6 +77,10 @@ pub struct PackageIr {
     /// type name)` — `package p is new g generic map (type T => u);` binds the
     /// generic type `T` to the actual type `u` inside the instance.
     pub type_actuals: Vec<(String, String)>,
+    /// Record field type names `(record, field, field type)` — lets nested
+    /// record selects (`r.outer.inner`) resolve in files that `use` the
+    /// package (the lowerer's per-file `rec_field_ty` map doesn't cross files).
+    pub rec_field_tys: Vec<(String, String, String)>,
     /// The package's own declaration node and the design-file root that
     /// declared it — retained so a package instantiation can re-lower the
     /// generic package with the `generic map` values as overrides.
@@ -135,7 +139,15 @@ pub enum Binding {
 /// yields `math`. The library manager compiles every unit of that library.
 pub fn context_libraries(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
     let mut out = Vec::new();
-    for child in real_children(root) {
+    // Context declarations (`context c is use ...; end context;`) name their
+    // clause units too — descend one level so a context file pulls in what its
+    // clauses reference.
+    let mut stack: Vec<SyntaxNode> = real_children(root);
+    while let Some(child) = stack.pop() {
+        if child.kind() == SyntaxKind::ContextDecl {
+            stack.extend(real_children(&child));
+            continue;
+        }
         match child.kind() {
             SyntaxKind::ContextClause | SyntaxKind::UseClause => {
                 for n in real_children(&child) {
@@ -163,7 +175,15 @@ pub fn context_libraries(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
 /// resolves these before lowering the file so the packages are visible.
 pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
     let mut out = Vec::new();
-    for child in real_children(root) {
+    // Context declarations (`context c is use ...; end context;`) name their
+    // clause units too — descend so a context file pulls in what its clauses
+    // reference.
+    let mut stack: Vec<SyntaxNode> = real_children(root);
+    while let Some(child) = stack.pop() {
+        if child.kind() == SyntaxKind::ContextDecl {
+            stack.extend(real_children(&child));
+            continue;
+        }
         match child.kind() {
             SyntaxKind::ContextClause | SyntaxKind::UseClause => {
                 for n in real_children(&child) {
@@ -307,6 +327,7 @@ pub fn lower_file(
                         functions: Vec::new(),
                         generics: Vec::new(),
                         type_actuals: Vec::new(),
+                        rec_field_tys: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
                         uses,
@@ -1979,6 +2000,11 @@ impl<'a> Lower<'a> {
                 self.attr_decls.insert(a.clone());
             }
         }
+        for (r, f, t) in &p.rec_field_tys {
+            self.rec_field_ty
+                .entry((r.clone(), f.clone()))
+                .or_insert_with(|| t.clone());
+        }
         // Use clauses are transitive through packages: `use work.p.all` also
         // exposes what `p` itself made visible via `use lib.q.all;`.
         if item.is_none() && visited.insert(p.name.to_ascii_lowercase()) {
@@ -2115,7 +2141,7 @@ impl<'a> Lower<'a> {
             }
         }
         // Collect the items this package added, for cross-file `use` clauses.
-        let types = self
+        let types: Vec<(String, TypeInfo)> = self
             .types
             .iter()
             .filter(|(k, _)| !types_before.contains(*k))
@@ -2134,6 +2160,13 @@ impl<'a> Lower<'a> {
             .filter(|(k, v)| consts_before.get(*k).map_or(true, |old| old != *v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let type_names: std::collections::HashSet<&String> = types.iter().map(|(k, _)| k).collect();
+        let rec_field_tys = self
+            .rec_field_ty
+            .iter()
+            .filter(|((r, _), _)| type_names.contains(r))
+            .map(|((r, f), t)| (r.clone(), f.clone(), t.clone()))
+            .collect();
         PackageIr {
             name,
             types,
@@ -2141,6 +2174,7 @@ impl<'a> Lower<'a> {
             functions,
             generics,
             type_actuals: Vec::new(),
+            rec_field_tys,
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
@@ -2269,6 +2303,7 @@ impl<'a> Lower<'a> {
             pkg.functions.extend(part.functions);
             pkg.uses.extend(part.uses);
             pkg.attr_decls.extend(part.attr_decls);
+            pkg.rec_field_tys.extend(part.rec_field_tys);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -4860,6 +4895,12 @@ impl<'a> Lower<'a> {
                         .map(|k| self.kw(k))
                         .unwrap_or_default();
                     let base = self.lower_expr(&call, env);
+                    // `v(i).all` (access auto-deref after indexing) or a bare
+                    // folded `v(i)`: the index already applied — nothing more
+                    // to select.
+                    if field.is_empty() || field == "all" {
+                        return base;
+                    }
                     let rec_name = match &base {
                         Expr::Idx { e: be, .. } => match &**be {
                             Expr::Sig(id) => self
@@ -6354,6 +6395,78 @@ mod tests {
     }
 
     #[test]
+    fn access_type_index_and_deref_lower_cleanly() {
+        // `l(0).all` — index into an access-to-array auto-derefs, `.all`
+        // derefs the element access; folded into one Name node by the parser.
+        let src = "package p is\n  type line_t is access string;\n  type line_vec_t is array (natural range <>) of line_t;\n  type lines_t is access line_vec_t;\n  function mk return lines_t;\n  function g return string;\nend package;\npackage body p is\n  function mk return lines_t is\n    variable v : lines_t;\n  begin\n    return v;\n  end function;\n  function g return string is\n    variable l : lines_t := mk;\n  begin\n    return l(0).all;\n  end function;\nend package body;\n";
+        let mut db = SourceDb::new();
+        let id = db.add_file("t.vhd".to_string(), src.to_string()).unwrap();
+        let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
+        let mut diags = Vec::new();
+        let _ = lower_file(
+            id,
+            &parsed.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "{:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    fn nested_record_field_via_used_package_resolves() {
+        // `m2s.ar.valid` — the record field type map must cross package
+        // boundaries (PackageIr::rec_field_tys).
+        let pkg = "package axi_pkg is\n  type ar_t is record\n    valid : bit;\n  end record;\n  type rd_t is record\n    ar : ar_t;\n  end record;\nend package;\n";
+        let top = "use work.axi_pkg.all;\nentity top is\n  port (q : out bit);\nend entity;\narchitecture rtl of top is\n  signal m2s : rd_t;\nbegin\n  q <= m2s.ar.valid;\nend architecture;\n";
+        let mut db = SourceDb::new();
+        let id1 = db.add_file("p.vhd".to_string(), pkg.to_string()).unwrap();
+        let parsed1 = hdl_syntax::vhdl::parser::parse_file(id1, db.file(id1));
+        let mut diags = Vec::new();
+        let mut pkgs = HashMap::new();
+        let lowered = lower_file(
+            id1,
+            &parsed1.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        for p in lowered.packages {
+            pkgs.insert(p.name.to_ascii_lowercase(), std::rc::Rc::new(p));
+        }
+        let id2 = db.add_file("top.vhd".to_string(), top.to_string()).unwrap();
+        let parsed2 = hdl_syntax::vhdl::parser::parse_file(id2, db.file(id2));
+        let _ = lower_file(
+            id2,
+            &parsed2.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &pkgs,
+            &HashMap::new(),
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "{:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     fn invalid_generate_range_and_literal_base_do_not_panic() {
         // Regression: a for-generate over a real range (`0.0 to 8.0`) read the
         // f64 bit pattern as a huge u64 and overflowed the unroll Vec; a based
