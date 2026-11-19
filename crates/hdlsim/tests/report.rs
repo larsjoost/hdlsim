@@ -45,7 +45,8 @@ fn report_dry_run_prints_issue_without_uploading() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(all.contains("dry run"), "{}", all);
-    assert!(all.contains("no issue was created"), "{}", all);
+    assert!(all.contains("no issue"), "{}", all);
+    assert!(all.contains("gist"), "{}", all);
     assert!(all.contains("larsjoost/hdlsim"), "{}", all);
     assert!(all.contains("check fails on unknown signal"), "{}", all);
     assert!(all.contains("gh issue create"), "{}", all);
