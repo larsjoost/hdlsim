@@ -22,6 +22,9 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 | `ieee.numeric_std` | ✅ | `unsigned`/`signed` arithmetic, comparisons, `resize`, `to_integer`, `to_unsigned`/`to_signed` | `tests/vhdl_signed.rs`, `tests/vhdl_std_arith.rs` |
 | `ieee.std_logic_arith` | ✅ | package resolves; `conv_*` conversions and shift/rotate builtins simulated | `tests/vhdl_std_arith.rs`, `tests/vhdl_shifts.rs` |
 | `ieee.std_logic_signed` / `std_logic_unsigned` | ◐ | same: decls resolve, common ops builtin | `tests/vhdl_std_arith.rs` |
+| `ieee.std_context` (VHDL-2008) | ✅ | embedded context declaration; `context ieee.ieee_std_context;` resolves and applies std.standard + ieee.std_logic_1164 + ieee.numeric_std | `tests/vhdl_std2019.rs` |
+| `ieee.numeric_std_unsigned` (VHDL-2019) | ✅ | re-exports ieee.numeric_std transitively; `to_slv` builtin (bit-identical std_logic_vector view) | `tests/vhdl_std2019.rs` |
+| `ieee_proposed.standard_additions` | ✅ | decl-only `to_string`/`to_hstring`/`to_ostring`/`to_bstring` family; `to_string(real)` formats decimal | `tests/vhdl_std2019.rs` |
 | `ieee.std_logic_textio` | ✅ | its `write`/`read` on `line` share the std.textio runtime (vector args print decimal/hex, see `std.textio`) | `tests/vhdl_textio.rs`, parse via `tests/corpus.rs` |
 | `ieee.fixed_pkg` | ✅ | embedded subset: `ufixed`/`sfixed` simulated as f64 `real` (bounds not modeled); `to_ufixed`/`to_sfixed`/`to_real`/`resize` + arithmetic/comparison via real ops | `tests/vhdl_real.rs` |
 | `ieee.float_pkg` | ✅ | embedded subset: `float` as f64 `real`; `to_float`/`to_real`/`to_integer`/`resize` | `tests/vhdl_real.rs` |
