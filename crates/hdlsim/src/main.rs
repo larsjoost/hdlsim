@@ -52,7 +52,7 @@ fn main() {
             if code != 0 {
                 report_hint();
                 if let Some(req) = &report {
-                    hdlsim::commands::report::maybe_file_issue(req, &args);
+                    hdlsim::commands::report::maybe_file_issue(req, &args, code);
                 }
             }
             std::process::exit(code)
@@ -62,7 +62,7 @@ fn main() {
             eprintln!("try 'hdlsim --help'");
             report_hint();
             if let Some(req) = &report {
-                hdlsim::commands::report::maybe_file_issue(req, &args);
+                hdlsim::commands::report::maybe_file_issue(req, &args, 2);
             }
             std::process::exit(2);
         }
