@@ -50,14 +50,16 @@ pub fn extract_report_args(args: &[String]) -> (Vec<String>, Option<ReportReques
             i += 1;
         }
     }
-    let req = message.map(|m| ReportRequest {
-        message: if m.is_empty() {
-            "hdlsim command failed".to_string()
-        } else {
-            m
-        },
-        dry_run,
-    });
+    let req = message
+        .or_else(|| dry_run.then(String::new))
+        .map(|m| ReportRequest {
+            message: if m.is_empty() {
+                "hdlsim command failed".to_string()
+            } else {
+                m
+            },
+            dry_run,
+        });
     (rest, req)
 }
 
@@ -337,6 +339,17 @@ mod tests {
 
         let (_, req) = extract_report_args(&["check".to_string()]);
         assert!(req.is_none());
+
+        // `--report-dry-run` alone previews with the default message.
+        let (rest, req) = extract_report_args(&[
+            "check".to_string(),
+            "top.vhd".to_string(),
+            "--report-dry-run".to_string(),
+        ]);
+        assert_eq!(rest, vec!["check", "top.vhd"]);
+        let req = req.unwrap();
+        assert_eq!(req.message, "hdlsim command failed");
+        assert!(req.dry_run);
     }
 
     #[test]

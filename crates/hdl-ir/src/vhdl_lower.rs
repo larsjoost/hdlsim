@@ -6637,6 +6637,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn nested_record_field_via_used_package_resolves() {
         // `m2s.ar.valid` — the record field type map must cross package
         // boundaries (PackageIr::rec_field_tys).
@@ -6749,7 +6750,6 @@ mod tests {
         assert_no_errors(&diags);
     }
 
-    #[test]
     #[test]
     fn protected_pkg_shared_var_member_select_via_use_is_placeholder() {
         // `messenger.timeout_is_allowed` / `messenger.get_all_actors` where
@@ -6871,6 +6871,7 @@ mod tests {
         assert_no_errors(&diags);
     }
 
+    #[test]
     fn invalid_generate_range_and_literal_base_do_not_panic() {
         // Regression: a for-generate over a real range (`0.0 to 8.0`) read the
         // f64 bit pattern as a huge u64 and overflowed the unroll Vec; a based

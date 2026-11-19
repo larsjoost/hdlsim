@@ -90,7 +90,8 @@ impl Command for Help {
         println!(
             "    --report \"msg\"             on failure, file a GitHub issue with a reproducer"
         );
-        println!("                                 bundle (uses the gh CLI; --report-dry-run to preview)");
+        println!("                                 bundle (uses the gh CLI; --report-dry-run to preview,");
+        println!("                                 also works without a message)");
         Ok(0)
     }
 }
