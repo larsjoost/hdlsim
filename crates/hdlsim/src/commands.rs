@@ -94,7 +94,10 @@ impl Command for Help {
             "                                 bundle with the captured command output (uses the gh"
         );
         println!(
-            "                                 CLI; --report-dry-run to preview, also works without"
+            "                                 CLI; large bundles are uploaded as a secret gist and"
+        );
+        println!(
+            "                                 linked; --report-dry-run to preview, also works without"
         );
         println!("                                 a message)");
         Ok(0)
