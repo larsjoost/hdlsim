@@ -109,3 +109,107 @@ fn without_report_only_the_hint_is_printed() {
     assert!(stderr.contains("--report"), "{}", stderr);
     assert!(!stderr.contains("hdlsim report:"), "{}", stderr);
 }
+
+/// Regression test for the "bundle not attached to the issue" problem
+/// (issue #113): `upload_gist` passed `--secret` to `gh gist create`, but gh
+/// has no such flag (secret is the default), so every upload failed with
+/// "unknown flag: --secret" and the issue was filed with no bundle link.
+/// A fake `gh` on PATH (no network, no real issue) records what hdlsim asks
+/// for: the gist upload must use valid flags and stage the bundle under the
+/// exact name the issue body links to.
+#[test]
+fn report_uploads_bundle_as_gist_and_links_it_in_the_issue() {
+    let dir = make_failing_project("gist");
+    let log = dir.join("gh.log");
+    let body_cap = dir.join("issue-body.md");
+    let gh = dir.join("gh");
+    let log_s = log.display().to_string();
+    let body_s = body_cap.display().to_string();
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" >> \"{log_s}\"\n\
+         last=\"\"\n\
+         for a in \"$@\"; do last=\"$a\"; done\n\
+         echo \"staged-file: $last\" >> \"{log_s}\"\n\
+         if [ \"$1\" = \"gist\" ]; then\n\
+           echo \"https://gist.github.com/fakeabc123def\"\n\
+         elif [ \"$1\" = \"issue\" ]; then\n\
+           prev=\"\"\n\
+           for a in \"$@\"; do\n\
+             if [ \"$prev\" = \"--body-file\" ]; then cp \"$a\" \"{body_s}\"; fi\n\
+             prev=\"$a\"\n\
+           done\n\
+           echo \"https://github.com/larsjoost/hdlsim/issues/999\"\n\
+         fi\n"
+    );
+    std::fs::write(&gh, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = hdlsim()
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .args(["check", "bad.vhd", "--report", "boom: gist upload test"])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("https://gist.github.com/fakeabc123def"),
+        "gist upload must be reported:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("issues/999"),
+        "issue creation must be reported:\n{stderr}"
+    );
+
+    let log = std::fs::read_to_string(&log).unwrap();
+    let gist_line = log
+        .lines()
+        .find(|l| l.starts_with("gist create"))
+        .expect("gh gist create must be invoked");
+    assert!(
+        !gist_line.contains("--secret"),
+        "gh has no --secret flag; it must never be passed: {gist_line}"
+    );
+    assert!(
+        !gist_line.contains("--public"),
+        "secret is the default; --public only with HDLSIM_REPORT_GIST=public: {gist_line}"
+    );
+    let staged = log
+        .lines()
+        .find(|l| l.starts_with("staged-file: "))
+        .expect("staged gist file recorded");
+    assert!(
+        staged.ends_with("hdlsim-repro.tar.b64"),
+        "the staged file basename becomes the gist file name and must match the raw link: {staged}"
+    );
+
+    let issue = std::fs::read_to_string(&body_cap).expect("issue body captured");
+    assert!(
+        issue.contains("https://gist.github.com/fakeabc123def"),
+        "issue body must link the gist:\n{issue}"
+    );
+    assert!(
+        issue.contains("https://gist.github.com/fakeabc123def/raw/hdlsim-repro.tar.b64"),
+        "issue body must link the raw bundle with the exact gist file name:\n{issue}"
+    );
+    assert!(
+        !issue.contains("attach it to this issue"),
+        "issue body must not fall back to manual attachment when the gist works:\n{issue}"
+    );
+    assert!(
+        issue.contains("hdlsim check bad.vhd --bundle hdlsim-repro.tar"),
+        "{issue}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
