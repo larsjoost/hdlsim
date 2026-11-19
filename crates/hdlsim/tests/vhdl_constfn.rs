@@ -41,3 +41,47 @@ fn package_function_calls_in_constant_initializers() {
     );
     assert!(!stderr.contains("unknown identifier"), "{}", stderr);
 }
+
+/// Regression test for the issue #106 follow-up warnings: a function-local
+/// constant with a parameter-dependent initializer
+/// (`constant rmsb : integer := size - 1;`, as in Vivado's std_logic_arith)
+/// must check with zero warnings AND evaluate per call at runtime.
+#[test]
+fn function_local_param_dependent_constant_checks_clean_and_evaluates_per_call() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pkg_fnlocalconst");
+    let lib = format!("work={}", dir.display());
+
+    let out = hdlsim()
+        .args(["check", "-L", &lib])
+        .arg(dir.join("top.vhd"))
+        .output()
+        .expect("runs");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{}{}", all, "");
+    assert!(!all.contains("warning["), "{}", all);
+    assert!(!all.contains("error["), "{}", all);
+
+    let out = hdlsim()
+        .args(["run", "--top", "tb_fnlocalconst", "-L", &lib])
+        .arg(dir.join("top.vhd"))
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("PASS: fn-local const per call"),
+        "{}",
+        stdout
+    );
+}

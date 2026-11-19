@@ -3174,6 +3174,115 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Function-local constant declaration. If the initializer is
+    /// const-evalable it is bound in `consts` like a package-level constant.
+    /// Otherwise (e.g. `constant msb := min(arg'length, size) - 1;` in
+    /// std_logic_arith — valid VHDL, ModelSim accepts it) the constant gets a
+    /// runtime slot and the initializer is evaluated on every call: the
+    /// lowered initializer is handed back in `pending` so the caller can
+    /// prepend `slot := init;` assignments to the function body. No warning:
+    /// the value is legitimately dynamic, not a degraded construct.
+    fn lower_fn_local_constant(
+        &mut self,
+        d: &SyntaxNode,
+        slots: &mut Vec<(String, usize)>,
+        locals: &mut Vec<SignalIr>,
+        local_types: &mut Vec<(String, String)>,
+        pending: &mut Vec<(SigId, Expr)>,
+    ) {
+        let kids = real_children(d);
+        let Some(colon) = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+        else {
+            return;
+        };
+        let names: Vec<String> = kids[..colon]
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))
+            .collect();
+        let type_mark = kids[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name);
+        let constraint = kids[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Range);
+        let eq = kids[colon + 1..]
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+        let init = match eq {
+            Some(e) => kids[colon + 1 + e + 1..]
+                .iter()
+                .find(|k| is_expr_node(k.kind()))
+                .cloned(),
+            None => kids[colon + 1..]
+                .iter()
+                .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
+                .cloned(),
+        };
+        let env = self.consts.clone();
+        let (width, signed, _, real) = type_mark
+            .map(|tm| self.resolve_type(tm, constraint, d.span()))
+            .unwrap_or((32, false, None, false));
+        if let Some(tm) = &type_mark {
+            let tn = self.text(tm).to_ascii_lowercase();
+            for n in &names {
+                self.const_types.insert(n.to_ascii_lowercase(), tn.clone());
+                local_types.push((n.clone(), self.kw(tm)));
+            }
+        }
+        let Some(init) = init else {
+            for n in &names {
+                Rc::make_mut(&mut self.consts)
+                    .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
+            }
+            return;
+        };
+        let ex = match type_mark {
+            Some(tm)
+                if init.kind() == SyntaxKind::Aggregate
+                    && matches!(
+                        self.types.get(&self.text(tm).to_ascii_lowercase()),
+                        Some(TypeInfo::Record { .. })
+                    ) =>
+            {
+                let tn = self.text(tm).to_ascii_lowercase();
+                let fields = self.record_fields_of_type(&tn);
+                self.lower_record_aggregate(&init, &fields, &env)
+            }
+            _ => self.lower_expr(&init, &env),
+        };
+        match self.ce_env(&ex, &env) {
+            Some(v) => {
+                for n in &names {
+                    Rc::make_mut(&mut self.consts).insert(n.to_ascii_lowercase(), v.clone());
+                }
+            }
+            None => {
+                for n in &names {
+                    let id = slots.len() as SigId;
+                    slots.push((n.clone(), width.max(1)));
+                    self.names.insert(n.clone(), id);
+                    locals.push(SignalIr {
+                        name: n.clone(),
+                        width: width.max(1),
+                        kind: if real { SigKind::Real } else { SigKind::Wire },
+                        init: None,
+                        mem: None,
+                        signed,
+                    });
+                    // Not bound in `consts`: expression uses resolve through
+                    // `names` to the runtime slot (consts are checked first in
+                    // lower_expr's env), and const contexts fall back to the
+                    // default width silently — the real value is computed per
+                    // call.
+                    pending.push((id, ex.clone()));
+                }
+            }
+        }
+    }
+
     /// Register one protected-type method as a stub `FuncIr` (signature only,
     /// empty body) so calls `obj.method(...)` resolve at lower time.
     fn protected_method_stub(&mut self, f: &SyntaxNode) {
@@ -3676,12 +3785,23 @@ impl<'a> Lower<'a> {
         // before it (parameters, types, constants, locals).
         let mut locals: Vec<SignalIr> = Vec::new();
         let mut local_types: Vec<(String, String)> = Vec::new();
+        // Function-local constants whose initializer is not const-evalable at
+        // lower time (e.g. `constant msb := min(arg'length, size) - 1;` in
+        // std_logic_arith): they get a runtime slot and the initializer is
+        // evaluated on every call, prepended to the body as an assignment.
+        let mut pending_const_inits: Vec<(SigId, Expr)> = Vec::new();
         for d in &decl_nodes {
             match d.kind() {
                 SyntaxKind::PortDecl => {} // parameters were slotted above
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
-                SyntaxKind::ConstantDecl => self.lower_constant_decl(d),
+                SyntaxKind::ConstantDecl => self.lower_fn_local_constant(
+                    d,
+                    &mut slots,
+                    &mut locals,
+                    &mut local_types,
+                    &mut pending_const_inits,
+                ),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 SyntaxKind::AttrDecl => {
                     self.register_attr_decl(d);
@@ -3760,6 +3880,20 @@ impl<'a> Lower<'a> {
             self.lower_seq_stmt(&stmt_nodes[0])
         } else {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
+        };
+        let body = if pending_const_inits.is_empty() {
+            body
+        } else {
+            let mut ss: Vec<Stmt> = pending_const_inits
+                .into_iter()
+                .map(|(id, e)| Stmt::Assign {
+                    lhs: Expr::Sig(id),
+                    rhs: e,
+                    nba: false,
+                })
+                .collect();
+            ss.push(body);
+            Stmt::Block(ss)
         };
         for sig in self.extra_signals.drain(..) {
             locals.push(sig);
@@ -6828,6 +6962,18 @@ mod tests {
             msgs.iter().all(|m| !m.contains("parameter-dependent")),
             "{msgs:?}"
         );
+    }
+
+    #[test]
+    fn param_dependent_local_constants_lower_without_warning() {
+        // std_logic_arith-style function-local constants (issue #106
+        // follow-up): `constant rMsb : integer := SIZE - 1;` and
+        // `constant msb : integer := min(ARG'length, SIZE) - 1;` are valid
+        // VHDL. They lower as per-call runtime slots (initializer evaluated
+        // on every call), so no "not constant; treated as X" warning.
+        let diags = lower_src("package p is\n  type nat_mat is array (natural range <>, natural range <>) of natural;\n  function f(size : integer; m : nat_mat) return integer;\nend package;\npackage body p is\n  function f(size : integer; m : nat_mat) return integer is\n    constant rmsb : integer := size - 1;\n    constant msb  : integer := m'length(1) - size;\n    constant xsz  : integer := m'length(2);\n  begin\n    return rmsb + msb + xsz;\n  end function;\nend package body;\n");
+        let msgs: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert!(diags.is_empty(), "{msgs:?}");
     }
 
     #[test]
