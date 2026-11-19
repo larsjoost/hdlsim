@@ -19,6 +19,16 @@ pub trait UnitProvider {
     /// Scan the provider once; returns `(unit name, source file)` pairs.
     /// Called at most once per provider (the manager caches the result).
     fn scan(&self) -> Vec<(String, PathBuf)>;
+    /// Like `scan`, but tags each unit with whether its file only contains the
+    /// *body* of the unit (`package body p;`) rather than its declaration.
+    /// Resolution prefers declaration files: a body compiled before its
+    /// declaration is lowered without the declaration's items in scope.
+    fn scan_tagged(&self) -> Vec<(String, PathBuf, bool)> {
+        self.scan()
+            .into_iter()
+            .map(|(u, p)| (u, p, false))
+            .collect()
+    }
     /// Read a unit's source text. Default: read the file `scan` reported.
     /// In-memory providers (e.g. the embedded stdlib) override this; their
     /// `scan` paths are labels, not real files.
@@ -124,6 +134,12 @@ impl UnitProvider for DirProvider {
         out
     }
 
+    fn scan_tagged(&self) -> Vec<(String, PathBuf, bool)> {
+        let mut out = Vec::new();
+        walk_tagged(&self.path, &self.extensions, &mut out);
+        out
+    }
+
     fn source_files(&self) -> Vec<PathBuf> {
         walk_source_files(&self.path)
             .into_iter()
@@ -202,17 +218,48 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
+fn walk_tagged(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf, bool)>) {
+    let files = walk_source_files_with(dir, |_, _| {});
+    for p in files {
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |e| exts.contains(&e))
+        {
+            for (unit, is_body) in units_in_file_tagged(&p) {
+                out.push((unit, p.clone(), is_body));
+            }
+        }
+    }
+}
+
 /// Walk `dir` recursively for source files of any known extension (skipping
 /// hidden dirs, `target`, `node_modules`); returns `(unit, file)` pairs.
 pub fn walk_sources(dir: &Path) -> Vec<(String, PathBuf)> {
+    walk_sources_tagged(dir)
+        .into_iter()
+        .map(|(u, p, _)| (u, p))
+        .collect()
+}
+
+/// Like `walk_sources`, but each pair also says whether the file holds only a
+/// unit *body* (e.g. `package body p;`) — declaration files win on conflicts.
+pub fn walk_sources_tagged(dir: &Path) -> Vec<(String, PathBuf, bool)> {
     let mut out = Vec::new();
-    walk(dir, &["v", "sv", "vhd", "vhdl"], &mut out);
+    walk_tagged(dir, &["v", "sv", "vhd", "vhdl"], &mut out);
     out
 }
 
 /// Design-unit names defined by one source file. Verilog: `module` names.
-/// VHDL files return no units until the VHDL front-end lands.
 pub fn units_in_file(path: &Path) -> Vec<String> {
+    units_in_file_tagged(path)
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect()
+}
+
+/// Like `units_in_file`, but each unit is tagged with whether its file holds
+/// only the unit's *body* (`package body p;`) and not its declaration.
+pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
     let lang = match Language::from_path(path) {
         Some(l) => l,
         None => return Vec::new(),
@@ -239,13 +286,14 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
         .children()
         .filter(|c| c.kind() == SyntaxKind::Module)
         .filter_map(|m| m.children().find(|c| c.kind() == SyntaxKind::Name))
-        .map(|n| db.span_text(n.span()).trim().to_string())
+        .map(|n| (db.span_text(n.span()).trim().to_string(), false))
         .collect()
 }
 
-/// Design-unit names defined by a VHDL file: entities, packages, and
-/// configurations (the name is the first identifier that isn't a keyword).
-fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
+/// Design-unit names defined by a VHDL file, tagged with body-ness: entities,
+/// packages, and configurations (the name is the first identifier that isn't
+/// a keyword); a `package body p;` tags `p` as a body-only file.
+fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
         return Vec::new();
@@ -264,6 +312,11 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
             )
         })
         .filter_map(|u| {
+            let is_body = u.kind() == SyntaxKind::Package
+                && u.children().any(|c| {
+                    c.kind() == SyntaxKind::Ident
+                        && db.span_text(c.span()).eq_ignore_ascii_case("body")
+                });
             u.children()
                 .filter(|c| c.kind() == SyntaxKind::Ident)
                 .find(|n| {
@@ -272,7 +325,7 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
                         "entity" | "package" | "body" | "configuration"
                     )
                 })
-                .map(|n| db.span_text(n.span()).trim().to_string())
+                .map(|n| (db.span_text(n.span()).trim().to_string(), is_body))
         })
         .collect()
 }
@@ -280,6 +333,41 @@ fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_sources_tags_package_bodies() {
+        let root = std::env::temp_dir().join(format!("hdlsim_tag_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // The body file sorts before the declaration file.
+        std::fs::write(
+            root.join("a_p-body.vhd"),
+            "package body p is end package body;",
+        )
+        .unwrap();
+        std::fs::write(root.join("z_p.vhd"), "package p is end package;").unwrap();
+        let tagged = walk_sources_tagged(&root);
+        let mut p_entries: Vec<_> = tagged.iter().filter(|(u, _, _)| u == "p").collect();
+        p_entries.sort_by_key(|(_, _, b)| *b);
+        assert_eq!(p_entries.len(), 2);
+        assert!(
+            !p_entries[0].2,
+            "declaration file must be non-body: {:?}",
+            p_entries[0]
+        );
+        assert!(
+            p_entries[1].2,
+            "body file must be tagged body: {:?}",
+            p_entries[1]
+        );
+        assert!(p_entries[1].1.ends_with("a_p-body.vhd"));
+        // Untagged view keeps both.
+        assert_eq!(
+            walk_sources(&root).iter().filter(|(u, _)| u == "p").count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn walk_source_files_skips_hidden_and_build_dirs() {
