@@ -141,9 +141,30 @@ fn file_args(args: &[String]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Compose the issue title and body. The bundle travels as base64 inside a
-/// collapsible section (GitHub attachment uploads need the API; the .tar is
-/// small and self-contained, and `tar -x` recovers it).
+/// Diagnostic codes (`[E0401]`, `[W0401]`, ...) appearing in the captured
+/// output, in first-seen order, deduplicated.
+fn diagnostic_codes(output: &str) -> Vec<String> {
+    let mut codes: Vec<String> = Vec::new();
+    let b = output.as_bytes();
+    let mut i = 0;
+    while i + 7 <= b.len() {
+        if b[i] == b'['
+            && (b[i + 1] == b'E' || b[i + 1] == b'W')
+            && b[i + 2..i + 6].iter().all(|c| c.is_ascii_digit())
+            && b[i + 6] == b']'
+        {
+            let code = output[i + 1..i + 6].to_string();
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+            i += 7;
+        } else {
+            i += 1;
+        }
+    }
+    codes
+}
+
 /// Compose the issue title/body. The bundle itself is never embedded in the
 /// body (GitHub rejects bodies over 65536 chars, and base64 inflates the tar);
 /// it is linked from an uploaded gist, or saved locally as a fallback.
@@ -151,6 +172,7 @@ fn compose_issue(
     message: &str,
     original_args: &[String],
     output: &str,
+    exit_code: i32,
     tar_len: usize,
     repo: &str,
     gist: Option<&str>,
@@ -185,23 +207,42 @@ fn compose_issue(
         ),
         None => format!(
             "The reproducer bundle ({tar_len} bytes) was saved as `hdlsim-repro.tar` in the \
-             working directory — attach it to this issue. To rerun locally: \
-             `hdlsim {} --bundle hdlsim-repro.tar`.\n",
-            original_args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "check".to_string())
+             working directory — attach it to this issue.\n"
         ),
+    };
+    let codes_section = {
+        let codes = diagnostic_codes(output);
+        if codes.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from(
+                "## Diagnostic codes\n\n\
+                 Scanned from the output above (`hdlsim explain <code>` prints the same text):\n\n",
+            );
+            for c in &codes {
+                match hdl_syntax::diagnostic::explain_code(c) {
+                    Some(ex) => s.push_str(&format!("- `{c}`: {ex}\n")),
+                    None => s.push_str(&format!("- `{c}`\n")),
+                }
+            }
+            s.push_str("\n");
+            s
+        }
     };
     let body = format!(
         "## Problem\n\n{message}\n\n## Command\n\n```\nhdlsim {}\n```\n\n\
          ## Output\n\n```\n{shown}\n```\n\n\
-         ## Environment\n\n- hdlsim {}\n- os: {}/{}\n- repo: {repo}\n\n\
-         ## Reproducer bundle\n\n{note}",
+         {codes_section}\
+         ## Environment\n\n- hdlsim {}\n- os: {}/{}\n- repo: {repo}\n- exit code: {exit_code}\n\n\
+         ## Reproducer bundle\n\n{note}\n\
+         ## Reproduce from the bundle\n\n\
+         From the bundle above (gist raw link, or the attached/local `hdlsim-repro.tar`):\n\n\
+         ```\nhdlsim {} --bundle hdlsim-repro.tar\n```\n",
         original_args.join(" "),
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
+        original_args.join(" "),
     );
     let bref = match gist {
         Some(url) => BundleRef::Gist(url.to_string()),
@@ -217,9 +258,10 @@ enum BundleRef {
 }
 
 /// File the issue (or dry-run it). Called from `main` when a command exited
-/// non-zero and `--report` was given. Never touches any token itself — the
-/// `gh` CLI does the authenticated API call.
-pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
+/// non-zero and `--report` was given; `exit_code` is the command's exit code.
+/// Never touches any token itself — the `gh` CLI does the authenticated API
+/// call.
+pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String], exit_code: i32) {
     let repo = std::env::var("HDLSIM_ISSUE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
     let run = |msg: String| eprintln!("hdlsim report: {}", msg);
 
@@ -287,6 +329,7 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
                 &req.message,
                 original_args,
                 &output,
+                exit_code,
                 tar.len(),
                 &repo,
                 Some(&url),
@@ -294,8 +337,15 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
             (t, b, r, None)
         }
         None => {
-            let (t, b, r) =
-                compose_issue(&req.message, original_args, &output, tar.len(), &repo, None);
+            let (t, b, r) = compose_issue(
+                &req.message,
+                original_args,
+                &output,
+                exit_code,
+                tar.len(),
+                &repo,
+                None,
+            );
             let local = std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("hdlsim-repro.tar");
@@ -494,11 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_codes_scans_and_dedupes() {
+        assert_eq!(diagnostic_codes(""), Vec::<String>::new());
+        let out = "warning[W0401]: a\nerror[E0401]: b\n\u{1b}[1;33mwarning[W0401]:^\u{1b}[0m c\nerror[E0301]: d\nnot a [E12] code\n[x0000]";
+        assert_eq!(diagnostic_codes(out), vec!["W0401", "E0401", "E0301"]);
+    }
+
+    #[test]
     fn issue_body_contains_message_command_output_and_gist_link() {
         let (title, body, bref) = compose_issue(
             "wrong result",
             &["run".to_string(), "tb.v".to_string()],
-            "error[E0401]: unknown identifier 'x'",
+            "error[E0401]: unknown identifier 'x'\nwarning[W0401]: degraded",
+            1,
             4096,
             "o/r",
             Some("https://gist.github.com/abc123"),
@@ -511,6 +569,12 @@ mod tests {
         assert!(body.contains("unknown identifier 'x'"));
         assert!(body.contains("https://gist.github.com/abc123/raw/hdlsim-repro.tar.b64"));
         assert!(body.contains("4096 bytes"));
+        assert!(body.contains("exit code: 1"));
+        assert!(body.contains("## Diagnostic codes"));
+        assert!(body.contains("`E0401`:"));
+        assert!(body.contains("`W0401`:"));
+        assert!(body.contains("## Reproduce from the bundle"));
+        assert!(body.contains("hdlsim run tb.v --bundle hdlsim-repro.tar"));
     }
 
     #[test]
@@ -519,6 +583,7 @@ mod tests {
             "big project fails",
             &["check".to_string(), "a.vhd".to_string()],
             "error: boom",
+            1,
             60_000,
             "o/r",
             None,
@@ -527,7 +592,10 @@ mod tests {
         assert!(title.contains("big project fails"));
         assert!(body.contains("hdlsim-repro.tar"));
         assert!(body.contains("60000 bytes"));
+        assert!(body.contains("hdlsim check a.vhd --bundle hdlsim-repro.tar"));
         assert!(!body.contains("gist.github.com"));
+        // No [E....]/[W....] code in the output: no Diagnostic codes section.
+        assert!(!body.contains("## Diagnostic codes"));
     }
 
     #[test]
@@ -537,11 +605,13 @@ mod tests {
             "m",
             &["check".to_string()],
             &big_out,
+            2,
             10,
             "o/r",
             Some("https://gist.github.com/z"),
         );
         assert!(body.contains("truncated"));
+        assert!(body.contains("exit code: 2"));
         assert!(body.len() < 30_000);
     }
 }

@@ -53,3 +53,32 @@ fn unresolved_use_clause_warns_but_check_passes() {
     assert!(stderr.contains("W0501"), "{}", stderr);
     assert!(stderr.contains("no_such_package"), "{}", stderr);
 }
+
+/// Regression test for issue #106: a vendored std_logic_arith-style package
+/// (functions with parameter-dependent locals, a qualified expression inside
+/// a concatenation, real literals with digit separators) must check with
+/// zero errors AND zero warnings. The first fix for #106 only removed the
+/// W0401 warnings; the same command still errored until the follow-up, so
+/// the assertion is on the whole diagnostic output, not on one code.
+#[test]
+fn vivado_arith_patterns_check_clean() {
+    let out = hdlsim()
+        .arg("check")
+        .arg(fixture("vivado_arith_patterns.vhd"))
+        .output()
+        .expect("runs");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}",
+        out.status,
+        all
+    );
+    assert!(!all.contains("error["), "{}", all);
+    assert!(!all.contains("warning["), "{}", all);
+    assert!(all.contains("0 diagnostics"), "{}", all);
+}

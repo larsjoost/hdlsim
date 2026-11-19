@@ -76,6 +76,23 @@ fn report_dry_run_prints_issue_without_uploading() {
     let names = String::from_utf8_lossy(&listing.stdout);
     assert!(names.contains("bad.vhd"), "{}", names);
     assert!(!names.contains(".hdlsim-cache"), "{}", names);
+    // The drafted issue body carries the exit code, the explained diagnostic
+    // codes, and the exact reproduce command — everything a fixer needs.
+    let body_line = all
+        .lines()
+        .find(|l| l.contains("issue body:"))
+        .expect("body line");
+    let body_path = PathBuf::from(body_line.split("issue body:").nth(1).unwrap().trim());
+    let body = std::fs::read_to_string(&body_path).expect("body file");
+    assert!(body.contains("exit code: 1"), "{}", body);
+    assert!(body.contains("## Diagnostic codes"), "{}", body);
+    assert!(body.contains("`E0401`"), "{}", body);
+    assert!(body.contains("## Reproduce from the bundle"), "{}", body);
+    assert!(
+        body.contains("hdlsim check bad.vhd --bundle hdlsim-repro.tar"),
+        "{}",
+        body
+    );
 }
 
 #[test]
