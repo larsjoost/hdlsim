@@ -144,18 +144,25 @@ fn file_args(args: &[String]) -> Vec<PathBuf> {
 /// Compose the issue title and body. The bundle travels as base64 inside a
 /// collapsible section (GitHub attachment uploads need the API; the .tar is
 /// small and self-contained, and `tar -x` recovers it).
+/// GitHub rejects issue bodies over 65536 chars (GraphQL createIssue); keep a
+/// safety margin for the rest of the body.
+const BODY_BUDGET: usize = 60_000;
+
+/// Compose the issue title/body. Returns `(title, body, bundle_embedded)` —
+/// when the base64 bundle would exceed the body limit, the bundle is left out
+/// and `bundle_embedded` is false (the caller saves the tar locally instead).
 fn compose_issue(
     message: &str,
     original_args: &[String],
     output: &str,
     tar: &[u8],
     repo: &str,
-) -> (String, String) {
+) -> (String, String, bool) {
     let first = message.lines().next().unwrap_or("").trim();
     let title = format!(
         "[hdlsim] {}",
         if first.len() > 80 {
-            format!("{}…", &first[..80])
+            format!("{}\u{2026}", &first[..80])
         } else if first.is_empty() {
             "command failed".to_string()
         } else {
@@ -173,27 +180,44 @@ fn compose_issue(
             output.len() - cut
         );
     }
-    let body = format!(
+    let head = format!(
         "## Problem\n\n{}\n\n## Command\n\n```\nhdlsim {}\n```\n\n\
          ## Output\n\n```\n{}\n```\n\n\
          ## Environment\n\n- hdlsim {}\n- os: {}/{}\n- repo: {}\n\n\
-         ## Reproducer bundle\n\n\
-         The base64 `.tar` below contains the full project (`src/`, `libs/`, `hdlsim.ini`, \
-         `REPRO.md`, `OUTPUT.txt` with the command output above). Decode + extract:\n\n\
-         ```\necho '<base64>' | base64 -d > repro.tar && tar -xf repro.tar -C repro && cd repro\n\
-         hdlsim run --bundle ../repro.tar --top <top>   # or see REPRO.md\n```\n\n\
-         <details><summary>repro.tar (base64, {} bytes)</summary>\n\n```\n{}\n```\n\n</details>\n",
+         ## Reproducer bundle\n\n",
         message,
         original_args.join(" "),
         shown,
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        repo,
+        repo
+    );
+    let embedded = format!(
+        "The base64 `.tar` below contains the full project (`src/`, `libs/`, `hdlsim.ini`, \
+         `REPRO.md`, `OUTPUT.txt` with the command output above). Decode + extract:\n\n\
+         ```\necho '<base64>' | base64 -d > repro.tar && tar -xf repro.tar -C repro && cd repro\n\
+         hdlsim run --bundle ../repro.tar --top <top>   # or see REPRO.md\n```\n\n\
+         <details><summary>repro.tar (base64, {} bytes)</summary>\n\n```\n{}\n```\n\n</details>\n",
         tar.len(),
         b64(tar)
     );
-    (title, body)
+    let body = format!("{head}{embedded}");
+    if body.len() <= BODY_BUDGET {
+        return (title, body, true);
+    }
+    let note = format!(
+        "The reproducer bundle ({} bytes) is too large to embed in an issue body \
+         (GitHub limit 65536 chars). It was saved as `hdlsim-repro.tar` in the working \
+         directory \u{2014} attach it to this issue. To rerun locally: \
+         `hdlsim {} --bundle hdlsim-repro.tar`.\n",
+        tar.len(),
+        original_args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "check".to_string())
+    );
+    (title, format!("{head}{note}"), false)
 }
 
 /// File the issue (or dry-run it). Called from `main` when a command exited
@@ -250,7 +274,31 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
         run("could not write the bundle to a temp file".to_string());
         return;
     }
-    let (title, body) = compose_issue(&req.message, original_args, &output, &tar, &repo);
+    let (title, body, embedded) = compose_issue(&req.message, original_args, &output, &tar, &repo);
+    let local_bundle = if embedded {
+        None
+    } else {
+        let local = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("hdlsim-repro.tar");
+        match std::fs::copy(&bundle_path, &local) {
+            Ok(_) => {
+                run(format!(
+                    "bundle too large to embed in the issue body ({} bytes) \u{2014} saved to {}",
+                    tar.len(),
+                    local.display()
+                ));
+                Some(local)
+            }
+            Err(e) => {
+                run(format!(
+                    "could not copy bundle to cwd ({e}); it stays at {}",
+                    bundle_path.display()
+                ));
+                None
+            }
+        }
+    };
     let body_path = std::env::temp_dir().join(format!("hdlsim-issue-{}.md", std::process::id()));
     if std::fs::write(&body_path, &body).is_err() {
         run("could not write the issue body to a temp file".to_string());
@@ -262,11 +310,16 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
             "dry run — no issue was created.\n\
              title: {title}\n\
              issue body: {}\n\
-             reproducer bundle: {} ({} bytes)\n\
+             reproducer bundle: {} ({} bytes, {})\n\
              would run: gh issue create --repo {repo} --title <title> --body-file {}",
             body_path.display(),
             bundle_path.display(),
             tar.len(),
+            if embedded {
+                "embedded in body"
+            } else {
+                "NOT embedded (too large)"
+            },
             body_path.display(),
         ));
         return;
@@ -305,11 +358,14 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
+            let attach = match &local_bundle {
+                Some(l) => format!("attach the bundle at {}", l.display()),
+                None => format!("attach the bundle at {}", bundle_path.display()),
+            };
             run(format!(
                 "`gh issue create` failed: {err}\n\
-                 file manually: https://github.com/{repo}/issues/new — attach the bundle at {bundle} \
+                 file manually: https://github.com/{repo}/issues/new — {attach} \
                  (issue body saved at {body})",
-                bundle = bundle_path.display(),
                 body = body_path.display()
             ));
         }
@@ -387,7 +443,7 @@ mod tests {
 
     #[test]
     fn issue_body_contains_message_command_and_bundle() {
-        let (title, body) = compose_issue(
+        let (title, body, embedded) = compose_issue(
             "wrong result",
             &["run".to_string(), "tb.v".to_string()],
             "error[E0401]: unknown identifier 'x'",
@@ -395,10 +451,31 @@ mod tests {
             "o/r",
         );
         assert!(title.contains("wrong result"));
+        assert!(embedded);
         assert!(body.contains("wrong result"));
         assert!(body.contains("hdlsim run tb.v"));
         assert!(body.contains("## Output"));
         assert!(body.contains("unknown identifier 'x'"));
         assert!(body.contains("VEFS")); // b64("TAR")
+    }
+
+    #[test]
+    fn oversized_bundle_is_not_embedded() {
+        // A bundle whose base64 form would exceed the GitHub body limit must
+        // be left out of the body (and reported as not embedded).
+        let big = vec![b'x'; 60_000];
+        let (title, body, embedded) = compose_issue(
+            "big project fails",
+            &["check".to_string(), "a.vhd".to_string()],
+            "error: boom",
+            &big,
+            "o/r",
+        );
+        assert!(!embedded);
+        assert!(title.contains("big project fails"));
+        assert!(body.contains("too large to embed"));
+        assert!(body.contains("hdlsim-repro.tar"));
+        assert!(!body.contains("<details>"));
+        assert!(body.len() <= BODY_BUDGET + 2_000);
     }
 }
