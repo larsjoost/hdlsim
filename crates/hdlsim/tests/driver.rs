@@ -179,3 +179,54 @@ fn run_without_top_picks_single_entity_over_arch_variants() {
     assert!(!stderr.contains("a/r"), "{}", stderr);
     let _ = std::fs::remove_file(&f2);
 }
+
+/// Issue #113: `hdlsim run unit_tests_behavior.vhd --max-time 10ms --progress`
+/// exited 2 with "elaboration error: ... port 'b' not connected" when a port
+/// map omits ports or uses `open` — legal VHDL (in-ports with defaults, open
+/// out-ports) that ModelSim accepts. Unconnected ports must elaborate to a
+/// private signal (initialised to the port default), not a hard error.
+#[test]
+fn run_with_omitted_and_open_ports() {
+    let dir = std::env::temp_dir().join(format!("hdlsim_uncon_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dut.vhd"),
+        "library ieee;\nuse ieee.std_logic_1164.all;\nentity dut is\n  port ( a : in std_logic;\n         b : in std_logic := '1';\n         y : out std_logic;\n         z : out std_logic_vector(3 downto 0) );\nend entity;\narchitecture rtl of dut is\nbegin\n  y <= a and b;\n  z <= (others => a);\nend architecture;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("unit_tests_behavior.vhd"),
+        "library ieee;\nuse ieee.std_logic_1164.all;\nuse std.env.all;\nentity unit_tests is end entity;\narchitecture behavior of unit_tests is\n  signal a : std_logic := '0';\n  signal y : std_logic;\nbegin\n  -- b omitted (has default '1'), z left open.\n  uut : entity work.dut port map ( a => a, y => y );\n  -- explicit `open` on in/out ports must not be an elaboration error either.\n  uut2 : entity work.dut port map ( a => a, b => open, y => open, z => open );\n  process\n  begin\n    a <= '1';\n    wait for 10 ns;\n    -- only passes if the omitted port b got its declared default '1'\n    assert y = '1' report \"defaulted port failed, y=\" & std_logic'image(y) severity error;\n    report \"PASS: unit_tests omitted/open ports\";\n    std.env.finish;\n    wait;\n  end process;\nend architecture;\n",
+    )
+    .unwrap();
+    let out = hdlsim()
+        .current_dir(&dir)
+        .args([
+            "run",
+            "unit_tests_behavior.vhd",
+            "--max-time",
+            "10ms",
+            "--progress",
+        ])
+        .output()
+        .expect("runs");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}",
+        out.status,
+        all
+    );
+    assert!(
+        all.contains("PASS: unit_tests omitted/open ports"),
+        "{}",
+        all
+    );
+    assert!(!all.contains("not connected"), "{}", all);
+    let _ = std::fs::remove_dir_all(&dir);
+}

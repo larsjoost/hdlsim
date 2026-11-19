@@ -1888,6 +1888,21 @@ impl<'a> Lower<'a> {
                     .collect();
                 // ...but the mode keyword was also before ':' and is an Ident, not a Name.
             }
+            // Port default (`:= expr` after the type mark): const-eval it into
+            // the port signal's init, so an unconnected (`open`) in-port still
+            // gets its default value at elaboration.
+            let init_v = dk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+                .and_then(|pos| {
+                    dk[pos + 1..]
+                        .iter()
+                        .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
+                })
+                .and_then(|e| {
+                    let ex = self.lower_expr(e, &self.consts.clone());
+                    self.ce(&ex)
+                });
             let span = d.span();
             let (width, signed, mem, _real) = match &type_mark {
                 Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
@@ -1927,7 +1942,7 @@ impl<'a> Lower<'a> {
                     name: n.clone(),
                     width,
                     kind,
-                    init: None,
+                    init: init_v.clone(),
                     mem,
                     signed,
                 });
