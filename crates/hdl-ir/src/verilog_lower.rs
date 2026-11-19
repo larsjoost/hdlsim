@@ -3733,15 +3733,69 @@ fn ce_stmt(
             Some(_) => ce_stmt(then, slots, env, funcs, flow),
             None => *flow = CeFlow::Abort,
         },
-        Stmt::Assign { lhs, rhs, .. } => match (ev(rhs, slots), lhs) {
-            (Some(v), Expr::Sig(i)) => {
-                while slots.len() <= *i as usize {
-                    slots.push(Value::x(32));
+        Stmt::Assign { lhs, rhs, .. } => {
+            let v = ev(rhs, slots);
+            match (v, lhs) {
+                (Some(v), Expr::Sig(i)) => {
+                    while slots.len() <= *i as usize {
+                        slots.push(Value::x(32));
+                    }
+                    slots[*i as usize] = v;
                 }
-                slots[*i as usize] = v;
+                // `v(i) := x` / `v(hi downto lo) := x` on a local slot: splice
+                // the rhs bits in at the index/slice offset, growing the slot
+                // with X as needed (mirrors ce_impl's bit-index read of
+                // Expr::Idx and msb/lsb read of Expr::Sel).
+                (Some(v), Expr::Idx { e, i }) => {
+                    let spliced = (|| {
+                        let idx = ev(i, slots)?.to_u64()? as usize;
+                        let Expr::Sig(s) = &**e else { return None };
+                        let s = *s as usize;
+                        while slots.len() <= s {
+                            slots.push(Value::x(32));
+                        }
+                        let w = v.width().max(1);
+                        if slots[s].bits.len() < idx + w {
+                            let mut bits = slots[s].bits.clone();
+                            bits.resize(idx + w, VX);
+                            slots[s] = Value { bits };
+                        }
+                        for b in 0..w {
+                            slots[s].set_bit(idx + b, v.bit(b));
+                        }
+                        Some(())
+                    })();
+                    if spliced.is_none() {
+                        *flow = CeFlow::Abort;
+                    }
+                }
+                (Some(v), Expr::Sel { e, msb, lsb }) => {
+                    let spliced = (|| {
+                        let msb = ev(msb, slots)?.to_u64()? as usize;
+                        let lsb = ev(lsb, slots)?.to_u64()? as usize;
+                        let Expr::Sig(s) = &**e else { return None };
+                        let s = *s as usize;
+                        while slots.len() <= s {
+                            slots.push(Value::x(32));
+                        }
+                        let w = msb.saturating_sub(lsb) + 1;
+                        if slots[s].bits.len() < lsb + w {
+                            let mut bits = slots[s].bits.clone();
+                            bits.resize(lsb + w, VX);
+                            slots[s] = Value { bits };
+                        }
+                        for b in 0..w {
+                            slots[s].set_bit(lsb + b, v.bit(b));
+                        }
+                        Some(())
+                    })();
+                    if spliced.is_none() {
+                        *flow = CeFlow::Abort;
+                    }
+                }
+                _ => *flow = CeFlow::Abort,
             }
-            _ => *flow = CeFlow::Abort,
-        },
+        }
         Stmt::Return(e) => match ev(e, slots) {
             Some(v) => {
                 slots[0] = v;
