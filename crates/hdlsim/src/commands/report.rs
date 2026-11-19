@@ -1,9 +1,9 @@
-//! `--report <msg>` — when a command fails, file a GitHub issue with a
-//! reproducer bundle attached (base64 in the issue body) instead of only
-//! printing the issue URL. Strictly opt-in per invocation; `--report-dry-run`
-//! prints the issue without uploading. The upload goes through the `gh` CLI
-//! (its own auth, e.g. `gh auth login` or `GITHUB_TOKEN`); the token is never
-//! read, logged, or embedded by hdlsim itself.
+//! `--report <msg>` — when a command fails, file a GitHub issue with the
+//! reproducer bundle uploaded as a gist and linked from the issue body.
+//! Strictly opt-in per invocation; `--report-dry-run` prints the issue without
+//! uploading. The upload goes through the `gh` CLI (its own auth, e.g.
+//! `gh auth login` or `GITHUB_TOKEN`); the token is never read, logged, or
+//! embedded by hdlsim itself.
 
 use super::bundle::build_bundle_entries;
 use super::CommonOpts;
@@ -317,7 +317,16 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String], exit_code
     let gist = if req.dry_run {
         None
     } else {
-        upload_gist(&tar, &req.message)
+        match upload_gist(&tar, &req.message) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                run(format!(
+                    "could not upload the reproducer bundle as a gist ({e}); \
+                     falling back to a local bundle — attach it to the issue manually"
+                ));
+                None
+            }
+        }
     };
     let (title, body, bref, local_bundle) = match gist {
         Some(url) => {
@@ -449,18 +458,44 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String], exit_code
     }
 }
 
-/// Upload the bundle (base64) as a gist via the `gh` CLI and return its URL.
-/// Secret (unlisted) by default; set HDLSIM_REPORT_GIST=public for a public
-/// gist. Gist files are size-limited, so the base64 form is capped at 8 MB.
-fn upload_gist(tar: &[u8], title: &str) -> Option<String> {
+/// Where the base64 bundle is staged before `gh gist create`. The file name
+/// matters: `gh gist create <file>` names the gist file after the local
+/// basename, and the issue body links `{gist}/raw/hdlsim-repro.tar.b64`, so
+/// the staged name must be exactly `hdlsim-repro.tar.b64`.
+fn gist_staging_path() -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("hdlsim-gist-{}", std::process::id()))
+        .join("hdlsim-repro.tar.b64")
+}
+
+/// The visibility flag for `gh gist create`: secret gists are the default
+/// and gh has NO `--secret` flag (passing it fails with "unknown flag:
+/// --secret", which used to make every upload fail), so `--public` is only
+/// passed when explicitly requested.
+fn gist_public_arg(public: bool) -> Option<&'static str> {
+    public.then_some("--public")
+}
+
+/// Upload the bundle (base64) as a gist via the `gh` CLI; `Ok(url)` on success,
+/// `Err(reason)` with gh's stderr on failure. Secret (unlisted) by default;
+/// set HDLSIM_REPORT_GIST=public for a public gist. Gist files are
+/// size-limited, so the base64 form is capped at 8 MB.
+fn upload_gist(tar: &[u8], title: &str) -> Result<String, String> {
     const GIST_B64_CAP: usize = 8 * 1024 * 1024;
-    let gh = which("gh")?;
+    let gh = which("gh").ok_or_else(|| "the `gh` CLI was not found on PATH".to_string())?;
     let b64tar = b64(tar);
     if b64tar.len() > GIST_B64_CAP {
-        return None;
+        return Err(format!(
+            "bundle too large for a gist ({} bytes base64, cap {GIST_B64_CAP})",
+            b64tar.len()
+        ));
     }
-    let path = std::env::temp_dir().join(format!("hdlsim-repro-{}.tar.b64", std::process::id()));
-    std::fs::write(&path, &b64tar).ok()?;
+    let path = gist_staging_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, &b64tar).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     let public = matches!(
         std::env::var("HDLSIM_REPORT_GIST").as_deref(),
         Ok("public") | Ok("1")
@@ -469,17 +504,25 @@ fn upload_gist(tar: &[u8], title: &str) -> Option<String> {
     cmd.arg("gist")
         .arg("create")
         .arg("--desc")
-        .arg(format!("hdlsim reproducer bundle — {title}"))
-        .arg(if public { "--public" } else { "--secret" })
-        .arg("--filename")
-        .arg("hdlsim-repro.tar.b64")
-        .arg(&path);
-    let out = cmd.output().ok()?;
+        .arg(format!("hdlsim reproducer bundle — {title}"));
+    if let Some(flag) = gist_public_arg(public) {
+        cmd.arg(flag);
+    }
+    cmd.arg(&path);
+    let out = cmd.output().map_err(|e| format!("cannot run `gh`: {e}"))?;
     if !out.status.success() {
-        return None;
+        return Err(format!(
+            "`gh gist create` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    url.starts_with("https://gist.github.com/").then_some(url)
+    // Accept github.com and GitHub Enterprise gist hosts (gist.<host>/...).
+    if url.starts_with("https://gist.") {
+        Ok(url)
+    } else {
+        Err(format!("unexpected `gh gist create` output: {url}"))
+    }
 }
 
 fn which(prog: &str) -> Option<PathBuf> {
@@ -493,6 +536,19 @@ fn which(prog: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gist_upload_uses_valid_gh_flags_and_staging_name() {
+        // `gh gist create` has no `--secret` flag (secret is the default) —
+        // passing it made every upload fail with "unknown flag: --secret", so
+        // issues were filed with no bundle attached (issue #113).
+        assert_eq!(gist_public_arg(false), None);
+        assert_eq!(gist_public_arg(true), Some("--public"));
+        let p = gist_staging_path();
+        // The gist file takes the local basename; the issue body links
+        // `{gist}/raw/hdlsim-repro.tar.b64`, so the staged name must match.
+        assert_eq!(p.file_name().unwrap(), "hdlsim-repro.tar.b64");
+    }
 
     #[test]
     fn b64_matches_rfc4648_vectors() {
