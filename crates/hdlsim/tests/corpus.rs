@@ -22,7 +22,7 @@ fn corpus_dir() -> PathBuf {
 /// `(subdir, files)` groups — each group is compiled together as one library.
 fn corpus_groups() -> Vec<(&'static str, Vec<PathBuf>)> {
     let mut out = Vec::new();
-    for sub in ["verilog", "vhdl"] {
+    for sub in ["verilog", "vhdl", "vhdl-vunit"] {
         let dir = corpus_dir().join(sub);
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap()
@@ -68,6 +68,12 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
         "vhdl" => {
             mgr.add_library_dir("neorv32", &dir);
             mgr.add_library_dir("unisim", &dir);
+            mgr.add_library_dir("work", &dir);
+        }
+        // VUnit's own sources live in their own library so their `work.*`
+        // references resolve within the group (not to same-named GHDL units).
+        "vhdl-vunit" => {
+            mgr.add_library_dir("vunit", &dir);
             mgr.add_library_dir("work", &dir);
         }
         _ => {

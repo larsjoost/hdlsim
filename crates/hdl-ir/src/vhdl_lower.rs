@@ -73,6 +73,10 @@ pub struct PackageIr {
     /// `(name, default value)` per generic, used when the package is
     /// instantiated (`package p is new g generic map (...)`).
     pub generics: Vec<(String, Value)>,
+    /// Type actuals of a package instantiation: `(generic type param, actual
+    /// type name)` — `package p is new g generic map (type T => u);` binds the
+    /// generic type `T` to the actual type `u` inside the instance.
+    pub type_actuals: Vec<(String, String)>,
     /// The package's own declaration node and the design-file root that
     /// declared it — retained so a package instantiation can re-lower the
     /// generic package with the `generic map` values as overrides.
@@ -1172,7 +1176,24 @@ impl<'a> Lower<'a> {
         span: Span,
     ) -> (usize, bool, Option<usize>, bool) {
         let name = self.kw(mark);
-        let base = self.types.get(&name).cloned();
+        let base = self.types.get(&name).cloned().or_else(|| {
+            // Selected type mark `lib.pkg.type` (e.g. ieee.numeric_std.unsigned):
+            // look the item up in the package, falling back to the bare item
+            // name (builtin/std types like `unsigned` are pre-registered and
+            // thus not re-exported by the package).
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() >= 2 {
+                let last = parts[parts.len() - 1];
+                if let Some(p) = self.pkgs.get(parts[parts.len() - 2]) {
+                    if let Some((_, v)) = p.types.iter().find(|(k, _)| k == last) {
+                        return Some(v.clone());
+                    }
+                }
+                self.types.get(last).cloned()
+            } else {
+                None
+            }
+        });
         let Some(base) = base else {
             // `X'subtype` type mark where X is a port/signal (not a type):
             // adopt the object's width as an anonymous vector.
@@ -1961,6 +1982,12 @@ impl<'a> Lower<'a> {
         {
             if let Some(decl) = self.pkgs.get(&name.to_ascii_lowercase()).cloned() {
                 self.merge_package(&decl, None, false);
+                // A package body also sees its declaration's context clauses
+                // (bodies often repeat no `use` clauses of their own).
+                if let Some(src) = &decl.src {
+                    let src = src.clone();
+                    self.apply_context_clauses(&src);
+                }
             }
         }
         // Package declarations: constants, types, and function bodies become
@@ -1978,7 +2005,8 @@ impl<'a> Lower<'a> {
             }
         }
         let mut functions: Vec<FuncIr> = Vec::new();
-        let mut uses: Vec<String> = Vec::new();
+        let mut uses: Vec<String> = context_units(self.db, root);
+        uses.retain(|u| u != &name.to_ascii_lowercase());
         let mut attr_decls: Vec<String> = Vec::new();
         for d in real_children(p) {
             match d.kind() {
@@ -2070,6 +2098,7 @@ impl<'a> Lower<'a> {
             consts,
             functions,
             generics,
+            type_actuals: Vec::new(),
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
@@ -2144,6 +2173,7 @@ impl<'a> Lower<'a> {
         lx2.apply_context_clauses(&src_root);
         // `generic map` associations: PortConn children with a leading Name.
         let mut overrides: HashMap<String, Value> = HashMap::new();
+        let mut type_actuals: Vec<(String, String)> = Vec::new();
         for k in real_children(node) {
             if k.kind() != SyntaxKind::PortConn {
                 continue;
@@ -2162,6 +2192,20 @@ impl<'a> Lower<'a> {
                 match lx2.ce_env(&ex, &HashMap::new()) {
                     Some(v) => {
                         overrides.insert(n, v);
+                    }
+                    // Not a constant: a generic `type` parameter bound to an
+                    // actual type name (`generic map (type T => u)`).
+                    None if matches!(e.kind(), SyntaxKind::Name) => {
+                        let actual = db
+                            .span_text(e.span())
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if !actual.is_empty() {
+                            type_actuals.push((n, actual));
+                        }
                     }
                     None => lx2.warn(
                         e.span(),
@@ -2187,6 +2231,18 @@ impl<'a> Lower<'a> {
                 pkg.generics = part.generics;
             }
         }
+        // Bind generic type parameters to their actual types in the instance's
+        // exported types, so `use work.p.all` exposes the real type (and package
+        // bodies of the instance see it).
+        for (formal, actual) in &type_actuals {
+            if let Some(ti) = lx2.types.get(actual).cloned() {
+                match pkg.types.iter_mut().find(|(k, _)| k == formal) {
+                    Some(e) => e.1 = ti,
+                    None => pkg.types.push((formal.clone(), ti)),
+                }
+            }
+        }
+        pkg.type_actuals = type_actuals;
         // The instance is fully bound (no longer generic); a further
         // instantiation of THIS package re-lowers the same generic source
         // with its own overrides (decl/src chain below).
@@ -2727,6 +2783,40 @@ impl<'a> Lower<'a> {
         let Some(target) = kids[is_pos + 1..].iter().find(|k| is_expr_node(k.kind())) else {
             return;
         };
+        // Type alias: `alias ptr_t is integer_vector_ptr_t;` registers the
+        // alias name as a type.
+        let tname = self.kw(target);
+        if let Some(ti) = self.types.get(&tname).cloned() {
+            self.types.insert(name.clone(), ti);
+        }
+        // Subprogram alias with a selected target:
+        // `alias RISING_EDGE is STD.STANDARD.RISING_EDGE [BIT return BOOLEAN];`
+        // — bind to the package's function so calls to the alias resolve.
+        if matches!(target.kind(), SyntaxKind::Name) {
+            let parts: Vec<&str> = tname.split('.').collect();
+            if parts.len() >= 3 {
+                let unit = parts[parts.len() - 2];
+                let item = parts[parts.len() - 1];
+                if let Some(p) = self.pkgs.get(unit) {
+                    if p.functions
+                        .iter()
+                        .any(|f| f.name.to_ascii_lowercase() == item)
+                    {
+                        self.aliases.insert(
+                            name.clone(),
+                            Expr::Call {
+                                name: item.to_string(),
+                                args: Vec::new(),
+                            },
+                        );
+                        return;
+                    }
+                }
+                // Unresolvable selected subprogram alias: silent placeholder.
+                self.aliases.insert(name.clone(), Expr::Lit(Value::x(1)));
+                return;
+            }
+        }
         let e = self.lower_expr(target, &self.consts.clone());
         match &e {
             Expr::Sig(id) => {
