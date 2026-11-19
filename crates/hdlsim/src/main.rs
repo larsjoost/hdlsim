@@ -42,6 +42,11 @@ fn main() {
     // Global `--report <msg>` / `--report-dry-run`: on failure, file a GitHub
     // issue with a reproducer bundle instead of only printing the URL.
     let (args, report) = hdlsim::commands::report::extract_report_args(&args);
+    if report.is_some() {
+        // Capture the rendered diagnostics so the filed issue includes the
+        // exact error/warning output, not just the reproducer bundle.
+        hdl_syntax::diagnostic::set_capture(true);
+    }
     match hdlsim::commands::dispatch(&args) {
         Ok(code) => {
             if code != 0 {

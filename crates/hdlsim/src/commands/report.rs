@@ -7,7 +7,7 @@
 
 use super::bundle::build_bundle_entries;
 use super::CommonOpts;
-use hdl_lib::bundle::write_tar;
+use hdl_lib::bundle::{write_tar, BundleEntry};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -50,14 +50,16 @@ pub fn extract_report_args(args: &[String]) -> (Vec<String>, Option<ReportReques
             i += 1;
         }
     }
-    let req = message.map(|m| ReportRequest {
-        message: if m.is_empty() {
-            "hdlsim command failed".to_string()
-        } else {
-            m
-        },
-        dry_run,
-    });
+    let req = message
+        .or_else(|| dry_run.then(String::new))
+        .map(|m| ReportRequest {
+            message: if m.is_empty() {
+                "hdlsim command failed".to_string()
+            } else {
+                m
+            },
+            dry_run,
+        });
     (rest, req)
 }
 
@@ -145,6 +147,7 @@ fn file_args(args: &[String]) -> Vec<PathBuf> {
 fn compose_issue(
     message: &str,
     original_args: &[String],
+    output: &str,
     tar: &[u8],
     repo: &str,
 ) -> (String, String) {
@@ -159,19 +162,33 @@ fn compose_issue(
             first.to_string()
         }
     );
+    // Cap the embedded output so a huge log cannot blow up the issue body.
+    const OUTPUT_CAP: usize = 16_000;
+    let mut shown = output.trim_end().to_string();
+    if shown.len() > OUTPUT_CAP {
+        let cut = shown.floor_char_boundary(OUTPUT_CAP);
+        shown = format!(
+            "{}\n... [truncated {} bytes; full output in repro.tar OUTPUT.txt]",
+            &shown[..cut],
+            output.len() - cut
+        );
+    }
     let body = format!(
         "## Problem\n\n{}\n\n## Command\n\n```\nhdlsim {}\n```\n\n\
-         ## Environment\n\n- hdlsim {}\n- os: {}\n- repo: {}\n\n\
+         ## Output\n\n```\n{}\n```\n\n\
+         ## Environment\n\n- hdlsim {}\n- os: {}/{}\n- repo: {}\n\n\
          ## Reproducer bundle\n\n\
          The base64 `.tar` below contains the full project (`src/`, `libs/`, `hdlsim.ini`, \
-         `REPRO.md`). Decode + extract:\n\n\
+         `REPRO.md`, `OUTPUT.txt` with the command output above). Decode + extract:\n\n\
          ```\necho '<base64>' | base64 -d > repro.tar && tar -xf repro.tar -C repro && cd repro\n\
          hdlsim run --bundle ../repro.tar --top <top>   # or see REPRO.md\n```\n\n\
          <details><summary>repro.tar (base64, {} bytes)</summary>\n\n```\n{}\n```\n\n</details>\n",
         message,
         original_args.join(" "),
+        shown,
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
+        std::env::consts::ARCH,
         repo,
         tar.len(),
         b64(tar)
@@ -193,8 +210,14 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
         opts.libs.push(("work".to_string(), PathBuf::from(".")));
     }
     let files = file_args(original_args);
-    let entries = match build_bundle_entries(&opts, None, &req.message, &files, "hdlsim-repro.tar")
-    {
+    let output = hdl_syntax::diagnostic::take_capture();
+    let mut entries = match build_bundle_entries(
+        &opts,
+        None,
+        &req.message,
+        &files,
+        "hdlsim-repro.tar",
+    ) {
         Ok(e) => e,
         Err(e) => {
             run(format!(
@@ -203,6 +226,18 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
             return;
         }
     };
+    if !output.is_empty() {
+        // Keep the full (untruncated) output inside the bundle.
+        let capped = if output.len() > 1_000_000 {
+            output[..output.floor_char_boundary(1_000_000)].to_string()
+        } else {
+            output.clone()
+        };
+        entries.push(BundleEntry {
+            path: "OUTPUT.txt".to_string(),
+            data: capped.into_bytes(),
+        });
+    }
     let tar = match write_tar(&entries) {
         Ok(t) => t,
         Err(e) => {
@@ -215,7 +250,7 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String]) {
         run("could not write the bundle to a temp file".to_string());
         return;
     }
-    let (title, body) = compose_issue(&req.message, original_args, &tar, &repo);
+    let (title, body) = compose_issue(&req.message, original_args, &output, &tar, &repo);
     let body_path = std::env::temp_dir().join(format!("hdlsim-issue-{}.md", std::process::id()));
     if std::fs::write(&body_path, &body).is_err() {
         run("could not write the issue body to a temp file".to_string());
@@ -337,6 +372,17 @@ mod tests {
 
         let (_, req) = extract_report_args(&["check".to_string()]);
         assert!(req.is_none());
+
+        // `--report-dry-run` alone previews with the default message.
+        let (rest, req) = extract_report_args(&[
+            "check".to_string(),
+            "top.vhd".to_string(),
+            "--report-dry-run".to_string(),
+        ]);
+        assert_eq!(rest, vec!["check", "top.vhd"]);
+        let req = req.unwrap();
+        assert_eq!(req.message, "hdlsim command failed");
+        assert!(req.dry_run);
     }
 
     #[test]
@@ -344,12 +390,15 @@ mod tests {
         let (title, body) = compose_issue(
             "wrong result",
             &["run".to_string(), "tb.v".to_string()],
+            "error[E0401]: unknown identifier 'x'",
             b"TAR",
             "o/r",
         );
         assert!(title.contains("wrong result"));
         assert!(body.contains("wrong result"));
         assert!(body.contains("hdlsim run tb.v"));
+        assert!(body.contains("## Output"));
+        assert!(body.contains("unknown identifier 'x'"));
         assert!(body.contains("VEFS")); // b64("TAR")
     }
 }

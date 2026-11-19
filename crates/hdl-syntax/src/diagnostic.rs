@@ -367,6 +367,21 @@ pub fn decode_diags(file: crate::source::FileId, bytes: &[u8]) -> Option<Vec<Dia
 
 /// An ordered collection of diagnostics. Iteration is deterministic: insertion
 /// order, which parse stages produce in source order.
+/// When enabled, every rendered diagnostic block is also appended here —
+/// used by `hdlsim --report` to embed the exact command output in the issue.
+static CAPTURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Enable or disable diagnostic capture (called by the binary when a
+/// `--report` request is active).
+pub fn set_capture(on: bool) {
+    *CAPTURE.lock().unwrap() = if on { Some(String::new()) } else { None };
+}
+
+/// Take the captured diagnostic output (empty string when capture is off).
+pub fn take_capture() -> String {
+    CAPTURE.lock().unwrap().take().unwrap_or_default()
+}
+
 #[derive(Default, Debug)]
 pub struct Diagnostics {
     pub items: Vec<Diagnostic>,
@@ -399,6 +414,15 @@ impl Diagnostics {
 
     /// Render all diagnostics with explicit color on/off.
     pub fn render_all_with(&self, db: &SourceDb, color: bool) -> String {
+        let out = self.render_all_plain(db, color);
+        if let Some(cap) = CAPTURE.lock().unwrap().as_mut() {
+            cap.push_str(&out);
+            cap.push('\n');
+        }
+        out
+    }
+
+    fn render_all_plain(&self, db: &SourceDb, color: bool) -> String {
         let mut out = self
             .items
             .iter()
@@ -456,6 +480,29 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_collects_rendered_output() {
+        let mut db = SourceDb::new();
+        let id = db
+            .add_file("t.vhd".to_string(), "entity e is end;\n".to_string())
+            .unwrap();
+        let mut ds = Diagnostics::new();
+        ds.push(Diagnostic::error("E0401", None, "unknown identifier 'x'"));
+        set_capture(false);
+        assert_eq!(take_capture(), "");
+        set_capture(true);
+        let rendered = ds.render_all(&db);
+        assert!(rendered.contains("unknown identifier 'x'"));
+        let cap = take_capture();
+        assert!(cap.contains("unknown identifier 'x'"));
+        assert_eq!(take_capture(), ""); // taken
+        set_capture(false);
+        ds.render_all(&db);
+        assert_eq!(take_capture(), "");
+        let _ = id;
+    }
+
     use crate::source::FileId;
 
     #[test]
