@@ -78,7 +78,7 @@ pub struct LibraryManager {
     /// the "out of the box" fallback when no library maps the unit.
     search_roots: Vec<PathBuf>,
     /// Lazily built unit → file index over `search_roots` (built on first miss).
-    search_index: Option<HashMap<String, PathBuf>>,
+    search_index: Option<HashMap<String, (PathBuf, bool)>>,
     /// Units already reported as found-by-search (warn once per unit).
     search_warned: HashSet<String>,
     /// Cross-file Verilog library state: SV packages and their `pkg::`-qualified
@@ -126,18 +126,29 @@ impl LibraryManager {
     /// `name`. Returns the file defining the unit, if the project has it.
     fn search_project(&mut self, name: &str) -> Option<PathBuf> {
         if self.search_index.is_none() {
-            let mut idx: HashMap<String, PathBuf> = HashMap::new();
+            // (file, is_body): a unit's declaration file wins over a file that
+            // only holds its body — compiling a body before its declaration
+            // lowers it without the declaration's items in scope.
+            let mut idx: HashMap<String, (PathBuf, bool)> = HashMap::new();
             for root in self.search_roots.clone() {
-                for (unit, path) in providers::walk_sources(&root) {
-                    idx.entry(unit.to_ascii_lowercase())
-                        .or_insert_with(|| path.clone());
+                for (unit, path, is_body) in providers::walk_sources_tagged(&root) {
+                    match idx.entry(unit.to_ascii_lowercase()) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if !is_body && e.get().1 {
+                                e.insert((path, false));
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((path, is_body));
+                        }
+                    }
                 }
             }
             self.search_index = Some(idx);
         }
         self.search_index
             .as_ref()
-            .and_then(|i| i.get(&name.to_ascii_lowercase()).cloned())
+            .and_then(|i| i.get(&name.to_ascii_lowercase()).map(|(p, _)| p.clone()))
     }
 
     /// Enable the persistent parse cache in `c`.
@@ -331,7 +342,7 @@ impl LibraryManager {
             return;
         }
         self.dir_scanned = true;
-        let scanned: Vec<(usize, String, PathBuf)> = self
+        let scanned: Vec<(usize, String, PathBuf, bool)> = self
             .all_providers()
             .enumerate()
             .filter(|(_, p)| !p.source_files().is_empty()) // filesystem providers
@@ -342,14 +353,28 @@ impl LibraryManager {
                         p.name()
                     );
                 }
-                p.scan().into_iter().map(move |(u, f)| (i, u, f))
+                p.scan_tagged()
+                    .into_iter()
+                    .map(move |(u, f, b)| (i, u, f, b))
             })
             .collect();
-        for (i, unit, file) in scanned {
-            self.index
-                .entry(unit.to_ascii_lowercase())
-                .or_default()
-                .push((i, file));
+        // Declaration files first: candidates are compiled in order, and a
+        // package body must be lowered after its declaration is registered.
+        let mut grouped: HashMap<String, (Vec<(usize, PathBuf)>, Vec<(usize, PathBuf)>)> =
+            HashMap::new();
+        for (i, unit, file, is_body) in scanned {
+            let e = grouped.entry(unit.to_ascii_lowercase()).or_default();
+            if is_body {
+                e.1.push((i, file));
+            } else {
+                e.0.push((i, file));
+            }
+        }
+        for (unit, (mut decls, mut bodies)) in grouped {
+            decls.append(&mut bodies);
+            // Extend, don't replace: `ensure_index` already put the in-memory
+            // (embedded stdlib) candidates under this unit name.
+            self.index.entry(unit).or_default().extend(decls);
         }
     }
 
@@ -959,6 +984,72 @@ mod tests {
             "{}",
             err
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_body_file_does_not_shadow_declaration_when_resolving() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_bodydecl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The body file sorts BEFORE the declaration file: a naive first-wins
+        // index would compile the body first, without the declaration in scope.
+        std::fs::write(
+            dir.join("a_my_pkg-body.vhd"),
+            "package body my_pkg is\n  constant C : natural := WIDTH;\nend package body;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("z_my_pkg.vhd"),
+            "package my_pkg is\n  constant WIDTH : natural := 8;\nend package;\n",
+        )
+        .unwrap();
+        let mut mgr = LibraryManager::new();
+        mgr.add_search_root(&dir);
+        let mut design = Design::default();
+        assert!(mgr.resolve(&mut design, "my_pkg").unwrap());
+        let rendered = mgr.diags().render_all(mgr.db());
+        assert!(
+            !mgr.diags().has_errors(),
+            "body compiled before decl: {}",
+            rendered
+        );
+        // The project-search hit must name the declaration file, not the body.
+        assert!(rendered.contains("z_my_pkg.vhd"), "{}", rendered);
+        assert!(!rendered.contains("a_my_pkg-body.vhd"), "{}", rendered);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_declaration_applies_via_context_reference() {
+        let dir = std::env::temp_dir().join(format!("hdlsim_ctxdecl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("my_pkg.vhd"),
+            "package my_pkg is\n  constant WIDTH : natural := 8;\nend package;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("my_context.vhd"),
+            "context my_context is\n  use work.my_pkg.all;\nend context;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("top.vhd"),
+            "context work.my_context;\nentity top is\n  port (q : out natural);\nend entity;\narchitecture rtl of top is\nbegin\n  q <= WIDTH;\nend architecture;\n",
+        )
+        .unwrap();
+        let mut mgr = LibraryManager::new();
+        mgr.add_library_dir("work", &dir);
+        let mut design = Design::default();
+        let paths: Vec<PathBuf> = ["my_pkg.vhd", "my_context.vhd", "top.vhd"]
+            .iter()
+            .map(|f| dir.join(f))
+            .collect();
+        mgr.compile_files(&mut design, &paths);
+        let rendered = mgr.diags().render_all(mgr.db());
+        assert!(!mgr.diags().has_errors(), "{}", rendered);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

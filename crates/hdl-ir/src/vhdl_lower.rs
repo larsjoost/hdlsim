@@ -171,9 +171,14 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                         let text = db.span_text(n.span()).trim();
                         let parts: Vec<&str> = text.split('.').collect();
                         // `lib.unit.all` / `lib.unit.item` / `unit.all` / `unit.item`
+                        // Two parts are ambiguous (`lib.unit` vs `unit.item`):
+                        // unless the second part is `all`, treat it as the unit
+                        // (`context vunit_lib.com_context;` references the unit
+                        // `com_context` in library `vunit_lib`).
                         let unit = match parts.len() {
                             n if n >= 3 => parts[n - 2],
-                            2 => parts[0],
+                            2 if parts[1].eq_ignore_ascii_case("all") => parts[0],
+                            2 => parts[1],
                             _ => continue,
                         };
                         if !unit.is_empty() && !out.iter().any(|u| u == unit) {
@@ -278,6 +283,36 @@ pub fn lower_file(
                     lx.merge_package(&p, None, true);
                     lx.pkgs
                         .insert(p.name.to_ascii_lowercase(), Rc::new(p.clone()));
+                    packages.push(p);
+                }
+            }
+            // A VHDL-2008 context declaration (`context c is use ...; end
+            // context;`) exports no items itself, but `context lib.c;` must
+            // apply its use/context clauses. Model it as an item-less package
+            // whose `uses` are the declaration's clause units, so the existing
+            // transitive-`use` merge applies it (and nested context refs).
+            SyntaxKind::ContextDecl => {
+                let name = real_children(&child)
+                    .iter()
+                    .filter(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| lx.kw(k))
+                    .find(|w| w != "context")
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    let uses = context_units(lx.db, &child);
+                    let p = PackageIr {
+                        name: name.clone(),
+                        types: Vec::new(),
+                        consts: Vec::new(),
+                        functions: Vec::new(),
+                        generics: Vec::new(),
+                        type_actuals: Vec::new(),
+                        decl: Some(child.clone()),
+                        src: Some(root.clone()),
+                        uses,
+                        attr_decls: Vec::new(),
+                    };
+                    lx.pkgs.entry(name).or_insert_with(|| Rc::new(p.clone()));
                     packages.push(p);
                 }
             }
@@ -938,8 +973,15 @@ impl<'a> Lower<'a> {
             if n.kind() == SyntaxKind::Name {
                 let text = self.db.span_text(n.span()).trim();
                 let parts: Vec<&str> = text.split('.').collect();
+                // Two-part names are ambiguous: `lib.unit` (e.g.
+                // `context vunit_lib.com_context;`) vs `unit.item` / `unit.all`.
+                // If the second part names a known package, it is the unit.
                 let (unit, item) = match parts.len() {
                     n if n >= 3 => (parts[n - 2], parts[n - 1]),
+                    2 if parts[1].eq_ignore_ascii_case("all") => (parts[0], parts[1]),
+                    2 if self.pkgs.contains_key(&parts[1].to_ascii_lowercase()) => {
+                        (parts[1], "all")
+                    }
                     2 => (parts[0], parts[1]),
                     _ => continue,
                 };

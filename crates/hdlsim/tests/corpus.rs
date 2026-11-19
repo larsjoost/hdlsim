@@ -72,9 +72,13 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
         }
         // VUnit's own sources live in their own library so their `work.*`
         // references resolve within the group (not to same-named GHDL units).
+        // Its test sources also reference `vunit_lib.*` (the logical name its
+        // compile script uses) and `osvvm.*` (the OSVVM sources kept in `vhdl/`).
         "vhdl-vunit" => {
             mgr.add_library_dir("vunit", &dir);
+            mgr.add_library_dir("vunit_lib", &dir);
             mgr.add_library_dir("work", &dir);
+            mgr.add_library_dir("osvvm", &corpus_dir().join("vhdl"));
         }
         _ => {
             mgr.add_library_dir("work", &dir);

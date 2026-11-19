@@ -47,6 +47,112 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// VHDL-2008 reserved words (a `'` after one of these is not a tick,
+/// e.g. `when '1' =>` starts a char literal, not an attribute).
+fn is_reserved_word(w: &str) -> bool {
+    matches!(
+        w,
+        "abs"
+            | "access"
+            | "after"
+            | "alias"
+            | "all"
+            | "and"
+            | "architecture"
+            | "array"
+            | "assert"
+            | "attribute"
+            | "begin"
+            | "block"
+            | "body"
+            | "buffer"
+            | "bus"
+            | "case"
+            | "component"
+            | "configuration"
+            | "constant"
+            | "disconnect"
+            | "downto"
+            | "else"
+            | "elsif"
+            | "end"
+            | "entity"
+            | "exit"
+            | "file"
+            | "for"
+            | "function"
+            | "generate"
+            | "generic"
+            | "group"
+            | "guarded"
+            | "if"
+            | "impure"
+            | "in"
+            | "inertial"
+            | "inout"
+            | "is"
+            | "label"
+            | "library"
+            | "linkage"
+            | "literal"
+            | "loop"
+            | "map"
+            | "mod"
+            | "nand"
+            | "new"
+            | "next"
+            | "nor"
+            | "not"
+            | "null"
+            | "of"
+            | "on"
+            | "open"
+            | "or"
+            | "others"
+            | "out"
+            | "package"
+            | "port"
+            | "postponed"
+            | "procedure"
+            | "process"
+            | "protected"
+            | "pure"
+            | "range"
+            | "record"
+            | "register"
+            | "reject"
+            | "rem"
+            | "report"
+            | "return"
+            | "rol"
+            | "ror"
+            | "select"
+            | "severity"
+            | "signal"
+            | "shared"
+            | "sla"
+            | "sll"
+            | "sra"
+            | "srl"
+            | "subtype"
+            | "then"
+            | "to"
+            | "transport"
+            | "type"
+            | "unaffected"
+            | "units"
+            | "until"
+            | "use"
+            | "variable"
+            | "wait"
+            | "when"
+            | "while"
+            | "with"
+            | "xnor"
+            | "xor"
+    )
+}
+
 impl<'a> Lexer<'a> {
     fn peek(&self, n: usize) -> Option<u8> {
         self.text.get(self.pos + n).copied()
@@ -153,16 +259,50 @@ impl<'a> Lexer<'a> {
         self.emit_from(TokenKind::StrLiteral, start);
     }
 
-    /// `'0'` → CharLiteral; `''''` (apostrophe literal) → CharLiteral of len 4;
-    /// otherwise the tick of an attribute/qualified expression → Punct('\'').
+    /// `'0'` → CharLiteral; apostrophe literal `'''` (len 3) or `''''`
+    /// (len 4, as in std.standard's enum) → CharLiteral (maximal munch); otherwise
+    /// the tick of an attribute/qualified expression → Punct('\'').
     fn tick_or_char(&mut self) {
+        // A tick directly after a name/literal/closing bracket is an
+        // attribute or qualified-expression tick (`bit'('1')`, `sig'event`),
+        // never the start of a char literal — `'('` after an operand would
+        // otherwise lex as the char literal '('.
+        if self.prev_allows_tick() {
+            self.emit(TokenKind::Punct, 1);
+            return;
+        }
         if self.peek(1) == Some(b'\'') && self.peek(2) == Some(b'\'') {
-            self.emit(TokenKind::CharLiteral, 4); // ''''
+            let len = if self.peek(3) == Some(b'\'') { 4 } else { 3 };
+            self.emit(TokenKind::CharLiteral, len);
         } else if self.peek(2) == Some(b'\'') && self.peek(1).is_some() {
             self.emit(TokenKind::CharLiteral, 3); // 'x'
         } else {
             self.emit(TokenKind::Punct, 1);
         }
+    }
+
+    /// True when the last significant token can be followed by a tick:
+    /// a non-keyword identifier, a literal, or a closing `)`/`]`.
+    fn prev_allows_tick(&self) -> bool {
+        for t in self.tokens.iter().rev() {
+            match t.kind {
+                TokenKind::Whitespace | TokenKind::Comment => continue,
+                TokenKind::Ident => {
+                    let text = String::from_utf8_lossy(
+                        &self.text[t.span.start as usize..t.span.end as usize],
+                    )
+                    .to_ascii_lowercase();
+                    return !is_reserved_word(&text);
+                }
+                TokenKind::CharLiteral | TokenKind::StrLiteral => return true,
+                TokenKind::Punct => {
+                    let text = &self.text[t.span.start as usize..t.span.end as usize];
+                    return text == b")" || text == b"]";
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// `\extended identifier\`.
@@ -310,13 +450,31 @@ mod tests {
     }
 
     #[test]
+    fn tick_after_name_vs_char_literal() {
+        // Qualified expression: `bit'('1')` — the tick after a name is a
+        // Punct, so `'(` is not lexed as the char literal '('.
+        let k = kinds("bit'('1')");
+        assert_eq!(k[0], (TokenKind::Ident, "bit".to_string()));
+        assert_eq!(k[1], (TokenKind::Punct, "'".to_string()));
+        assert_eq!(k[2], (TokenKind::Punct, "(".to_string()));
+        assert_eq!(k[3], (TokenKind::CharLiteral, "'1'".to_string()));
+        // After a keyword (`when`), a quote starts a char literal again.
+        let k = kinds("when '1' =>");
+        assert_eq!(k[1], (TokenKind::CharLiteral, "'1'".to_string()));
+        // Apostrophe char literals: ''' (len 3) and '''' (len 4, std.standard).
+        let k = kinds("= ''' ) = '''' ,");
+        assert_eq!(k[1], (TokenKind::CharLiteral, "'''".to_string()));
+        assert_eq!(k[4], (TokenKind::CharLiteral, "''''".to_string()));
+    }
+
+    #[test]
     fn tick_vs_char() {
-        let k = kinds("clk'event '0' a'range");
+        let k = kinds("clk'event, '0', a'range");
         assert_eq!(k[0], (TokenKind::Ident, "clk".to_string()));
         assert_eq!(k[1], (TokenKind::Punct, "'".to_string()));
         assert_eq!(k[2], (TokenKind::Ident, "event".to_string()));
-        assert_eq!(k[3], (TokenKind::CharLiteral, "'0'".to_string()));
-        assert_eq!(k[5], (TokenKind::Punct, "'".to_string()));
+        assert_eq!(k[4], (TokenKind::CharLiteral, "'0'".to_string()));
+        assert_eq!(k[7], (TokenKind::Punct, "'".to_string()));
     }
 
     #[test]
