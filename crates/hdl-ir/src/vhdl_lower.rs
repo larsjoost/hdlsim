@@ -84,6 +84,9 @@ pub struct PackageIr {
     /// Package-level signals / shared variables `(name, type mark)` — exported
     /// so `use work.com_pkg.all;` also exposes bare reads of `net` etc.
     pub sig_types: Vec<(String, String)>,
+    /// Typed constants `(name, type mark)` — exported so `pkg_const.field`
+    /// (record-typed constant select) resolves in files that `use` the package.
+    pub const_tys: Vec<(String, String)>,
     /// The package's own declaration node and the design-file root that
     /// declared it — retained so a package instantiation can re-lower the
     /// generic package with the `generic map` values as overrides.
@@ -332,6 +335,7 @@ pub fn lower_file(
                         type_actuals: Vec::new(),
                         rec_field_tys: Vec::new(),
                         sig_types: Vec::new(),
+                        const_tys: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
                         uses,
@@ -2025,6 +2029,13 @@ impl<'a> Lower<'a> {
                 .entry(n.clone())
                 .or_insert_with(|| tn.clone());
         }
+        for (n, tn) in &p.const_tys {
+            if item.is_none_or(|i| i == n) {
+                self.const_types
+                    .entry(n.clone())
+                    .or_insert_with(|| tn.clone());
+            }
+        }
         // Use clauses are transitive through packages: `use work.p.all` also
         // exposes what `p` itself made visible via `use lib.q.all;`.
         if item.is_none() && visited.insert(p.name.to_ascii_lowercase()) {
@@ -2102,7 +2113,35 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
-                SyntaxKind::AliasDecl => self.lower_alias_decl(&d),
+                SyntaxKind::AliasDecl => {
+                    self.lower_alias_decl(&d);
+                    // `alias runner_phase is runner(...)` where runner is a
+                    // package-level signal: export the alias name like the
+                    // signal, so using files resolve bare `runner_phase`.
+                    let ak = real_children(&d);
+                    if let Some(npos) = ak.iter().position(|k| k.kind() == SyntaxKind::Name) {
+                        let aname = self.kw(&ak[npos]);
+                        if let Some(is_pos) = ak
+                            .iter()
+                            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "is")
+                        {
+                            if let Some(target) =
+                                ak[is_pos + 1..].iter().find(|k| is_expr_node(k.kind()))
+                            {
+                                let ttext = self.text(target);
+                                let base = ttext
+                                    .split(['.', '('])
+                                    .next()
+                                    .unwrap_or(ttext.as_str())
+                                    .to_ascii_lowercase();
+                                if let Some(tn) = self.pkg_sig_types.get(&base).cloned() {
+                                    self.pkg_sig_types.insert(aname.clone(), tn.clone());
+                                    sig_types.push((aname, tn));
+                                }
+                            }
+                        }
+                    }
+                }
                 SyntaxKind::AttrDecl => {
                     if let Some(a) = self.register_attr_decl(&d) {
                         attr_decls.push(a);
@@ -2130,7 +2169,12 @@ impl<'a> Lower<'a> {
                             .collect();
                         let tmark = dk[c + 1..].iter().find(|k| k.kind() == SyntaxKind::Name);
                         if let Some(tm) = tmark {
-                            let tn = self.kw(tm);
+                            let tn = self
+                                .kw(tm)
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
                             for n in names {
                                 self.pkg_sig_types.insert(n.clone(), tn.clone());
                                 sig_types.push((n, tn.clone()));
@@ -2176,7 +2220,7 @@ impl<'a> Lower<'a> {
         // package already brought a same-named const into scope (e.g. an enum
         // label like ENABLED vs OsvvmOptionsType's) — keep new or overridden
         // entries.
-        let consts = self
+        let consts: Vec<(String, Value)> = self
             .consts
             .iter()
             .filter(|(k, v)| consts_before.get(*k).map_or(true, |old| old != *v))
@@ -2189,6 +2233,14 @@ impl<'a> Lower<'a> {
             .filter(|((r, _), _)| type_names.contains(r))
             .map(|((r, f), t)| (r.clone(), f.clone(), t.clone()))
             .collect();
+        let const_names: std::collections::HashSet<&String> =
+            consts.iter().map(|(k, _)| k).collect();
+        let const_tys = self
+            .const_types
+            .iter()
+            .filter(|(k, _)| const_names.contains(k))
+            .map(|(k, t)| (k.clone(), t.clone()))
+            .collect();
         PackageIr {
             name,
             types,
@@ -2198,6 +2250,7 @@ impl<'a> Lower<'a> {
             type_actuals: Vec::new(),
             rec_field_tys,
             sig_types,
+            const_tys,
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
@@ -2328,6 +2381,7 @@ impl<'a> Lower<'a> {
             pkg.attr_decls.extend(part.attr_decls);
             pkg.rec_field_tys.extend(part.rec_field_tys);
             pkg.sig_types.extend(part.sig_types);
+            pkg.const_tys.extend(part.const_tys);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -2602,6 +2656,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::PackageInst => self.register_package_inst(d),
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
                 SyntaxKind::PortClause => self.lower_port_clause(module, d),
+                SyntaxKind::Function if self.subprogram_is_function(d) => {
+                    self.lower_function_decl(module, d)
+                }
                 SyntaxKind::GenericClause => {
                     // Block-header generics: register as constants so port
                     // constraints see them (not module params).
@@ -3432,6 +3489,7 @@ impl<'a> Lower<'a> {
     /// parameters, then local variables.
     fn lower_function_decl(&mut self, module: &mut ModuleIr, f: &SyntaxNode) {
         if let Some(fi) = self.lower_function_node(f) {
+            self.funcs.insert(fi.name.to_ascii_lowercase(), fi.clone());
             module.functions.push(fi);
         }
     }
@@ -3454,6 +3512,48 @@ impl<'a> Lower<'a> {
             }
         }
         false
+    }
+
+    /// Name + argument count of a subprogram declaration, as a stub FuncIr —
+    /// pre-registered so declarative items (constant initializers) that
+    /// reference a nested subprogram before its body is lowered resolve to a
+    /// call; the real body overwrites the stub afterwards.
+    fn subprogram_stub(&self, f: &SyntaxNode) -> Option<FuncIr> {
+        let kids = real_children(f);
+        let mut name = String::new();
+        let mut seen_return = false;
+        let mut seen_begin = false;
+        let mut nargs = 0usize;
+        for k in &kids {
+            match k.kind() {
+                SyntaxKind::Ident if self.kw(k) == "return" => seen_return = true,
+                SyntaxKind::Ident if self.kw(k) == "begin" => seen_begin = true,
+                SyntaxKind::Name if !seen_return && name.is_empty() => name = self.text(k),
+                SyntaxKind::PortDecl if !seen_begin => {
+                    let pk = real_children(k);
+                    if let Some(colon) = pk
+                        .iter()
+                        .position(|c| c.kind() == SyntaxKind::Punct && self.text(c) == ":")
+                    {
+                        nargs += pk[..colon]
+                            .iter()
+                            .filter(|c| c.kind() == SyntaxKind::Name)
+                            .count();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            return None;
+        }
+        Some(FuncIr {
+            name,
+            ret_width: 32,
+            args: (0..nargs).map(|i| (format!("a{i}"), 32)).collect(),
+            locals: Vec::new(),
+            body: Stmt::Null,
+        })
     }
 
     /// which cannot be lowered without knowing the call argument.
@@ -3607,6 +3707,14 @@ impl<'a> Lower<'a> {
                 if let Some(en) = self.as_elem_record(&tn) {
                     self.sig_elem_rec.insert(i as SigId, en);
                 }
+            }
+        }
+        // Pre-register nested subprograms so constant initializers in the
+        // declarative part can reference them (`constant r : string := f;`);
+        // real bodies are lowered after the loop and overwrite the stubs.
+        for k in &nested_fns {
+            if let Some(stub) = self.subprogram_stub(k) {
+                self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
             }
         }
         // Declarative items in textual order: each may reference the ones
@@ -3774,7 +3882,12 @@ impl<'a> Lower<'a> {
                 SyntaxKind::SensList => {
                     sens = self.lower_sens_list(k);
                 }
-                SyntaxKind::Function if self.subprogram_is_function(k) => local_fns.push(k.clone()),
+                SyntaxKind::Function if self.subprogram_is_function(k) => {
+                    if let Some(stub) = self.subprogram_stub(k) {
+                        self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                    }
+                    local_fns.push(k.clone());
+                }
                 SyntaxKind::SignalDecl
                 | SyntaxKind::VariableDecl
                 | SyntaxKind::ConstantDecl
@@ -3922,6 +4035,17 @@ impl<'a> Lower<'a> {
                     .to_string();
                 let lookup = if base_name != name { &base_name } else { &name };
                 if let Some(id) = self.sig_id(lookup) {
+                    edges.push(Edge {
+                        sig: id,
+                        kind: EdgeKind::Any,
+                    });
+                } else if self
+                    .pkg_sig_types
+                    .contains_key(&lookup.to_ascii_lowercase())
+                {
+                    // Package-level signal (e.g. `signal runner` in a package
+                    // declaration, used in `wait on runner`): placeholder.
+                    let id = self.ensure_global_sig(lookup);
                     edges.push(Edge {
                         sig: id,
                         kind: EdgeKind::Any,
@@ -5047,7 +5171,16 @@ impl<'a> Lower<'a> {
                     let field = fields_path.join(".").to_ascii_lowercase();
                     let id = self
                         .sig_id(&base)
-                        .or_else(|| self.names.get(&format!("__const_{}", base)).copied());
+                        .or_else(|| self.names.get(&format!("__const_{}", base)).copied())
+                        .or_else(|| {
+                            self.names_stack.iter().rev().find_map(|m| {
+                                m.get(&base).copied().or_else(|| {
+                                    m.iter()
+                                        .find(|(k, _)| k.eq_ignore_ascii_case(&base))
+                                        .map(|(_, v)| *v)
+                                })
+                            })
+                        });
                     if let Some(id) = id {
                         if let Some(tn) = self.sig_rec.get(&id).cloned() {
                             let path: Vec<String> =
@@ -5064,17 +5197,17 @@ impl<'a> Lower<'a> {
                                 };
                             }
                         }
-                    } else if id.is_none() {
-                        // Package-level signal / shared variable: record-field
-                        // select lowers to a placeholder (not simulated).
-                        if let Some(tn) = self.pkg_sig_types.get(&base).cloned() {
-                            if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
-                                if let Some((_, w, _)) =
-                                    fields.iter().find(|(fn_, _, _)| *fn_ == field)
-                                {
-                                    return Expr::Lit(Value::x((*w).max(1)));
-                                }
+                    }
+                    // Package-level signal / shared variable: record-field or
+                    // protected-type member select lowers to a placeholder
+                    // (not simulated).
+                    if let Some(tn) = self.pkg_sig_types.get(&base).cloned() {
+                        if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                            if let Some((_, w, _)) = fields.iter().find(|(fn_, _, _)| *fn_ == field)
+                            {
+                                return Expr::Lit(Value::x((*w).max(1)));
                             }
+                            return Expr::Lit(Value::x(32));
                         }
                     }
                     if let (Some(v), Some(tn)) = (
@@ -5575,7 +5708,7 @@ impl<'a> Lower<'a> {
         // Dotted callee `rec.field(args)` or `pkg_var.method(args)`: if the
         // base names a signal/record or a package-level signal, this is a
         // method call — lower as a plain call of the field name.
-        if base_id.is_none() && name.contains('.') && !args.is_empty() {
+        if base_id.is_none() && name.contains('.') {
             let base = name.split('.').next().unwrap_or(name.as_str());
             if self.sig_id(base).is_some()
                 || self.pkg_sig_types.contains_key(&base.to_ascii_lowercase())
@@ -6613,6 +6746,94 @@ mod tests {
     fn record_typed_generic_field_select_resolves() {
         // `bus_handle.p_logger` where bus_handle is a record-typed generic.
         let diags = lower_src("package p is\n  type logger_t is record id : integer; end record;\n  type bus_t is record p_logger : logger_t; end record;\nend package;\nuse work.p.all;\nentity top is\n  generic (bus_handle : bus_t);\n  port (q : out bit);\nend entity;\narchitecture rtl of top is\nbegin\n  q <= bit'val(bus_handle.p_logger.id = 0);\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    #[test]
+    fn protected_pkg_shared_var_member_select_via_use_is_placeholder() {
+        // `messenger.timeout_is_allowed` / `messenger.get_all_actors` where
+        // messenger is a package-level shared variable of a protected type.
+        let mut db = SourceDb::new();
+        let id1 = db.add_file("p.vhd".to_string(), "package p is\n  type messenger_t is protected\n    impure function get_all_actors return integer;\n  end protected;\n  shared variable messenger : messenger_t;\nend package;\n".to_string()).unwrap();
+        let parsed1 = hdl_syntax::vhdl::parser::parse_file(id1, db.file(id1));
+        let mut diags = Vec::new();
+        let mut pkgs = HashMap::new();
+        let lowered = lower_file(
+            id1,
+            &parsed1.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        for p in lowered.packages {
+            pkgs.insert(p.name.to_ascii_lowercase(), std::rc::Rc::new(p));
+        }
+        let id2 = db.add_file("top.vhd".to_string(), "use work.p.all;\npackage body p is\n  function f return boolean is\n    constant actors : integer := messenger.get_all_actors;\n  begin\n    return messenger.timeout_is_allowed or actors > 0;\n  end;\nend package body;\n".to_string()).unwrap();
+        let parsed2 = hdl_syntax::vhdl::parser::parse_file(id2, db.file(id2));
+        let _ = lower_file(
+            id2,
+            &parsed2.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &pkgs,
+            &HashMap::new(),
+        );
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn pkg_signal_alias_exported_and_usable_in_sens_list() {
+        // `alias runner_phase is runner(...)` in a package with a
+        // package-level signal: the alias must be visible in using files,
+        // and the signal in a sensitivity list (`wait on runner`).
+        let mut db = SourceDb::new();
+        let id1 = db.add_file("p.vhd".to_string(), "package p is\n  signal runner : bit_vector(7 downto 0);\n  alias runner_phase is runner(3 downto 0);\nend package;\n".to_string()).unwrap();
+        let parsed1 = hdl_syntax::vhdl::parser::parse_file(id1, db.file(id1));
+        let mut diags = Vec::new();
+        let mut pkgs = HashMap::new();
+        let lowered = lower_file(
+            id1,
+            &parsed1.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        for p in lowered.packages {
+            pkgs.insert(p.name.to_ascii_lowercase(), std::rc::Rc::new(p));
+        }
+        let id2 = db.add_file("top.vhd".to_string(), "use work.p.all;\nentity top is port (q : out bit); end entity;\narchitecture rtl of top is\nbegin\n  process\n  begin\n    wait on runner until runner_phase = \"0000\";\n    q <= '1';\n    wait;\n  end process;\nend architecture;\n".to_string()).unwrap();
+        let parsed2 = hdl_syntax::vhdl::parser::parse_file(id2, db.file(id2));
+        let _ = lower_file(
+            id2,
+            &parsed2.root,
+            &db,
+            &mut diags,
+            1_000_000,
+            &pkgs,
+            &HashMap::new(),
+        );
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn nested_function_referenced_in_constant_initializer() {
+        // `constant result : string := create_string;` where create_string is
+        // a function nested in the same subprogram (stub pre-registration).
+        let diags = lower_src("package p is\nend package;\npackage body p is\n  function outer(s : string) return string is\n    impure function create_string return string is\n    begin\n      return s;\n    end;\n    constant result : string := create_string;\n  begin\n    return result;\n  end;\nend package body;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn block_level_function_bare_call_resolves() {
+        // `impure function next_outstanding ...` declared in a block's
+        // declarative part, called bare from a process inside the block.
+        let diags = lower_src("entity top is port (clk : in bit; q : out natural); end entity;\narchitecture a of top is\n  signal outstanding : natural := 0;\nbegin\n  write_block : block\n    impure function next_outstanding return natural is\n    begin\n      return outstanding + 1;\n    end;\n  begin\n    main : process\n    begin\n      wait until rising_edge(clk);\n      outstanding <= next_outstanding;\n      q <= outstanding;\n    end process;\n  end block;\nend architecture;\n");
         assert_no_errors(&diags);
     }
 

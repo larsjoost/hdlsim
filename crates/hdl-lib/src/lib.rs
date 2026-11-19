@@ -450,11 +450,12 @@ impl LibraryManager {
                 if unit != "work" && ctx_libs.contains(&unit) && self.has_library(&unit) {
                     continue;
                 }
-                if !design.packages.contains_key(&unit) {
-                    if let Err(e) = self.resolve(design, &unit) {
-                        if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
-                            self.unresolved_units.push((unit, e));
-                        }
+                // Resolve even when a same-named unit is already on the design:
+                // duplicate units across files must ALL be compiled so their
+                // items merge (try_one skips already-compiled candidates).
+                if let Err(e) = self.resolve(design, &unit) {
+                    if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
+                        self.unresolved_units.push((unit, e));
                     }
                 }
             }
@@ -670,6 +671,16 @@ impl LibraryManager {
         pi: usize,
         path: PathBuf,
     ) -> Result<bool, String> {
+        // Already compiled (possibly as another duplicate candidate): skip
+        // without re-reading the file.
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if self.compiled.contains(&canon) {
+            return Ok(design
+                .modules
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(name))
+                || design.packages.contains_key(lname));
+        }
         let text = self
             .all_providers()
             .nth(pi)
@@ -886,6 +897,7 @@ pub fn compile_one(
                         e.functions.extend(p.functions);
                         e.rec_field_tys.extend(p.rec_field_tys);
                         e.sig_types.extend(p.sig_types);
+                        e.const_tys.extend(p.const_tys);
                         if e.generics.is_empty() {
                             e.generics = p.generics;
                         }
