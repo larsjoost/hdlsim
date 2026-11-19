@@ -28,6 +28,9 @@ fn report_hint() {
     eprintln!(
         "        or rerun with `--report \"what went wrong\"` to file the issue automatically"
     );
+    eprintln!(
+        "        (--report uploads the bundle with your sources publicly \u{2014} see README)"
+    );
 }
 
 fn main() {
@@ -42,7 +45,19 @@ fn main() {
     // Global `--report <msg>` / `--report-dry-run`: on failure, file a GitHub
     // issue with a reproducer bundle instead of only printing the URL.
     let (args, report) = hdlsim::commands::report::extract_report_args(&args);
-    if report.is_some() {
+    if let Some(req) = &report {
+        if !req.dry_run {
+            // Warn before running, not only on failure: the bundle carries the
+            // user's source files and the issue is public.
+            eprintln!(
+                "warning: --report uploads a reproducer bundle containing your source files\n\
+                 \x20        (as a gist) and files a PUBLIC GitHub issue if this command fails.\n\
+                 \x20        Do not use it on code you cannot share \u{2014} reduce the failure to a\n\
+                 \x20        minimal reproducer based on the bundled examples first (see the\n\
+                 \x20        \"Reporting bugs\" section of the README), or use --report-dry-run to\n\
+                 \x20        preview what would be uploaded without uploading."
+            );
+        }
         // Capture the rendered diagnostics so the filed issue includes the
         // exact error/warning output, not just the reproducer bundle.
         hdl_syntax::diagnostic::set_capture(true);

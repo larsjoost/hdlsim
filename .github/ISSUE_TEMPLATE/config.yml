@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: How to file a fixable bug (README)
+    url: https://github.com/larsjoost/hdlsim#reporting-bugs--reproducer-bundles
+    about: Read this first — issues are public, so attach a minimal reproducer built from the bundled examples, never your private project. Explains hdlsim bundle and --report / --report-dry-run.
+  - name: Documentation (docs/)
+    url: https://github.com/larsjoost/hdlsim/tree/main/docs
+    about: VHDL support coverage, extensibility rules, and design notes.

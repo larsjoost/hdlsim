@@ -203,7 +203,9 @@ fn compose_issue(
         Some(url) => format!(
             "The reproducer bundle ({tar_len} bytes) was uploaded as a gist: {url}\n\
              Raw bundle (base64 tar): `{url}/raw/hdlsim-repro.tar.b64` — decode with \
-             `... | base64 -d > repro.tar`, then rerun per REPRO.md inside.\n"
+             `... | base64 -d > repro.tar`, then rerun per REPRO.md inside.\n\
+             (The gist is unlisted but linked from this PUBLIC issue, so treat the bundle as\n\
+             public; if it contains code you cannot share, edit this issue to remove the link.)\n"
         ),
         None => format!(
             "The reproducer bundle ({tar_len} bytes) was saved as `hdlsim-repro.tar` in the \
