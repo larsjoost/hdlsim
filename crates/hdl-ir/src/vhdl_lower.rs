@@ -3830,6 +3830,20 @@ impl<'a> Lower<'a> {
                         Some(tm) => self.resolve_type(tm, constraint, d.span()),
                         None => (32, false, None, false),
                     };
+                    // `variable v : integer := 0;` — the initializer runs on
+                    // every call (VHDL subprogram variables are re-initialized
+                    // per call), so lower it and prepend `v := init;` to the
+                    // body like a dynamic local constant.
+                    let init_ex = dk[colon + 1..]
+                        .iter()
+                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+                        .and_then(|e| {
+                            dk[colon + 1 + e + 1..]
+                                .iter()
+                                .find(|k| is_expr_node(k.kind()))
+                                .cloned()
+                        })
+                        .map(|node| self.lower_expr(&node, &self.consts.clone()));
                     for n in names {
                         let id = slots.len() as SigId;
                         if let Some(tm) = &tmark {
@@ -3837,6 +3851,9 @@ impl<'a> Lower<'a> {
                         }
                         slots.push((n.clone(), w));
                         self.names.insert(n.clone(), id);
+                        if let Some(ex) = &init_ex {
+                            pending_const_inits.push((id, ex.clone()));
+                        }
                         locals.push(SignalIr {
                             name: n,
                             width: w,
@@ -5829,6 +5846,18 @@ impl<'a> Lower<'a> {
                 };
             }
         }
+        // Fully-qualified call `work.pkg.f(...)` with no `use` clause for pkg:
+        // pull the package's subprogram into scope so the call resolves (and
+        // can be const-evaluated in a constant initializer).
+        if self.funcs.get(&fname).is_none() && name.contains('.') {
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() >= 3 {
+                let unit = parts[parts.len() - 2].to_ascii_lowercase();
+                if let Some(p) = self.pkgs.get(&unit).cloned() {
+                    self.merge_package(&p, Some(&fname), false);
+                }
+            }
+        }
         if base_id.is_none() && !args.is_empty() {
             if let Some(e) = self.lower_const_array_index(&fname, &args) {
                 return e;
@@ -6962,6 +6991,17 @@ mod tests {
             msgs.iter().all(|m| !m.contains("parameter-dependent")),
             "{msgs:?}"
         );
+    }
+
+    #[test]
+    fn loop_built_vector_in_constant_initializer_const_evals() {
+        // `constant c := ones_vec(3);` where ones_vec fills the vector in a
+        // for loop: the const evaluator must splice indexed assignments into
+        // the local slot — this was the last remaining W0401 from the issue
+        // #106 report (a testbench `constant c := generate_test_vector;`).
+        let diags = lower_src("package p is\n  function ones_vec(n : integer) return bit_vector;\nend package;\npackage body p is\n  function ones_vec(n : integer) return bit_vector is\n    variable v : bit_vector(0 to n - 1);\n  begin\n    for i in 0 to n - 1 loop\n      v(i) := '1';\n    end loop;\n    return v;\n  end function;\nend package body;\nentity e is end entity;\narchitecture a of e is\n  constant c : bit_vector := work.p.ones_vec(3);\n  signal s : bit := c(0);\nbegin\nend architecture;\n");
+        let msgs: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert!(diags.is_empty(), "{msgs:?}");
     }
 
     #[test]
