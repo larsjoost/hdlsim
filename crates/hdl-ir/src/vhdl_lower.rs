@@ -59,6 +59,14 @@ pub struct PendingArch {
     pub arch: SyntaxNode,
 }
 
+/// Elaboration variant spec: re-lower `entity` with `overrides` applied to its
+/// generic clause; modules are named `<entity><suffix>` / `<entity><suffix>/<arch>`.
+struct VariantSpec {
+    entity: String,
+    suffix: String,
+    overrides: HashMap<String, Value>,
+}
+
 /// A lowered package's declarative items, keyed by unit name on the `Design`,
 /// so `use lib.pkg.all;` in another file can merge them into scope.
 #[derive(Clone, Debug, Default)]
@@ -700,6 +708,82 @@ pub fn lower_pending_architectures(
     still_pending
 }
 
+/// Re-lower one entity and its architectures (from the same file) with
+/// `generic map` overrides applied to the entity's generic clause, producing
+/// variant modules named `<entity><suffix>` and `<entity><suffix>/<arch>`.
+/// Used at elaboration so an instantiation's `generic map` actually re-binds
+/// the child's generics (generate ranges, port widths, ...). Returns the
+/// lowered modules (empty when the file does not declare `entity_name`).
+pub fn lower_entity_variant(
+    db: &SourceDb,
+    diags: &mut Vec<Diagnostic>,
+    pkgs: &HashMap<String, Rc<PackageIr>>,
+    cfgs: &HashMap<String, Rc<ConfigIr>>,
+    root: &SyntaxNode,
+    entity_name: &str,
+    overrides: &HashMap<String, Value>,
+    suffix: &str,
+) -> Vec<ModuleIr> {
+    let mut lx = Lower::new(db, diags);
+    lx.register_builtin_types();
+    lx.file_root = Some(root.clone());
+    lx.pkgs = pkgs
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+    lx.cfgs = cfgs
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+    lx.apply_context_clauses(root);
+    let lname = entity_name.to_ascii_lowercase();
+    lx.variant = Some(VariantSpec {
+        entity: lname.clone(),
+        suffix: suffix.to_string(),
+        overrides: overrides.clone(),
+    });
+    let mut modules: Vec<ModuleIr> = Vec::new();
+    let mut entities: HashMap<String, usize> = HashMap::new();
+    for child in real_children(root) {
+        if child.kind() == SyntaxKind::Entity {
+            let ename = real_children(&child)
+                .iter()
+                .find(|k| {
+                    k.kind() == SyntaxKind::Ident
+                        && !matches!(lx.kw(k).as_str(), "entity" | "is" | "end" | "begin")
+                })
+                .map(|k| lx.kw(k))
+                .unwrap_or_default();
+            if ename.eq_ignore_ascii_case(&lname) {
+                entities.insert(lname.clone(), modules.len());
+                modules.push(lx.lower_entity(&child));
+            }
+        }
+    }
+    if modules.is_empty() {
+        return modules;
+    }
+    let vent = format!("{lname}{suffix}");
+    let mut last_arch: HashMap<String, String> = HashMap::new();
+    for child in real_children(root) {
+        if child.kind() == SyntaxKind::Architecture {
+            if let Some((_, en)) = arch_entity(&child, db) {
+                if en.eq_ignore_ascii_case(&lname) {
+                    if let Some((ent, arch)) =
+                        lx.lower_architecture(&child, &mut modules, &entities)
+                    {
+                        last_arch.insert(ent, arch);
+                    }
+                }
+            }
+        }
+    }
+    let mut ventities: HashMap<String, usize> = HashMap::new();
+    ventities.insert(vent, 0);
+    apply_default_archs(&mut modules, &ventities, &last_arch, &HashMap::new());
+    modules
+}
+
 /// The entity an architecture belongs to (`architecture NAME of ENTITY is ...`)
 /// → (entity ident node, entity name).
 fn arch_entity(a: &SyntaxNode, db: &SourceDb) -> Option<(SyntaxNode, String)> {
@@ -901,6 +985,11 @@ struct Lower<'a> {
     /// otherwise leak across entities; the architecture of entity E installs
     /// E's snapshot (see lower_architecture).
     entity_maps: HashMap<String, SigMaps>,
+    /// Set when re-lowering one entity as an elaboration variant (generic-map
+    /// overrides); modules get the `<entity><suffix>` name.
+    variant: Option<VariantSpec>,
+    /// Entity currently being lowered (variant override matching).
+    cur_entity: String,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -951,6 +1040,8 @@ impl<'a> Lower<'a> {
             inst_packages: Vec::new(),
             entity_maps: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
+            variant: None,
+            cur_entity: String::new(),
         }
     }
 
@@ -1719,8 +1810,10 @@ impl<'a> Lower<'a> {
             functions: Vec::new(),
             instances: Vec::new(),
             time_unit_fs: 1_000_000,
+            is_vhdl: true,
         };
         self.names.clear();
+        self.cur_entity = module.name.to_ascii_lowercase();
         for k in &kids {
             // Arm the hidden-signal allocator for this phase (ports/generics
             // push directly into `module.signals`, so re-arm per item).
@@ -1747,11 +1840,22 @@ impl<'a> Lower<'a> {
             .map(|(i, s)| (s.name.clone(), i as SigId))
             .collect();
         self.snapshot_entity_maps(&module.name);
+        if let Some(v) = &self.variant {
+            if v.entity == module.name.to_ascii_lowercase() {
+                module.name = format!("{}{}", module.name, v.suffix);
+            }
+        }
         module
     }
 
     fn lower_generic_clause(&mut self, module: &mut ModuleIr, g: &SyntaxNode) {
-        for (name, def) in self.lower_generic_decls(g, &HashMap::new()) {
+        let overrides = self
+            .variant
+            .as_ref()
+            .filter(|v| v.entity == self.cur_entity)
+            .map(|v| v.overrides.clone())
+            .unwrap_or_default();
+        for (name, def) in self.lower_generic_decls(g, &overrides) {
             module.params.push(ParamIr { name, default: def });
         }
     }
@@ -2445,6 +2549,13 @@ impl<'a> Lower<'a> {
         let Some(&midx) = entities.get(&entity_name) else {
             return None;
         };
+        // Variant re-lowering: name the arch module after the variant entity.
+        let disp = self
+            .variant
+            .as_ref()
+            .filter(|v| v.entity == entity_name.to_ascii_lowercase())
+            .map(|v| format!("{}{}", entity_name.to_ascii_lowercase(), v.suffix))
+            .unwrap_or_else(|| entity_name.clone());
         let idents: Vec<&SyntaxNode> = kids
             .iter()
             .filter(|k| k.kind() == SyntaxKind::Ident)
@@ -2454,7 +2565,7 @@ impl<'a> Lower<'a> {
             .map(|k| self.text(k).to_ascii_lowercase())
             .unwrap_or_default();
         let mut module_owned = modules[midx].clone();
-        module_owned.name = format!("{entity_name}/{arch_name}");
+        module_owned.name = format!("{disp}/{arch_name}");
         let module = &mut module_owned;
         self.names = module
             .signals
@@ -2557,7 +2668,7 @@ impl<'a> Lower<'a> {
             }
         }
         modules.push(module_owned);
-        Some((entity_name, arch_name))
+        Some((disp, arch_name))
     }
 
     /// Lower one concurrent statement (architecture body, block, or generate

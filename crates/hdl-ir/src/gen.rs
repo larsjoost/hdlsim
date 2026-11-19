@@ -258,6 +258,7 @@ mod tests {
             functions: vec![],
             instances: vec![],
             time_unit_fs: 1_000_000,
+            is_vhdl: false,
         }
     }
 

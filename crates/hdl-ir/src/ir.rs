@@ -40,6 +40,9 @@ pub struct ModuleIr {
     pub instances: Vec<InstIr>,
     /// Timescale unit in femtoseconds (from `` `timescale ``), default 1 ns.
     pub time_unit_fs: u64,
+    /// Source language: VHDL modules can be re-lowered as elaboration
+    /// variants (generic-map overrides); Verilog modules cannot.
+    pub is_vhdl: bool,
 }
 
 #[derive(Clone, Debug)]
