@@ -547,10 +547,7 @@ mod tests {
     fn diagnostic_codes_scans_and_dedupes() {
         assert_eq!(diagnostic_codes(""), Vec::<String>::new());
         let out = "warning[W0401]: a\nerror[E0401]: b\n\u{1b}[1;33mwarning[W0401]:^\u{1b}[0m c\nerror[E0301]: d\nnot a [E12] code\n[x0000]";
-        assert_eq!(
-            diagnostic_codes(out),
-            vec!["W0401", "E0401", "E0301"]
-        );
+        assert_eq!(diagnostic_codes(out), vec!["W0401", "E0401", "E0301"]);
     }
 
     #[test]
