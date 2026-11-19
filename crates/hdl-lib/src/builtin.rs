@@ -63,6 +63,18 @@ fn embedded_stdlib() -> Vec<EmbeddedProvider> {
                     include_str!("../stdlib/ieee/float_generic_pkg.vhd"),
                 ),
                 ("math_real", include_str!("../stdlib/ieee/math_real.vhd")),
+                (
+                    "math_complex",
+                    include_str!("../stdlib/ieee/math_complex.vhd"),
+                ),
+                (
+                    "numeric_bit",
+                    include_str!("../stdlib/ieee/numeric_bit.vhd"),
+                ),
+                (
+                    "numeric_bit_unsigned",
+                    include_str!("../stdlib/ieee/numeric_bit_unsigned.vhd"),
+                ),
             ],
         ),
         // Pre-2008 name of the same packages (`library ieee_proposed`).
