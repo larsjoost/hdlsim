@@ -3061,7 +3061,6 @@ end architecture;
     }
 
     #[test]
-    #[test]
     fn parses_vhdl2008_parameter_keyword_and_sized_bitstrings() {
         let src = r#"package p is
     procedure check parameter (filename : string);
@@ -3076,6 +3075,7 @@ end package body;
         no_errors(&p, &db);
     }
 
+    #[test]
     fn parses_block_header_sized_bitstring_and_misc() {
         let src = r#"entity t is
     generic (g_w : natural := 32X"0" & "00");

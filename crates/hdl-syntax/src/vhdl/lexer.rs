@@ -105,7 +105,19 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ if b.is_ascii() => self.emit(TokenKind::Punct, 1),
-                _ => self.err(1, "unexpected byte in VHDL source"),
+                // Consume the whole UTF-8 char so token spans stay on char
+                // boundaries (slicing mid-char would panic in span_text).
+                _ => {
+                    let clen = match b {
+                        0xC0..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        _ => 4,
+                    };
+                    self.err(
+                        clen.min(self.text.len() - self.pos),
+                        "unexpected byte in VHDL source",
+                    )
+                }
             }
         }
     }
@@ -257,6 +269,20 @@ mod tests {
         let k = kinds("ENTITY Foo IS\nend;");
         assert_eq!(k[0], (TokenKind::Ident, "ENTITY".to_string()));
         assert_eq!(k[1], (TokenKind::Ident, "Foo".to_string()));
+    }
+
+    #[test]
+    fn non_ascii_bytes_stay_on_char_boundaries() {
+        // Regression: a multibyte char (e.g. a curly quote used as a char
+        // literal) made the error token span end mid-char, and span_text
+        // then panicked slicing it.
+        let mut db = SourceDb::new();
+        let src = "if (x = \u{2018}1\u{2019}) then\nend if;\n";
+        let id = db.add_file("t.vhd", src).unwrap();
+        let (toks, _diags) = lex(id, db.file(id));
+        for t in &toks {
+            let _ = db.span_text(t.span);
+        }
     }
 
     #[test]
