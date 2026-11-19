@@ -101,6 +101,11 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 enum Ev {
     /// Resume a suspended process at a time.
     Resume(u32),
+    /// A delayed signal transaction (VHDL `s <= v after t;`) landing at a
+    /// time: applied in that time's NBA region.
+    Nba(FlatSigId, Value, Option<u32>),
+    /// Delayed part-write (indexed/sliced target) landing at a time.
+    NbaExpr(Expr, Value, Option<u32>),
 }
 
 /// One frame of a running process's explicit continuation stack.
@@ -607,6 +612,8 @@ impl Simulator {
                     for ev in evs {
                         match ev {
                             Ev::Resume(pid) => self.activate(pid),
+                            Ev::Nba(sig, v, drv) => self.nba.push((sig, v, drv)),
+                            Ev::NbaExpr(lhs, v, drv) => self.nba_exprs.push((lhs, v, drv)),
                         }
                     }
                 }
@@ -905,6 +912,36 @@ impl Simulator {
                     self.proc_rt[pid as usize]
                         .frames
                         .push(Frame::block(vec![b]));
+                }
+                Control::Done
+            }
+            Stmt::AssignDelayed { lhs, rhs, delay } => {
+                // VHDL `s <= v after t;`: evaluate now, schedule the update at
+                // now + t on the time wheel without suspending the process.
+                let v = self.eval_expr(&rhs, None);
+                let t = self.eval_expr(&delay, None).to_u64().unwrap_or(0);
+                if t == 0 {
+                    if let Some(sig) = lhs_sig(&lhs) {
+                        let w = self.flat.signals[sig as usize].width;
+                        let v = self.convert_for_target(&lhs, &rhs, v, None);
+                        self.nba.push((sig, v.resize(w.max(1)), self.cur_proc));
+                    } else {
+                        let lhs = self.concretize_target(&lhs);
+                        self.nba_apply_later(lhs, v);
+                    }
+                } else if let Some(sig) = lhs_sig(&lhs) {
+                    let w = self.flat.signals[sig as usize].width;
+                    let v = self.convert_for_target(&lhs, &rhs, v, None);
+                    self.time_events
+                        .entry(self.time + t)
+                        .or_default()
+                        .push(Ev::Nba(sig, v.resize(w.max(1)), self.cur_proc));
+                } else {
+                    let lhs = self.concretize_target(&lhs);
+                    self.time_events
+                        .entry(self.time + t)
+                        .or_default()
+                        .push(Ev::NbaExpr(lhs, v, self.cur_proc));
                 }
                 Control::Done
             }

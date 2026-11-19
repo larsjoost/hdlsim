@@ -103,6 +103,11 @@ fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) 
             lhs_roots(lhs, driven);
             read(rhs, reads);
         }
+        Stmt::AssignDelayed { lhs, rhs, delay } => {
+            lhs_roots(lhs, driven);
+            read(rhs, reads);
+            read(delay, reads);
+        }
         Stmt::Delay { stmt, .. } => walk_stmt(stmt, driven, reads),
         Stmt::Wait { sens, body } => {
             for e in sens {

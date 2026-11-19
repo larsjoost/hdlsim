@@ -125,6 +125,13 @@ pub struct BlockCfg {
     pub binding: Binding,
 }
 
+/// One waveform element of a signal assignment: `expr [after t] [when c]`.
+struct WaveElem {
+    val: SyntaxNode,
+    delay: Option<SyntaxNode>,
+    cond: Option<SyntaxNode>,
+}
+
 /// A binding indication: `use entity lib.e(arch) [maps]` or
 /// `use configuration lib.cfg`.
 #[derive(Clone, Debug)]
@@ -4209,24 +4216,13 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn lower_conc_assign(&mut self, s: &SyntaxNode, idx: usize) -> Option<ConcOut> {
-        let kids = real_children(s);
-        let lhs_pos = kids.iter().position(|k| {
-            k.kind() == SyntaxKind::Name
-                || k.kind() == SyntaxKind::Call
-                || k.kind() == SyntaxKind::PartSelect
-        })?;
-        let lhs = self.lower_expr(&kids[lhs_pos], &self.consts.clone());
+    /// One waveform element: `expr [after t] [when c]`.
+    fn waveform_elems(&self, kids: &[SyntaxNode], start: usize) -> Vec<WaveElem> {
         // Waveform elements: `expr [after t] [when c]`, comma-separated, or the
         // conditional form `expr when c else expr [when c]... [else expr]`.
-        struct Elem {
-            val: SyntaxNode,
-            delay: Option<SyntaxNode>,
-            cond: Option<SyntaxNode>,
-        }
-        let mut elems: Vec<Elem> = Vec::new();
-        let mut cur: Option<Elem> = None;
-        let mut i = lhs_pos + 1;
+        let mut elems: Vec<WaveElem> = Vec::new();
+        let mut cur: Option<WaveElem> = None;
+        let mut i = start;
         while i < kids.len() {
             let k = &kids[i];
             match self.kw(k).as_str() {
@@ -4249,7 +4245,7 @@ impl<'a> Lower<'a> {
                         elems.push(c);
                     }
                     if let Some(e) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
-                        cur = Some(Elem {
+                        cur = Some(WaveElem {
                             val: e.clone(),
                             delay: None,
                             cond: None,
@@ -4263,7 +4259,7 @@ impl<'a> Lower<'a> {
                     if let Some(c) = cur.take() {
                         elems.push(c);
                     }
-                    cur = Some(Elem {
+                    cur = Some(WaveElem {
                         val: k.clone(),
                         delay: None,
                         cond: None,
@@ -4276,6 +4272,18 @@ impl<'a> Lower<'a> {
         if let Some(c) = cur {
             elems.push(c);
         }
+        elems
+    }
+
+    fn lower_conc_assign(&mut self, s: &SyntaxNode, idx: usize) -> Option<ConcOut> {
+        let kids = real_children(s);
+        let lhs_pos = kids.iter().position(|k| {
+            k.kind() == SyntaxKind::Name
+                || k.kind() == SyntaxKind::Call
+                || k.kind() == SyntaxKind::PartSelect
+        })?;
+        let lhs = self.lower_expr(&kids[lhs_pos], &self.consts.clone());
+        let elems = self.waveform_elems(&kids, lhs_pos + 1);
         if elems.is_empty() {
             return None;
         }
@@ -4612,6 +4620,58 @@ impl<'a> Lower<'a> {
                 let has_when = kids
                     .iter()
                     .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
+                let has_after = kids
+                    .iter()
+                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "after");
+                if has_after {
+                    // `s <= v [after t] [, v2 [after t2] ...] [when c] ...`:
+                    // each element is a transaction scheduled at now + its own
+                    // delay (VHDL waveform delays are relative to the statement
+                    // execution, not cumulative) — the process is not suspended.
+                    if let (Some(l), Some(op)) = (lhs, op_pos) {
+                        let elems = self.waveform_elems(&kids, op + 1);
+                        if !elems.is_empty() {
+                            let lhs_e = self.lower_expr(l, &self.consts.clone());
+                            let mut stmts = Vec::new();
+                            for e in &elems {
+                                // The delay may be a runtime expression (e.g.
+                                // OSVVM `after iDelayVal`): evaluated when the
+                                // statement executes.
+                                let delay = e
+                                    .delay
+                                    .as_ref()
+                                    .map(|d| self.lower_expr(d, &self.consts.clone()));
+                                let val = self.lower_rhs(l, &e.val, &self.consts.clone());
+                                let a = match &delay {
+                                    None => Stmt::Assign {
+                                        lhs: lhs_e.clone(),
+                                        rhs: val,
+                                        nba: true,
+                                    },
+                                    Some(dv) => Stmt::AssignDelayed {
+                                        lhs: lhs_e.clone(),
+                                        rhs: val,
+                                        delay: dv.clone(),
+                                    },
+                                };
+                                stmts.push(match &e.cond {
+                                    Some(c) => Stmt::If {
+                                        cond: self.lower_expr(c, &self.consts.clone()),
+                                        then: Box::new(a),
+                                        els: None,
+                                    },
+                                    None => a,
+                                });
+                            }
+                            return if stmts.len() == 1 {
+                                stmts.pop().unwrap()
+                            } else {
+                                Stmt::Block(stmts)
+                            };
+                        }
+                    }
+                    return Stmt::Null;
+                }
                 if has_when {
                     if let (Some(l), Some(op)) = (lhs, op_pos) {
                         if let Some(e) =

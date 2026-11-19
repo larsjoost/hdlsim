@@ -660,6 +660,11 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             rhs: remap_expr(rhs, map),
             nba: *nba,
         },
+        Stmt::AssignDelayed { lhs, rhs, delay } => Stmt::AssignDelayed {
+            lhs: remap_expr(lhs, map),
+            rhs: remap_expr(rhs, map),
+            delay: remap_expr(delay, map),
+        },
         Stmt::Delay { time_fs, stmt } => Stmt::Delay {
             time_fs: *time_fs,
             stmt: Box::new(remap_stmt(stmt, map)),
