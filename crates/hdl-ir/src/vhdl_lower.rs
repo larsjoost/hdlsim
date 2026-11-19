@@ -746,6 +746,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::PartSelect
             | SyntaxKind::Index
             | SyntaxKind::Attr
+            | SyntaxKind::Qualified
             | SyntaxKind::Others
     )
 }
@@ -4990,6 +4991,27 @@ impl<'a> Lower<'a> {
                     None => Expr::Lit(Value::x(1)),
                 }
             }
+            // Qualified expression `type_mark'(expr)` — a type conversion:
+            // lower the operand (the target type only matters for width, which
+            // the operand already carries).
+            SyntaxKind::Qualified => {
+                let kids = real_children(e);
+                let rest = &kids[1..];
+                // A qualified *aggregate* (`T'(field => v, others => x)`) is a
+                // construction, not a conversion — placeholder.
+                let is_aggregate = rest.iter().any(|k| k.kind() == SyntaxKind::Others)
+                    || kids
+                        .iter()
+                        .any(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+                    || kids.iter().any(|k| k.kind() == SyntaxKind::Range);
+                if is_aggregate {
+                    return Expr::Lit(Value::x(32));
+                }
+                match rest.iter().find(|k| is_expr_node(k.kind())) {
+                    Some(k) => self.lower_expr(k, env),
+                    None => Expr::Lit(Value::x(32)),
+                }
+            }
             // VHDL-2008 conditional expression `v when c else e` (children:
             // value, condition, else) or the `??` operator (children: value,
             // condition).
@@ -6199,9 +6221,12 @@ impl<'a> Lower<'a> {
         if let Some(v) = self.parse_int_literal(&t) {
             return Expr::Lit(v);
         }
-        if let Ok(v) = t.parse::<f64>() {
+        // VHDL digit separators (`2.71828_18284_...`) are not valid in Rust's
+        // f64 parse — strip them first.
+        let t_clean: String = t.chars().filter(|c| *c != '_').collect();
+        if let Ok(v) = t_clean.parse::<f64>() {
             // VHDL real literal (contains '.' or exponent, no base '#').
-            if t.contains('.') || t.contains('e') || t.contains('E') {
+            if t_clean.contains('.') || t_clean.contains('e') || t_clean.contains('E') {
                 return Expr::Real(v);
             }
             self.warn(e.span(), "real literals unsupported; X");
@@ -6803,6 +6828,22 @@ mod tests {
             msgs.iter().all(|m| !m.contains("parameter-dependent")),
             "{msgs:?}"
         );
+    }
+
+    #[test]
+    fn qualified_expression_in_concat_and_aggregate_form() {
+        // `'0' & signed'(abs(b))` (Vivado std_logic_arith mult): the qualified
+        // conversion is a plain operand of `&`; a qualified aggregate
+        // `t'(field => v, others => x)` is a placeholder, not an error.
+        let diags = lower_src("entity top is end entity;\narchitecture rtl of top is\n  signal b : bit_vector(7 downto 0) := (others => '0');\n  signal x : bit_vector(15 downto 0);\n  type rec_t is record elem : bit_vector(2 downto 0); end record;\n  signal r : rec_t;\nbegin\n  x <= '0' & bit_vector'(b);\n  r <= rec_t'(elem => \"000\");\n  r <= rec_t'(others => '0');\nend architecture;\n");
+        assert_no_errors(&diags);
+    }
+
+    #[test]
+    fn real_literal_with_digit_separators() {
+        // math_real.vhdl: `constant MATH_E : real := 2.71828_18284_59045_23536;`
+        let diags = lower_src("package p is\n  constant math_e : real := 2.71828_18284_59045_23536;\n  constant math_pi : real := 3.14159_26535_89793_23846;\nend package;\n");
+        assert_no_errors(&diags);
     }
 
     #[test]
