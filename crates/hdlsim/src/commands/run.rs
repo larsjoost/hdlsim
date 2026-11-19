@@ -130,17 +130,7 @@ impl Command for Run {
         }
         let top_name = match top {
             Some(t) => t,
-            None => {
-                if design.modules.len() == 1 {
-                    design.modules[0].name.clone()
-                } else {
-                    let names: Vec<&str> = design.modules.iter().map(|m| m.name.as_str()).collect();
-                    return Err(anyhow::anyhow!(
-                        "multiple modules ({}); pick one with --top",
-                        names.join(", ")
-                    ));
-                }
-            }
+            None => super::pick_default_top(&design)?,
         };
         let flat = elab::elaborate_with(&mut design, &top_name, &mut mgr)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;

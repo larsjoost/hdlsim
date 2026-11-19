@@ -133,3 +133,49 @@ fn two_modules_in_one_file_compile() {
     );
     let _ = std::fs::remove_file(&f);
 }
+
+/// `hdlsim run file.vhd` without `--top`: a VHDL file lowers to an entity
+/// module plus an `entity/arch` variant per architecture, so "multiple
+/// modules" must not fire — the single entity is picked (regression test for
+/// the issue #106 reproducer `hdlsim run unit_tests_behavior.vhd`).
+#[test]
+fn run_without_top_picks_single_entity_over_arch_variants() {
+    let f = tmp(
+        "unit_tests_behavior.vhd",
+        "library std;\nuse std.env.all;\nentity unit_tests is end entity;\narchitecture behavior of unit_tests is\nbegin\n  process\n  begin\n    report \"PASS: unit_tests\";\n    std.env.finish;\n    wait;\n  end process;\nend architecture;\n",
+    );
+    let out = hdlsim()
+        .args(["run", f.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}",
+        out.status,
+        all
+    );
+    assert!(all.contains("PASS: unit_tests"), "{}", all);
+    assert!(!all.contains("multiple modules"), "{}", all);
+    let _ = std::fs::remove_file(&f);
+
+    // Genuinely ambiguous (two entities) still asks for --top, listing only
+    // the entity names, not the entity/arch variants.
+    let f2 = tmp(
+        "two_ent.vhd",
+        "entity a is end entity;\narchitecture r of a is begin end architecture;\nentity b is end entity;\narchitecture r of b is begin end architecture;\n",
+    );
+    let out = hdlsim()
+        .args(["run", f2.to_str().unwrap()])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("multiple modules (a, b)"), "{}", stderr);
+    assert!(!stderr.contains("a/r"), "{}", stderr);
+    let _ = std::fs::remove_file(&f2);
+}

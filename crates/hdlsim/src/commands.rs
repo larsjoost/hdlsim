@@ -311,6 +311,34 @@ pub fn remap_into_bundle(f: &Path, root: &Option<PathBuf>) -> PathBuf {
     f.to_path_buf()
 }
 
+/// Pick the top module when `--top` is omitted. VHDL architectures lower to
+/// `entity/arch` variant modules while the plain entity module carries the
+/// default architecture's body, so only names without `/` are candidates.
+/// Exactly one candidate (or one module overall) wins; otherwise the caller
+/// must pass `--top`.
+pub fn pick_default_top(design: &hdl_ir::Design) -> anyhow::Result<String> {
+    let mut tops: Vec<&str> = design
+        .modules
+        .iter()
+        .map(|m| m.name.as_str())
+        .filter(|n| !n.contains('/'))
+        .collect();
+    tops.sort_unstable();
+    tops.dedup();
+    let names: Vec<&str> = if tops.is_empty() {
+        design.modules.iter().map(|m| m.name.as_str()).collect()
+    } else {
+        tops
+    };
+    match names.len() {
+        1 => Ok(names[0].to_string()),
+        _ => Err(anyhow::anyhow!(
+            "multiple modules ({}); pick one with --top",
+            names.join(", ")
+        )),
+    }
+}
+
 /// Parse a time like `100ns`, `10us`, `1ms`, `500` (bare = ns) into femtoseconds.
 pub fn parse_time(s: &str) -> anyhow::Result<u64> {
     let (num, unit) = s
