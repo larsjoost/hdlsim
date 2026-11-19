@@ -213,3 +213,45 @@ fn report_uploads_bundle_as_gist_and_links_it_in_the_issue() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--report` (not dry-run) must warn UP FRONT -- before the command runs, and
+/// even when the command then succeeds -- that on failure the reproducer bundle
+/// containing the user's sources is uploaded and a public issue is filed.
+/// `--report-dry-run` never uploads, so it must not warn.
+#[test]
+fn report_warns_upfront_that_sources_will_be_uploaded() {
+    let out = hdlsim()
+        .args([
+            "run",
+            "--top",
+            "tb_pass",
+            "tests/fixtures/tb_pass.vhd",
+            "--report",
+            "must not be filed on success",
+        ])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("warning: --report"), "{stderr}");
+    assert!(stderr.contains("PUBLIC GitHub issue"), "{stderr}");
+    assert!(stderr.contains("source files"), "{stderr}");
+    assert!(stderr.contains("--report-dry-run"), "{stderr}");
+    // A passing command files nothing, so no report activity at all.
+    assert!(!stderr.contains("hdlsim report:"), "{stderr}");
+
+    // Dry-run previews without uploading: no upload warning.
+    let out = hdlsim()
+        .args([
+            "run",
+            "--top",
+            "tb_pass",
+            "tests/fixtures/tb_pass.vhd",
+            "--report-dry-run",
+        ])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("warning: --report"), "{stderr}");
+}

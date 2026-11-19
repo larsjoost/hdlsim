@@ -88,18 +88,24 @@ impl Command for Help {
         println!("                                 NO_COLOR also apply)");
         println!("    --no-color                   disable color output");
         println!(
-            "    --report \"msg\"             on failure, file a GitHub issue with a reproducer"
+            "    --report \"msg\"             on failure, file a PUBLIC GitHub issue with a reproducer"
         );
         println!(
-            "                                 bundle with the captured command output (uses the gh"
+            "                                 bundle of your sources, uploaded as a gist and linked"
         );
         println!(
-            "                                 CLI; large bundles are uploaded as a secret gist and"
+            "                                 (uses the gh CLI). A warning is printed up front because"
         );
         println!(
-            "                                 linked; --report-dry-run to preview, also works without"
+            "                                 the sources become public \u{2014} reduce the failure to a"
         );
-        println!("                                 a message)");
+        println!(
+            "                                 minimal repro from the bundled examples/ first, or use"
+        );
+        println!(
+            "                                 --report-dry-run to preview without uploading (also works"
+        );
+        println!("                                 without a message)");
         Ok(0)
     }
 }

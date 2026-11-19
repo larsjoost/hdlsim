@@ -188,6 +188,23 @@ copy-paste away. To include in an issue: the full error output (diagnostic
 codes like `E0301` can be explained with `hdlsim explain E0301`), the
 `hdlsim doctor` output (first line has the version), and a reproducer bundle.
 
+**Privacy first:** issues are public, and so is anything attached or linked
+(gist) in them. If your design is confidential, do not attach your project and
+do not run `--report` on it — instead reduce the failure to a **minimal
+reproducer written as new code based on a bundled example** (`examples/counter`,
+`examples/vhdl-counter`, `examples/features`, `examples/fp-vhdl`, ...): copy an
+example, modify it until hdlsim fails on it, and bundle only that:
+
+```
+cp -r examples/vhdl-counter repro && cd repro   # then modify the copied files
+hdlsim bundle --out hdlsim-repro.tar --top tb_counter counter.vhd tb_counter.vhd
+```
+
+Anyone can then reproduce from the bundle alone (`hdlsim run --bundle
+hdlsim-repro.tar --top tb_counter`), so the issue is fixable without exposing
+your code. The issue templates (`.github/ISSUE_TEMPLATE/`) spell out the same
+checklist when you open an issue.
+
 If hdlsim fails on your project (compile error, wrong simulation result), pack
 it into a single file and attach it to an issue:
 
@@ -199,8 +216,10 @@ hdlsim bundle --out repro.tar --top tb_my_test my_tb.vhd ...   # add -L/--config
 ```
 
 Or file the issue directly from the failing command (uses the `gh` CLI's auth —
-`gh auth login` or `GITHUB_TOKEN`; the bundle with your sources becomes public,
-`--report-dry-run` previews without uploading):
+`gh auth login` or `GITHUB_TOKEN`). Because the bundle with your sources is
+uploaded as a gist and linked from a **public** issue, `--report` prints an
+upfront warning before running anything; `--report-dry-run` previews exactly
+what would be uploaded without uploading:
 
 ```
 hdlsim check my_tb.vhd --report "wrong result on my design"   # files a GitHub issue on failure
