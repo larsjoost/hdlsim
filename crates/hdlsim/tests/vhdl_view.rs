@@ -19,7 +19,7 @@ fn hdlsim() -> Command {
 fn vhdl2019_views_and_entity_context_simulate() {
     let f = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vhdl_view_tb.vhd");
     let out = hdlsim()
-        .args(["run", "--top", "tb_view"])
+        .args(["run", "--top", "tb_view", "--max-time", "1us"])
         .arg(&f)
         .output()
         .expect("runs");
