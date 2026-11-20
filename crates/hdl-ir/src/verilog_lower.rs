@@ -3544,8 +3544,25 @@ fn ce_impl(
     mut slots: Option<&mut Vec<Value>>,
 ) -> Option<Value> {
     match e {
-        Expr::Rising(_) | Expr::Falling(_) | Expr::Prev(_) | Expr::ToInt(_) | Expr::ToString(_) => {
-            None
+        Expr::Rising(_) | Expr::Falling(_) | Expr::Prev(_) => None,
+        // `to_integer(x)` in a constant initializer.
+        Expr::ToInt(e) => {
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            if ce_real(e) {
+                let f = ce_f64(&v)?;
+                return Some(Value::from_u64(32, f.round() as u64));
+            }
+            v.to_u64().map(|n| Value::from_u64(32, n))
+        }
+        // `T'image(x)` in a constant initializer (e.g. integer'image(42)).
+        Expr::ToString(e) => {
+            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let s = if ce_real(e) {
+                ce_f64(&v).map(|f| format!("{}", f))?
+            } else {
+                v.to_u64().map(|n| n.to_string())?
+            };
+            Some(crate::vhdl_lower::string_value(&s))
         }
         Expr::Lit(v) => Some(v.clone()),
         Expr::Real(x) => Some(Value::from_f64(*x)),
@@ -3653,6 +3670,11 @@ fn ce_impl(
                 let v = ce_impl(&args[0], env, funcs, slots.as_deref_mut())?;
                 let n = v.to_u64()?;
                 return Some(Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64));
+            }
+            // VHDL `type'val(x)` / `type'pos(x)` — numeric identity (the 'val
+            // result width is applied by a Resize at the lower site).
+            if (name == "$val" || name == "$pos") && args.len() == 1 {
+                return ce_impl(&args[0], env, funcs, slots.as_deref_mut());
             }
             let f = funcs.get(&name.to_ascii_lowercase())?;
             let mut argv = Vec::with_capacity(args.len());
