@@ -152,6 +152,19 @@ fn parse_one(path: &Path) -> Vec<hdl_syntax::diagnostic::Diagnostic> {
     }
 }
 
+/// Group compiles recurse deeply over the syntax tree (parse + lower); the
+/// default 2 MiB test-thread stack overflows on the big framework files, so
+/// the group-compile tests run on a thread with a large stack.
+fn run_with_big_stack(f: impl FnOnce() + Send + 'static) {
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .unwrap();
+    if let Err(e) = handle.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
 #[test]
 fn corpus_files_lex_and_parse_without_errors() {
     let mut failures = Vec::new();
@@ -179,33 +192,35 @@ fn corpus_files_lex_and_parse_without_errors() {
 
 #[test]
 fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
-    let mut checked = 0;
-    let mut with_diags = 0;
-    for (sub, files) in corpus_groups() {
-        // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
-        let mgr = compile_group(sub, &files);
-        checked += files.len();
-        let rendered = mgr.diags().render_all(mgr.db());
-        if !mgr.diags().is_empty() {
-            with_diags += 1;
-            // rustc-style: every error line carries a stable `error[Exxxx]` code.
-            for line in rendered.lines().filter(|l| l.starts_with("error")) {
-                assert!(
-                    line.starts_with("error[") || line.starts_with("error:"),
-                    "{}: non-rustc-style line: {}",
-                    sub,
-                    line
-                );
+    run_with_big_stack(|| {
+        let mut checked = 0;
+        let mut with_diags = 0;
+        for (sub, files) in corpus_groups() {
+            // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
+            let mgr = compile_group(sub, &files);
+            checked += files.len();
+            let rendered = mgr.diags().render_all(mgr.db());
+            if !mgr.diags().is_empty() {
+                with_diags += 1;
+                // rustc-style: every error line carries a stable `error[Exxxx]` code.
+                for line in rendered.lines().filter(|l| l.starts_with("error")) {
+                    assert!(
+                        line.starts_with("error[") || line.starts_with("error:"),
+                        "{}: non-rustc-style line: {}",
+                        sub,
+                        line
+                    );
+                }
             }
         }
-    }
-    // Sanity: the corpus is real code, so at least some files should produce
-    // diagnostics for constructs outside the current subset (no panics either way).
-    eprintln!(
-        "corpus: {} files checked, {} group(s) with diagnostics",
-        checked, with_diags
-    );
-    assert_eq!(checked, corpus_sources().len());
+        // Sanity: the corpus is real code, so at least some files should produce
+        // diagnostics for constructs outside the current subset (no panics either way).
+        eprintln!(
+            "corpus: {} files checked, {} group(s) with diagnostics",
+            checked, with_diags
+        );
+        assert_eq!(checked, corpus_sources().len());
+    });
 }
 
 // ---- per-file expected status (corpus/expected.json) ------------------------
@@ -229,67 +244,69 @@ fn rank(status: &str) -> u8 {
 
 #[test]
 fn corpus_files_meet_their_recorded_status() {
-    let expected_path = corpus_dir().join("expected.json");
-    let mut actual: HashMap<String, String> = HashMap::new();
-    for (sub, files) in corpus_groups() {
-        for (rel, status) in group_statuses(sub, &files) {
-            actual.insert(rel, status.to_string());
+    run_with_big_stack(|| {
+        let expected_path = corpus_dir().join("expected.json");
+        let mut actual: HashMap<String, String> = HashMap::new();
+        for (sub, files) in corpus_groups() {
+            for (rel, status) in group_statuses(sub, &files) {
+                actual.insert(rel, status.to_string());
+            }
         }
-    }
-    if std::env::var_os("HDLSIM_UPDATE_CORPUS_EXPECTED").is_some() {
-        let mut entries: Vec<(&String, &String)> = actual.iter().collect();
-        entries.sort();
-        let obj: serde_json::Value = serde_json::Value::Object(
-            entries
-                .into_iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        );
-        std::fs::write(
-            &expected_path,
-            format!("{}\n", serde_json::to_string_pretty(&obj).unwrap()),
-        )
-        .unwrap();
-        eprintln!("corpus: wrote {}", expected_path.display());
-        return;
-    }
-    let text = std::fs::read_to_string(&expected_path).unwrap_or_else(|e| {
-        panic!(
-            "read {}: {} (run with HDLSIM_UPDATE_CORPUS_EXPECTED=1 to create)",
-            expected_path.display(),
-            e
-        )
-    });
-    let expected: HashMap<String, String> = serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("parse {}: {}", expected_path.display(), e));
-    for (rel, status) in &expected {
-        assert!(
-            corpus_dir().join(rel).exists(),
-            "expected.json entry '{}' has no file on disk",
-            rel
-        );
-        let actual_status = actual
-            .get(rel)
-            .unwrap_or_else(|| panic!("corpus file '{}' missing from this run", rel));
-        assert!(
-            rank(actual_status) >= rank(status),
-            "{}: recorded status '{}' but actual '{}' — regression?",
-            rel,
-            status,
-            actual_status
-        );
-    }
-    for rel in actual.keys() {
-        assert!(
+        if std::env::var_os("HDLSIM_UPDATE_CORPUS_EXPECTED").is_some() {
+            let mut entries: Vec<(&String, &String)> = actual.iter().collect();
+            entries.sort();
+            let obj: serde_json::Value = serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            );
+            std::fs::write(
+                &expected_path,
+                format!("{}\n", serde_json::to_string_pretty(&obj).unwrap()),
+            )
+            .unwrap();
+            eprintln!("corpus: wrote {}", expected_path.display());
+            return;
+        }
+        let text = std::fs::read_to_string(&expected_path).unwrap_or_else(|e| {
+            panic!(
+                "read {}: {} (run with HDLSIM_UPDATE_CORPUS_EXPECTED=1 to create)",
+                expected_path.display(),
+                e
+            )
+        });
+        let expected: HashMap<String, String> = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse {}: {}", expected_path.display(), e));
+        for (rel, status) in &expected {
+            assert!(
+                corpus_dir().join(rel).exists(),
+                "expected.json entry '{}' has no file on disk",
+                rel
+            );
+            let actual_status = actual
+                .get(rel)
+                .unwrap_or_else(|| panic!("corpus file '{}' missing from this run", rel));
+            assert!(
+                rank(actual_status) >= rank(status),
+                "{}: recorded status '{}' but actual '{}' — regression?",
+                rel,
+                status,
+                actual_status
+            );
+        }
+        for rel in actual.keys() {
+            assert!(
             expected.contains_key(rel),
             "corpus file '{}' not in expected.json — add it (or snapshot with HDLSIM_UPDATE_CORPUS_EXPECTED=1)",
             rel
         );
-    }
-    let clean = actual.values().filter(|s| *s == "clean").count();
-    eprintln!(
-        "corpus: {}/{} files check-clean (expected.json)",
-        clean,
-        actual.len()
-    );
+        }
+        let clean = actual.values().filter(|s| *s == "clean").count();
+        eprintln!(
+            "corpus: {}/{} files check-clean (expected.json)",
+            clean,
+            actual.len()
+        );
+    });
 }
