@@ -48,6 +48,14 @@ pub struct Lowered {
     /// Architectures whose entity was not declared in the same file; bound
     /// design-wide later via [`lower_pending_architectures`].
     pub pending: Vec<PendingArch>,
+    /// Entity name → root of the file that declared the entity. An
+    /// architecture inherits its entity's context clauses (LRM 1076 §13.3),
+    /// so the pending-architecture pass re-applies them.
+    pub entity_roots: Vec<(String, SyntaxNode)>,
+    /// Entity name → signal maps + entity-declarative constants/types, so
+    /// architectures in other files see the entity's ports and declarative
+    /// items (bound design-wide via [`lower_pending_architectures`]).
+    pub entity_maps: HashMap<String, SigMaps>,
 }
 
 /// An architecture deferred until its entity is known design-wide (the entity
@@ -374,9 +382,11 @@ pub fn lower_file(
     // instantiated) are in `pkgs`.
     lx.apply_context_clauses(root);
     // Pass 1: entities (interfaces).
+    let mut entity_roots: Vec<(String, SyntaxNode)> = Vec::new();
     for child in real_children(root) {
         if child.kind() == SyntaxKind::Entity {
             let m = lx.lower_entity(&child);
+            entity_roots.push((m.name.clone(), root.clone()));
             entities.insert(m.name.clone(), modules.len());
             modules.push(m);
         }
@@ -430,6 +440,8 @@ pub fn lower_file(
         packages,
         configurations,
         pending,
+        entity_roots,
+        entity_maps: lx.entity_maps.clone(),
     }
 }
 
@@ -673,6 +685,8 @@ pub fn lower_pending_architectures(
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
     emit_errors: bool,
+    entity_roots: &HashMap<String, SyntaxNode>,
+    entity_maps: &HashMap<String, SigMaps>,
 ) -> Vec<PendingArch> {
     if pending.is_empty() {
         return Vec::new();
@@ -689,6 +703,7 @@ pub fn lower_pending_architectures(
         let mut lx = Lower::new(db, diags);
         lx.register_builtin_types();
         lx.file_root = Some(p.root.clone());
+        lx.entity_maps = entity_maps.clone();
         lx.pkgs = pkgs
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -697,6 +712,13 @@ pub fn lower_pending_architectures(
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
+        // An architecture sees its entity's context clauses even when the
+        // entity lives in another file (LRM 1076 §13.3).
+        if let Some((_, ename)) = arch_entity(&p.arch, db) {
+            if let Some(er) = entity_roots.get(&ename) {
+                lx.apply_context_clauses(er);
+            }
+        }
         lx.apply_context_clauses(&p.root);
         match lx.lower_architecture(&p.arch, modules, &entities) {
             Some((ent, arch)) => {
@@ -983,6 +1005,9 @@ struct Lower<'a> {
     /// aliases can't be a plain SigId). Whole-signal aliases are additionally
     /// inserted into `names`.
     aliases: HashMap<String, Expr>,
+    /// Record type of a record alias (`alias LAW : R'subtype is s.field;`), so
+    /// `LAW.field` selects slice the aliased expression.
+    alias_rec: HashMap<String, String>,
     /// >0 while lowering binding-actual expressions in configuration
     /// specifications: actuals name signals of the enclosing architecture,
     /// which are not in scope design-wide, so E0401s are suppressed.
@@ -1008,6 +1033,10 @@ struct Lower<'a> {
     /// otherwise leak across entities; the architecture of entity E installs
     /// E's snapshot (see lower_architecture).
     entity_maps: HashMap<String, SigMaps>,
+    /// Delta of `consts`/`types` declared in the entity declarative part,
+    /// exported to the entity's architectures via `SigMaps`.
+    entity_consts: HashMap<String, Value>,
+    entity_types: HashMap<String, TypeInfo>,
     /// Set when re-lowering one entity as an elaboration variant (generic-map
     /// overrides); modules get the `<entity><suffix>` name.
     variant: Option<VariantSpec>,
@@ -1030,7 +1059,7 @@ struct Lower<'a> {
 
 /// Per-module signal metadata (`SigId` is relative to one module).
 #[derive(Default, Clone)]
-struct SigMaps {
+pub struct SigMaps {
     mems: HashMap<SigId, usize>,
     sig_signed: HashMap<SigId, bool>,
     sig_rec: HashMap<SigId, String>,
@@ -1038,6 +1067,11 @@ struct SigMaps {
     sig_width: HashMap<SigId, usize>,
     sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
     uncon_ports: std::collections::HashSet<SigId>,
+    /// Constants and types declared in the entity's declarative part — an
+    /// architecture sees them (the entity's declarative region encompasses
+    /// its architectures, LRM 1076 §1.2).
+    consts: HashMap<String, Value>,
+    types: HashMap<String, TypeInfo>,
 }
 
 impl<'a> Lower<'a> {
@@ -1066,12 +1100,15 @@ impl<'a> Lower<'a> {
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
             aliases: HashMap::new(),
+            alias_rec: HashMap::new(),
             suppress_err: 0,
             pkgs: HashMap::new(),
             cfgs: HashMap::new(),
             file_root: None,
             inst_packages: Vec::new(),
             entity_maps: HashMap::new(),
+            entity_consts: HashMap::new(),
+            entity_types: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
             variant: None,
             cur_entity: String::new(),
@@ -1095,6 +1132,8 @@ impl<'a> Lower<'a> {
                 sig_width: self.sig_width.clone(),
                 sig_dims: self.sig_dims.clone(),
                 uncon_ports: self.uncon_ports.clone(),
+                consts: self.entity_consts.clone(),
+                types: self.entity_types.clone(),
             },
         );
         self.mems.clear();
@@ -1117,6 +1156,12 @@ impl<'a> Lower<'a> {
         self.sig_width = m.sig_width;
         self.sig_dims = m.sig_dims;
         self.uncon_ports = m.uncon_ports;
+        for (k, v) in m.consts {
+            Rc::make_mut(&mut self.consts).entry(k).or_insert(v);
+        }
+        for (k, v) in m.types {
+            self.types.entry(k).or_insert(v);
+        }
     }
 
     /// Merge the packages named in the file's context clauses into scope
@@ -1376,6 +1421,54 @@ impl<'a> Lower<'a> {
     }
 
     /// Resolve a type mark + optional constraint to (width, signed, mem_depth).
+    /// Type mark of an interface element, given the children after the `:`:
+    /// the first Name, skipping a VHDL-2019 `view [(] ViewName [)] of` prefix.
+    fn iface_type_mark<'k>(&self, after: &'k [SyntaxNode]) -> Option<&'k SyntaxNode> {
+        let is_view = after.first().map_or(false, |k| {
+            k.kind() == SyntaxKind::Ident && self.kw(k) == "view"
+        });
+        if is_view {
+            let of = after
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "of")?;
+            after[of + 1..]
+                .iter()
+                .find(|k| k.kind() == SyntaxKind::Name)
+        } else {
+            after.iter().find(|k| k.kind() == SyntaxKind::Name)
+        }
+    }
+
+    /// VHDL-2019 view declaration: register the view name as an alias of its
+    /// subtype's type, so `port (bus : view V of T)` elements and `V'converse`
+    /// aliases resolve to `T`.
+    fn lower_view_decl(&mut self, d: &SyntaxNode) {
+        let kids = real_children(d);
+        let Some(name_node) = kids.iter().find(|k| k.kind() == SyntaxKind::Name) else {
+            return;
+        };
+        let name = self.kw(name_node);
+        let of_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "of");
+        let tm = of_pos.and_then(|p| kids[p + 1..].iter().find(|k| k.kind() == SyntaxKind::Name));
+        let ti = match tm {
+            Some(tm) => {
+                let tname = self.kw(tm);
+                self.types
+                    .get(&tname)
+                    .cloned()
+                    .or_else(|| {
+                        let last = tname.split('.').last().unwrap_or(tname.as_str());
+                        self.types.get(last).cloned()
+                    })
+                    .unwrap_or(TypeInfo::Scalar)
+            }
+            None => TypeInfo::Scalar,
+        };
+        self.types.insert(name, ti);
+    }
+
     fn resolve_type(
         &mut self,
         mark: &SyntaxNode,
@@ -1744,6 +1837,17 @@ impl<'a> Lower<'a> {
     /// If `tn` is (or is an access to) a record type, return the record type
     /// name — access-typed signals get implicit `.all` on field selects.
     fn as_record(&self, tn: &str) -> Option<String> {
+        // `X.field'subtype` where X is a record-typed signal: the field's type.
+        if let Some((base, rest)) = tn.split_once('.') {
+            let path: Vec<&str> = rest.split('.').collect();
+            if let Some(ft) = self.record_type_at_path(base, &path) {
+                if matches!(self.types.get(&ft), Some(TypeInfo::Record { .. })) {
+                    return Some(ft);
+                }
+            }
+        }
+        // Selected type mark (`work.p.rec_t`): the bare item name is registered.
+        let tn = tn.rsplit('.').next().unwrap_or(tn);
         if matches!(self.types.get(tn), Some(TypeInfo::Record { .. })) {
             return Some(tn.to_string());
         }
@@ -1764,6 +1868,8 @@ impl<'a> Lower<'a> {
     /// If `tn` is (or is an access to) an array-of-records, return the element
     /// record type name (for `arr(i).field`).
     fn as_elem_record(&self, tn: &str) -> Option<String> {
+        // Selected type mark (`work.p.arr_t`): the bare item name is registered.
+        let tn = tn.rsplit('.').next().unwrap_or(tn);
         let get = |t: &str| match self.types.get(t) {
             Some(TypeInfo::Array {
                 elem_name: Some(en),
@@ -1772,6 +1878,20 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         get(tn).or_else(|| self.access_inner.get(tn).and_then(|i| get(i)))
+    }
+
+    /// Record type at the end of a field path rooted at a record-typed signal
+    /// (`sig.a.b` → the type of field `b`).
+    fn record_type_at_path(&self, base: &str, path: &[&str]) -> Option<String> {
+        let id = self.sig_id(base)?;
+        let mut cur = self.sig_rec.get(&id)?.clone();
+        for seg in path {
+            cur = self
+                .rec_field_ty
+                .get(&(cur.clone(), seg.to_ascii_lowercase()))?
+                .clone();
+        }
+        Some(cur)
     }
 
     /// Offset (lsb, width) of a (possibly nested) record field path inside
@@ -1852,6 +1972,11 @@ impl<'a> Lower<'a> {
         };
         self.names.clear();
         self.cur_entity = module.name.to_ascii_lowercase();
+        // Snapshot scope so the entity declarative part's constants/types can
+        // be exported to the entity's architectures (SigMaps).
+        let consts_before: std::collections::HashSet<String> =
+            self.consts.keys().cloned().collect();
+        let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
         for k in &kids {
             // Arm the hidden-signal allocator for this phase (ports/generics
             // push directly into `module.signals`, so re-arm per item).
@@ -1860,6 +1985,11 @@ impl<'a> Lower<'a> {
             match k.kind() {
                 SyntaxKind::GenericClause => self.lower_generic_clause(&mut module, k),
                 SyntaxKind::PortClause => self.lower_port_clause(&mut module, k),
+                SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
+                SyntaxKind::TypeDecl => self.lower_type_decl(k),
+                SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
+                SyntaxKind::ViewDecl => self.lower_view_decl(k),
+                SyntaxKind::AliasDecl => self.lower_alias_decl(k),
                 SyntaxKind::AttrDecl => {
                     self.register_attr_decl(k);
                 }
@@ -1876,6 +2006,18 @@ impl<'a> Lower<'a> {
             .iter()
             .enumerate()
             .map(|(i, s)| (s.name.clone(), i as SigId))
+            .collect();
+        self.entity_consts = self
+            .consts
+            .iter()
+            .filter(|(k, _)| !consts_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.entity_types = self
+            .types
+            .iter()
+            .filter(|(k, _)| !types_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.snapshot_entity_maps(&module.name);
         if let Some(v) = &self.variant {
@@ -1935,7 +2077,7 @@ impl<'a> Lower<'a> {
                     &dk[..],
                 ),
             };
-            let type_mark = after.iter().find(|k| k.kind() == SyntaxKind::Name);
+            let type_mark = self.iface_type_mark(after);
             let constraint = after.iter().find(|k| k.kind() == SyntaxKind::Range);
             let eq = after
                 .iter()
@@ -2019,16 +2161,13 @@ impl<'a> Lower<'a> {
                     _ => {}
                 }
             }
-            // The type mark is the last Name child (after the ':' punct).
+            // The type mark is the first Name child after the ':' punct
+            // (skipping a `view V of` prefix).
             if let Some(pos) = dk
                 .iter()
                 .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
             {
-                for k in &dk[pos + 1..] {
-                    if k.kind() == SyntaxKind::Name && type_mark.is_none() {
-                        type_mark = Some(k.clone());
-                    }
-                }
+                type_mark = self.iface_type_mark(&dk[pos + 1..]).cloned();
                 // Port names are Name children before the ':'.
                 names = dk[..pos]
                     .iter()
@@ -2288,6 +2427,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(&d),
                 SyntaxKind::TypeDecl => self.lower_type_decl(&d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(&d),
+                SyntaxKind::ViewDecl => self.lower_view_decl(&d),
                 SyntaxKind::AliasDecl => {
                     self.lower_alias_decl(&d);
                     // `alias runner_phase is runner(...)` where runner is a
@@ -2670,6 +2810,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::VariableDecl => self.lower_signal_decl(module, d), // rare at arch level
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                SyntaxKind::ViewDecl => self.lower_view_decl(d),
                 SyntaxKind::ComponentDecl => {} // components resolve to entities by name
                 SyntaxKind::Function => self.lower_function_decl(module, d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
@@ -2840,6 +2981,7 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                SyntaxKind::ViewDecl => self.lower_view_decl(d),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 SyntaxKind::AttrDecl => {
                     self.register_attr_decl(d);
@@ -3137,7 +3279,9 @@ impl<'a> Lower<'a> {
         // alias name as a type.
         let tname = self.kw(target);
         if let Some(ti) = self.types.get(&tname).cloned() {
+            // Type alias (incl. a view name): `alias V2 is V1;` — done.
             self.types.insert(name.clone(), ti);
+            return;
         }
         // Subprogram alias with a selected target:
         // `alias RISING_EDGE is STD.STANDARD.RISING_EDGE [BIT return BOOLEAN];`
@@ -3167,6 +3311,24 @@ impl<'a> Lower<'a> {
                 return;
             }
         }
+        // Record alias: `alias LAW : SomeRec'subtype is sig.field;` — remember
+        // the record type so `LAW.field` selects slice the aliased expression.
+        let colon = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+        if let Some(c) = colon {
+            if c > name_pos && c < is_pos {
+                if let Some(tm) = kids[c + 1..is_pos]
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                {
+                    let tn = self.text(tm).to_ascii_lowercase();
+                    if let Some(rn) = self.as_record(&tn) {
+                        self.alias_rec.insert(name.clone(), rn);
+                    }
+                }
+            }
+        }
         let e = self.lower_expr(target, &self.consts.clone());
         match &e {
             Expr::Sig(id) => {
@@ -3176,6 +3338,22 @@ impl<'a> Lower<'a> {
                 Rc::make_mut(&mut self.consts).insert(name.clone(), v.clone());
             }
             _ => {}
+        }
+        // No declared subtype: derive the record type from a dotted target
+        // (`alias LAW is AxiDefaults.WriteAddress;`).
+        if !self.alias_rec.contains_key(&name) && matches!(target.kind(), SyntaxKind::Name) {
+            let ttext = self.text(target);
+            let segs: Vec<&str> = ttext.split('.').collect();
+            if segs.len() >= 2 {
+                let base = segs[0].to_ascii_lowercase();
+                let path: Vec<String> = segs[1..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                if let Some(tn) = self.record_type_at_path(&base, &path_refs) {
+                    if matches!(self.types.get(&tn), Some(TypeInfo::Record { .. })) {
+                        self.alias_rec.insert(name.clone(), tn);
+                    }
+                }
+            }
         }
         self.aliases.insert(name, e);
     }
@@ -4062,13 +4240,8 @@ impl<'a> Lower<'a> {
                 .map(|k| self.text(k))
                 .collect();
             // Type mark is the first Name after `:` — a mode keyword
-            // (`inout`, `out`, …) may sit between them.
-            let tmark = colon.and_then(|c| {
-                pk[c + 1..]
-                    .iter()
-                    .find(|k| k.kind() == SyntaxKind::Name)
-                    .cloned()
-            });
+            // (`inout`, `out`, …) or a `view V of` prefix may sit between.
+            let tmark = colon.and_then(|c| self.iface_type_mark(&pk[c + 1..]).cloned());
             let constraint = tmark
                 .as_ref()
                 .and_then(|tm| {
@@ -4143,6 +4316,7 @@ impl<'a> Lower<'a> {
                 SyntaxKind::PortDecl => {} // parameters were slotted above
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
+                SyntaxKind::ViewDecl => self.lower_view_decl(d),
                 SyntaxKind::ConstantDecl => self.lower_fn_local_constant(
                     d,
                     &mut slots,
@@ -4350,7 +4524,9 @@ impl<'a> Lower<'a> {
                 | SyntaxKind::VariableDecl
                 | SyntaxKind::ConstantDecl
                 | SyntaxKind::TypeDecl
-                | SyntaxKind::SubtypeDecl => {
+                | SyntaxKind::SubtypeDecl
+                | SyntaxKind::AliasDecl
+                | SyntaxKind::AttrDecl => {
                     // Process-local declarations.
                     match k.kind() {
                         SyntaxKind::VariableDecl => {
@@ -5894,6 +6070,28 @@ impl<'a> Lower<'a> {
                             if let Some((lsb, w)) = self.record_field_offset(&tn, &path_refs) {
                                 return Expr::Sel {
                                     e: Box::new(Expr::Sig(id)),
+                                    msb: Box::new(Expr::Lit(Value::from_u64(
+                                        32,
+                                        (lsb + w - 1) as u64,
+                                    ))),
+                                    lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                                };
+                            }
+                        }
+                    }
+                    // Field select rooted at a record alias (`alias LAW : R'subtype
+                    // is sig.field;` → `LAW.x` slices the aliased expression).
+                    if id.is_none() {
+                        if let (Some(ae), Some(tn)) = (
+                            self.aliases.get(&base).cloned(),
+                            self.alias_rec.get(&base).cloned(),
+                        ) {
+                            let path: Vec<String> =
+                                fields_path.iter().map(|s| s.to_ascii_lowercase()).collect();
+                            let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                            if let Some((lsb, w)) = self.record_field_offset(&tn, &path_refs) {
+                                return Expr::Sel {
+                                    e: Box::new(ae),
                                     msb: Box::new(Expr::Lit(Value::from_u64(
                                         32,
                                         (lsb + w - 1) as u64,

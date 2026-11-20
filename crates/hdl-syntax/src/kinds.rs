@@ -201,6 +201,8 @@ pub enum SyntaxKind {
     PackageInst,
     /// `alias name [: type] is target;`.
     AliasDecl,
+    /// VHDL-2019 view declaration: `view name of subtype_indication is ... end view;`.
+    ViewDecl,
     /// `attribute a : type;` declaration.
     AttrDecl,
     /// `attribute a of target : label is expr;` specification.
@@ -362,6 +364,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::ContextDecl,
     SyntaxKind::PackageInst,
     SyntaxKind::AliasDecl,
+    SyntaxKind::ViewDecl,
     SyntaxKind::AttrDecl,
     SyntaxKind::AttrSpec,
     SyntaxKind::DisconnectSpec,
@@ -579,7 +582,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 125);
+        assert_eq!(ALL.len(), 126);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

@@ -190,6 +190,7 @@ impl<'a> Lexer<'a> {
                         matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)
                     }),
                 b'-' if self.peek(1) == Some(b'-') => self.line_comment(),
+                b'/' if self.peek(1) == Some(b'*') => self.block_comment(),
                 b'"' => self.string(),
                 b'\'' => self.tick_or_char(),
                 b'\\' => self.extended_ident(),
@@ -238,6 +239,21 @@ impl<'a> Lexer<'a> {
 
     fn line_comment(&mut self) {
         self.run_of(TokenKind::Comment, |b| b != b'\n');
+    }
+
+    /// VHDL-2019 block comment `/* ... */` (non-nesting). Stops only at ASCII
+    /// bytes (`*`, `/`, EOF), so `pos` stays on char boundaries.
+    fn block_comment(&mut self) {
+        let start = self.pos;
+        self.pos += 2; // /*
+        while self.pos < self.text.len() {
+            if self.text[self.pos] == b'*' && self.peek(1) == Some(b'/') {
+                self.pos += 2;
+                break;
+            }
+            self.pos += 1;
+        }
+        self.emit_from(TokenKind::Comment, start);
     }
 
     fn string(&mut self) {

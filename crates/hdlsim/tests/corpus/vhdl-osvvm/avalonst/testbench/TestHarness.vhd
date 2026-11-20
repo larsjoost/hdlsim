@@ -1,0 +1,137 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use ieee.numeric_std_unsigned.all;
+
+library osvvm_avalonst;
+context osvvm_avalonst.AvalonStreamContext;
+
+entity TestHarness is
+end entity TestHarness;
+architecture structural of TestHarness is
+
+  function log2(x : positive) return natural is
+    variable result : natural := 0;
+    variable value : positive := x;
+  begin
+    while value > 1 loop
+      value := value / 2;
+      result := result + 1;
+    end loop;
+    return result;
+  end function;
+
+  constant tperiod_Clk : time := 10 ns;
+  constant tpd : time := 2 ns;
+  constant AvalonStreamDataWidth   : integer := 32;
+  constant AvalonStreamSymbolWidth : integer := 8;
+
+  constant TCHANNEL_MAX_WIDTH : integer := 8; -- maximum number of AvalonStream channels
+  constant TEMPTY_MAX_WIDTH   : integer := log2(AvalonStreamDataWidth/AvalonStreamSymbolWidth);
+
+  constant INIT_CHANNEL : std_logic_vector(TCHANNEL_MAX_WIDTH - 1 downto 0) := (others => '0');
+  constant INIT_EMPTY   : std_logic_vector(TEMPTY_MAX_WIDTH - 1 downto 0) := (others => '0');
+  constant AXI_PARAM_WIDTH : integer := TCHANNEL_MAX_WIDTH + TEMPTY_MAX_WIDTH;
+
+  signal Clk : std_logic := '1';
+  signal Reset : std_logic := '0';
+
+  signal Ready : std_logic;
+  signal Data : std_logic_vector(AvalonStreamDataWidth - 1 downto 0);
+  signal Valid : std_logic;
+  signal StartOfPacket : std_logic;
+  signal EndOfPacket : std_logic;
+  signal Empty   : std_logic_vector(TEMPTY_MAX_WIDTH - 1 downto 0) := (others => '0');
+  signal Channel : std_logic_vector(TCHANNEL_MAX_WIDTH - 1 downto 0) := (others => '0');
+  signal StreamRxRec, StreamTxRec : StreamRecType(
+      DataToModel   (AvalonStreamDataWidth - 1 downto 0),
+      DataFromModel (AvalonStreamDataWidth - 1 downto 0),
+      ParamToModel  (AXI_PARAM_WIDTH - 1 downto 0),
+      ParamFromModel(AXI_PARAM_WIDTH - 1 downto 0)
+  );
+  component TestCtrl is
+    generic (
+      CHANNEL_LEN : integer;
+      EMPTY_LEN : integer
+    );
+    port (
+      -- Global Signal Interface
+      Reset : in std_logic;
+      Clk : in std_logic;
+
+      -- Record Interface
+      StreamTxRec : inout StreamRecType;
+      StreamRxRec : inout StreamRecType
+    );
+  end component TestCtrl;
+begin
+
+  -- create Clock
+  CreateClock (
+    Clk     => Clk,
+    Period  => Tperiod_Clk
+  );
+
+  -- create nReset
+  CreateReset (
+    Reset       => Reset,
+    ResetActive => '0',
+    Clk         => Clk,
+    Period      => 2 * tperiod_Clk,
+    tpd         => tpd
+  );
+
+  AvalonStreamTransmitter_1 : AvalonStreamTransmitter
+    generic map(
+      INIT_CHANNEL => INIT_CHANNEL,
+      INIT_EMPTY => INIT_EMPTY,
+      DEFAULT_DELAY => 1 ns,
+      tpd_Clk_Valid => 1 ns,
+      tpd_Clk_Data => 1 ns
+    )
+    port map(
+      Clk => Clk,
+      Reset => Reset,
+      Valid => Valid,
+      Data => Data,
+      Channel => Channel,
+      Ready => Ready,
+      StartOfPacket => StartOfPacket,
+      EndOfPacket => EndOfPacket,
+      Empty => Empty,
+      TransRec => StreamTxRec
+    );
+
+  AvalonStreamReceiver_1 : AvalonStreamReceiver
+    generic map(
+      DEFAULT_DELAY => 1 ns,
+      tpd_Clk_Ready => 1 ns
+    )
+    port map(
+      Clk => Clk,
+      Reset => Reset,
+      Valid => Valid,
+      Data => Data,
+      Channel => Channel,
+      Ready => Ready,
+      StartOfPacket => StartOfPacket,
+      EndOfPacket => EndOfPacket,
+      Empty => Empty,
+      TransRec => StreamRxRec
+    );
+
+  TestCtrl_1 : TestCtrl
+    generic map(
+      CHANNEL_LEN => Channel'length,
+      EMPTY_LEN   => Empty'length
+    )
+    port map(
+      -- Globals
+      Reset       => Reset,
+      Clk         => Clk,
+
+      -- Transaction Record
+      StreamTxRec => StreamTxRec,
+      StreamRxRec => StreamRxRec
+    );
+end architecture structural ;
