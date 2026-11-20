@@ -897,6 +897,22 @@ pub enum TypeInfo {
     /// Record type: fields as (name, width, signed) in declaration order.
     /// Lowered as one flat vector; the first declared field is the MSB.
     Record { fields: Vec<(String, usize, bool)> },
+    /// Protected type (VHDL-2008): objects are 64-bit handles into the
+    /// simulator's object store (same model as SV classes); state lives in
+    /// the object word, methods are `t::m` functions.
+    Handle,
+}
+
+/// A protected type's layout: state variables as (name, width, lsb, signed)
+/// in declaration order (first declared = MSB of the object word), plus the
+/// method names declared in the protected header.
+#[derive(Clone, Debug, Default)]
+pub struct ProtType {
+    pub fields: Vec<(String, usize, usize, bool)>,
+    pub methods: Vec<String>,
+    /// State-variable initializers (field name → lowered expr), written by
+    /// the generated `t::new` constructor.
+    pub inits: Vec<(String, Expr)>,
 }
 
 struct Lower<'a> {
@@ -988,6 +1004,16 @@ struct Lower<'a> {
     /// Set when re-lowering one entity as an elaboration variant (generic-map
     /// overrides); modules get the `<entity><suffix>` name.
     variant: Option<VariantSpec>,
+    /// Protected types (VHDL-2008): type name → state fields + methods.
+    prot_types: HashMap<String, ProtType>,
+    /// Protected type whose body is currently being lowered (bare state-var
+    /// and method references resolve against it).
+    prot_body_ctx: Option<String>,
+    /// Signal id → protected type name (objects holding a 64-bit handle).
+    sig_prot: HashMap<SigId, String>,
+    /// FuncIrs lowered inside protected bodies / ctor — drained into the
+    /// enclosing package's or module's function list.
+    pending_funcs: Vec<FuncIr>,
     /// Entity currently being lowered (variant override matching).
     cur_entity: String,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
@@ -1042,6 +1068,10 @@ impl<'a> Lower<'a> {
             attr_decls: std::collections::HashSet::new(),
             variant: None,
             cur_entity: String::new(),
+            prot_types: HashMap::new(),
+            prot_body_ctx: None,
+            sig_prot: HashMap::new(),
+            pending_funcs: Vec::new(),
         }
     }
 
@@ -1416,6 +1446,7 @@ impl<'a> Lower<'a> {
                 None,
                 false,
             ),
+            TypeInfo::Handle => (64, false, None, false),
         }
     }
 
@@ -2324,6 +2355,8 @@ impl<'a> Lower<'a> {
                 _ => {}
             }
         }
+        // Protected-type methods + generated ctors lowered inside type bodies.
+        functions.extend(self.pending_funcs.drain(..));
         // Collect the items this package added, for cross-file `use` clauses.
         let types: Vec<(String, TypeInfo)> = self
             .types
@@ -2644,6 +2677,8 @@ impl<'a> Lower<'a> {
         for s in &stmts {
             self.lower_conc_stmt(module, s, &mut proc_idx);
         }
+        // Protected-type methods + ctors lowered from arch-level type bodies.
+        module.functions.extend(self.pending_funcs.drain(..));
         // Configuration specifications rebind the matching instance label.
         for fs in &config_specs {
             let fk = real_children(fs);
@@ -3185,6 +3220,27 @@ impl<'a> Lower<'a> {
                         self.sig_dims.insert(id, d);
                     }
                 }
+                // Protected-type object: the signal holds a 64-bit handle.
+                // Remember the type for member selects even when the type
+                // comes from a use'd package (no local body); allocate +
+                // initialize only for locally declared types (ctor exists).
+                if self.prot_types.contains_key(tn)
+                    || matches!(self.types.get(tn), Some(TypeInfo::Handle))
+                {
+                    self.sig_prot.insert(id, tn.clone());
+                }
+                if self.prot_types.contains_key(tn) {
+                    module.processes.push(ProcessIr {
+                        kind: ProcKind::Initial,
+                        sens: Sens::List(Vec::new()),
+                        body: Stmt::SysCall {
+                            name: format!("$new::{}", tn),
+                            args: vec![Expr::Sig(id)],
+                        },
+                        origin: format!("init protected object {n}"),
+                        initial: false,
+                    });
+                }
             }
             self.names.insert(n.clone(), id);
         }
@@ -3526,27 +3582,150 @@ impl<'a> Lower<'a> {
             self.types.insert(name, TypeInfo::Scalar);
             return;
         }
-        // Protected type: `type t is protected ... end protected [body];` —
-        // register an opaque placeholder type and stub functions for the
-        // methods, so `obj.method(...)` and alias targets resolve. Method
-        // bodies are not simulated (calls return X).
+        // Protected type (VHDL-2008): `type t is protected ... end protected;`
+        // declares the methods; `type t is protected body ... end protected
+        // body;` holds the state variables and method bodies. Objects are
+        // 64-bit handles (same object model as SV classes); state lives in the
+        // object word, methods lower as `t::m` functions.
         if kids
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "protected")
         {
-            // Protected type: methods are stubbed below; register as an empty
-            // record so `obj.field` selects resolve to a placeholder (bodies
-            // are not simulated).
-            self.types
-                .insert(name, TypeInfo::Record { fields: Vec::new() });
+            let is_body = kids
+                .iter()
+                .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "body");
+            self.types.insert(name.clone(), TypeInfo::Handle);
+            let mut pt = self.prot_types.remove(&name).unwrap_or_default();
+            // First pass: inner type decls + state variables, so the type is
+            // registered (with its fields) before any initializer/method body
+            // is lowered (a state-variable initializer may reference an
+            // earlier field of the same type).
+            let mut init_decls: Vec<(String, SyntaxNode)> = Vec::new();
             for k in &kids {
                 match k.kind() {
-                    // Inner type declarations (e.g. inside a protected body).
                     SyntaxKind::TypeDecl => self.lower_type_decl(k),
-                    SyntaxKind::Function => self.protected_method_stub(k),
+                    SyntaxKind::VariableDecl if is_body => {
+                        let vk = real_children(k);
+                        let colon = vk
+                            .iter()
+                            .position(|c| c.kind() == SyntaxKind::Punct && self.text(c) == ":");
+                        if let Some(c) = colon {
+                            let names: Vec<String> = vk[..c]
+                                .iter()
+                                .filter(|c| c.kind() == SyntaxKind::Name)
+                                .map(|c| self.kw(c))
+                                .collect();
+                            let tmark = vk[c + 1..].iter().find(|c| c.kind() == SyntaxKind::Name);
+                            let constraint =
+                                vk[c + 1..].iter().find(|c| c.kind() == SyntaxKind::Range);
+                            let init = vk[c + 1..]
+                                .iter()
+                                .find(|c| is_expr_node(c.kind()) && c.kind() != SyntaxKind::Name);
+                            let (w, signed, _, _) = match tmark {
+                                Some(tm) => self.resolve_type(tm, constraint, k.span()),
+                                None => (32, false, None, false),
+                            };
+                            for n in names {
+                                pt.fields.push((n.clone(), w.max(1), 0, signed));
+                                // Field initializer (for the `t::new` ctor).
+                                if let Some(ie) = init {
+                                    init_decls.push((n, ie.clone()));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
+            // Assign lsb offsets: first declared field is the MSB of the word.
+            let total: usize = pt.fields.iter().map(|f| f.1).sum::<usize>().max(1);
+            let mut run = 0usize;
+            for f in pt.fields.iter_mut() {
+                f.2 = total - run - f.1;
+                run += f.1;
+            }
+            // Register before lowering initializers/methods: they reference
+            // the fields (bare names resolve to `$getf::t::field@lsb,w($this)`).
+            self.prot_types.insert(name.clone(), pt.clone());
+            {
+                let saved = self.prot_body_ctx.replace(name.clone());
+                for (n, ie) in init_decls {
+                    let ex = self.lower_expr(&ie, &self.consts.clone());
+                    pt.inits.push((n, ex));
+                }
+                self.prot_body_ctx = saved;
+            }
+            // Second pass: methods (stubs in the header, real bodies in the
+            // protected body, lowered with the protected context so bare
+            // state-var references resolve to `$getf::t::field@lsb,w($this)`).
+            for k in &kids {
+                if k.kind() != SyntaxKind::Function {
+                    continue;
+                }
+                // Method name: first Name before `return`/`begin`.
+                let mname = {
+                    let mut seen = false;
+                    let mut mn = String::new();
+                    for c in real_children(k) {
+                        match c.kind() {
+                            SyntaxKind::Ident
+                                if matches!(self.kw(&c).as_str(), "return" | "begin") =>
+                            {
+                                seen = true
+                            }
+                            SyntaxKind::Name if !seen && mn.is_empty() => mn = self.text(&c),
+                            _ => {}
+                        }
+                    }
+                    mn.to_ascii_lowercase()
+                };
+                if mname.is_empty() {
+                    continue;
+                }
+                if is_body {
+                    let saved = self.prot_body_ctx.replace(name.clone());
+                    let fi = self.lower_function_node(k);
+                    self.prot_body_ctx = saved;
+                    if let Some(mut fi) = fi {
+                        fi.name = format!("{}::{}", name, fi.name);
+                        self.funcs.insert(fi.name.to_ascii_lowercase(), fi.clone());
+                        self.pending_funcs.push(fi);
+                    }
+                } else {
+                    self.protected_method_stub(k);
+                }
+                if !pt.methods.contains(&mname) {
+                    pt.methods.push(mname);
+                }
+            }
+            // Constructor: `t::new` runs after `$new::t` allocates the object;
+            // it writes each state variable's initializer into the word.
+            let mut ctor_stmts: Vec<Stmt> = Vec::new();
+            for (fn_, w, lsb, _) in &pt.fields {
+                if let Some((_, ex)) = pt.inits.iter().find(|(n, _)| n == fn_) {
+                    ctor_stmts.push(Stmt::SysCall {
+                        name: format!("$setf::{}::{}@{},{}", name, fn_, lsb, w),
+                        args: vec![
+                            Expr::Call {
+                                name: "$this".into(),
+                                args: vec![],
+                            },
+                            ex.clone(),
+                        ],
+                    });
+                }
+            }
+            let ctor = FuncIr {
+                name: format!("{}::new", name),
+                ret_width: 1,
+                args: Vec::new(),
+                locals: Vec::new(),
+                body: Stmt::Block(ctor_stmts),
+            };
+            self.funcs
+                .insert(ctor.name.to_ascii_lowercase(), ctor.clone());
+            self.pending_funcs.push(ctor);
+            self.prot_types.insert(name, pt);
             return;
         }
         // Record: `type t is record f : typ [constraint]; ... end record;`
@@ -3904,6 +4083,10 @@ impl<'a> Lower<'a> {
                 if let Some(en) = self.as_elem_record(&tn) {
                     self.sig_elem_rec.insert(i as SigId, en);
                 }
+                // Protected-type object local: member selects placeholder.
+                if matches!(self.types.get(&tn), Some(TypeInfo::Handle)) {
+                    self.sig_prot.insert(i as SigId, tn.clone());
+                }
             }
         }
         // Pre-register nested subprograms so constant initializers in the
@@ -4012,6 +4195,10 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(en) = self.as_elem_record(&tn) {
                     self.sig_elem_rec.insert(i as SigId, en);
+                }
+                // Protected-type object local: member selects placeholder.
+                if matches!(self.types.get(&tn), Some(TypeInfo::Handle)) {
+                    self.sig_prot.insert(i as SigId, tn.clone());
                 }
             }
         }
@@ -4241,6 +4428,10 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(en) = self.as_elem_record(tn) {
                     self.sig_elem_rec.insert(id, en);
+                }
+                // Protected-type object local: member selects placeholder.
+                if matches!(self.types.get(tn), Some(TypeInfo::Handle)) {
+                    self.sig_prot.insert(id, tn.clone());
                 }
                 if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
                     if !dims.is_empty() {
@@ -4707,6 +4898,50 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// If `l` is a bare state-variable name of the protected body currently
+    /// being lowered (and not shadowed by a local/param), return
+    /// (type, field, lsb, width) so the assignment becomes a `$setf` write.
+    fn prot_field_lhs(&self, l: &SyntaxNode) -> Option<(String, String, usize, usize)> {
+        if l.kind() != SyntaxKind::Name {
+            return None;
+        }
+        let key = self.kw(l).to_ascii_lowercase();
+        if self.sig_id(&key).is_some() {
+            return None; // local/param shadows the field
+        }
+        let t = self.prot_body_ctx.as_ref()?;
+        let pt = self.prot_types.get(t)?;
+        let f = pt.fields.iter().find(|(n, _, _, _)| *n == key);
+        let (_, w, lsb, _) = f?;
+        Some((t.clone(), key, *lsb, *w))
+    }
+
+    /// Assignment target rooted at a protected-type state variable but not a
+    /// whole field (`st.ptr := …`, `st.idxs(st.idx) := …` with `st` a state
+    /// field): cannot use `$setf` — the statement is dropped (placeholder).
+    fn prot_nested_lhs(&self, l: &SyntaxNode) -> bool {
+        let text = match l.kind() {
+            SyntaxKind::Name => self.kw(l),
+            SyntaxKind::Call => real_children(l)
+                .iter()
+                .find(|c| c.kind() == SyntaxKind::Name)
+                .map(|c| self.kw(c))
+                .unwrap_or_default(),
+            _ => return false,
+        };
+        let base = text.split('.').next().unwrap_or("").to_ascii_lowercase();
+        if base.is_empty() || self.sig_id(&base).is_some() {
+            return false; // local/param shadows the field
+        }
+        let Some(t) = self.prot_body_ctx.as_ref() else {
+            return false;
+        };
+        let Some(pt) = self.prot_types.get(t) else {
+            return false;
+        };
+        pt.fields.iter().any(|(n, _, _, _)| *n == base)
+    }
+
     fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
         match s.kind() {
             SyntaxKind::SeqAssign => {
@@ -4799,11 +5034,29 @@ impl<'a> Lower<'a> {
                 }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
-                    (Some(l), Some(r)) => Stmt::Assign {
-                        lhs: self.lower_expr(l, &self.consts.clone()),
-                        rhs: self.lower_rhs(l, r, &self.consts.clone()),
-                        nba: true, // VHDL signal assignment is delta-delayed
-                    },
+                    (Some(l), Some(r)) => {
+                        if let Some((t, f, lsb, w)) = self.prot_field_lhs(l) {
+                            let rv = self.lower_rhs(l, r, &self.consts.clone());
+                            return Stmt::SysCall {
+                                name: format!("$setf::{}::{}@{},{}", t, f, lsb, w),
+                                args: vec![
+                                    Expr::Call {
+                                        name: "$this".into(),
+                                        args: vec![],
+                                    },
+                                    rv,
+                                ],
+                            };
+                        }
+                        if self.prot_nested_lhs(l) {
+                            return Stmt::Null;
+                        }
+                        Stmt::Assign {
+                            lhs: self.lower_expr(l, &self.consts.clone()),
+                            rhs: self.lower_rhs(l, r, &self.consts.clone()),
+                            nba: true, // VHDL signal assignment is delta-delayed
+                        }
+                    }
                     _ => Stmt::Null,
                 }
             }
@@ -4837,11 +5090,29 @@ impl<'a> Lower<'a> {
                 }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
-                    (Some(l), Some(r)) => Stmt::Assign {
-                        lhs: self.lower_expr(l, &self.consts.clone()),
-                        rhs: self.lower_rhs(l, r, &self.consts.clone()),
-                        nba: false,
-                    },
+                    (Some(l), Some(r)) => {
+                        if let Some((t, f, lsb, w)) = self.prot_field_lhs(l) {
+                            let rv = self.lower_rhs(l, r, &self.consts.clone());
+                            return Stmt::SysCall {
+                                name: format!("$setf::{}::{}@{},{}", t, f, lsb, w),
+                                args: vec![
+                                    Expr::Call {
+                                        name: "$this".into(),
+                                        args: vec![],
+                                    },
+                                    rv,
+                                ],
+                            };
+                        }
+                        if self.prot_nested_lhs(l) {
+                            return Stmt::Null;
+                        }
+                        Stmt::Assign {
+                            lhs: self.lower_expr(l, &self.consts.clone()),
+                            rhs: self.lower_rhs(l, r, &self.consts.clone()),
+                            nba: false,
+                        }
+                    }
                     _ => Stmt::Null,
                 }
             }
@@ -4939,6 +5210,45 @@ impl<'a> Lower<'a> {
                 } else {
                     fname
                 };
+                // `obj.m(args);` on a protected-type object →
+                // `$callmethod::t::m(obj, …)`.
+                if let Some(dot) = raw.find('.') {
+                    let (base, m) = (&raw[..dot], raw[dot + 1..].to_ascii_lowercase());
+                    if let Some(id) = self.sig_id(base) {
+                        if let Some(t) = self.sig_prot.get(&id).cloned() {
+                            let is_method = self
+                                .prot_types
+                                .get(&t)
+                                .map_or(false, |p| p.methods.contains(&m));
+                            if is_method {
+                                let mut args2 = vec![Expr::Sig(id)];
+                                args2.extend(args.iter().cloned());
+                                return Stmt::SysCall {
+                                    name: format!("$callmethod::{}::{}", t, m),
+                                    args: args2,
+                                };
+                            }
+                        }
+                    }
+                }
+                // Bare `m(args);` inside a protected-type body → self-call.
+                if let Some(t) = self.prot_body_ctx.clone() {
+                    if self
+                        .prot_types
+                        .get(&t)
+                        .map_or(false, |p| p.methods.contains(&name))
+                    {
+                        let mut args2 = vec![Expr::Call {
+                            name: "$this".into(),
+                            args: vec![],
+                        }];
+                        args2.extend(args.iter().cloned());
+                        return Stmt::SysCall {
+                            name: format!("$callmethod::{}::{}", t, name),
+                            args: args2,
+                        };
+                    }
+                }
                 Stmt::SysCall { name, args }
             }
             _ => Stmt::Null,
@@ -5389,6 +5699,56 @@ impl<'a> Lower<'a> {
                     .filter(|s| !s.eq_ignore_ascii_case("all"))
                     .collect::<Vec<_>>()
                     .join(".");
+                // `obj.m` / `obj.field` on a protected-type object in
+                // expression position (parameterless method call / field).
+                // Unknown members (and package-level shared variables, which
+                // have no per-module object yet) stay placeholders.
+                if let Some(dot) = name.rfind('.') {
+                    let (base, last) = (&name[..dot], name[dot + 1..].to_ascii_lowercase());
+                    let base_lc = base.to_ascii_lowercase();
+                    // Subprogram/process locals live in names_stack, not names.
+                    let id = self.sig_id(base).or_else(|| {
+                        self.names_stack.iter().rev().find_map(|m| {
+                            m.get(&base_lc).copied().or_else(|| {
+                                m.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(&base_lc))
+                                    .map(|(_, v)| *v)
+                            })
+                        })
+                    });
+                    if let Some(id) = id {
+                        if let Some(t) = self.sig_prot.get(&id).cloned() {
+                            if let Some(pt) = self.prot_types.get(&t) {
+                                if pt.methods.contains(&last) {
+                                    return Expr::Call {
+                                        name: format!("$method::{}::{}", t, last),
+                                        args: vec![Expr::Sig(id)],
+                                    };
+                                }
+                                if let Some((_, w, lsb, _)) =
+                                    pt.fields.iter().find(|(n, _, _, _)| *n == last)
+                                {
+                                    return Expr::Call {
+                                        name: format!("$getf::{}::{}@{},{}", t, last, lsb, w),
+                                        args: vec![Expr::Sig(id)],
+                                    };
+                                }
+                                // Unknown member on a known protected object.
+                                return Expr::Lit(Value::x(32));
+                            } else {
+                                // Protected type from a use'd package (no
+                                // local body): member select is a placeholder.
+                                return Expr::Lit(Value::x(32));
+                            }
+                        }
+                    } else if let Some(tn) = self.pkg_sig_types.get(base) {
+                        if matches!(self.types.get(tn), Some(TypeInfo::Handle)) {
+                            // Package-level shared variable of protected type:
+                            // not simulated yet — placeholder.
+                            return Expr::Lit(Value::x(32));
+                        }
+                    }
+                }
                 // `arr(i).field` — the parser folds this into one Name node
                 // wrapping a Call plus `.field`. Lower the call, then select
                 // the record field inside the element (slice of the memory
@@ -5508,6 +5868,18 @@ impl<'a> Lower<'a> {
                                     ))),
                                     lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
                                 };
+                            }
+                        }
+                    }
+                    // Nested member select rooted at a protected-type state
+                    // variable (`st.ptr`, `st` a record-typed state field):
+                    // placeholder (not simulated).
+                    if env.get(&base).is_none() {
+                        if let Some(t) = self.prot_body_ctx.clone() {
+                            if let Some(pt) = self.prot_types.get(&t) {
+                                if pt.fields.iter().any(|(n, _, _, _)| *n == base) {
+                                    return Expr::Lit(Value::x(32));
+                                }
                             }
                         }
                     }
@@ -5655,10 +6027,33 @@ impl<'a> Lower<'a> {
                 ) {
                     return Expr::Lit(Value::from_u64(32, time_unit_fs(&key)));
                 }
+                // Bare state-variable reference inside a protected-type body:
+                // read the field of `$this` (`$getf::t::field@lsb,w`).
+                if let Some(t) = self.prot_body_ctx.clone() {
+                    if let Some(pt) = self.prot_types.get(&t) {
+                        if let Some((_, w, lsb, _)) =
+                            pt.fields.iter().find(|(n, _, _, _)| *n == key)
+                        {
+                            return Expr::Call {
+                                name: format!("$getf::{}::{}@{},{}", t, key, lsb, w),
+                                args: vec![Expr::Call {
+                                    name: "$this".into(),
+                                    args: vec![],
+                                }],
+                            };
+                        }
+                    }
+                }
                 // Package-level shared variable read from a package-body
                 // subprogram: placeholder (not simulated).
                 if self.pkg_sig_types.contains_key(&key) {
                     return Expr::Lit(Value::x(1));
+                }
+                // Inside a protected-type body, unresolved names are common
+                // (conversions to the protected object, use'd package items,
+                // access-type fields): placeholder, no diagnostic.
+                if self.prot_body_ctx.is_some() {
+                    return Expr::Lit(Value::x(32));
                 }
                 self.err(e.span(), format!("unknown identifier '{}'", base));
                 Expr::Lit(Value::x(1))
@@ -6089,6 +6484,62 @@ impl<'a> Lower<'a> {
         if base_id.is_none() && !args.is_empty() {
             if let Some(e) = self.lower_const_array_index(&fname, &args) {
                 return e;
+            }
+        }
+        // `obj.m(args)` on a protected-type object → `$method::t::m(obj, …)`.
+        if let Some(dot) = name.find('.') {
+            let (base, m) = (&name[..dot], name[dot + 1..].to_ascii_lowercase());
+            if let Some(id) = self.sig_id(base) {
+                if let Some(t) = self.sig_prot.get(&id).cloned() {
+                    let is_method = self
+                        .prot_types
+                        .get(&t)
+                        .map_or(false, |p| p.methods.contains(&m));
+                    if is_method {
+                        let mut args2 = vec![Expr::Sig(id)];
+                        args2.extend(args.iter().cloned());
+                        return Expr::Call {
+                            name: format!("$method::{}::{}", t, m),
+                            args: args2,
+                        };
+                    }
+                    // Unknown member on a protected object — or any member of
+                    // a protected type from a use'd package: placeholder.
+                    return Expr::Lit(Value::x(32));
+                }
+            } else if let Some(tn) = self.pkg_sig_types.get(base) {
+                // Package-level shared variable of protected type: placeholder.
+                if matches!(self.types.get(tn), Some(TypeInfo::Handle)) {
+                    return Expr::Lit(Value::x(32));
+                }
+            } else if let Some(t) = self.prot_body_ctx.clone() {
+                // `st.field(args)` rooted at a protected-type state variable:
+                // placeholder (not simulated).
+                if self.prot_types.get(&t).map_or(false, |pt| {
+                    pt.fields
+                        .iter()
+                        .any(|(n, _, _, _)| n.eq_ignore_ascii_case(base))
+                }) {
+                    return Expr::Lit(Value::x(32));
+                }
+            }
+        }
+        // Bare `m(args)` inside a protected-type body → self-call on `$this`.
+        if let Some(t) = self.prot_body_ctx.clone() {
+            if self
+                .prot_types
+                .get(&t)
+                .map_or(false, |p| p.methods.contains(&fname))
+            {
+                let mut args2 = vec![Expr::Call {
+                    name: "$this".into(),
+                    args: vec![],
+                }];
+                args2.extend(args.iter().cloned());
+                return Expr::Call {
+                    name: format!("$method::{}::{}", t, fname),
+                    args: args2,
+                };
             }
         }
         match fname.as_str() {
