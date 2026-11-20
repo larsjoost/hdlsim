@@ -89,6 +89,12 @@ pub struct PackageIr {
     /// record selects (`r.outer.inner`) resolve in files that `use` the
     /// package (the lowerer's per-file `rec_field_ty` map doesn't cross files).
     pub rec_field_tys: Vec<(String, String, String)>,
+    /// Protected types `(name, layout)` declared by this package — lets
+    /// `obj.field` / `obj.m(...)` on a protected object resolve in files that
+    /// `use` the package (the lowerer's per-file `prot_types` map doesn't cross
+    /// files). The body's entry (with state fields + initializers) wins over
+    /// the declaration's.
+    pub prot_tys: Vec<(String, ProtType)>,
     /// Package-level signals / shared variables `(name, type mark)` — exported
     /// so `use work.com_pkg.all;` also exposes bare reads of `net` etc.
     pub sig_types: Vec<(String, String)>,
@@ -349,6 +355,7 @@ pub fn lower_file(
                         generics: Vec::new(),
                         type_actuals: Vec::new(),
                         rec_field_tys: Vec::new(),
+                        prot_tys: Vec::new(),
                         sig_types: Vec::new(),
                         const_tys: Vec::new(),
                         decl: Some(child.clone()),
@@ -2182,6 +2189,13 @@ impl<'a> Lower<'a> {
                 .entry((r.clone(), f.clone()))
                 .or_insert_with(|| t.clone());
         }
+        for (n, pt) in &p.prot_tys {
+            if item.is_none_or(|i| i == n) {
+                // Last wins: the package body (state fields + initializers)
+                // follows the declaration (methods only).
+                self.prot_types.insert(n.clone(), pt.clone());
+            }
+        }
         for (n, tn) in &p.sig_types {
             self.pkg_sig_types
                 .entry(n.clone())
@@ -2251,6 +2265,9 @@ impl<'a> Lower<'a> {
         // visible in this file.
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
         let consts_before = self.consts.clone();
+        // Snapshot so the package body's protected-type entry (which gains
+        // state fields + initializers over the declaration's) is exported too.
+        let prot_before = self.prot_types.clone();
         // VHDL-2008 generic clause first, so constants/types declared after it
         // see the generic values (`generic map` overrides win over defaults).
         let mut generics: Vec<(String, Value)> = Vec::new();
@@ -2384,6 +2401,19 @@ impl<'a> Lower<'a> {
             .filter(|((r, _), _)| type_names.contains(r))
             .map(|((r, f), t)| (r.clone(), f.clone(), t.clone()))
             .collect();
+        let prot_tys = self
+            .prot_types
+            .iter()
+            .filter(|(n, pt)| {
+                type_names.contains(n)
+                    || prot_before.get(*n).map_or(true, |old| {
+                        old.fields != pt.fields
+                            || old.methods != pt.methods
+                            || old.inits.len() != pt.inits.len()
+                    })
+            })
+            .map(|(n, pt)| (n.clone(), pt.clone()))
+            .collect();
         let const_names: std::collections::HashSet<&String> =
             consts.iter().map(|(k, _)| k).collect();
         let const_tys = self
@@ -2400,6 +2430,7 @@ impl<'a> Lower<'a> {
             generics,
             type_actuals: Vec::new(),
             rec_field_tys,
+            prot_tys,
             sig_types,
             const_tys,
             decl: Some(p.clone()),
@@ -2531,6 +2562,7 @@ impl<'a> Lower<'a> {
             pkg.uses.extend(part.uses);
             pkg.attr_decls.extend(part.attr_decls);
             pkg.rec_field_tys.extend(part.rec_field_tys);
+            pkg.prot_tys.extend(part.prot_tys);
             pkg.sig_types.extend(part.sig_types);
             pkg.const_tys.extend(part.const_tys);
             if pkg.generics.is_empty() {

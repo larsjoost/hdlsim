@@ -40,3 +40,33 @@ fn protected_type_state_and_methods_simulate() {
         stderr
     );
 }
+
+#[test]
+fn protected_type_cross_file_simulates() {
+    // Package and testbench in separate files: `use work.prot_pkg.all;` must
+    // expose the protected type's fields/methods (PackageIr::prot_tys), so
+    // `sv.inc`/`sv.get` dispatch to the real `counter_t::m` bodies.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let pkg = dir.join("vhdl_protected_pkg.vhd");
+    let tb = dir.join("vhdl_protected_xfile_tb.vhd");
+    let out = hdlsim()
+        .args(["run", "--top", "tb_protected_xfile"])
+        .arg(&pkg)
+        .arg(&tb)
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("PASS: vhdl protected types cross-file"),
+        "{}",
+        stdout
+    );
+}
