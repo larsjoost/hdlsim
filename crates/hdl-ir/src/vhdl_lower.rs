@@ -4811,23 +4811,16 @@ impl<'a> Lower<'a> {
         let has_cond = elems.iter().any(|e| e.cond.is_some());
         let has_delay = elems.iter().any(|e| e.delay.is_some());
         if has_delay {
-            // A delayed concurrent assignment is a one-shot process scheduling
-            // each transaction; VHDL waveform delays are each relative to the
-            // time the statement executes (not cumulative like Verilog).
+            // VHDL waveform: each element's delay is relative to the time the
+            // statement executes. `v after t` schedules a transaction at
+            // now + t WITHOUT suspending the process (`AssignDelayed`), so the
+            // equivalent process (LRM 11.3)
+            //   `process begin <assigns>; wait on <rhs signals>; end process;`
+            // re-arms on every RHS event — self-oscillators
+            // (`clk <= not clk after 10 ns;`) keep ticking.
             let mut stmts = Vec::new();
-            let mut prev = 0u64;
+            let mut rhs_sigs: Vec<SigId> = Vec::new();
             for e in &elems {
-                let mut t = 0u64;
-                if let Some(d) = &e.delay {
-                    let dv = self.lower_expr(d, &self.consts.clone());
-                    match self.ce(&dv) {
-                        Some(v) => t = v.to_u64().unwrap_or(0), // X (unoverridden generic) -> 0
-                        None => {
-                            self.err(d.span(), "waveform delay must be constant");
-                            return None;
-                        }
-                    }
-                }
                 let mut val = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
                 if let Some(c) = &e.cond {
                     // `v after t when c` — fold the condition into the value.
@@ -4837,25 +4830,60 @@ impl<'a> Lower<'a> {
                         e: Box::new(Expr::Lit(Value::x(1))),
                     };
                 }
-                let a = Stmt::Assign {
+                val.collect_sigs(&mut rhs_sigs);
+                let t_fs = match &e.delay {
+                    Some(d) => {
+                        let dv = self.lower_expr(d, &self.consts.clone());
+                        match self.ce(&dv) {
+                            Some(v) => v.to_u64().unwrap_or(0), // X (unoverridden generic) -> 0
+                            None => {
+                                self.err(d.span(), "waveform delay must be constant");
+                                return None;
+                            }
+                        }
+                    }
+                    None => 0,
+                };
+                stmts.push(Stmt::AssignDelayed {
                     lhs: lhs.clone(),
                     rhs: val,
-                    nba: false,
-                };
-                stmts.push(if t > prev {
-                    Stmt::Delay {
-                        time_fs: t - prev,
-                        stmt: Box::new(a),
-                    }
-                } else {
-                    a
+                    delay: Expr::Lit(Value::from_u64(64, t_fs)),
                 });
-                prev = t;
             }
             let body = if stmts.len() == 1 {
                 stmts.pop().unwrap()
             } else {
                 Stmt::Block(stmts)
+            };
+            if rhs_sigs.is_empty() {
+                // A waveform reading no signal: schedule once, no wake source.
+                return Some(ConcOut::Proc(ProcessIr {
+                    kind: ProcKind::Initial,
+                    sens: Sens::List(Vec::new()),
+                    body,
+                    origin: format!("concurrent assign #{}", idx),
+                    initial: false,
+                }));
+            }
+            // Loop with a trailing `wait on <rhs signals>` so each RHS event
+            // re-executes the assignment. The explicit Wait parks in
+            // `self.waiting`; no implicit sens re-park (which would miss the
+            // process's own writes).
+            let wake = Stmt::Wait {
+                sens: rhs_sigs
+                    .iter()
+                    .map(|s| Edge {
+                        sig: *s,
+                        kind: EdgeKind::Any,
+                    })
+                    .collect(),
+                body: Box::new(Stmt::Null),
+            };
+            let body = Stmt::For {
+                init: Box::new(Stmt::Null),
+                cond: Expr::Lit(Value::from_u64(1, 1)),
+                step: Box::new(Stmt::Null),
+                body: Box::new(Stmt::Block(vec![body, wake])),
             };
             return Some(ConcOut::Proc(ProcessIr {
                 kind: ProcKind::Initial,
@@ -5796,6 +5824,7 @@ impl<'a> Lower<'a> {
         let mut cond = None;
         let mut sens = None;
         let mut time_fs = None;
+        let mut time_expr = None;
         let mut i = 0;
         while i < kids.len() {
             let k = &kids[i];
@@ -5814,7 +5843,9 @@ impl<'a> Lower<'a> {
                     "for" => {
                         // Physical literal: `10 ns`. The parser may merge number
                         // and unit into one Literal token, or leave the unit as
-                        // a separate Ident sibling.
+                        // a separate Ident sibling. A non-literal expression
+                        // (`for C_TIMEOUT - now`) lowers to an arbitrary time
+                        // expression — evaluated when the wait executes.
                         let num = kids.get(i + 1);
                         if let Some(n) = num.filter(|k| k.kind() == SyntaxKind::Literal) {
                             let t = self.text(n);
@@ -5839,6 +5870,9 @@ impl<'a> Lower<'a> {
                             };
                             time_fs = Some(v.saturating_mul(mult));
                             i += 1;
+                        } else if let Some(e) = num.filter(|k| is_expr_node(k.kind())) {
+                            time_expr = Some(self.lower_expr(e, &self.consts.clone()));
+                            i += 1;
                         }
                     }
                     _ => {}
@@ -5846,37 +5880,69 @@ impl<'a> Lower<'a> {
             }
             i += 1;
         }
-        // `wait for 10 ns` → timed delay (takes precedence over a condition).
-        if let Some(t) = time_fs {
-            return Stmt::Delay {
-                time_fs: t,
-                stmt: Box::new(Stmt::Null),
+        // Timeout for `wait until`/`wait on`: literal fs, or the lowered
+        // expression (LRM 8.1: the timeout is evaluated when the wait runs).
+        let timeout = time_expr.or_else(|| time_fs.map(|fs| Expr::Lit(Value::from_u64(64, fs))));
+
+        // `wait for T;` — pure timed wait: literal → Delay, expression →
+        // timeout-only WaitUntil. No until/on clauses.
+        if cond.is_none() && sens.is_none() {
+            if let Some(t) = time_fs {
+                return Stmt::Delay {
+                    time_fs: t,
+                    stmt: Box::new(Stmt::Null),
+                };
+            }
+            if let Some(te) = timeout {
+                return Stmt::WaitUntil {
+                    cond: None,
+                    sens: Vec::new(),
+                    timeout: Some(te),
+                };
+            }
+            // Bare `wait;` — park forever.
+            return Stmt::Wait {
+                sens: Vec::new(),
+                body: Box::new(Stmt::Null),
             };
         }
-        // `wait until rising_edge(clk)` → edge wait; `wait until expr` → any-edge on expr's signals.
-        if let Some(c) = &cond {
-            if let Some(e) = edges_from_cond(c, self) {
-                return Stmt::Wait {
-                    sens: e,
-                    body: Box::new(Stmt::Null),
-                };
-            }
-        }
-        if let Some(sl) = sens.as_ref() {
+
+        // Explicit `on` list wins over cond-derived edges (LRM 8.1).
+        let edges = if let Some(sl) = sens.as_ref() {
             if sl.kind() == SyntaxKind::SensList {
-                return Stmt::Wait {
-                    sens: match self.lower_sens_list(sl) {
-                        Sens::List(es) => es,
-                        Sens::All => Vec::new(),
-                    },
-                    body: Box::new(Stmt::Null),
-                };
+                Some(match self.lower_sens_list(sl) {
+                    Sens::List(es) => es,
+                    Sens::All => Vec::new(),
+                })
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        let edges = edges.or_else(|| cond.as_ref().and_then(|c| edges_from_cond(c, self)));
+
+        // A pure `rising_edge(s)`/`falling_edge(s)` condition is fully encoded
+        // by its edge kind — no re-check. Any other condition wakes on any
+        // event of its signals and re-checks the full expression (slightly
+        // over-sensitive vs the LRM, but never misses the true wake).
+        let recheck = match &cond {
+            Some(Expr::Rising(inner)) | Some(Expr::Falling(inner)) => {
+                !matches!(inner.as_ref(), Expr::Sig(_))
+            }
+            _ => true,
+        };
+        if edges.is_none() && timeout.is_none() {
+            // No wake source at all: the process can never resume.
+            self.warn(
+                s.span(),
+                "wait statement has no sensitivity, condition signals, or timeout — it can never resume",
+            );
         }
-        // Bare `wait;` — park forever.
-        Stmt::Wait {
-            sens: Vec::new(),
-            body: Box::new(Stmt::Null),
+        Stmt::WaitUntil {
+            cond: if recheck { cond } else { None },
+            sens: edges.unwrap_or_default(),
+            timeout,
         }
     }
 
@@ -6303,7 +6369,9 @@ impl<'a> Lower<'a> {
                         | "mhz"
                         | "ghz"
                 ) {
-                    return Expr::Lit(Value::from_u64(32, time_unit_fs(&key)));
+                    // Physical unit constants (`ns`, `ms`, ...) are values of
+                    // type `time` — 64-bit, else `30 ms` truncates to µs.
+                    return Expr::Lit(Value::from_u64(64, time_unit_fs(&key)));
                 }
                 // Bare state-variable reference inside a protected-type body:
                 // read the field of `$this` (`$getf::t::field@lsb,w`).
@@ -7225,7 +7293,8 @@ impl<'a> Lower<'a> {
                         .map(|f| (f * time_unit_fs(unit.trim()) as f64) as u64)
                         .unwrap_or(0),
                 };
-                return Expr::Lit(Value::from_u64(32, fs));
+                // Time is femtoseconds — 64-bit, else `30 ms` overflows 32 bits.
+                return Expr::Lit(Value::from_u64(64, fs));
             }
         }
         // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` / signed

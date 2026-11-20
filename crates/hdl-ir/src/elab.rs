@@ -740,6 +740,21 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
                 .collect(),
             body: Box::new(remap_stmt(body, map)),
         },
+        Stmt::WaitUntil {
+            cond,
+            sens,
+            timeout,
+        } => Stmt::WaitUntil {
+            cond: cond.as_ref().map(|c| remap_expr(c, map)),
+            sens: sens
+                .iter()
+                .map(|e| Edge {
+                    sig: map[e.sig as usize],
+                    kind: e.kind,
+                })
+                .collect(),
+            timeout: timeout.as_ref().map(|t| remap_expr(t, map)),
+        },
         Stmt::SysCall { name, args } => Stmt::SysCall {
             name: name.clone(),
             args: args.iter().map(|a| remap_expr(a, map)).collect(),

@@ -30,16 +30,21 @@ begin
     end process;
 
     process
-        -- one mul case: pulse start_m, wait done_m, compare res_m
+        -- one mul case: raise start_m until done_m pulses, then compare res_m.
+        -- The waits carry timeouts so a lost handshake fails loudly instead of
+        -- hanging the simulation.
         -- (written out inline per case to stay within the supported subset)
     begin
         -- ===== fp_mul =====
         -- 1.5 * 2.0 = 3.0
         a <= x"3FC00000"; b <= x"40000000"; start_m <= '1';
-        wait until rising_edge(clk);
+        wait until done_m = '1' for 100 ns;
         start_m <= '0';
-        wait until done_m = '0';  -- previous done pulse clears at the next edge
-        wait until done_m = '1';
+        if done_m /= '1' then
+            report "FAIL: fp_mul handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_m = '0' for 100 ns;
         if res_m = x"40400000" then
             report "PASS: fp_mul 1.5*2.0 = 3.0";
         else
@@ -49,10 +54,13 @@ begin
         end if;
         -- -1.5 * 2.0 = -3.0
         a <= x"BFC00000"; b <= x"40000000"; start_m <= '1';
-        wait until rising_edge(clk);
+        wait until done_m = '1' for 100 ns;
         start_m <= '0';
-        wait until done_m = '0';  -- previous done pulse clears at the next edge
-        wait until done_m = '1';
+        if done_m /= '1' then
+            report "FAIL: fp_mul handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_m = '0' for 100 ns;
         if res_m = x"C0400000" then
             report "PASS: fp_mul -1.5*2.0 = -3.0";
         else
@@ -62,10 +70,13 @@ begin
         end if;
         -- 2.0 * 3.0 = 6.0
         a <= x"40000000"; b <= x"40400000"; start_m <= '1';
-        wait until rising_edge(clk);
+        wait until done_m = '1' for 100 ns;
         start_m <= '0';
-        wait until done_m = '0';  -- previous done pulse clears at the next edge
-        wait until done_m = '1';
+        if done_m /= '1' then
+            report "FAIL: fp_mul handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_m = '0' for 100 ns;
         if res_m = x"40C00000" then
             report "PASS: fp_mul 2.0*3.0 = 6.0";
         else
@@ -75,10 +86,13 @@ begin
         end if;
         -- 1.5 * 0.0 = +0.0
         a <= x"3FC00000"; b <= x"00000000"; start_m <= '1';
-        wait until rising_edge(clk);
+        wait until done_m = '1' for 100 ns;
         start_m <= '0';
-        wait until done_m = '0';  -- previous done pulse clears at the next edge
-        wait until done_m = '1';
+        if done_m /= '1' then
+            report "FAIL: fp_mul handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_m = '0' for 100 ns;
         if res_m = x"00000000" then
             report "PASS: fp_mul 1.5*0.0 = +0.0";
         else
@@ -88,10 +102,13 @@ begin
         end if;
         -- NaN * 2.0 = NaN (0x7FC00000)
         a <= x"7FC00000"; b <= x"40000000"; start_m <= '1';
-        wait until rising_edge(clk);
+        wait until done_m = '1' for 100 ns;
         start_m <= '0';
-        wait until done_m = '0';  -- previous done pulse clears at the next edge
-        wait until done_m = '1';
+        if done_m /= '1' then
+            report "FAIL: fp_mul handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_m = '0' for 100 ns;
         if res_m = x"7FC00000" then
             report "PASS: fp_mul NaN*2.0 = NaN";
         else
@@ -102,10 +119,13 @@ begin
         -- ===== fp_add =====
         -- 1.5 + 2.25 = 3.75
         a <= x"3FC00000"; b <= x"40100000"; start_a <= '1';
-        wait until rising_edge(clk);
+        wait until done_a = '1' for 100 ns;
         start_a <= '0';
-        wait until done_a = '0';  -- previous done pulse clears at the next edge
-        wait until done_a = '1';
+        if done_a /= '1' then
+            report "FAIL: fp_add handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_a = '0' for 100 ns;
         if res_a = x"40700000" then
             report "PASS: fp_add 1.5+2.25 = 3.75";
         else
@@ -115,10 +135,13 @@ begin
         end if;
         -- 1.0 + (-1.0) = +0.0
         a <= x"3F800000"; b <= x"BF800000"; start_a <= '1';
-        wait until rising_edge(clk);
+        wait until done_a = '1' for 100 ns;
         start_a <= '0';
-        wait until done_a = '0';  -- previous done pulse clears at the next edge
-        wait until done_a = '1';
+        if done_a /= '1' then
+            report "FAIL: fp_add handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_a = '0' for 100 ns;
         if res_a = x"00000000" then
             report "PASS: fp_add 1.0+(-1.0) = +0.0";
         else
@@ -128,10 +151,13 @@ begin
         end if;
         -- 3.75 + (-1.5) = 2.25
         a <= x"40700000"; b <= x"BFC00000"; start_a <= '1';
-        wait until rising_edge(clk);
+        wait until done_a = '1' for 100 ns;
         start_a <= '0';
-        wait until done_a = '0';  -- previous done pulse clears at the next edge
-        wait until done_a = '1';
+        if done_a /= '1' then
+            report "FAIL: fp_add handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_a = '0' for 100 ns;
         if res_a = x"40100000" then
             report "PASS: fp_add 3.75+(-1.5) = 2.25";
         else
@@ -141,10 +167,13 @@ begin
         end if;
         -- 0.5 + 0.25 = 0.75
         a <= x"3F000000"; b <= x"3E800000"; start_a <= '1';
-        wait until rising_edge(clk);
+        wait until done_a = '1' for 100 ns;
         start_a <= '0';
-        wait until done_a = '0';  -- previous done pulse clears at the next edge
-        wait until done_a = '1';
+        if done_a /= '1' then
+            report "FAIL: fp_add handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_a = '0' for 100 ns;
         if res_a = x"3F400000" then
             report "PASS: fp_add 0.5+0.25 = 0.75";
         else
@@ -154,10 +183,13 @@ begin
         end if;
         -- 1.0 + 1.0 = 2.0 (carry path)
         a <= x"3F800000"; b <= x"3F800000"; start_a <= '1';
-        wait until rising_edge(clk);
+        wait until done_a = '1' for 100 ns;
         start_a <= '0';
-        wait until done_a = '0';  -- previous done pulse clears at the next edge
-        wait until done_a = '1';
+        if done_a /= '1' then
+            report "FAIL: fp_add handshake timeout" severity error;
+            errors := errors + 1;
+        end if;
+        wait until done_a = '0' for 100 ns;
         if res_a = x"40000000" then
             report "PASS: fp_add 1.0+1.0 = 2.0";
         else

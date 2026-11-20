@@ -65,6 +65,8 @@ pub fn coverage_universe(design: &Design) -> (HashSet<Span>, HashSet<Span>) {
                 }
             }
             Stmt::Delay { stmt, .. } | Stmt::Wait { body: stmt, .. } => walk(stmt, lines, branches),
+            // `wait until` has no nested statement to cover.
+            Stmt::WaitUntil { .. } => {}
             Stmt::For {
                 init, step, body, ..
             } => {
