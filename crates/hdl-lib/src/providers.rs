@@ -293,7 +293,7 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
 /// Design-unit names defined by a VHDL file, tagged with body-ness: entities,
 /// packages, and configurations (the name is the first identifier that isn't
 /// a keyword); a `package body p;` tags `p` as a body-only file.
-fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
+pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
         return Vec::new();

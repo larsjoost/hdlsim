@@ -95,6 +95,19 @@ pub enum ElabError {
 /// available and elaboration should retry.
 pub trait UnitResolver {
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String>;
+    /// Produce (or reuse) a variant of `unit` (a module name, possibly
+    /// `entity/arch`) re-lowered with the constant `params` overrides from an
+    /// instantiation's `generic map` / `#(...)`; returns the variant module
+    /// name, or `None` when unsupported (elaboration then falls back to the
+    /// default-generics module).
+    fn resolve_variant(
+        &mut self,
+        _design: &mut Design,
+        _unit: &str,
+        _params: &HashMap<String, Value>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// Resolver that never loads anything (all units must be compiled up front).
@@ -136,6 +149,7 @@ pub fn elaborate_with_opts(
     }
     let mut tried: Vec<String> = Vec::new();
     loop {
+        bind_param_variants(design, resolver).map_err(ElabError::Message)?;
         match try_elaborate(design, top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
             Err(ElabError::UnknownUnit { name, .. }) => {
@@ -158,6 +172,50 @@ pub fn elaborate_with_opts(
                 });
             }
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Rewrite instance module references to generic-map variants: for every
+/// instance with constant `param_overrides` whose target module declares
+/// params, ask the resolver for a variant module re-lowered with those
+/// overrides and point the instance at it. Repeats to a fixpoint (variants
+/// may carry their own instances with overrides).
+fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> Result<(), String> {
+    loop {
+        let mut changed = false;
+        for mi in 0..design.modules.len() {
+            for ii in 0..design.modules[mi].instances.len() {
+                if design.modules[mi].instances[ii].param_overrides.is_empty() {
+                    continue;
+                }
+                let unit = design.modules[mi].instances[ii].module.clone();
+                let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+                    continue;
+                };
+                // Only VHDL entities can be re-lowered as generic-map variants.
+                if !design.modules[tid].is_vhdl || design.modules[tid].params.is_empty() {
+                    continue;
+                }
+                let mut params: HashMap<String, Value> = HashMap::new();
+                for (n, e) in &design.modules[mi].instances[ii].param_overrides {
+                    if let Expr::Lit(v) = e {
+                        params.insert(n.to_ascii_lowercase(), v.clone());
+                    }
+                }
+                if params.is_empty() {
+                    continue;
+                }
+                if let Some(v) = resolver.resolve_variant(design, &unit, &params)? {
+                    if v != unit {
+                        design.modules[mi].instances[ii].module = v;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return Ok(());
         }
     }
 }
@@ -736,6 +794,7 @@ mod tests {
             functions: vec![],
             instances: vec![],
             time_unit_fs: 1000,
+            is_vhdl: false,
         };
         child.assigns.push(AssignIr {
             lhs: Expr::Sig(0),
@@ -757,6 +816,7 @@ mod tests {
                 config: None,
             }],
             time_unit_fs: 1000,
+            is_vhdl: false,
         };
         Design {
             modules: vec![top, child],
@@ -787,6 +847,7 @@ mod tests {
             functions: vec![],
             instances: vec![],
             time_unit_fs: 1000,
+            is_vhdl: false,
         };
         other.assigns.push(AssignIr {
             lhs: Expr::Sig(0),

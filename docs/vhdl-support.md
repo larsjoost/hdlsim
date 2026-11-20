@@ -42,6 +42,7 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | generic packages: `generic (…)` clause + `package p is new g generic map (…)` (design-unit or declarative part) | ✅ re-lowers the generic package with the map values as overrides; constants/types/functions all see them | `tests/vhdl_genpkg.rs` + parser test `parses_generic_package_declaration` |
 | parameterless function call without parentheses (`c_hi`) | ✅ | `tests/vhdl_genpkg.rs` |
 | `configuration` (top-level `for <arch>`) + `entity lib.unit(arch)` instantiation | ✅ per-arch variant modules `unit/arch`; default = configuration choice else last analyzed (IEEE rule) | `tests/vhdl_arch_select.rs` |
+| `generic map` on an instantiation re-binds the child's generics at elaboration | ✅ elab-time variant re-lower (`<entity>#<k=v,...>` modules): port widths and for-generate ranges use the mapped values; constant actuals only | `tests/vhdl_generic_map.rs` |
 | nested block configurations (`for … use entity …`) | ◐ parsed, not wired | parser tests |
 | `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501); `use lib.pkg.all;` is transitive through packages (what `pkg` itself used is visible too), as in VHDL | `tests/vhdl_std_arith.rs`, `tests/vhdl_osvvmish.rs`, corpus OSVVM files |
 

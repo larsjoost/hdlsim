@@ -214,6 +214,7 @@ pub fn wrap_top(design: &mut hdl_ir::Design, top: &str) -> Result<(), String> {
             config: None,
         }],
         time_unit_fs: m.time_unit_fs,
+        is_vhdl: m.is_vhdl,
     };
     design.modules.push(wrapper);
     Ok(())

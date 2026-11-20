@@ -419,6 +419,7 @@ mod tests {
             functions: Vec::new(),
             instances: Vec::new(),
             time_unit_fs: 1_000,
+            is_vhdl: false,
         }
     }
 

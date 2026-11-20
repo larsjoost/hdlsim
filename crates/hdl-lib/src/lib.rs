@@ -580,6 +580,115 @@ impl Default for LibraryManager {
 /// On-demand dependency resolution for elaboration: find the unit in the
 /// indexed libraries, compile its file, and report what was searched on a miss.
 impl UnitResolver for LibraryManager {
+    /// VHDL `generic map` variant: re-lower the entity (and its architectures
+    /// from the same file) with the constant overrides applied, registered as
+    /// `<entity>#<k=v,...>` modules, so elaboration binds the child's generics
+    /// (generate ranges, port widths, ...). `unit` may be `entity` or
+    /// `entity/arch`.
+    fn resolve_variant(
+        &mut self,
+        design: &mut Design,
+        unit: &str,
+        params: &HashMap<String, hdl_ir::Value>,
+    ) -> Result<Option<String>, String> {
+        let (ent, arch) = match unit.split_once('/') {
+            Some((e, a)) => (e.to_string(), Some(a.to_ascii_lowercase())),
+            None => (unit.to_string(), None),
+        };
+        let lname = ent.to_ascii_lowercase();
+        let mut items: Vec<(String, u64)> = params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_u64().unwrap_or(0)))
+            .collect();
+        items.sort();
+        let suffix = format!(
+            "#{}",
+            items
+                .iter()
+                .map(|(k, v)| format!("{k}={v:x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let vbase = format!("{lname}{suffix}");
+        let want = match &arch {
+            Some(a) => format!("{vbase}/{a}"),
+            None => vbase.clone(),
+        };
+        if design.modules.iter().any(|m| m.name == want) {
+            return Ok(Some(want));
+        }
+        self.ensure_stem_index();
+        let mut cands: Vec<PathBuf> = self
+            .stem_index
+            .get(&lname)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        if cands.is_empty() {
+            self.ensure_index();
+            cands = self
+                .index
+                .get(&lname)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+        }
+        if cands.is_empty() {
+            cands = self.search_project(&lname);
+        }
+        for path in cands {
+            // VHDL variants only — a Verilog `#(...)` override keeps the
+            // default-parameter behavior.
+            if !matches!(
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .as_deref(),
+                Some("vhd") | Some("vhdl")
+            ) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let units = crate::providers::vhdl_units_in_file(&path, &text);
+            if !units.iter().any(|(n, _)| n.eq_ignore_ascii_case(&lname)) {
+                continue;
+            }
+            let Ok(id) = self.db.add_file(path.display().to_string(), text) else {
+                continue;
+            };
+            let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
+            let mut lower_diags = Vec::new();
+            let modules = hdl_ir::vhdl_lower::lower_entity_variant(
+                &self.db,
+                &mut lower_diags,
+                &design.packages,
+                &design.configurations,
+                &parsed.root,
+                &lname,
+                params,
+                &suffix,
+            );
+            self.diags.extend(lower_diags);
+            if modules.is_empty() {
+                continue;
+            }
+            design.modules.extend(modules);
+            if design.modules.iter().any(|m| m.name == want) {
+                return Ok(Some(want));
+            }
+            if arch.is_none() && design.modules.iter().any(|m| m.name == vbase) {
+                return Ok(Some(vbase));
+            }
+        }
+        Ok(None)
+    }
+
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
         // Staged lookup: cheap file-stem index (no parsing) → in-memory
         // built-ins → full parse scan of directory providers → project search.
