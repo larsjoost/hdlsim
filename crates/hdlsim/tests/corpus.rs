@@ -19,26 +19,98 @@ fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
 }
 
-/// `(subdir, files)` groups — each group is compiled together as one library.
-fn corpus_groups() -> Vec<(&'static str, Vec<PathBuf>)> {
+fn is_source_file(p: &Path) -> bool {
+    matches!(
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("v") | Some("sv") | Some("vhd") | Some("vhdl")
+    )
+}
+
+fn dir_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file() && is_source_file(p))
+        .collect();
+    files.sort();
+    files
+}
+
+/// All directories under `root` (recursive) that directly hold source files.
+fn collect_group_dirs(root: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(root) {
+        let mut entries: Vec<PathBuf> = rd.map(|e| e.unwrap().path()).collect();
+        entries.sort();
+        if entries.iter().any(|p| p.is_file() && is_source_file(p)) {
+            out.push(root.to_path_buf());
+        }
+        for p in entries {
+            if p.is_dir() {
+                collect_group_dirs(&p, out);
+            }
+        }
+    }
+}
+
+/// `(group, files)` groups — each group is compiled together as one library.
+/// The OSVVM model tree (`vhdl-osvvm/<repo>/...`) is split per source directory:
+/// each testbench directory is its own `work` library (its `TestCtrl` entity
+/// must not collide with another testbench's), while each repo's `src` trees
+/// are registered under the repo's logical library name.
+fn corpus_groups() -> Vec<(String, Vec<PathBuf>)> {
     let mut out = Vec::new();
     for sub in ["verilog", "vhdl", "vhdl-vunit"] {
-        let dir = corpus_dir().join(sub);
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
+        out.push((sub.to_string(), dir_sources(&corpus_dir().join(sub))));
+    }
+    // OSVVM model repos are grouped per subproject (`vhdl-osvvm/<repo>/<sub>`
+    // when the repo has subdirs, else `vhdl-osvvm/<repo>`): each subproject's
+    // testbench entity (e.g. one `TestCtrl` per subproject) is then unique
+    // within its group's `work` library. Duplicate-unit files (same unit name
+    // in several testbench variants of a subproject) are excluded from the
+    // corpus — see corpus/README.md.
+    let osvvm_root = corpus_dir().join("vhdl-osvvm");
+    if let Ok(rd) = std::fs::read_dir(&osvvm_root) {
+        let mut repos: Vec<PathBuf> = rd
             .map(|e| e.unwrap().path())
-            .filter(|p| {
-                matches!(
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.to_ascii_lowercase())
-                        .as_deref(),
-                    Some("v") | Some("sv") | Some("vhd") | Some("vhdl")
-                )
-            })
+            .filter(|p| p.is_dir())
             .collect();
-        files.sort();
-        out.push((sub, files));
+        repos.sort();
+        for repo in repos {
+            let has_files = std::fs::read_dir(&repo)
+                .map(|rd| rd.filter_map(|e| e.ok()).any(|e| is_source_file(&e.path())))
+                .unwrap_or(false);
+            let kids: Vec<PathBuf> = std::fs::read_dir(&repo)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let groups = if !kids.is_empty() && !has_files {
+                kids
+            } else {
+                vec![repo.clone()]
+            };
+            for g in groups {
+                let mut dirs = Vec::new();
+                collect_group_dirs(&g, &mut dirs);
+                let mut files = Vec::new();
+                for d in dirs {
+                    files.extend(dir_sources(&d));
+                }
+                files.sort();
+                let rel = g
+                    .strip_prefix(corpus_dir())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, files));
+            }
+        }
     }
     out
 }
@@ -59,11 +131,39 @@ fn rel_path(f: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Logical library name of an OSVVM model repo dir (`vhdl-osvvm/<repo>`).
+fn osvvm_repo_lib(repo: &str) -> Option<&'static str> {
+    Some(match repo {
+        "axi4" => "osvvm_axi4",
+        "osvvm-common" => "osvvm_common",
+        "uart" => "osvvm_uart",
+        "avalonst" => "osvvm_avalonst",
+        "wishbone" => "osvvm_wishbone",
+        "ethernet" => "osvvm_ethernet",
+        "dpram" => "osvvm_dpram",
+        "spacewiremonitor" => "osvvm_spacewire",
+        _ => return None,
+    })
+}
+
+/// One parse-cache directory shared by all group compiles in this test process
+/// (the OSVVM tree is split into per-directory groups, and each group would
+/// otherwise re-parse the shared `src` libraries).
+fn shared_cache_dir() -> &'static PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("hdlsim-corpus-cache-{}", std::process::id()))
+    })
+}
+
 /// Compile one group as a single library, registering the directory under the
 /// logical library names its files declare in `library` clauses.
 fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
     let dir = corpus_dir().join(sub);
     let mut mgr = LibraryManager::new();
+    if let Some(c) = hdl_lib::cache::Cache::open(shared_cache_dir().clone()) {
+        mgr.enable_cache(c);
+    }
     match sub {
         "vhdl" => {
             mgr.add_library_dir("neorv32", &dir);
@@ -78,6 +178,36 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
             mgr.add_library_dir("vunit", &dir);
             mgr.add_library_dir("vunit_lib", &dir);
             mgr.add_library_dir("work", &dir);
+            mgr.add_library_dir("osvvm", &corpus_dir().join("vhdl"));
+        }
+        // OSVVM model tree: `work` is the group's own directory (per-testbench
+        // `work.TestCtrl` etc. must not collide across testbenches); every
+        // repo's `src` tree is registered under the repo's logical library
+        // name (osvvm_axi4, osvvm_common, ...); the OSVVM core comes from the
+        // `vhdl/` group.
+        _ if sub.starts_with("vhdl-osvvm/") => {
+            mgr.add_library_dir("work", &dir);
+            let mut src_dirs = Vec::new();
+            collect_group_dirs(&corpus_dir().join("vhdl-osvvm"), &mut src_dirs);
+            for sd in &src_dirs {
+                let rel = sd
+                    .strip_prefix(corpus_dir().join("vhdl-osvvm"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let mut comps = rel.split('/');
+                let repo = comps.next().unwrap_or("");
+                // Only `src` trees are library code, not testbench dirs.
+                if !rel.split('/').any(|c| c.eq_ignore_ascii_case("src")) {
+                    continue;
+                }
+                if let Some(lib) = osvvm_repo_lib(repo) {
+                    mgr.add_library_dir(lib, sd);
+                }
+                if repo == "spacewiremonitor" {
+                    mgr.add_library_dir("spacewire_light", sd);
+                }
+            }
             mgr.add_library_dir("osvvm", &corpus_dir().join("vhdl"));
         }
         _ => {
@@ -197,7 +327,7 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
         let mut with_diags = 0;
         for (sub, files) in corpus_groups() {
             // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
-            let mgr = compile_group(sub, &files);
+            let mgr = compile_group(&sub, &files);
             checked += files.len();
             let rendered = mgr.diags().render_all(mgr.db());
             if !mgr.diags().is_empty() {
@@ -248,7 +378,7 @@ fn corpus_files_meet_their_recorded_status() {
         let expected_path = corpus_dir().join("expected.json");
         let mut actual: HashMap<String, String> = HashMap::new();
         for (sub, files) in corpus_groups() {
-            for (rel, status) in group_statuses(sub, &files) {
+            for (rel, status) in group_statuses(&sub, &files) {
                 actual.insert(rel, status.to_string());
             }
         }

@@ -44,7 +44,11 @@ being silently ignored (`tests/vhdl_std_arith.rs`).
 | `configuration` (top-level `for <arch>`) + `entity lib.unit(arch)` instantiation | ✅ per-arch variant modules `unit/arch`; default = configuration choice else last analyzed (IEEE rule) | `tests/vhdl_arch_select.rs` |
 | `generic map` on an instantiation re-binds the child's generics at elaboration | ✅ elab-time variant re-lower (`<entity>#<k=v,...>` modules): port widths and for-generate ranges use the mapped values; constant actuals only | `tests/vhdl_generic_map.rs` |
 | nested block configurations (`for … use entity …`) | ◐ parsed, not wired | parser tests |
-| `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501); `use lib.pkg.all;` is transitive through packages (what `pkg` itself used is visible too), as in VHDL | `tests/vhdl_std_arith.rs`, `tests/vhdl_osvvmish.rs`, corpus OSVVM files |
+| `library` / `use` / `context` clauses | ✅ (unresolved `use` → W0501); `use lib.pkg.all;` is transitive through packages (what `pkg` itself used is visible too), as in VHDL. An architecture inherits its entity's context clauses and declarative items (constants/types) even when they live in a separate file (LRM 1076 §13.3/§1.2) | `tests/vhdl_std_arith.rs`, `tests/vhdl_osvvmish.rs`, `tests/vhdl_view.rs`, corpus OSVVM files |
+| VHDL-2019 `view` declaration (`view v of t is … end view;`), `view [(]v[)] of t` interface mode in port/generic/subprogram-parameter lists (incl. nested `view v` elements); view names register as type aliases of their subtype, `v'converse` aliases resolve | ✅ parsed + lowered (a view-mode port is a port of the subtype's type) | parser test `parses_vhdl2019_block_comments_views_and_external_names`, `tests/vhdl_view.rs`, corpus `vhdl-osvvm/` |
+| VHDL-2019 external names `<< signal|constant|variable ^.path.all : t >>` (expression primary and alias target) | ◐ parsed + lowered to a placeholder (X), not simulated | parser test above, `tests/vhdl_view.rs` |
+| VHDL-2019 `/* … */` block comments (non-nesting) | ✅ lexer | parser test above, corpus `vhdl-osvvm/` |
+| record alias `alias a : r.f'subtype is r.f;` — `a.field` selects slice the aliased expression (`alias_rec`); process-local aliases are lowered | ✅ | `tests/vhdl_view.rs`, corpus `vhdl-osvvm/` |
 
 ## Declarations
 

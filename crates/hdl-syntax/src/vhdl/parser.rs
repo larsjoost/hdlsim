@@ -153,6 +153,17 @@ impl<'a> Parser<'a> {
         t.kind == TokenKind::Punct && t.span.len() == 1 && self.peek_text() == c.to_string()
     }
 
+    /// Two adjacent single-char punct tokens forming a two-char sequence (`<<`, `>>`).
+    fn at_punct2(&self, s: &str) -> bool {
+        let a = self.peek();
+        let b = self.peek2();
+        a.kind == TokenKind::Punct
+            && b.kind == TokenKind::Punct
+            && a.span.len() == 1
+            && b.span.len() == 1
+            && format!("{}{}", self.peek_text(), self.peek2_text()) == s
+    }
+
     /// Three adjacent punct tokens forming a three-char operator (`?<=`, `?>=`).
     fn peek_op3(&self) -> Option<String> {
         let i0 = self.skip_trivia_from(self.pos);
@@ -683,16 +694,30 @@ impl<'a> Parser<'a> {
             return;
         }
         self.expect_punct(':', "before the mode/type");
-        // Optional mode after the colon: in/out/inout/buffer/linkage.
-        if self.at_kw("in")
+        // VHDL-2019 view mode: `bus : view ViewName of RecType` (the view
+        // name may be parenthesized: `view (V) of T`).
+        if self.at_kw("view") {
+            self.bump();
+            if self.eat_punct('(') {
+                self.parse_name(); // view name
+                self.expect_punct(')', "to close the parenthesized view name");
+            } else {
+                self.parse_name(); // view name
+            }
+            self.expect_kw("of", "in the view mode");
+            self.parse_type_mark();
+        } else if self.at_kw("in")
             || self.at_kw("out")
             || self.at_kw("inout")
             || self.at_kw("buffer")
             || self.at_kw("linkage")
         {
+            // Optional mode after the colon: in/out/inout/buffer/linkage.
             self.bump();
+            self.parse_type_mark();
+        } else {
+            self.parse_type_mark();
         }
-        self.parse_type_mark();
         while self.at_punct('(') {
             self.parse_constraint();
         }
@@ -745,6 +770,13 @@ impl<'a> Parser<'a> {
                 self.builder.finish_node();
             }
             _ if self.at_kw("alias") => self.parse_alias(),
+            // VHDL-2019 view declaration: `view name of subtype is ... end view;`.
+            _ if self.at_kw("view")
+                && self.peek2().kind == TokenKind::Ident
+                && self.peek3_text().eq_ignore_ascii_case("of") =>
+            {
+                self.parse_view_decl();
+            }
             _ if self.at_kw("attribute") => {
                 // `attribute a : type;` (decl) vs `attribute a of t : l is e;` (spec)
                 if self.peek3_text() == ":" {
@@ -866,7 +898,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_kw("is", "in the alias declaration");
-        self.parse_name();
+        if self.at_punct2("<<") {
+            // External-name alias: `alias x is << signal ^.dut.s : t >>;`.
+            self.parse_ext_name();
+        } else {
+            self.parse_name();
+        }
         if self.eat_punct('[') {
             // Subprogram signature after the name: `alias a is f[T, boolean return boolean];`
             let mut depth = 1;
@@ -893,6 +930,72 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(';', "to end the alias declaration");
+        self.builder.finish_node();
+    }
+
+    /// VHDL-2019 view declaration: `view name of subtype_indication is
+    /// { view element | decl } end view [name];`. View elements are
+    /// `name {, name} : [mode] [subtype_indication] ;` — the subtype may be
+    /// omitted because the view's own subtype provides it.
+    fn parse_view_decl(&mut self) {
+        self.start(SyntaxKind::ViewDecl);
+        self.bump(); // view
+        self.parse_name(); // view name
+        self.expect_kw("of", "in the view declaration");
+        self.parse_type_mark();
+        while self.at_punct('(') {
+            self.parse_constraint();
+        }
+        self.expect_kw("is", "in the view declaration");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("alias")
+                || self.at_kw("attribute")
+                || self.at_kw("use")
+                || self.at_kw("shared")
+            {
+                self.parse_decl();
+                continue;
+            }
+            self.start(SyntaxKind::PortDecl);
+            loop {
+                if self.peek().kind == TokenKind::Ident && !self.at_class_or_mode_kw() {
+                    self.parse_name();
+                }
+                if !self.eat_punct(',') {
+                    break;
+                }
+            }
+            self.expect_punct(':', "in the view element");
+            if self.at_kw("view") {
+                // Nested view element: `WriteAddress : view Axi4WriteAddressManagerView ;`
+                self.bump();
+                self.parse_name();
+                if self.eat_kw("of") {
+                    self.parse_type_mark();
+                    while self.at_punct('(') {
+                        self.parse_constraint();
+                    }
+                }
+            } else {
+                if self.at_class_or_mode_kw() {
+                    self.bump(); // mode: in/out/inout
+                }
+                if !self.at_punct(';') {
+                    self.parse_type_mark();
+                    while self.at_punct('(') {
+                        self.parse_constraint();
+                    }
+                }
+            }
+            self.expect_punct(';', "to end the view element");
+            self.builder.finish_node();
+        }
+        self.expect_kw("end", "to close the view declaration");
+        self.eat_kw("view");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional view name
+        }
+        self.expect_punct(';', "to end the view declaration");
         self.builder.finish_node();
     }
 
@@ -2420,6 +2523,74 @@ impl<'a> Parser<'a> {
 
     /// A name: `ident` with selected (`.b`), indexed (`(i)`), sliced
     /// (`(msb downto lsb)`), called (`(args)`), or attributed (`'attr`) suffixes.
+    /// VHDL-2008 external name: `<< signal|constant|variable path : subtype >>`.
+    fn parse_ext_name(&mut self) {
+        self.start(SyntaxKind::ExtName);
+        self.bump();
+        self.bump(); // <<
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // signal | constant | variable
+        }
+        self.parse_external_path();
+        self.expect_punct(':', "in the external name");
+        self.parse_type_mark();
+        if self.at_punct('(') {
+            self.parse_constraint();
+        }
+        if self.at_punct2(">>") {
+            self.bump();
+            self.bump(); // >>
+        } else {
+            self.error_here("expected '>>' to close the external name");
+        }
+        self.builder.finish_node();
+    }
+
+    /// External-name path: `[^] [. name]...` with optional indices and a
+    /// trailing `.all` (e.g. `^.Transmitter_1.TransRec`, `dut.bus.all`).
+    fn parse_external_path(&mut self) {
+        self.start(SyntaxKind::Name);
+        if self.at_punct('^') {
+            self.bump();
+        }
+        if self.at_punct('.') {
+            self.bump();
+        }
+        loop {
+            if matches!(
+                self.peek().kind,
+                TokenKind::Ident | TokenKind::StrLiteral | TokenKind::CharLiteral
+            ) {
+                self.bump();
+            } else {
+                self.error_here("expected a name in the external path");
+                break;
+            }
+            if self.at_punct('(') {
+                let mut depth = 1;
+                self.bump();
+                while depth > 0 && self.peek().kind != TokenKind::Eof {
+                    if self.at_punct('(') {
+                        depth += 1;
+                    } else if self.at_punct(')') {
+                        depth -= 1;
+                    }
+                    self.bump();
+                }
+            }
+            if self.at_punct('.') {
+                self.bump();
+                if self.at_kw("all") {
+                    self.bump();
+                    break; // trailing `.all`
+                }
+                continue;
+            }
+            break;
+        }
+        self.builder.finish_node();
+    }
+
     fn parse_name(&mut self) {
         let mark = self.builder.mark();
         if matches!(
@@ -2875,27 +3046,9 @@ impl<'a> Parser<'a> {
                 self.parse_name();
                 self.builder.finish_node();
             }
-            TokenKind::Punct if self.peek_text() == "<" && self.peek2_text() == "<" => {
+            TokenKind::Punct if self.at_punct2("<<") => {
                 // VHDL-2008 external name: `<< signal dut.s : std_logic >>`
-                self.start(SyntaxKind::ExtName);
-                self.bump();
-                self.bump(); // <<
-                if self.peek().kind == TokenKind::Ident {
-                    self.bump(); // signal | constant | variable
-                }
-                self.parse_name();
-                self.expect_punct(':', "in the external name");
-                self.parse_type_mark();
-                if self.at_punct('(') {
-                    self.parse_constraint();
-                }
-                if self.peek_text() == ">" && self.peek2_text() == ">" {
-                    self.bump();
-                    self.bump(); // >>
-                } else {
-                    self.error_here("expected '>>' to close the external name");
-                }
-                self.builder.finish_node();
+                self.parse_ext_name();
             }
             TokenKind::Ident if self.peek_text().eq_ignore_ascii_case("others") => {
                 self.start(SyntaxKind::Others);
@@ -3748,5 +3901,48 @@ end package;
             "{}",
             sexp
         );
+    }
+
+    #[test]
+    fn parses_vhdl2019_block_comments_views_and_external_names() {
+        // VHDL-2019: `/* */` block comments, view declarations, `view` interface
+        // mode (incl. parenthesized view name and nested view elements), and
+        // external names with `^`/`.all` paths — as alias targets too.
+        let sexp = ok(r#"package p is
+  /* block
+     comment */
+  type sub_t is record
+    addr : bit_vector(7 downto 0);
+  end record;
+  type rec_t is record
+    wa : sub_t;
+    wd : sub_t;
+  end record;
+  view subv of sub_t is
+    addr : out;
+  end view subv;
+  view v1 of rec_t is
+    wa : view subv;
+    wd : in;
+  end view v1;
+  alias v2 is v1'converse;
+end package;
+
+entity e is
+  port (
+    bus : view work.p.v1 of work.p.rec_t;
+    bus2 : view (v1) of rec_t
+  );
+end entity;
+
+architecture rtl of e is
+  alias ext is << signal ^.u0.internal_sig.all : bit_vector(3 downto 0) >>;
+begin
+end architecture;
+"#);
+        assert_eq!(sexp.matches("(ViewDecl").count(), 2, "{}", sexp);
+        assert!(sexp.contains("(ExtName"), "{}", sexp);
+        // The view-mode type mark is the subtype after `of`, not the view name.
+        assert!(sexp.contains("Ident \"of\" (Name Ident \"work\" Punct \".\" Ident \"p\" Punct \".\" Ident \"rec_t\")"), "{}", sexp);
     }
 }

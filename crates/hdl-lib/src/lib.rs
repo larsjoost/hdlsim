@@ -70,6 +70,12 @@ pub struct LibraryManager {
     /// VHDL architectures whose entity was not in the same file; re-bound
     /// design-wide once all known files are lowered (see `compile_files`).
     pending_archs: Vec<hdl_ir::vhdl_lower::PendingArch>,
+    /// Entity name → root of the file that declared it, so pending
+    /// architectures can inherit the entity's context clauses (LRM §13.3).
+    entity_roots: HashMap<String, hdl_syntax::cst::SyntaxNode>,
+    /// Entity name → signal maps + entity-declarative items, so pending
+    /// architectures (entity in another file) see the entity's scope.
+    entity_maps: HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
     /// `use`d library units that failed to resolve while compiling a file:
     /// (unit name, resolve error). Warned about at the end of `compile_files`
     /// if still unresolved (a later explicit file may still provide them).
@@ -104,6 +110,8 @@ impl LibraryManager {
             cache: None,
             cache_hits: 0,
             pending_archs: Vec::new(),
+            entity_roots: HashMap::new(),
+            entity_maps: HashMap::new(),
             unresolved_units: Vec::new(),
             search_roots: Vec::new(),
             search_index: None,
@@ -471,6 +479,8 @@ impl LibraryManager {
             cache,
             &mut self.cache_hits,
             &mut self.pending_archs,
+            &mut self.entity_roots,
+            &mut self.entity_maps,
             &mut self.verilog_scope,
         )
     }
@@ -565,6 +575,8 @@ impl LibraryManager {
             &mut design.modules,
             pending,
             emit_errors,
+            &self.entity_roots,
+            &self.entity_maps,
         );
         self.diags.extend(lower_diags);
         self.pending_archs = still;
@@ -914,6 +926,8 @@ pub fn compile_one(
     cache: Option<&cache::Cache>,
     cache_hits: &mut u64,
     pending_archs: &mut Vec<hdl_ir::vhdl_lower::PendingArch>,
+    entity_roots: &mut HashMap<String, hdl_syntax::cst::SyntaxNode>,
+    entity_maps: &mut HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
     verilog_scope: &mut verilog_lower::VerilogScope,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
@@ -990,6 +1004,12 @@ pub fn compile_one(
             diags.extend(lower_diags);
             design.modules.extend(lowered.modules);
             pending_archs.extend(lowered.pending);
+            for (name, root) in lowered.entity_roots {
+                entity_roots.entry(name).or_insert(root);
+            }
+            for (name, m) in lowered.entity_maps {
+                entity_maps.entry(name).or_insert(m);
+            }
             for c in lowered.configurations {
                 design
                     .configurations
