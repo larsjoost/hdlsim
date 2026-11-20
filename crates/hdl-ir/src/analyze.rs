@@ -115,6 +115,21 @@ fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) 
             }
             walk_stmt(body, driven, reads);
         }
+        Stmt::WaitUntil {
+            cond,
+            sens,
+            timeout,
+        } => {
+            for e in sens {
+                reads.insert(e.sig);
+            }
+            if let Some(c) = cond {
+                read(c, reads);
+            }
+            if let Some(t) = timeout {
+                read(t, reads);
+            }
+        }
         Stmt::SysCall { args, .. } => {
             for a in args {
                 read(a, reads);

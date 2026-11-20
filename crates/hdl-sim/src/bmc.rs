@@ -653,6 +653,8 @@ fn stmt_writes(s: &Stmt, out: &mut Vec<FlatSigId>) {
         Stmt::Assign { lhs, .. } | Stmt::AssignDelayed { lhs, .. } => lhs_roots(lhs, out),
         Stmt::Delay { stmt, .. } => stmt_writes(stmt, out),
         Stmt::Wait { body, .. } => stmt_writes(body, out),
+        // `wait until` writes nothing; there is no nested body.
+        Stmt::WaitUntil { .. } => {}
         Stmt::For {
             init, step, body, ..
         } => {
@@ -680,6 +682,7 @@ fn stmt_has_sva(s: &Stmt) -> bool {
         Stmt::Assign { .. } | Stmt::AssignDelayed { .. } | Stmt::Return(_) => false,
         Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
         Stmt::Wait { body, .. } => stmt_has_sva(body),
+        Stmt::WaitUntil { .. } => false,
         Stmt::For {
             init, step, body, ..
         } => stmt_has_sva(init) || stmt_has_sva(step) || stmt_has_sva(body),
@@ -975,6 +978,7 @@ fn extract_from_stmt(
             Ok(())
         }
         Stmt::Wait { body, .. } => extract_from_stmt(body, guards, delay + 1, origin, out),
+        Stmt::WaitUntil { .. } => Ok(()),
         // Other statements (assignments etc.) belong to the enclosing process,
         // which is still executed normally — only the asserts are extracted.
         _ => Ok(()),
@@ -1440,6 +1444,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                 Err("prove: delayed signal assignment (`after`) is not supported".to_string())
             }
             Stmt::Wait { .. } => Err("prove: `@wait` is not supported in processes".to_string()),
+            Stmt::WaitUntil { .. } => {
+                Err("prove: `wait until` is not supported in processes".to_string())
+            }
         }
     }
 

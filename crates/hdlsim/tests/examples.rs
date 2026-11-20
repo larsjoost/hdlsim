@@ -40,7 +40,7 @@ fn every_feature_example_prints_pass() {
     let mut failed = Vec::new();
     for f in feature_files() {
         let out = hdlsim()
-            .args(["run", "--top", "tb"])
+            .args(["run", "--top", "tb", "--max-time", "1ms"])
             .arg(&f)
             .output()
             .expect("runs hdlsim");

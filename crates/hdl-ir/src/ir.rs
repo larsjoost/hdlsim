@@ -204,6 +204,16 @@ pub enum Stmt {
         sens: Vec<Edge>,
         body: Box<Stmt>,
     },
+    /// VHDL `wait until cond [for T]` — park on `sens` edges; resume when
+    /// `cond` holds at an edge, or when the timeout expires (femtoseconds,
+    /// evaluated once when the wait executes). `cond: None` is a pure edge
+    /// wait (`wait until rising_edge(clk)`): the edge kind encodes the check,
+    /// no condition re-evaluation.
+    WaitUntil {
+        cond: Option<Expr>,
+        sens: Vec<Edge>,
+        timeout: Option<Expr>,
+    },
     SysCall {
         name: String,
         args: Vec<Expr>,
@@ -408,6 +418,21 @@ impl Stmt {
                     out.push(e.sig);
                 }
                 body.collect_sigs(out);
+            }
+            Stmt::WaitUntil {
+                cond,
+                sens,
+                timeout,
+            } => {
+                for e in sens {
+                    out.push(e.sig);
+                }
+                if let Some(c) = cond {
+                    c.collect_sigs(out);
+                }
+                if let Some(t) = timeout {
+                    t.collect_sigs(out);
+                }
             }
             Stmt::SysCall { args, .. } => {
                 for a in args {

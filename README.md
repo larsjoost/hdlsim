@@ -8,6 +8,17 @@ and no wrapping of GHDL, Icarus Verilog, Verilator, or any other existing
 simulator. Lexers, parsers, library manager, elaboration, simulation kernel, and
 the graphical wave display are all implemented here.
 
+**Primary aim: the debug and verification tool for AI-driven VHDL/Verilog
+development.** hdlsim is built for coding agents that write and debug HDL. An
+agent needs a simulator it can trust and drive programmatically: LRM-conformant
+semantics pinned by regression fixtures, deterministic reproducible runs,
+unambiguous pass/fail (exit code plus a zero-errors/zero-warnings bar), fast
+failure instead of deadlock (`--max-time`), and machine-readable diagnosis
+(`HDLSIM_TRACE=1` scheduler trace, rustc-style diagnostics, JUnit XML). The
+human-facing surface — wave windows, LSP, formatter — serves the same loop from
+the other side; every feature is judged by how well it shortens the agent's
+edit → simulate → diagnose cycle.
+
 ## Highlights
 
 - **Reusable syntax trees.** `hdl-syntax` exposes a lossless CST and typed AST for

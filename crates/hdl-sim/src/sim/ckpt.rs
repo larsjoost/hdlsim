@@ -15,7 +15,7 @@ use hdl_ir::{BinOp, Edge, EdgeKind, Expr, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -502,6 +502,31 @@ fn w_stmt(w: &mut W, s: &Stmt) {
             }
             w_stmt(w, body);
         }
+        Stmt::WaitUntil {
+            cond,
+            sens,
+            timeout,
+        } => {
+            w.u8(16);
+            match cond {
+                Some(c) => {
+                    w.bool(true);
+                    w_expr(w, c);
+                }
+                None => w.bool(false),
+            }
+            w.u32(sens.len() as u32);
+            for e in sens {
+                w_edge(w, e);
+            }
+            match timeout {
+                Some(t) => {
+                    w.bool(true);
+                    w_expr(w, t);
+                }
+                None => w.bool(false),
+            }
+        }
         Stmt::SysCall { name, args } => {
             w.u8(6);
             w.str(name);
@@ -627,6 +652,23 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             let body = Box::new(r_stmt(r)?);
             Stmt::Wait { sens, body }
         }
+        16 => {
+            let cond = if r.bool()? { Some(r_expr(r)?) } else { None };
+            let n = r.u32()? as usize;
+            if n > (1 << 16) {
+                return Err("too many sens edges".to_string());
+            }
+            let mut sens = Vec::with_capacity(n);
+            for _ in 0..n {
+                sens.push(r_edge(r)?);
+            }
+            let timeout = if r.bool()? { Some(r_expr(r)?) } else { None };
+            Stmt::WaitUntil {
+                cond,
+                sens,
+                timeout,
+            }
+        }
         6 => {
             let name = r.str()?;
             let n = r.u32()? as usize;
@@ -694,6 +736,27 @@ fn w_frame(w: &mut W, f: &Frame) {
             w_stmt(w, body);
             w.bool(*after_body);
         }
+        Frame::WaitUntilCheck {
+            cond,
+            edges,
+            deadline,
+            gen,
+        } => {
+            w.u8(3);
+            match cond {
+                Some(c) => {
+                    w.bool(true);
+                    w_expr(w, c);
+                }
+                None => w.bool(false),
+            }
+            w.u32(edges.len() as u32);
+            for e in edges {
+                w_edge(w, e);
+            }
+            w.u64(*deadline);
+            w.u64(*gen);
+        }
     }
 }
 
@@ -724,6 +787,23 @@ fn r_frame(r: &mut R) -> Result<Frame, String> {
             body: Box::new(r_stmt(r)?),
             after_body: r.bool()?,
         },
+        3 => {
+            let cond = if r.bool()? { Some(r_expr(r)?) } else { None };
+            let n = r.u32()? as usize;
+            if n > (1 << 16) {
+                return Err("too many wait edges".to_string());
+            }
+            let mut edges = Vec::with_capacity(n);
+            for _ in 0..n {
+                edges.push(r_edge(r)?);
+            }
+            Frame::WaitUntilCheck {
+                cond,
+                edges,
+                deadline: r.u64()?,
+                gen: r.u64()?,
+            }
+        }
         t => return Err(format!("bad Frame tag {}", t)),
     })
 }
@@ -752,11 +832,17 @@ fn w_ev(w: &mut W, e: &Ev) {
                 w.u32(*d);
             }
         }
+        Ev::WaitTimeout(pid, gen) => {
+            w.u8(3);
+            w.u32(*pid);
+            w.u64(*gen);
+        }
     }
 }
 fn r_ev(r: &mut R) -> Result<Ev, String> {
     match r.u8()? {
         0 => Ok(Ev::Resume(r.u32()?)),
+        3 => Ok(Ev::WaitTimeout(r.u32()?, r.u64()?)),
         1 => {
             let sig = r.u32()?;
             let v = r.value()?;

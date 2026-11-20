@@ -93,7 +93,7 @@ fn vhdl_radix_string(v: &Value, radix: u32) -> String {
     }
     out
 }
-use hdl_ir::{BinOp, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
+use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Scheduled future event.
@@ -101,6 +101,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 enum Ev {
     /// Resume a suspended process at a time.
     Resume(u32),
+    /// `wait until ... for T` timeout: pop the process's `WaitUntilCheck`
+    /// frame and resume it — but only if the frame's wake token matches
+    /// (`gen`); stale timeouts after an identical earlier wait are ignored.
+    WaitTimeout(u32, u64),
     /// A delayed signal transaction (VHDL `s <= v after t;`) landing at a
     /// time: applied in that time's NBA region.
     Nba(FlatSigId, Value, Option<u32>),
@@ -131,6 +135,18 @@ enum Frame {
         remaining: i64,
         body: Box<Stmt>,
         after_body: bool,
+    },
+    /// `wait until` check, on top of the frames while the process is parked.
+    /// On an edge wake the kernel re-evaluates `cond` (and re-parks on false);
+    /// on a timeout wake the kernel pops the frame directly. `gen` is a wake
+    /// token: each park increments a counter, and a timeout event only pops
+    /// the frame whose `gen` matches — stale timeouts from an earlier wait
+    /// (same pid, same deadline) are ignored.
+    WaitUntilCheck {
+        cond: Option<Expr>,
+        edges: Vec<Edge>,
+        deadline: u64,
+        gen: u64,
     },
 }
 
@@ -181,6 +197,10 @@ pub struct Simulator {
     finish_status: Option<i32>,
     /// Number of test failures seen (severity error/failure, `$error`/`$fatal`).
     failures: u64,
+    /// Wake-token counter for `wait until` parks (see `Frame::WaitUntilCheck`).
+    wait_gen: u64,
+    /// `HDLSIM_TRACE=1` — stderr execution trace of wait/wake scheduling.
+    trace_on: bool,
     monitor: Vec<Vec<Expr>>,
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
@@ -270,6 +290,8 @@ impl Simulator {
             finish_notified: false,
             finish_status: None,
             failures: 0,
+            wait_gen: 0,
+            trace_on: std::env::var("HDLSIM_TRACE").is_ok_and(|v| v == "1"),
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             objmem,
             objs: std::cell::RefCell::new(HashMap::new()),
@@ -480,6 +502,15 @@ impl Simulator {
         }
     }
 
+    /// Execution trace line (`HDLSIM_TRACE=1` on stderr): wait/wake events,
+    /// signal wakes, and timeouts — for debugging scheduler semantics without
+    /// a wave viewer.
+    fn trace(&self, msg: impl std::fmt::Display) {
+        if self.trace_on {
+            eprintln!("TRACE t={}fs: {}", self.time, msg);
+        }
+    }
+
     /// Record a test failure (emits [`SimEvent::TestFailed`]).
     fn fail(&mut self, text: String) {
         self.failures += 1;
@@ -627,6 +658,7 @@ impl Simulator {
                     for ev in evs {
                         match ev {
                             Ev::Resume(pid) => self.activate(pid),
+                            Ev::WaitTimeout(pid, gen) => self.wait_timeout(pid, gen),
                             Ev::Nba(sig, v, drv) => self.nba.push((sig, v, drv)),
                             Ev::NbaExpr(lhs, v, drv) => self.nba_exprs.push((lhs, v, drv)),
                         }
@@ -660,17 +692,54 @@ impl Simulator {
     /// would queue the process several times and re-run its body repeatedly.
     fn activate(&mut self, pid: u32) {
         if self.active.iter().any(|p| *p == pid) || self.waiting.iter().any(|(w, _)| *w == pid) {
+            self.trace(format!(
+                "activate {} skipped (in active={}, waiting={})",
+                self.flat.procs[pid as usize].origin,
+                self.active.iter().any(|p| *p == pid),
+                self.waiting.iter().any(|(w, _)| *w == pid)
+            ));
             return;
         }
+        self.trace(format!("activate {}", self.flat.procs[pid as usize].origin));
         self.active.push_back(pid);
     }
 
     /// Park a process on an event list, at most once per process.
     fn park(&mut self, pid: u32, edges: Vec<(FlatSigId, EdgeKind)>) {
         if self.waiting.iter().any(|(w, _)| *w == pid) {
+            self.trace(format!(
+                "{}: park SKIPPED, already parked ({} entries)",
+                self.flat.procs[pid as usize].origin,
+                self.waiting.iter().filter(|(w, _)| *w == pid).count()
+            ));
             return;
         }
+        self.trace(format!(
+            "{}: park on {:?}",
+            self.flat.procs[pid as usize].origin, edges
+        ));
         self.waiting.push((pid, edges));
+    }
+
+    /// A `wait until ... for T` timeout expired. Pop the process's check
+    /// frame and resume it — regardless of the condition (LRM 8.1). If the
+    /// wake token does not match, the process already resumed from an earlier
+    /// identical wait (or finished): ignore the stale event.
+    fn wait_timeout(&mut self, pid: u32, gen: u64) {
+        let matches = matches!(
+            self.proc_rt[pid as usize].frames.last(),
+            Some(Frame::WaitUntilCheck { gen: g, .. }) if *g == gen
+        );
+        if !matches {
+            return;
+        }
+        self.trace(format!(
+            "{}: wait until timeout fired",
+            self.flat.procs[pid as usize].origin
+        ));
+        self.proc_rt[pid as usize].frames.pop();
+        self.waiting.retain(|(w, _)| *w != pid);
+        self.activate(pid);
     }
 
     fn run_proc(&mut self, pid: u32) {
@@ -741,6 +810,9 @@ impl Simulator {
             ForStep,
             ForTest,
             RepeatTest,
+            /// Top frame is a `wait until` check: a wake arrived (an edge —
+            /// a timeout wake pops the frame first, in `wait_timeout`).
+            WaitCheck,
         }
         loop {
             let n = self.proc_rt[pid as usize].frames.len();
@@ -778,6 +850,7 @@ impl Simulator {
                         }
                         Act::RepeatTest
                     }
+                    Frame::WaitUntilCheck { .. } => Act::WaitCheck,
                 }
             };
             match action {
@@ -867,6 +940,37 @@ impl Simulator {
                     } else {
                         rt.frames.pop();
                     }
+                }
+                Act::WaitCheck => {
+                    // Reached only on an edge wake — a timeout wake pops the
+                    // frame before resuming (see `wait_timeout`). LRM 8.1:
+                    // re-check the condition; proceed on true/absent, re-park
+                    // on false. The original timeout event stays queued and
+                    // still fires if the re-park lasts until the deadline.
+                    let (proceed, edges) = match self.proc_rt[pid as usize].frames.last() {
+                        Some(Frame::WaitUntilCheck { cond, edges, .. }) => (
+                            match cond {
+                                None => true,
+                                Some(c) => truthy(&self.eval_expr(&c, None)),
+                            },
+                            edges.clone(),
+                        ),
+                        _ => (true, Vec::new()),
+                    };
+                    self.trace(format!(
+                        "{}: wake, cond {} -> {}",
+                        self.flat.procs[pid as usize].origin,
+                        if proceed { "true" } else { "false" },
+                        if proceed { "proceed" } else { "re-park" }
+                    ));
+                    if proceed {
+                        self.proc_rt[pid as usize].frames.pop();
+                        continue;
+                    }
+                    let parked: Vec<(FlatSigId, EdgeKind)> =
+                        edges.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                    self.park(pid, parked);
+                    return Control::Wait;
                 }
             }
         }
@@ -1004,6 +1108,53 @@ impl Simulator {
                     .frames
                     .push(Frame::block(vec![*body]));
                 self.park(pid, edges);
+                Control::Wait
+            }
+            Stmt::WaitUntil {
+                cond,
+                sens,
+                timeout,
+            } => {
+                // LRM 8.1: the timeout expression is evaluated once, when the
+                // wait executes. `None` → no timeout (park until an edge).
+                let deadline = match timeout {
+                    Some(t) => {
+                        let v = self.eval_expr(&t, None);
+                        self.time.saturating_add(v.to_u64().unwrap_or(0))
+                    }
+                    None => u64::MAX,
+                };
+                self.wait_gen += 1;
+                let gen = self.wait_gen;
+                self.proc_rt[pid as usize]
+                    .frames
+                    .push(Frame::WaitUntilCheck {
+                        cond: cond.clone(),
+                        edges: sens.clone(),
+                        deadline,
+                        gen,
+                    });
+                let edges: Vec<(FlatSigId, EdgeKind)> =
+                    sens.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                self.trace(format!(
+                    "{}: wait until ({} edges, deadline {})",
+                    self.flat.procs[pid as usize].origin,
+                    edges.len(),
+                    if deadline == u64::MAX {
+                        "none".to_string()
+                    } else {
+                        format!("{deadline}")
+                    }
+                ));
+                if !edges.is_empty() {
+                    self.park(pid, edges);
+                }
+                if deadline != u64::MAX {
+                    self.time_events
+                        .entry(deadline)
+                        .or_default()
+                        .push(Ev::WaitTimeout(pid, gen));
+                }
                 Control::Wait
             }
             Stmt::For {
@@ -1931,6 +2082,10 @@ impl Simulator {
                 .any(|(s, ek)| *s == sig && edge_of(ek));
             if hit {
                 let (pid, _) = self.waiting.remove(i);
+                self.trace(format!(
+                    "{}: woken by edge on signal {sig}",
+                    self.flat.procs[pid as usize].origin
+                ));
                 self.activate(pid);
             } else {
                 i += 1;
@@ -3132,7 +3287,7 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Break => Control::Break,
             Stmt::Continue => Control::Continue,
-            Stmt::Delay { .. } | Stmt::Wait { .. } => {
+            Stmt::Delay { .. } | Stmt::Wait { .. } | Stmt::WaitUntil { .. } => {
                 // The body runs inline inside one `sys_call`, so a suspend
                 // cannot return to the caller with its position saved. Warn
                 // instead of silently ignoring the statement.

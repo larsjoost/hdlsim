@@ -9,6 +9,13 @@ library manager, elaboration, simulation kernel, and graphical wave display,
 all implemented here (no wrapping of GHDL, Icarus, or Verilator). Used to
 simulate and debug HDL designs from the command line.
 
+**Primary aim:** the debug and verification tool for AI-driven VHDL/Verilog
+development. Features are judged by how well they serve an agent's
+edit → simulate → diagnose loop: LRM-conformant semantics pinned by regression
+fixtures, unambiguous pass/fail (exit code + zero errors/warnings), bounded
+runs (`--max-time`), and machine-readable diagnosis (`HDLSIM_TRACE=1`
+scheduler trace, rustc-style diagnostics, JUnit XML).
+
 ## Architecture overview
 
 Both language front-ends lower to a shared IR, so mixed VHDL/Verilog designs
