@@ -2302,6 +2302,9 @@ impl Simulator {
                 let n = v.to_u64().unwrap_or(1);
                 return Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64);
             }
+            // VHDL `type'val(x)` / `type'pos(x)` — numeric identity (width is
+            // applied by a Resize at the lower site).
+            "$val" | "$pos" if !args.is_empty() => return self.eval_expr(&args[0], locals),
             "unsigned" | "signed" => return self.eval_expr(&args[0], locals),
             // std.standard `now` — current simulation time in fs.
             "$now" => return Value::from_u64(64, self.time),

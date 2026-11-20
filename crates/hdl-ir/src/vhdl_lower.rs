@@ -5978,6 +5978,48 @@ impl<'a> Lower<'a> {
                     return Expr::ToString(Box::new(self.lower_expr(arg, env)));
                 }
             }
+            // `type'val(x)` / `type'pos(x)` — numeric identity, but 'val takes
+            // the prefix type's width (character'val(65) is 8 bits). Only take
+            // this path when the argument resolves in the current scope — a
+            // bare name that does not (e.g. an entity-declared enum literal
+            // used in an architecture) keeps the old call fallback.
+            if attr_name == "val" || attr_name == "pos" {
+                let arg = kids
+                    .iter()
+                    .enumerate()
+                    .find(|(i, k)| *i != ap && is_expr_node(k.kind()))
+                    .map(|(_, k)| k);
+                let resolvable = match arg {
+                    Some(a) if a.kind() == SyntaxKind::Name => {
+                        let k = self.kw(a).to_ascii_lowercase();
+                        env.contains_key(&k)
+                            || self.consts.contains_key(&k)
+                            || self.names.contains_key(&k)
+                            || self.funcs.contains_key(&k)
+                            || self.sig_id(&k).is_some()
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                if let (Some(arg), true) = (arg, resolvable) {
+                    let inner = Expr::Call {
+                        name: format!("${attr_name}"),
+                        args: vec![self.lower_expr(arg, env)],
+                    };
+                    if attr_name == "val" {
+                        let prefix = ak.iter().find(|k| k.kind() == SyntaxKind::Name).cloned();
+                        if let Some(pn) = prefix {
+                            let (w, _, _, _) = self.resolve_type(&pn, None, e.span());
+                            return Expr::Resize {
+                                e: Box::new(inner),
+                                width: w.max(1),
+                                signed: false,
+                            };
+                        }
+                    }
+                    return inner;
+                }
+            }
         }
         // The callee is the first Name child (absent for attribute calls like
         // `integer'image(x)`, where kids are [Attr, args...]). Arguments are
@@ -6874,7 +6916,7 @@ fn edges_from_cond(c: &Expr, lx: &Lower) -> Option<Vec<Edge>> {
 }
 
 /// String as a Value (first char in the high byte, matching `lower_literal`).
-fn string_value(s: &str) -> Value {
+pub(crate) fn string_value(s: &str) -> Value {
     let bytes = s.as_bytes();
     let n = bytes.len().max(1);
     let mut bits = vec![V0; n * 8];
