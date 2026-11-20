@@ -2,4 +2,10 @@
 .hdlsim-cache/
 *.vcd
 *.hwf
+
+# Local, private HDL designs used to exercise the simulator (see project/README.md).
+# Everything under project/ stays out of git — except its README, which documents
+# the layout and the privacy policy and contains no design information.
+/project/*
+!/project/README.md
 !crates/hdlsim/tests/fixtures/counter_golden.vcd
