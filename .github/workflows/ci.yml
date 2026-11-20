@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to the same branch makes the previous run obsolete: cancel it
+# instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: fmt + build + test
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,16 +24,49 @@ jobs:
         with:
           components: rustfmt
 
-      # The workspace uses only the vetted common crates from
-      # [workspace.dependencies]; they are fetched from crates.io here.
       - name: Check formatting
         run: cargo fmt --check
 
+  test:
+    name: build + test (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the registry and target dir (keyed on Cargo.lock and rustc
+      # version): only changed crates recompile between runs.
+      - name: Cache cargo (debug)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # The workspace uses only the vetted common crates from
+      # [workspace.dependencies]; they are fetched from crates.io here.
       - name: Build (debug)
         run: cargo build
 
       - name: Run tests
         run: cargo test
+
+  release-smoke:
+    name: release binary smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Distinct prefix key so the release target dir is cached separately
+      # from the debug one.
+      - name: Cache cargo (release)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: v0-rust-release
 
       - name: Build release binary and smoke-test it
         run: |
