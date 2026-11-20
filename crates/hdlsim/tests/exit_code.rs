@@ -96,6 +96,44 @@ fn verilog_finish_arg_is_not_exit_code() {
 }
 
 #[test]
+fn finish_status_inside_procedure_becomes_exit_code() {
+    // report + std.env.finish(status) inside a user procedure: the status
+    // is the exit code, the procedure's report is visible, and statements
+    // after the call in the same activation do not run.
+    let out = run("tb_proc_finish", "tests/fixtures/vhdl_proc_finish_tb.vhd");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("PROC RAN"), "{}", stdout);
+    assert!(
+        !stdout.contains("AFTER FINISH"),
+        "statements after finish must not run:\n{}",
+        stdout
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "std.env.finish(3) inside a procedure must exit 3\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn procedure_parameter_reaches_nested_finish() {
+    // wrap(2) → quit(code) → std.env.finish(code): bare-name arguments pass
+    // through nested procedure frames and the parameter becomes the status.
+    let out = run(
+        "tb_proc_param_finish",
+        "tests/fixtures/vhdl_proc_param_finish_tb.vhd",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "nested finish(parameter) must exit 2\n{}",
+        stdout
+    );
+}
+
+#[test]
 fn failures_print_report_hint() {
     // Usage error (exit 2): hint with the bundle command and the issue link.
     let out = hdlsim().args(["frobnicate"]).output().expect("runs");

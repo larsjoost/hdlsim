@@ -1026,6 +1026,9 @@ struct Lower<'a> {
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
+    /// Counter for path-less file declarations: each gets a unique
+    /// `$file:name#n` marker constant, resolved at runtime by file_open.
+    file_seq: u64,
 }
 
 /// Per-module signal metadata (`SigId` is relative to one module).
@@ -1079,6 +1082,7 @@ impl<'a> Lower<'a> {
             prot_body_ctx: None,
             sig_prot: HashMap::new(),
             pending_funcs: Vec::new(),
+            file_seq: 0,
         }
     }
 
@@ -3303,7 +3307,14 @@ impl<'a> Lower<'a> {
                 Some(p) => p.clone(),
                 None if n == "input" => "stdin".to_string(),
                 None if n == "output" => "stdout".to_string(),
-                None => String::new(),
+                // Path-less file: a unique marker constant, resolved at
+                // runtime — `$textio_file_open` binds it to the actual path
+                // (kernel-side map), writeline/readline consult the map.
+                None => {
+                    let marker = format!("$file:{}#{}", n, self.file_seq);
+                    self.file_seq += 1;
+                    marker
+                }
             };
             Rc::make_mut(&mut self.consts).insert(n, string_value(&p));
         }
@@ -5228,14 +5239,40 @@ impl<'a> Lower<'a> {
                     .unwrap_or(raw.as_str())
                     .to_ascii_lowercase();
                 let is_textio = TEXTIO_PROCS.contains(&fname.as_str());
-                // textio arguments are frequently plain names (`output`, `l`);
-                // for other calls keep skipping bare names (named associations).
+                // Association keys (`name => value`) are not arguments: drop
+                // a bare Name immediately followed by `=>`. Every other bare
+                // Name is a real positional argument — e.g. a variable passed
+                // to a user procedure — and must be kept.
+                let is_assoc_key: Vec<bool> = src
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        k.kind() == SyntaxKind::Name
+                            && src
+                                .get(i + 1)
+                                .map(|n| self.text(n) == "=>")
+                                .unwrap_or(false)
+                    })
+                    .collect();
                 let args: Vec<Expr> = src
                     .iter()
                     .enumerate()
-                    .filter(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()))
-                    .filter(|(_, k)| is_textio || k.kind() != SyntaxKind::Name)
-                    .map(|(_, k)| self.lower_expr(k, &self.consts.clone()))
+                    .filter(|(i, k)| {
+                        Some(*i) != name_pos && is_expr_node(k.kind()) && !is_assoc_key[*i]
+                    })
+                    .map(|(_, k)| {
+                        if k.kind() == SyntaxKind::Name {
+                            // A bare-name argument may reference something from
+                            // an unseen package/context — lower leniently to a
+                            // placeholder, like port-map association actuals.
+                            self.suppress_err += 1;
+                            let e = self.lower_expr(k, &self.consts.clone());
+                            self.suppress_err -= 1;
+                            e
+                        } else {
+                            self.lower_expr(k, &self.consts.clone())
+                        }
+                    })
                     .collect();
                 let name = if is_textio {
                     format!("$textio_{fname}")

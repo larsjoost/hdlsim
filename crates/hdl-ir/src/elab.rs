@@ -15,6 +15,7 @@
 use crate::ir::*;
 use crate::value::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub type FlatSigId = u32;
 pub type ScopeId = u32;
@@ -62,7 +63,9 @@ pub struct FlatFunc {
     pub ret_width: usize,
     /// Width of each slot; slot ids in the body index this vector.
     pub slots: Vec<usize>,
-    pub body: Stmt,
+    /// Shared handle: the kernel can execute a body while mutably borrowing
+    /// the simulator (procedure calls re-enter), and cloning stays cheap.
+    pub body: Arc<Stmt>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -280,7 +283,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
                 name: func.name.clone(),
                 ret_width: func.ret_width,
                 slots,
-                body: func.body.clone(),
+                body: Arc::new(func.body.clone()),
             });
         }
     }
@@ -479,7 +482,7 @@ impl Flat {
             }
             // Function bodies live in slot space (args then locals); the lowerer
             // already emitted slot ids, so do NOT remap them through the module map.
-            let body = f.body.clone();
+            let body = Arc::new(f.body.clone());
             let _ = (arg_ids, local_base);
             self.functions.push(FlatFunc {
                 name: f.name.clone(),

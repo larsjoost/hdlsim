@@ -204,6 +204,9 @@ pub struct Simulator {
     /// std.textio read positions: file path → lines already consumed by
     /// `readline` (RefCell so `endfile` can peek from &self expression eval).
     textio_pos: std::cell::RefCell<HashMap<String, usize>>,
+    /// Dynamically opened files: `$file:…` marker (or a literal-path file's
+    /// path) → the actual filesystem path bound by `$textio_file_open`.
+    open_files: HashMap<String, String>,
     /// Current object handle while executing a class method (`$this`).
     cur_obj: std::cell::Cell<u64>,
     /// External stop request (e.g. the live wave window's Stop button):
@@ -271,6 +274,7 @@ impl Simulator {
             objmem,
             objs: std::cell::RefCell::new(HashMap::new()),
             textio_pos: std::cell::RefCell::new(HashMap::new()),
+            open_files: HashMap::new(),
             cur_obj: std::cell::Cell::new(u64::MAX),
             stop_flag: None,
             monitor: Vec::new(),
@@ -778,7 +782,17 @@ impl Simulator {
             };
             match action {
                 Act::Exec(s) => match self.exec_stmt(pid, s) {
-                    Control::Done => continue,
+                    Control::Done => {
+                        // `$finish`/`std.env.finish` stop the process here —
+                        // statements after the call in this activation do not
+                        // run. Clear the frames so the process does not
+                        // resume into the rest of its body.
+                        if self.finished || self.stopped {
+                            self.proc_rt[pid as usize].frames.clear();
+                            return Control::Done;
+                        }
+                        continue;
+                    }
                     Control::Suspend(at) => return Control::Suspend(at),
                     Control::Wait => return Control::Wait,
                     Control::Break => {
@@ -1026,7 +1040,8 @@ impl Simulator {
                 Control::Done
             }
             Stmt::SysCall { name, args } => {
-                self.sys_call(&name, args);
+                // Process context: process variables are flat signals, no frame.
+                self.sys_call(&name, args, None);
                 Control::Done
             }
         }
@@ -1110,12 +1125,16 @@ impl Simulator {
 
     // ---- system tasks -------------------------------------------------------------
 
-    fn sys_call(&mut self, name: &str, args: Vec<Expr>) {
+    /// Dispatch a system call (builtin task/procedure or user subprogram).
+    /// `locals` is the subprogram frame when called from one: frame slots
+    /// (`Expr::Sig(i)` with `i < locals.len()`) shadow real signals, matching
+    /// `eval_expr`.
+    fn sys_call(&mut self, name: &str, args: Vec<Expr>, mut locals: Option<&mut Vec<Value>>) {
         match name {
             // `arr = new[n]` — resize a dynamic array / queue.
             "$array_new" => {
                 if let (Some(Expr::Sig(sig)), Some(n)) = (args.first(), args.get(1)) {
-                    let n = self.eval_expr(n, None).to_u64().unwrap_or(0) as usize;
+                    let n = self.eval_expr(n, locals.as_deref()).to_u64().unwrap_or(0) as usize;
                     let sig = *sig as FlatSigId;
                     let w = self.flat.signals[sig as usize].width;
                     self.mems[sig as usize].resize(n, Value::x(w.max(1)));
@@ -1132,7 +1151,7 @@ impl Simulator {
                         let w = self.flat.signals[sig as usize].width.max(1);
                         let margs: Vec<Value> = args[1..]
                             .iter()
-                            .map(|a| self.eval_expr(a, None).resize(w))
+                            .map(|a| self.eval_expr(a, locals.as_deref()).resize(w))
                             .collect();
                         match method {
                             "push_back" => {
@@ -1193,7 +1212,11 @@ impl Simulator {
                 if let Some(fi) = self.funcs.get(rest).copied() {
                     let obj = args
                         .first()
-                        .map(|a| self.eval_expr(a, None).to_u64().unwrap_or(u64::MAX))
+                        .map(|a| {
+                            self.eval_expr(a, locals.as_deref())
+                                .to_u64()
+                                .unwrap_or(u64::MAX)
+                        })
                         .unwrap_or(u64::MAX);
                     let saved = self.cur_obj.replace(obj);
                     self.run_func(fi, &args[1..], None);
@@ -1201,7 +1224,7 @@ impl Simulator {
                 }
             }
             "display" | "write" => {
-                let text = self.fmt_args(&args);
+                let text = self.fmt_args(&args, locals.as_deref());
                 let text = if name == "display" {
                     format!("{}\n", text)
                 } else {
@@ -1215,7 +1238,10 @@ impl Simulator {
             "monitor" => {
                 self.monitor.push(args);
                 self.monitor_last.push(None);
-                let text = self.fmt_args(&self.monitor[self.monitor.len() - 1].clone());
+                let text = self.fmt_args(
+                    &self.monitor[self.monitor.len() - 1].clone(),
+                    locals.as_deref(),
+                );
                 self.emit(SimEvent::Message {
                     text: format!("{}\n", text),
                     time_fs: self.time,
@@ -1224,16 +1250,16 @@ impl Simulator {
             "assert" => {
                 let ok = args
                     .first()
-                    .map(|a| truthy(&self.eval_expr(a, None)))
+                    .map(|a| truthy(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or(true);
                 if !ok {
                     let msg = args
                         .get(1)
-                        .map(|a| string_of(&self.eval_expr(a, None)))
+                        .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                         .unwrap_or_default();
                     let severity = args
                         .get(2)
-                        .map(|a| string_of(&self.eval_expr(a, None)))
+                        .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                         .unwrap_or_default()
                         .to_ascii_lowercase();
                     self.emit(SimEvent::Message {
@@ -1258,11 +1284,11 @@ impl Simulator {
             "report" => {
                 let msg = args
                     .first()
-                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_default();
                 let severity = args
                     .get(1)
-                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_default()
                     .to_ascii_lowercase();
                 self.emit(SimEvent::Message {
@@ -1288,7 +1314,7 @@ impl Simulator {
                 // failed test (unlike VHDL's severity-gated `assert` above).
                 let ok = args
                     .first()
-                    .map(|e| truthy(&self.eval_expr(e, None)))
+                    .map(|e| truthy(&self.eval_expr(e, locals.as_deref())))
                     .unwrap_or(false);
                 if !ok {
                     let text = match args.first() {
@@ -1304,7 +1330,7 @@ impl Simulator {
             }
             "error" | "fatal" => {
                 // Verilog $error / $fatal — a failed test.
-                let text = self.fmt_args(&args);
+                let text = self.fmt_args(&args, locals.as_deref());
                 self.emit(SimEvent::Message {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
@@ -1315,7 +1341,7 @@ impl Simulator {
                 }
             }
             "warning" | "info" => {
-                let text = self.fmt_args(&args);
+                let text = self.fmt_args(&args, locals.as_deref());
                 self.emit(SimEvent::Message {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
@@ -1331,7 +1357,7 @@ impl Simulator {
                 self.finished = true;
                 if let Some(a) = args.first() {
                     // 32-bit two's complement (VHDL integer) → i32.
-                    let raw = self.eval_expr(a, None).to_u64().unwrap_or(0) as u32;
+                    let raw = self.eval_expr(a, locals.as_deref()).to_u64().unwrap_or(0) as u32;
                     self.finish_status = Some(raw as i32);
                 }
             }
@@ -1351,13 +1377,13 @@ impl Simulator {
                 // the kernel RNG, then assign each binding to its lvalue.
                 let spec = args
                     .first()
-                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_default();
                 match self.rand_solve(&spec, rand::DEFAULT_SOLVE_ATTEMPTS) {
                     Ok(bindings) => {
                         let mut i = 1;
                         while i + 1 < args.len() {
-                            let name = string_of(&self.eval_expr(&args[i], None));
+                            let name = string_of(&self.eval_expr(&args[i], locals.as_deref()));
                             match bindings.iter().find(|(n, _)| *n == name) {
                                 Some((_, v)) => {
                                     self.assign_to(
@@ -1395,39 +1421,62 @@ impl Simulator {
                 }
             }
             // std.textio: `write(l, v)` appends the formatted value to the
-            // line buffer (right-aligned: first char in the highest used byte).
+            // line buffer (right-aligned: first char in the highest used
+            // byte). The buffer may be a subprogram frame slot (a
+            // procedure-local `variable l : line`) — those grow to fit,
+            // matching VHDL's unconstrained line/string semantics.
             "$textio_write" => {
-                if let (Some(Expr::Sig(sig)), Some(v)) = (args.first(), args.get(1)) {
-                    let sig = *sig as FlatSigId;
-                    let w = self.flat.signals[sig as usize].width.max(1);
-                    let text = self.fmt_text_value(&self.eval_expr(v, None));
-                    let add = text.as_bytes().len().min(w / 8);
+                if let (Some(target), Some(v)) = (args.first(), args.get(1)) {
+                    let text = self.fmt_text_value(&self.eval_expr(v, locals.as_deref()));
+                    let is_slot = matches!(target, Expr::Sig(s) if (*s as usize)
+                        < locals.as_deref().map_or(0, Vec::len));
+                    let (w, add) = if is_slot {
+                        // Dynamic line: always take the full text.
+                        (usize::MAX, text.as_bytes().len())
+                    } else {
+                        let w = self
+                            .width_of_target(target, locals.as_deref())
+                            .unwrap_or(1)
+                            .max(1);
+                        (w, text.as_bytes().len().min(w / 8))
+                    };
                     if add == 0 {
                         return;
                     }
                     let shift = add * 8;
-                    let old = self.vals[sig as usize].bits.clone();
-                    let mut nb = vec![V0; w];
-                    for i in 0..w.saturating_sub(shift) {
-                        nb[i + shift] = old[i];
+                    let old = self.eval_expr(target, locals.as_deref()).bits;
+                    // Freshly declared lines hold X bits — treat those as
+                    // empty so the appended text is not prefixed with X bytes.
+                    let buf_w = if is_slot {
+                        old.len().max(shift).max(8)
+                    } else {
+                        w
+                    };
+                    let mut nb = vec![V0; buf_w];
+                    for i in 0..old.len() {
+                        if i + shift < buf_w && (old[i] == V0 || old[i] == V1) {
+                            nb[i + shift] = old[i];
+                        }
                     }
                     for (bi, &b) in text.as_bytes()[..add].iter().enumerate() {
                         for j in 0..8 {
                             nb[(add - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                         }
                     }
-                    self.vals[sig as usize] = Value { bits: nb };
+                    self.store_value(target, Value { bits: nb }, locals.as_deref_mut());
                 }
             }
             // `writeline(f, l)` — print the line (stdout) or append to the file.
             "$textio_writeline" => {
-                let path = args
+                let mut path = args
                     .first()
-                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_else(|| "stdout".to_string());
+                if let Some(p) = self.open_files.get(&path) {
+                    path = p.clone();
+                }
                 let text = match args.get(1) {
-                    Some(Expr::Sig(sig)) => string_of(&self.vals[*sig as usize]),
-                    Some(e) => string_of(&self.eval_expr(e, None)),
+                    Some(e) => string_of(&self.eval_expr(e, locals.as_deref())),
                     None => String::new(),
                 };
                 if path == "stdout" || path.is_empty() {
@@ -1455,54 +1504,118 @@ impl Simulator {
                     }
                 }
             }
+            // `file_open([status,] f, path, mode)` — bind the path to the
+            // file's marker (path-less declarations lower to a unique
+            // `$file:…` constant) or to a literal-path declaration's path.
+            // `write_mode` (file_open_kind 1) truncates, matching VHDL open
+            // semantics; read/append keep existing content.
+            "$textio_file_open" => {
+                let mut it = args.iter();
+                let status = if args.len() >= 4 { it.next() } else { None };
+                if let (Some(ftarget), Some(p)) = (it.next(), it.next()) {
+                    let fkey = string_of(&self.eval_expr(ftarget, locals.as_deref()));
+                    let path = string_of(&self.eval_expr(p, locals.as_deref()));
+                    let mode = match it.next() {
+                        Some(m) => self.eval_expr(m, locals.as_deref()).to_u64(),
+                        None => None,
+                    };
+                    if mode == Some(1) {
+                        let _ = std::fs::File::create(&path);
+                    }
+                    if !fkey.is_empty() {
+                        self.open_files.insert(fkey, path);
+                    }
+                    if let Some(st) = status {
+                        // file_open_status: open_ok = 0.
+                        self.store_value(st, Value::from_u64(32, 0), locals.as_deref_mut());
+                    }
+                }
+            }
+            // `file_close(f)` — drop the binding; writes are flushed per
+            // writeline, so there is no buffered handle to close.
+            "$textio_file_close" => {
+                if let Some(ftarget) = args.first() {
+                    let fkey = string_of(&self.eval_expr(ftarget, locals.as_deref()));
+                    self.open_files.remove(&fkey);
+                }
+            }
             // `readline(f, l)` — read the next line of the file into `l`.
             "$textio_readline" => {
-                let path = args
+                let mut path = args
                     .first()
-                    .map(|a| string_of(&self.eval_expr(a, None)))
+                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_else(|| "stdin".to_string());
+                if let Some(p) = self.open_files.get(&path) {
+                    path = p.clone();
+                }
                 let line = self.textio_read_line(&path);
-                if let (Some(Expr::Sig(sig)), Some(text)) = (args.get(1), line) {
-                    let sig = *sig as FlatSigId;
-                    let w = self.flat.signals[sig as usize].width.max(1);
-                    self.vals[sig as usize] = pack_str_value(&text).resize(w);
+                if let (Some(target), Some(text)) = (args.get(1), line) {
+                    let w = match target {
+                        Expr::Sig(sig) => {
+                            let i = *sig as usize;
+                            if i < locals.as_deref().map_or(0, Vec::len) {
+                                locals.as_deref().map(|l| l[i].width()).unwrap_or(1)
+                            } else {
+                                self.flat.signals[i].width
+                            }
+                        }
+                        _ => 1,
+                    }
+                    .max(1);
+                    self.store_value(
+                        target,
+                        pack_str_value(&text).resize(w),
+                        locals.as_deref_mut(),
+                    );
                 }
             }
             // `read(l, v)` — parse the first whitespace-delimited token of the
             // line into `v` (decimal integer, or string for wide targets).
+            // Both targets may be subprogram frame slots.
             "$textio_read" => {
-                if let (Some(Expr::Sig(lsig)), Some(Expr::Sig(vsig))) = (args.first(), args.get(1))
-                {
-                    let lsig = *lsig as FlatSigId;
-                    let vsig = *vsig as FlatSigId;
-                    let content = string_of(&self.vals[lsig as usize]);
-                    let (tok, rest) = match content.find(char::is_whitespace) {
-                        Some(i) => (
-                            content[..i].to_string(),
-                            content[i..].trim_start().to_string(),
-                        ),
-                        None => (content.clone(), String::new()),
-                    };
-                    let lw = self.flat.signals[lsig as usize].width.max(1);
-                    self.vals[lsig as usize] = pack_str_value(&rest).resize(lw);
-                    let vw = self.flat.signals[vsig as usize].width.max(1);
-                    let v = match tok.parse::<u64>() {
-                        Ok(n) => Value::from_u64(vw, n),
-                        Err(_) => match tok.parse::<i64>() {
-                            Ok(n) => Value::from_u64(vw, n as u64),
-                            // Not a number: read it as a string into a
-                            // byte-multiple target.
-                            Err(_) if vw % 8 == 0 => pack_str_value(&tok).resize(vw),
-                            Err(_) => Value::x(vw),
-                        },
-                    };
-                    self.vals[vsig as usize] = v;
+                if let (Some(ltarget), Some(vtarget)) = (args.first(), args.get(1)) {
+                    if matches!(ltarget, Expr::Sig(_)) && matches!(vtarget, Expr::Sig(_)) {
+                        let content = string_of(&self.eval_expr(ltarget, locals.as_deref()));
+                        let (tok, rest) = match content.find(char::is_whitespace) {
+                            Some(i) => (
+                                content[..i].to_string(),
+                                content[i..].trim_start().to_string(),
+                            ),
+                            None => (content.clone(), String::new()),
+                        };
+                        let lw = self
+                            .width_of_target(ltarget, locals.as_deref())
+                            .unwrap_or(1)
+                            .max(1);
+                        self.store_value(
+                            ltarget,
+                            pack_str_value(&rest).resize(lw),
+                            locals.as_deref_mut(),
+                        );
+                        let vw = self
+                            .width_of_target(vtarget, locals.as_deref())
+                            .unwrap_or(1)
+                            .max(1);
+                        let v = match tok.parse::<u64>() {
+                            Ok(n) => Value::from_u64(vw, n),
+                            Err(_) => match tok.parse::<i64>() {
+                                Ok(n) => Value::from_u64(vw, n as u64),
+                                // Not a number: read it as a string into a
+                                // byte-multiple target.
+                                Err(_) if vw % 8 == 0 => pack_str_value(&tok).resize(vw),
+                                Err(_) => Value::x(vw),
+                            },
+                        };
+                        self.store_value(vtarget, v, locals.as_deref_mut());
+                    }
                 }
             }
             _ => {
-                // User procedure called as a statement, if registered.
+                // User procedure / SV task called as a statement, if
+                // registered: run with full side effects (syscalls, signal
+                // assignment) — not the pure function path.
                 if let Some(fi) = self.funcs.get(name).copied() {
-                    self.run_func(fi, &args, None);
+                    self.run_procedure(fi, &args, locals.as_deref());
                 } else {
                     self.emit(SimEvent::Message {
                         text: format!(
@@ -1513,6 +1626,41 @@ impl Simulator {
                     });
                 }
             }
+        }
+    }
+
+    /// Store into a statement target: a subprogram frame slot when the
+    /// `Expr::Sig` id indexes the frame, otherwise the real signal.
+    fn store_value(&mut self, e: &Expr, v: Value, locals: Option<&mut Vec<Value>>) {
+        let Expr::Sig(s) = e else {
+            return;
+        };
+        let i = *s as usize;
+        if let Some(l) = locals {
+            if i < l.len() {
+                // Frame slots hold unconstrained values (string/line/file
+                // paths): grow to fit instead of truncating to the declared
+                // slot width.
+                let w = l[i].width().max(v.width()).max(1);
+                l[i] = v.resize(w);
+                return;
+            }
+        }
+        if let Some(sig) = self.flat.signals.get(i) {
+            self.vals[i] = v.resize(sig.width.max(1));
+        }
+    }
+
+    /// Width of a statement target: frame slot or real signal.
+    fn width_of_target(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Option<usize> {
+        let Expr::Sig(s) = e else {
+            return None;
+        };
+        let i = *s as usize;
+        if i < locals.map_or(0, Vec::len) {
+            Some(locals.unwrap()[i].width())
+        } else {
+            Some(self.flat.signals.get(i)?.width)
         }
     }
 
@@ -1602,7 +1750,7 @@ impl Simulator {
         }
     }
 
-    fn fmt_args(&mut self, args: &[Expr]) -> String {
+    fn fmt_args(&mut self, args: &[Expr], locals: Option<&Vec<Value>>) -> String {
         let mut out = String::new();
         let mut argi = 0;
         let fmt = match args.first() {
@@ -1629,7 +1777,7 @@ impl Simulator {
                     '%' => out.push('%'),
                     'h' | 'x' | 'd' | 'b' | 'o' | 'c' | 's' | 't' => {
                         if argi < args.len() {
-                            let v = self.eval_expr(&args[argi], None);
+                            let v = self.eval_expr(&args[argi], locals);
                             argi += 1;
                             match spec {
                                 's' => out.push_str(&string_of(&v)),
@@ -1681,7 +1829,7 @@ impl Simulator {
             let vals: Vec<Value> = args.iter().map(|a| self.eval_expr(a, None)).collect();
             if self.monitor_last[i].as_ref() != Some(&vals) {
                 self.monitor_last[i] = Some(vals);
-                let text = self.fmt_args(&args);
+                let text = self.fmt_args(&args, None);
                 self.emit(SimEvent::Message {
                     text: format!("{}\n", text),
                     time_fs: self.time,
@@ -2555,6 +2703,33 @@ impl Simulator {
         lvals[0].clone()
     }
 
+    /// Run a user procedure called in statement position. Unlike `run_func`
+    /// (expression position, pure), the body executes with `&mut self`, so
+    /// syscalls (report/assert/finish/textio) and signal assignment take
+    /// effect instead of being silently dropped.
+    fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&Vec<Value>>) {
+        let f = self.flat.functions[fi].clone();
+        let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
+        lvals.push(Value::x(f.ret_width.max(1))); // slot 0 = return slot (unused)
+        for (i, a) in args.iter().enumerate() {
+            let w = f.slots.get(i + 1).copied().unwrap_or(1);
+            let v = self.eval_expr(a, caller);
+            // An actual wider than the declared slot (unconstrained string
+            // parameters) keeps its full width — the slot is a lower bound,
+            // never a truncation.
+            lvals.push(v.resize(w.max(v.width())));
+        }
+        while lvals.len() < f.slots.len() {
+            lvals.push(Value::x(f.slots[lvals.len()]));
+        }
+        let mut runner = ProcRunner {
+            sim: self,
+            locals: &mut lvals,
+            returned: false,
+        };
+        runner.exec(&f.body);
+    }
+
     /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in
     /// class `cn` (null handle → all X).
     fn read_field(&self, cn: &str, handle: u64, lsb: usize, w: usize) -> Value {
@@ -2637,6 +2812,8 @@ impl Simulator {
 }
 
 /// Helper: run function bodies (recursive, no delays) with a local slot space.
+/// Pure: syscalls other than class-field/randomize and real-signal assignment
+/// are dropped — statement-position subprogram calls use `ProcRunner` instead.
 struct FnRunner<'a> {
     sim: &'a Simulator,
     locals: &'a mut Vec<Value>,
@@ -2780,9 +2957,282 @@ impl<'a> FnRunner<'a> {
             }
             Stmt::SysCall { name, args } => {
                 // Class field writes / randomize are &self-capable: run them
-                // as calls. Other syscalls need &mut self (process context).
+                // as calls. Other syscalls need &mut self — only reachable
+                // here via `ProcRunner`-dispatched nested expression calls.
                 if name.starts_with("$setf::") || name.starts_with("$randomize::") {
                     self.sim.eval_call(name, args, Some(self.locals));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Helper: run procedure bodies (statement-position subprogram calls) with
+/// full side effects. `FnRunner` holds `&Simulator`, so syscalls and signal
+/// assignment would be dropped; this runner holds `&mut Simulator`.
+/// `wait`/`#delay` inside a procedure still cannot suspend the caller (the
+/// body runs inline within one `sys_call`), so those warn and continue.
+struct ProcRunner<'a> {
+    sim: &'a mut Simulator,
+    locals: &'a mut Vec<Value>,
+    /// Set when a `return` executed — stops the rest of the body.
+    returned: bool,
+}
+
+impl<'a> ProcRunner<'a> {
+    fn exec(&mut self, stmt: &Stmt) -> Control {
+        match stmt {
+            Stmt::Spanned { inner, .. } => self.exec(inner),
+            Stmt::Return(e) => {
+                let v = self.sim.eval_expr(e, Some(self.locals));
+                let w = self.locals[0].width().max(1);
+                self.locals[0] = v.resize(w);
+                self.returned = true;
+                Control::Done
+            }
+            Stmt::Block(ss) => {
+                for s in ss {
+                    match self.exec(s) {
+                        Control::Done => {
+                            if self.returned {
+                                return Control::Done;
+                            }
+                        }
+                        other => return other,
+                    }
+                }
+                Control::Done
+            }
+            Stmt::If { cond, then, els } => {
+                let c = self.sim.eval_expr(cond, Some(self.locals));
+                if truthy(&c) {
+                    self.exec(then)
+                } else if let Some(e) = els {
+                    self.exec(e)
+                } else {
+                    Control::Done
+                }
+            }
+            Stmt::Assign { lhs, rhs, nba } => {
+                let v = self.sim.eval_expr(rhs, Some(self.locals));
+                self.assign(lhs, rhs, v, *nba);
+                Control::Done
+            }
+            Stmt::AssignDelayed { lhs, rhs, delay } => {
+                let v = self.sim.eval_expr(rhs, Some(self.locals));
+                let t = self
+                    .sim
+                    .eval_expr(delay, Some(self.locals))
+                    .to_u64()
+                    .unwrap_or(0);
+                if t == 0 {
+                    self.assign(lhs, rhs, v, true);
+                } else if let Some(sig) = lhs_sig(lhs) {
+                    let w = self.sim.flat.signals[sig as usize].width;
+                    let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+                    self.sim
+                        .time_events
+                        .entry(self.sim.time + t)
+                        .or_default()
+                        .push(Ev::Nba(sig, v.resize(w.max(1)), self.sim.cur_proc));
+                } else {
+                    let lhs = self.sim.concretize_target(lhs);
+                    self.sim
+                        .time_events
+                        .entry(self.sim.time + t)
+                        .or_default()
+                        .push(Ev::NbaExpr(lhs, v, self.sim.cur_proc));
+                }
+                Control::Done
+            }
+            Stmt::Case {
+                expr,
+                items,
+                default,
+                matching,
+            } => {
+                let v = self.sim.eval_expr(expr, Some(self.locals));
+                for (conds, body) in items {
+                    for c in conds {
+                        let cv = self.sim.eval_expr(c, Some(self.locals));
+                        let hit = if *matching {
+                            v.matches_case(&cv)
+                        } else {
+                            eq_strict(&v, &cv)
+                        };
+                        if hit {
+                            return self.exec(body);
+                        }
+                    }
+                }
+                if let Some(d) = default {
+                    return self.exec(d);
+                }
+                Control::Done
+            }
+            Stmt::ExprStmt(e) => {
+                self.sim.eval_expr(e, Some(self.locals));
+                Control::Done
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                self.exec(init);
+                let mut guard = 0u32;
+                loop {
+                    let c = self.sim.eval_expr(cond, Some(self.locals));
+                    if !truthy(&c) {
+                        break;
+                    }
+                    match self.exec(body) {
+                        Control::Break => break,
+                        Control::Continue => {}
+                        Control::Done => {
+                            if self.returned {
+                                return Control::Done;
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.exec(step);
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        break;
+                    }
+                }
+                Control::Done
+            }
+            Stmt::Repeat { count, body } => {
+                let n = self
+                    .sim
+                    .eval_expr(count, Some(self.locals))
+                    .to_u64()
+                    .unwrap_or(0);
+                for _ in 0..n {
+                    match self.exec(body) {
+                        Control::Break => break,
+                        Control::Done | Control::Continue => {
+                            if self.returned {
+                                return Control::Done;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Control::Done
+            }
+            Stmt::SysCall { name, args } => {
+                self.sim
+                    .sys_call(name, args.clone(), Some(&mut *self.locals));
+                Control::Done
+            }
+            Stmt::Break => Control::Break,
+            Stmt::Continue => Control::Continue,
+            Stmt::Delay { .. } | Stmt::Wait { .. } => {
+                // The body runs inline inside one `sys_call`, so a suspend
+                // cannot return to the caller with its position saved. Warn
+                // instead of silently ignoring the statement.
+                self.sim.emit(SimEvent::Message {
+                    text: format!(
+                        "warning: wait/delay inside a procedure is not supported; continuing without suspending at t={}\n",
+                        self.sim.time
+                    ),
+                    time_fs: self.sim.time,
+                });
+                Control::Done
+            }
+            Stmt::Null => Control::Done,
+        }
+    }
+
+    /// Assign `v` to `lhs` in a procedure body: frame-slot writes for
+    /// variables (direct, indexed, or sliced), real-signal writes for
+    /// signals — blocking or NBA, mirroring the process executor.
+    fn assign(&mut self, lhs: &Expr, rhs: &Expr, v: Value, nba: bool) {
+        let base = match lhs {
+            Expr::Sig(_) => Some(lhs),
+            Expr::Idx { e, .. } | Expr::Sel { e, .. } => Some(&**e),
+            _ => None,
+        };
+        if let Some(Expr::Sig(s)) = base {
+            if (*s as usize) < self.locals.len() {
+                self.assign_local(lhs, v);
+                return;
+            }
+        }
+        if nba {
+            if let Some(sig) = lhs_sig(lhs) {
+                let w = self.sim.flat.signals[sig as usize].width;
+                let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+                self.sim
+                    .nba
+                    .push((sig, v.resize(w.max(1)), self.sim.cur_proc));
+            } else {
+                let lhs = self.sim.concretize_target(lhs);
+                self.sim.nba_apply_later(lhs, v);
+            }
+        } else {
+            let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+            self.sim.assign_to(lhs, v, Some(self.locals));
+        }
+    }
+
+    /// Write a local slot: direct, indexed (`v(i) := x`), or sliced
+    /// (`v(hi downto lo) := x`), mirroring `FnRunner`.
+    fn assign_local(&mut self, lhs: &Expr, v: Value) {
+        match lhs {
+            Expr::Sig(s) => {
+                let i = *s as usize;
+                if i < self.locals.len() {
+                    let w = self.locals[i].width();
+                    self.locals[i] = v.resize(w.max(1));
+                }
+            }
+            // `v(i) := x` / `v(hi downto lo) := x` on a local slot:
+            // splice the rhs bits in at the offset, growing with X.
+            Expr::Idx { e, i } => {
+                if let Expr::Sig(s) = &**e {
+                    let idx = self.sim.eval_expr(i, Some(self.locals));
+                    if let Some(a) = idx.to_u64() {
+                        let s = *s as usize;
+                        let a = a as usize;
+                        if s < self.locals.len() {
+                            let w = v.width().max(1);
+                            if self.locals[s].bits.len() < a + w {
+                                let mut bits = self.locals[s].bits.clone();
+                                bits.resize(a + w, VX);
+                                self.locals[s] = Value { bits };
+                            }
+                            for b in 0..w {
+                                self.locals[s].set_bit(a + b, v.bit(b));
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Sel { e, msb, lsb } => {
+                if let Expr::Sig(s) = &**e {
+                    let m = self.sim.eval_expr(msb, Some(self.locals));
+                    let l = self.sim.eval_expr(lsb, Some(self.locals));
+                    if let (Some(m), Some(l)) = (m.to_u64(), l.to_u64()) {
+                        let s = *s as usize;
+                        let (m, l) = (m as usize, l as usize);
+                        if s < self.locals.len() {
+                            let w = m.saturating_sub(l) + 1;
+                            if self.locals[s].bits.len() < l + w {
+                                let mut bits = self.locals[s].bits.clone();
+                                bits.resize(l + w, VX);
+                                self.locals[s] = Value { bits };
+                            }
+                            for b in 0..w {
+                                self.locals[s].set_bit(l + b, v.bit(b));
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
