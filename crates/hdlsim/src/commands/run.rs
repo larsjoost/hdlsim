@@ -249,6 +249,11 @@ impl Command for Run {
             );
             return Ok(1);
         }
+        // std.env.finish(status): the STATUS argument becomes the process exit
+        // code (OS exit codes are 0..=255; values are truncated to that range).
+        if let Some(status) = sim.finish_status() {
+            return Ok((status & 0xFF) as i32);
+        }
         if let Some(bus) = &live_bus {
             // End the SSE streams (they drain their backlog first), but keep
             // the HTTP server up so the finished waves stay in the browser

@@ -95,9 +95,15 @@ impl Command for DoCmd {
         if code != 0 {
             return Ok(code);
         }
-        // Like `hdlsim run`: exit 1 if any test failed.
-        let failures = session.sim.as_ref().map(|s| s.failures()).unwrap_or(0);
-        Ok(if failures > 0 { 1 } else { 0 })
+        // Like `hdlsim run`: exit 1 if any test failed; otherwise a
+        // std.env.finish(status) argument becomes the exit code (0..=255).
+        let sim = session.sim.as_ref();
+        if sim.map(|s| s.failures()).unwrap_or(0) > 0 {
+            return Ok(1);
+        }
+        Ok(sim
+            .and_then(|s| s.finish_status())
+            .map_or(0, |c| (c & 0xFF) as i32))
     }
 }
 

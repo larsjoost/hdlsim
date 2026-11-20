@@ -176,6 +176,9 @@ pub struct Simulator {
     stopped: bool,
     started: bool,
     finish_notified: bool,
+    /// STATUS argument of VHDL `std.env.finish(status)` (VHDL-2008). Verilog
+    /// `$finish(n)` does not set this — its argument is a diagnostic level.
+    finish_status: Option<i32>,
     /// Number of test failures seen (severity error/failure, `$error`/`$fatal`).
     failures: u64,
     monitor: Vec<Vec<Expr>>,
@@ -262,6 +265,7 @@ impl Simulator {
             stopped: false,
             started: false,
             finish_notified: false,
+            finish_status: None,
             failures: 0,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             objmem,
@@ -335,6 +339,13 @@ impl Simulator {
     /// CLI runners exit non-zero when this is > 0 after `run`.
     pub fn failures(&self) -> u64 {
         self.failures
+    }
+
+    /// STATUS argument passed to VHDL `std.env.finish(status)` (VHDL-2008),
+    /// or `None` when the simulation ended by bare `finish`, `$finish`, or
+    /// running out of events. CLI runners may use it as the process exit code.
+    pub fn finish_status(&self) -> Option<i32> {
+        self.finish_status
     }
 
     /// Find a signal by id (`"#57"`), full hierarchical name (`tb.dut.q`), or
@@ -1312,6 +1323,17 @@ impl Simulator {
             }
             "finish" => {
                 self.finished = true;
+            }
+            "$env_finish" => {
+                // VHDL std.env.finish([status]): stop the simulation; the
+                // optional STATUS argument is reported via `finish_status()`
+                // so the CLI can use it as the process exit code.
+                self.finished = true;
+                if let Some(a) = args.first() {
+                    // 32-bit two's complement (VHDL integer) → i32.
+                    let raw = self.eval_expr(a, None).to_u64().unwrap_or(0) as u32;
+                    self.finish_status = Some(raw as i32);
+                }
             }
             "stop" => {
                 self.stopped = true;
