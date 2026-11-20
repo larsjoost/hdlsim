@@ -1005,6 +1005,14 @@ pub fn compile_one(
                         e.consts.extend(p.consts);
                         e.functions.extend(p.functions);
                         e.rec_field_tys.extend(p.rec_field_tys);
+                        for (n, pt) in p.prot_tys {
+                            // Body entry (state fields + initializers) wins
+                            // over the declaration's.
+                            match e.prot_tys.iter_mut().find(|(en, _)| *en == n) {
+                                Some(entry) => entry.1 = pt,
+                                None => e.prot_tys.push((n, pt)),
+                            }
+                        }
                         e.sig_types.extend(p.sig_types);
                         e.const_tys.extend(p.const_tys);
                         if e.generics.is_empty() {
