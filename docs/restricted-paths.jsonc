@@ -1,0 +1,11 @@
+{
+  "paths": [
+    {
+      "pattern": "project/**",
+      "read": "allow",
+      "edit": "deny",
+      "reason": "Private HDL designs, one subfolder per design (hdlsim init runs inside each). May be read to debug hdlsim and may inspire tests, but nothing in the repository may be traceable to this code: no copied or lightly-renamed snippets, names, identifiers, comments, structure, or wave data in tests, fixtures, examples, docs, commits, PRs, or issues. Derived tests are re-expressed in hdlsim's own fixture style with invented names. Sim artifacts stay under project/ (gitignored)."
+    }
+  ],
+  "confirmed": true
+}
