@@ -1061,7 +1061,11 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     sim.stopped = r.bool()?;
     sim.started = r.bool()?;
     sim.finish_notified = r.bool()?;
-    sim.finish_status = if r.bool()? { Some(r.u32()? as i32) } else { None };
+    sim.finish_status = if r.bool()? {
+        Some(r.u32()? as i32)
+    } else {
+        None
+    };
     sim.failures = r.u64()?;
     let n = r.u32()? as usize;
     if n > (1 << 24) {
