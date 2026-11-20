@@ -15,7 +15,7 @@ use hdl_ir::{BinOp, Edge, EdgeKind, Expr, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -877,6 +877,10 @@ pub(crate) fn save(sim: &Simulator, out: &mut Vec<u8>) {
     w.bool(sim.stopped);
     w.bool(sim.started);
     w.bool(sim.finish_notified);
+    w.bool(sim.finish_status.is_some());
+    if let Some(s) = sim.finish_status {
+        w.u32(s as u32);
+    }
     w.u64(sim.failures);
     w.u32(sim.monitor.len() as u32);
     for exprs in &sim.monitor {
@@ -1057,6 +1061,11 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     sim.stopped = r.bool()?;
     sim.started = r.bool()?;
     sim.finish_notified = r.bool()?;
+    sim.finish_status = if r.bool()? {
+        Some(r.u32()? as i32)
+    } else {
+        None
+    };
     sim.failures = r.u64()?;
     let n = r.u32()? as usize;
     if n > (1 << 24) {

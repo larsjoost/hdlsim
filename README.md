@@ -180,6 +180,11 @@ fails** — a VHDL `assert`/`report` with severity `error`/`failure`, or a Veril
 exposes the count to library users). Compile errors also exit 1, usage errors
 exit 2. So CI and `run_tests.sh` scripts can rely on the exit code alone.
 
+A VHDL `std.env.finish(status)` argument (VHDL-2008) also becomes the exit
+code — truncated to the OS range 0..=255, and with test failures still taking
+precedence (a failing run always exits 1). Verilog `$finish(n)` is unaffected:
+its argument is a diagnostic level, not an exit status.
+
 ## Reporting bugs — reproducer bundles
 
 Whenever hdlsim exits non-zero, it prints a short `note:` hint on stderr with

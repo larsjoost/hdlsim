@@ -16,7 +16,7 @@ test (parser unit test, `crates/hdlsim/tests/vhdl_*.rs` fixture, or a
 | Package | Status | Notes | Test |
 |---|---|---|---|
 | `std.standard` | ✅ | boolean/bit/character/integer/… types; `true`/`false`; `severity_level` literals; char control literals `NUL`…`DEL` (`LF`, `CR`, `HT`); VHDL-2008 `file_open_kind`/`file_open_status` (`OPEN_OK`, `READ_MODE`…), `delay_length`; VHDL-2019 vector types `integer_vector`/`real_vector`/`time_vector`/`boolean_vector`; `now` (sim time); `std.env` (`resolution_limit`, tool/version constants, assert API stubs) | `tests/vhdl_std_ulogic.rs`, `tests/vhdl_severity.rs`, `tests/vhdl_osvvmish.rs`, corpus OSVVM |
-| `std.env` | ✅ | `finish`/`stop` are simulator builtins | `tests/fixtures/tb_pass.vhd`, `tests/vhdl_std_arith.rs` |
+| `std.env` | ✅ | `finish`/`stop` are simulator builtins; `finish(status)` reports STATUS as the process exit code (`tests/exit_code.rs`) | `tests/fixtures/tb_pass.vhd`, `tests/vhdl_std_arith.rs` |
 | `std.textio` | ✅ | simulated: `line` buffer, `write`/`read` (string/integer/vector), `readline`/`writeline`, `endfile`; `file f : text open … is "path"` reads/writes real files, `input`=stdin, `output`=stdout | `tests/vhdl_textio.rs` |
 | `ieee.std_logic_1164` | ✅ | 9-value logic as 1-bit scalar, vectors, logic ops, `rising_edge`/`falling_edge`, `to_x01` | `tests/vhdl_std_ulogic.rs`, examples |
 | `ieee.numeric_std` | ✅ | `unsigned`/`signed` arithmetic, comparisons, `resize`, `to_integer`, `to_unsigned`/`to_signed` | `tests/vhdl_signed.rs`, `tests/vhdl_std_arith.rs` |

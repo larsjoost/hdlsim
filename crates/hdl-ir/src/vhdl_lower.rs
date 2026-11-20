@@ -5281,6 +5281,17 @@ impl<'a> Lower<'a> {
                         };
                     }
                 }
+                // std.env.finish([status]) lowers to a distinct syscall so the
+                // kernel can capture the STATUS argument; Verilog `$finish(n)`
+                // keeps the plain "finish" name (its argument is a diagnostic
+                // level, not an exit status). A user-defined procedure that
+                // happens to be named `finish` is treated the same way — the
+                // simulation still stops, just without a status.
+                let name = if name == "finish" {
+                    "$env_finish".to_string()
+                } else {
+                    name
+                };
                 Stmt::SysCall { name, args }
             }
             _ => Stmt::Null,

@@ -59,6 +59,43 @@ fn failing_tests_exit_nonzero() {
 }
 
 #[test]
+fn finish_status_becomes_exit_code() {
+    // VHDL-2008 std.env.finish(status): the argument is the exit code.
+    let out = run("tb_finish_status", "tests/fixtures/tb_finish_status.vhd");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PASS"),
+        "fixture should pass before finishing:\n{}",
+        stdout
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "std.env.finish(3) must exit 3\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn verilog_finish_arg_is_not_exit_code() {
+    // Verilog $finish(1): the argument is a diagnostic level, not a status —
+    // the run still exits 0.
+    let out = run("tb_finish_v_arg", "tests/fixtures/tb_finish_v_arg.v");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("PASS"),
+        "fixture should pass before finishing:\n{}",
+        stdout
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "$finish(1) must not turn into exit code 1\n{}",
+        stdout
+    );
+}
+
+#[test]
 fn failures_print_report_hint() {
     // Usage error (exit 2): hint with the bundle command and the issue link.
     let out = hdlsim().args(["frobnicate"]).output().expect("runs");
