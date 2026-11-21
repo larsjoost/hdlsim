@@ -677,8 +677,11 @@ impl<'a> Lower<'a> {
                     .map(|(_, c)| c);
                 let Some(e) = expr else { continue };
                 self.suppress_err += 1;
-                let ex = self.lower_expr(e, &self.consts.clone());
+                let mut ex = self.lower_expr(e, &self.consts.clone());
                 self.suppress_err -= 1;
+                if in_generic {
+                    ex = self.fold_generic_actual(ex);
+                }
                 match (assoc, in_generic) {
                     (Some(n), true) => generic_map.push((Some(n), ex)),
                     (Some(n), false) => port_map.push(Conn::Named(n, ex)),
@@ -696,6 +699,18 @@ impl<'a> Lower<'a> {
             arch,
             generic_map,
             port_map,
+        }
+    }
+
+    /// Generic actuals are static expressions (VHDL evaluates them at
+    /// elaboration): fold what const-evals to a literal, so generic-map
+    /// variants and child parameter binding carry values instead of
+    /// parent-scope references the elaborator cannot chase. Non-constant
+    /// actuals pass through unchanged.
+    fn fold_generic_actual(&self, ex: Expr) -> Expr {
+        match self.ce_env(&ex, &self.consts.clone()) {
+            Some(v) => Expr::Lit(v),
+            None => ex,
         }
     }
 
@@ -1239,7 +1254,10 @@ struct Lower<'a> {
     const_types: HashMap<String, String>,
     /// User function bodies in scope (package functions via `use`), for
     /// const-evaluating calls in constant initializers.
-    funcs: HashMap<String, FuncIr>,
+    /// Lowered functions/procedures by bare name. Overloads (same name,
+    /// different signatures) coexist as candidates; `register_func` keeps
+    /// the map invariant and const-eval picks by argument fit.
+    funcs: HashMap<String, Vec<FuncIr>>,
     /// Type marks in scope (built-ins + user type/subtype decls).
     types: HashMap<String, TypeInfo>,
     /// Subtype name -> constrained width, so `signal x : my_subtype` (no
@@ -1709,16 +1727,13 @@ impl<'a> Lower<'a> {
             ("setvhdlreadseverity", 1),
             ("getvhdlreadseverity", 32),
         ] {
-            self.funcs.insert(
-                n.to_string(),
-                FuncIr {
-                    name: n.to_string(),
-                    ret_width: ret,
-                    args: Vec::new(),
-                    locals: Vec::new(),
-                    body: Stmt::Null,
-                },
-            );
+            self.register_func(FuncIr {
+                name: n.to_string(),
+                ret_width: ret,
+                args: Vec::new(),
+                locals: Vec::new(),
+                body: Stmt::Null,
+            });
         }
         // std.standard delay_length and the VHDL-2019 vector types.
         self.types
@@ -2698,6 +2713,23 @@ impl<'a> Lower<'a> {
     /// With `force`, an instantiated package's items override existing ones
     /// (e.g. the generic package's own defaults that leaked into scope while
     /// it was lowered); otherwise built-ins and earlier bindings win.
+    /// Register a lowered function/procedure. Overloads (same name, other
+    /// signatures) coexist as separate candidates. A candidate with the same
+    /// signature (formal count and widths) replaces the earlier one: package
+    /// bodies follow specs and real bodies follow pre-registered stubs, and
+    /// the body is the one that must execute.
+    fn register_func(&mut self, f: FuncIr) {
+        let cands = self.funcs.entry(f.name.to_ascii_lowercase()).or_default();
+        let sig = |c: &FuncIr| {
+            c.args.len() == f.args.len()
+                && c.args.iter().map(|a| a.1).eq(f.args.iter().map(|a| a.1))
+        };
+        match cands.iter().position(sig) {
+            Some(i) => cands[i] = f,
+            None => cands.push(f),
+        }
+    }
+
     fn merge_package(&mut self, p: &PackageIr, item: Option<&str>, force: bool) {
         let mut visited = std::collections::HashSet::new();
         self.merge_package_rec(p, item, force, &mut visited);
@@ -2734,9 +2766,10 @@ impl<'a> Lower<'a> {
         }
         for f in &p.functions {
             if item.is_none_or(|i| i == &f.name.to_ascii_lowercase()) {
-                // Last wins: the package body (with real bodies) follows the
-                // declaration (signature-only) in the merged package.
-                self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
+                // The package body (with real bodies) follows the
+                // declaration (signature-only) in the merged package;
+                // register_func replaces the earlier candidate.
+                self.register_func(f.clone());
             }
         }
         for a in &p.attr_decls {
@@ -2926,7 +2959,7 @@ impl<'a> Lower<'a> {
                     // constant *initializers* calling such functions fall back to
                     // X (reported separately at the initializer).
                     if let Some(f) = self.lower_function_node(&d) {
-                        self.funcs.insert(f.name.to_ascii_lowercase(), f.clone());
+                        self.register_func(f.clone());
                         functions.push(f);
                     }
                 }
@@ -3245,7 +3278,7 @@ impl<'a> Lower<'a> {
         for d in &decls {
             if d.kind() == SyntaxKind::Function {
                 if let Some(stub) = self.subprogram_stub(d) {
-                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                    self.register_func(stub);
                 }
             }
         }
@@ -3417,7 +3450,7 @@ impl<'a> Lower<'a> {
         for d in decls {
             if d.kind() == SyntaxKind::Function && self.subprogram_is_function(d) {
                 if let Some(stub) = self.subprogram_stub(d) {
-                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                    self.register_func(stub);
                 }
             }
         }
@@ -4222,16 +4255,13 @@ impl<'a> Lower<'a> {
                 args.push((n, w));
             }
         }
-        self.funcs.insert(
-            name.to_ascii_lowercase(),
-            FuncIr {
-                name,
-                ret_width: ret_width.max(1),
-                args,
-                locals: Vec::new(),
-                body: Stmt::Null,
-            },
-        );
+        self.register_func(FuncIr {
+            name,
+            ret_width: ret_width.max(1),
+            args,
+            locals: Vec::new(),
+            body: Stmt::Null,
+        });
     }
 
     fn lower_type_decl(&mut self, d: &SyntaxNode) {
@@ -4390,7 +4420,7 @@ impl<'a> Lower<'a> {
                     self.prot_body_ctx = saved;
                     if let Some(mut fi) = fi {
                         fi.name = format!("{}::{}", name, fi.name);
-                        self.funcs.insert(fi.name.to_ascii_lowercase(), fi.clone());
+                        self.register_func(fi.clone());
                         self.pending_funcs.push(fi);
                     }
                 } else {
@@ -4424,8 +4454,7 @@ impl<'a> Lower<'a> {
                 locals: Vec::new(),
                 body: Stmt::Block(ctor_stmts),
             };
-            self.funcs
-                .insert(ctor.name.to_ascii_lowercase(), ctor.clone());
+            self.register_func(ctor.clone());
             self.pending_funcs.push(ctor);
             self.prot_types.insert(name, pt);
             return;
@@ -4604,7 +4633,7 @@ impl<'a> Lower<'a> {
     /// parameters, then local variables.
     fn lower_function_decl(&mut self, module: &mut ModuleIr, f: &SyntaxNode) {
         if let Some(fi) = self.lower_function_node(f) {
-            self.funcs.insert(fi.name.to_ascii_lowercase(), fi.clone());
+            self.register_func(fi.clone());
             module.functions.push(fi);
         }
     }
@@ -4791,7 +4820,7 @@ impl<'a> Lower<'a> {
         // real bodies are lowered after the loop and overwrite the stubs.
         for k in &nested_fns {
             if let Some(stub) = self.subprogram_stub(k) {
-                self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                self.register_func(stub);
             }
         }
         // Declarative items in textual order: each may reference the ones
@@ -4903,7 +4932,7 @@ impl<'a> Lower<'a> {
         // Nested function declarations, now that all outer slots are visible.
         for k in &nested_fns {
             if let Some(fi) = self.lower_function_node(k) {
-                self.funcs.insert(fi.name.to_ascii_lowercase(), fi);
+                self.register_func(fi);
             }
         }
         // Loop variables allocated while lowering the body get slots after the
@@ -4979,9 +5008,16 @@ impl<'a> Lower<'a> {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { e, .. } => self.expr_width_est(e),
-            Expr::Call { name, .. } => self
+            Expr::Call { name, args } => self
                 .funcs
                 .get(&name.to_ascii_lowercase())
+                .and_then(|c| {
+                    // Overloads: prefer the candidate with this call's
+                    // formal count (ret_width only depends on the body).
+                    c.iter()
+                        .find(|f| f.args.len() == args.len())
+                        .or_else(|| c.first())
+                })
                 .map(|f| f.ret_width)
                 .unwrap_or(32)
                 .max(1),
@@ -5008,7 +5044,7 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::Function if self.subprogram_is_function(k) => {
                     if let Some(stub) = self.subprogram_stub(k) {
-                        self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                        self.register_func(stub);
                     }
                     local_fns.push(k.clone());
                 }
@@ -5048,7 +5084,7 @@ impl<'a> Lower<'a> {
         // register them so bare parameterless calls (`prefix & "..."`) resolve.
         for k in &local_fns {
             if let Some(fi) = self.lower_function_node(k) {
-                self.funcs.insert(fi.name.to_ascii_lowercase(), fi);
+                self.register_func(fi);
             }
         }
         self.extra_base = module.signals.len();
@@ -5601,7 +5637,10 @@ impl<'a> Lower<'a> {
                         .find(|(i, c)| Some(*i) != name_pos && is_expr_node(c.kind()))
                         .map(|(_, c)| c);
                     let Some(e) = expr else { continue };
-                    let ex = self.lower_expr(e, &self.consts.clone());
+                    let mut ex = self.lower_expr(e, &self.consts.clone());
+                    if in_generic {
+                        ex = self.fold_generic_actual(ex);
+                    }
                     match (assoc_name, in_generic) {
                         (Some(n), true) => param_overrides.push((Some(n), ex)),
                         (Some(n), false) => conns.push(Conn::Named(n, ex)),
@@ -6784,7 +6823,7 @@ impl<'a> Lower<'a> {
                 // alias target `alias a is f[...];`): resolve to a call — with
                 // placeholder args for parameterized functions, which are only
                 // legal as alias targets anyway.
-                if let Some(f) = self.funcs.get(&key) {
+                if let Some(f) = self.funcs.get(&key).and_then(|c| c.first()) {
                     return Expr::Call {
                         name: f.name.clone(),
                         args: vec![Expr::Lit(Value::x(32)); f.args.len()],

@@ -35,7 +35,7 @@ pub fn lower_file(
 pub struct VerilogScope {
     pub packages: HashMap<String, ModuleIr>,
     pub gconsts: HashMap<String, Value>,
-    pub funcs_all: HashMap<String, FuncIr>,
+    pub funcs_all: HashMap<String, Vec<FuncIr>>,
     /// `pkg::Type` typedefs of previously compiled files, so a later file's
     /// `import pkg::*;` can resolve imported struct/enum types (field selects).
     pub types: HashMap<String, TypeDef>,
@@ -106,10 +106,10 @@ pub fn lower_file_with_time_scoped(
         if child.kind() == SyntaxKind::Package {
             let pkg = lx.lower_module(child);
             for f in &pkg.functions {
-                lx.funcs_all.insert(
-                    format!("{}::{}", pkg.name, f.name).to_ascii_lowercase(),
-                    f.clone(),
-                );
+                lx.funcs_all
+                    .entry(format!("{}::{}", pkg.name, f.name).to_ascii_lowercase())
+                    .or_default()
+                    .push(f.clone());
             }
             lx.packages.insert(pkg.name.clone(), pkg);
         }
@@ -120,16 +120,25 @@ pub fn lower_file_with_time_scoped(
         .funcs_all
         .iter()
         .filter(|(k, _)| k.contains("::"))
-        .map(|(k, v)| (k.rsplit("::").next().unwrap().to_string(), v.clone()))
+        .flat_map(|(k, v)| {
+            let bare = k.rsplit("::").next().unwrap().to_string();
+            v.iter().map(move |f| (bare.clone(), f.clone()))
+        })
         .collect();
     for (k, v) in pkg_funcs {
-        lx.funcs_all.entry(k).or_insert(v);
+        let cands = lx.funcs_all.entry(k).or_default();
+        if !cands.iter().any(|c| c.name == v.name && c.args == v.args) {
+            cands.push(v);
+        }
     }
     for child in children {
         if child.kind() == SyntaxKind::Module {
             let m = lx.lower_module(&child);
             for f in &m.functions {
-                lx.funcs_all.insert(f.name.to_ascii_lowercase(), f.clone());
+                lx.funcs_all
+                    .entry(f.name.to_ascii_lowercase())
+                    .or_default()
+                    .push(f.clone());
             }
             modules.push(m);
         }
@@ -246,7 +255,7 @@ struct Lower<'a> {
     packages: HashMap<String, ModuleIr>,
     /// All lowered functions (package functions keyed `pkg::name`), for
     /// const-evaluating calls like `cc_pkg::idx_width(Depth)` in param defaults.
-    funcs_all: HashMap<String, FuncIr>,
+    funcs_all: HashMap<String, Vec<FuncIr>>,
     /// Signals allocated during statement lowering (e.g. foreach index vars).
     extra_signals: Vec<SignalIr>,
     /// module.signals.len() after the registration pre-pass — the id base of
@@ -3501,7 +3510,7 @@ pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
 pub fn const_eval_f(
     e: &Expr,
     env: &HashMap<String, Value>,
-    funcs: &HashMap<String, FuncIr>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
 ) -> Option<Value> {
     ce_impl(e, env, funcs, None)
 }
@@ -3543,7 +3552,7 @@ fn ce_f64(v: &Value) -> Option<f64> {
 fn ce_impl(
     e: &Expr,
     env: &HashMap<String, Value>,
-    funcs: &HashMap<String, FuncIr>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
     mut slots: Option<&mut Vec<Value>>,
 ) -> Option<Value> {
     match e {
@@ -3679,11 +3688,30 @@ fn ce_impl(
             if (name == "$val" || name == "$pos") && args.len() == 1 {
                 return ce_impl(&args[0], env, funcs, slots.as_deref_mut());
             }
-            let f = funcs.get(&name.to_ascii_lowercase())?;
+            // Overload resolution: same-name candidates may exist (VHDL
+            // overloaded subprograms, e.g. `elog2(integer)` vs
+            // `elog2(std_ulogic_vector)`). Prefer the candidate whose
+            // formal count matches, then the one whose formal widths fit
+            // the actual argument widths (exact match, or an
+            // unconstrained/unknown formal width of 0 or 1). Without a
+            // fitting candidate, the first same-arity one runs — matching
+            // the simulator's runtime pick.
+            let cands = funcs.get(&name.to_ascii_lowercase())?;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
             }
+            let f = cands
+                .iter()
+                .filter(|f| f.args.len() == argv.len())
+                .find(|f| {
+                    f.args
+                        .iter()
+                        .zip(argv.iter())
+                        .all(|((_, w), v)| *w == v.width() || *w <= 1)
+                })
+                .or_else(|| cands.iter().find(|f| f.args.len() == argv.len()))
+                .or_else(|| cands.first())?;
             let depth = CE_DEPTH.with(|d| d.get());
             if depth >= CE_MAX_DEPTH {
                 return None; // recursive const-eval: not constant
@@ -3711,7 +3739,7 @@ fn const_eval_func(
     f: &FuncIr,
     argv: &[Value],
     env: &HashMap<String, Value>,
-    funcs: &HashMap<String, FuncIr>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
 ) -> Option<Value> {
     let mut slots: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
     slots.extend(argv.iter().cloned());
@@ -3732,7 +3760,7 @@ fn ce_stmt(
     s: &Stmt,
     slots: &mut Vec<Value>,
     env: &HashMap<String, Value>,
-    funcs: &HashMap<String, FuncIr>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
     flow: &mut CeFlow,
 ) {
     if *flow != CeFlow::Continue {
