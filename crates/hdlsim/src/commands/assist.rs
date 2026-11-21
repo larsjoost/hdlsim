@@ -378,7 +378,7 @@ pub struct Assist;
 
 #[derive(Parser)]
 #[command(
-    about = "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
+    about = "describe what you want in plain English, get the command: hdlsim assist \"why does tb.v fail\""
 )]
 struct AssistArgs {
     #[command(flatten)]
@@ -398,7 +398,7 @@ impl Command for Assist {
         "assist"
     }
     fn about(&self) -> &'static str {
-        "map a prompt to an hdlsim task: hdlsim assist [--yes] [--top T] \"why does tb.v fail\""
+        "describe what you want in plain English, get the command: hdlsim assist \"why does tb.v fail\""
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AssistArgs>("assist", args) {
@@ -447,7 +447,7 @@ impl Command for Assist {
 pub struct Explain;
 
 #[derive(Parser)]
-#[command(about = "explain a diagnostic/lint code: hdlsim explain E0301 (no arg lists all codes)")]
+#[command(about = "explain an error or warning code and how to fix it: hdlsim explain E0301")]
 struct ExplainArgs {
     /// Diagnostic/lint code (e.g. E0301); omit to list all codes.
     code: Option<String>,
@@ -458,7 +458,7 @@ impl Command for Explain {
         "explain"
     }
     fn about(&self) -> &'static str {
-        "explain a diagnostic/lint code: hdlsim explain E0301 (no arg lists all codes)"
+        "explain an error or warning code and how to fix it: hdlsim explain E0301"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ExplainArgs>("explain", args) {

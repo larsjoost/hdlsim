@@ -24,9 +24,7 @@ use hdl_sim::Simulator;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(
-    about = "run a mini-Tcl do-file: hdlsim do <script.do> --top <tb> [--max-time 10us] [files...]"
-)]
+#[command(about = "run a ModelSim-style .do script: hdlsim do script.do --top tb [files]")]
 struct DoArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -49,7 +47,7 @@ impl Command for DoCmd {
         "do"
     }
     fn about(&self) -> &'static str {
-        "run a mini-Tcl do-file: hdlsim do script.do --top tb [files]"
+        "run a ModelSim-style .do script: hdlsim do script.do --top tb [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DoArgs>("do", args) {

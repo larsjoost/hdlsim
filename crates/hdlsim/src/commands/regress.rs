@@ -76,7 +76,7 @@ impl Command for Regress {
     }
 
     fn about(&self) -> &'static str {
-        "run testbenches, emit JUnit XML: hdlsim regress [--junit out.xml] [--list tests.txt] [--max-time 10us] [--coverage] [top ...]"
+        "run several testbenches and emit a JUnit XML report for CI: hdlsim regress --list tests.txt [--junit out.xml]"
     }
 
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {

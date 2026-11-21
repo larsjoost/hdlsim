@@ -27,7 +27,7 @@ impl Command for Wave {
         "wave"
     }
     fn about(&self) -> &'static str {
-        "render a .hwf/.fst wave file to the HTML viewer: hdlsim wave file.hwf [-o out.html]"
+        "write a recorded wave file as a self-contained HTML page: hdlsim wave waves.hwf"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<WaveArgs>("wave", args) {

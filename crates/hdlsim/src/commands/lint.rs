@@ -13,7 +13,9 @@ use hdl_syntax::source::SourceDb;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "run the source linter: hdlsim lint [--fix] <file.v|file.vhd> ...")]
+#[command(
+    about = "flag common mistakes and style issues; --fix applies the safe ones: hdlsim lint [files]"
+)]
 struct LintArgs {
     /// Apply safe automatic fixes in place.
     #[arg(long)]
@@ -29,7 +31,7 @@ impl Command for LintCmd {
         "lint"
     }
     fn about(&self) -> &'static str {
-        "lint sources: hdlsim lint [--fix] file.v ... (exit 1 if any finding)"
+        "flag common mistakes and style issues; --fix applies the safe ones: hdlsim lint [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<LintArgs>("lint", args) {

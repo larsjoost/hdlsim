@@ -8,7 +8,9 @@ use hdl_lib::doctor::{cache_from_env, checks, Status};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "check the environment (stdlib, config, libraries, cache)")]
+#[command(
+    about = "verify the installation finds stdlib, libraries, includes, cache: hdlsim doctor"
+)]
 struct DoctorArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -21,7 +23,7 @@ impl Command for Doctor {
         "doctor"
     }
     fn about(&self) -> &'static str {
-        "check the environment (stdlib, config, libraries, cache): hdlsim doctor"
+        "verify the installation finds stdlib, libraries, includes, cache: hdlsim doctor"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DoctorArgs>("doctor", args) {

@@ -38,7 +38,7 @@ impl Command for Prove {
         "prove"
     }
     fn about(&self) -> &'static str {
-        "bounded model check a DUT: hdlsim prove --top dut [--bmc N] files..."
+        "bounded model check — assert the DUT holds, get a counterexample trace if not: hdlsim prove --top dut [--bmc N] [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ProveArgs>("prove", args) {

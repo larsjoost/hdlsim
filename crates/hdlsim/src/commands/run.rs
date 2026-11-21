@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    about = "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--live] [--max-time 10us] [--seed N]"
+    about = "compile and simulate a testbench: hdlsim run --top tb [files] [--vcd w.vcd] [--max-time 10us]"
 )]
 struct RunArgs {
     #[command(flatten)]
@@ -17,30 +17,40 @@ struct RunArgs {
     /// Top-level unit (default: the single compiled module).
     #[arg(long)]
     top: Option<String>,
+    /// Write waves to this VCD file.
     #[arg(long)]
     vcd: Option<PathBuf>,
+    /// Write waves to this .hwf file (view with `hdlsim wave`).
     #[arg(long)]
     hwf: Option<PathBuf>,
+    /// Write waves to this FST file (view with `hdlsim wave`).
     #[arg(long)]
     fst: Option<PathBuf>,
+    /// Write a standalone HTML wave-viewer page.
     #[arg(long)]
     wave: Option<PathBuf>,
     /// Open the live wave viewer in the browser.
     #[arg(long)]
     live: bool,
+    /// Port for --live.
     #[arg(long, default_value_t = 8085)]
     port: u16,
     /// Stop time (e.g. 10us); default: run until there are no more events.
     #[arg(long)]
     max_time: Option<String>,
+    /// Save the simulator state here when the run stops (resume with --restore).
     #[arg(long)]
     checkpoint: Option<PathBuf>,
+    /// Start from a checkpoint saved by an earlier --checkpoint run.
     #[arg(long)]
     restore: Option<PathBuf>,
+    /// Collect code coverage during the run and report it at the end.
     #[arg(long)]
     coverage: bool,
+    /// Write the coverage report to this file (default: stdout).
     #[arg(long)]
     coverage_out: Option<PathBuf>,
+    /// Seed for random stimulus ($random, $urandom): same seed, same sequence.
     #[arg(long)]
     seed: Option<u64>,
     /// Source files.
@@ -86,7 +96,7 @@ impl Command for Run {
         "run"
     }
     fn about(&self) -> &'static str {
-        "compile and simulate: hdlsim run --top tb [files] [--vcd out.vcd] [--hwf out.hwf] [--fst out.fst] [--wave out.html] [--live [--port N]] [--max-time 10us] [--seed N]"
+        "compile and simulate a testbench: hdlsim run --top tb [files] [--vcd w.vcd] [--max-time 10us]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<RunArgs>("run", args) {

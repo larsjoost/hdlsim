@@ -11,7 +11,9 @@ use hdl_syntax::source::SourceDb;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "compile files and report diagnostics without simulating")]
+#[command(
+    about = "compile and report errors/warnings without simulating; --syntax-only parses just the named files: hdlsim check [files]"
+)]
 struct CheckArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -79,7 +81,7 @@ impl Command for Check {
         "check"
     }
     fn about(&self) -> &'static str {
-        "compile files and report diagnostics without simulating"
+        "compile and report errors/warnings without simulating; --syntax-only parses just the named files: hdlsim check [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<CheckArgs>("check", args) {
