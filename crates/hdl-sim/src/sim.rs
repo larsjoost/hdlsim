@@ -218,8 +218,21 @@ pub struct Simulator {
     cur_proc: Option<u32>,
     /// Per-signal last driver: (proc, time_fs). proc == u32::MAX = assign.
     last_driver: Vec<Option<(u32, u64)>>,
-    /// Processes parked at `@(...)` event waits: (proc, edges).
-    waiting: Vec<(u32, Vec<(FlatSigId, EdgeKind)>)>,
+    /// "Parked at a wait" per process — O(1) park check and wake. The wait's
+    /// wake edges live in `sens_index` while parked (see `park`).
+    parked: Vec<bool>,
+    /// Inverse of the processes' CURRENT sensitivity: signal → (proc, edge)
+    /// entries woken by a change on it. Non-parked processes contribute their
+    /// declared list; parked ones the edges of the wait they are parked on
+    /// (see `park`). Scheduling a changed signal is O(fanout) instead of
+    /// scanning every process's sensitivity list — the dominant cost on big
+    /// designs.
+    sens_index: Vec<Vec<(u32, EdgeKind)>>,
+    /// Each process's entries currently in `sens_index` — `park` swaps them
+    /// out for the parked wait's edges; wake swaps them back.
+    cur_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
+    /// "Already queued in `active`" per process — O(1) activate dedupe.
+    in_active: Vec<bool>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
     rng: std::cell::Cell<u64>,
     /// Object memory signal for SV classes: class name → `__objmem_<Class>`
@@ -244,6 +257,7 @@ pub struct Simulator {
 impl Simulator {
     pub fn new(flat: Flat) -> Simulator {
         let n = flat.signals.len();
+        let np = flat.procs.len();
         let objmem: HashMap<String, FlatSigId> = flat
             .signals
             .iter()
@@ -316,7 +330,10 @@ impl Simulator {
                 .unwrap_or(100_000_000),
             error_stopped: false,
             nba_exprs: Vec::new(),
-            waiting: Vec::new(),
+            parked: vec![false; np],
+            sens_index: vec![Vec::new(); n],
+            cur_sens: Vec::new(),
+            in_active: vec![false; np],
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
@@ -325,29 +342,31 @@ impl Simulator {
         sim.proc_rt = (0..sim.flat.procs.len())
             .map(|_| ProcRt::default())
             .collect();
-        for (i, p) in sim.flat.procs.iter().enumerate() {
-            match &p.sens {
+        for (pid, p) in sim.flat.procs.iter().enumerate() {
+            let list: Vec<(FlatSigId, EdgeKind)> = match &p.sens {
                 Sens::List(es) => {
-                    sim.proc_sens
-                        .push(es.iter().map(|e| (e.sig, e.kind)).collect());
                     // Keep `proc_all` index-aligned with `procs`.
                     sim.proc_all.push(Vec::new());
+                    es.iter().map(|e| (e.sig, e.kind)).collect()
                 }
                 Sens::All => {
                     let mut sigs = Vec::new();
                     p.body.collect_sigs(&mut sigs);
                     sigs.sort_unstable();
                     sigs.dedup();
-                    sim.proc_sens.push(
-                        sigs.iter()
-                            .map(|s| (*s as FlatSigId, EdgeKind::Any))
-                            .collect(),
-                    );
                     sim.proc_all
                         .push(sigs.iter().map(|s| *s as FlatSigId).collect());
+                    sigs.iter()
+                        .map(|s| (*s as FlatSigId, EdgeKind::Any))
+                        .collect()
                 }
+            };
+            // Non-parked processes wake on their declared sensitivity.
+            for (s, ek) in &list {
+                sim.sens_index[*s as usize].push((pid as u32, *ek));
             }
-            let _ = i;
+            sim.cur_sens.push(list.clone());
+            sim.proc_sens.push(list);
         }
         sim
     }
@@ -646,6 +665,7 @@ impl Simulator {
             }
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
+                self.in_active[pid as usize] = false;
                 drain_guard += 1;
                 if drain_guard > 1_000_000 {
                     self.emit(SimEvent::Message {
@@ -735,26 +755,29 @@ impl Simulator {
     /// parked. Without this, several sensitivity signals changing in one delta
     /// would queue the process several times and re-run its body repeatedly.
     fn activate(&mut self, pid: u32) {
-        if self.active.iter().any(|p| *p == pid) || self.waiting.iter().any(|(w, _)| *w == pid) {
+        if self.in_active[pid as usize] || self.parked[pid as usize] {
             self.trace(format!(
-                "activate {} skipped (in active={}, waiting={})",
+                "activate {} skipped (in active={}, parked={})",
                 self.flat.procs[pid as usize].origin,
-                self.active.iter().any(|p| *p == pid),
-                self.waiting.iter().any(|(w, _)| *w == pid)
+                self.in_active[pid as usize],
+                self.parked[pid as usize]
             ));
             return;
         }
         self.trace(format!("activate {}", self.flat.procs[pid as usize].origin));
+        self.in_active[pid as usize] = true;
         self.active.push_back(pid);
     }
 
-    /// Park a process on an event list, at most once per process.
+    /// Park a process on an event list, at most once per process. The
+    /// process's `sens_index` entries swap from its declared sensitivity to
+    /// the wait's edges — while parked, only those can wake it.
     fn park(&mut self, pid: u32, edges: Vec<(FlatSigId, EdgeKind)>) {
-        if self.waiting.iter().any(|(w, _)| *w == pid) {
+        let i = pid as usize;
+        if self.parked[i] {
             self.trace(format!(
-                "{}: park SKIPPED, already parked ({} entries)",
-                self.flat.procs[pid as usize].origin,
-                self.waiting.iter().filter(|(w, _)| *w == pid).count()
+                "{}: park SKIPPED, already parked",
+                self.flat.procs[pid as usize].origin
             ));
             return;
         }
@@ -762,7 +785,32 @@ impl Simulator {
             "{}: park on {:?}",
             self.flat.procs[pid as usize].origin, edges
         ));
-        self.waiting.push((pid, edges));
+        let old = std::mem::replace(&mut self.cur_sens[i], edges.clone());
+        for (s, _ek) in &old {
+            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
+        }
+        for (s, ek) in &edges {
+            self.sens_index[*s as usize].push((pid, *ek));
+        }
+        self.parked[i] = true;
+    }
+
+    /// Release a process from its wait, swapping its `sens_index` entries back
+    /// to the declared sensitivity. Called before re-activation.
+    fn unpark(&mut self, pid: u32) {
+        let i = pid as usize;
+        if !self.parked[i] {
+            return;
+        }
+        self.parked[i] = false;
+        let old = std::mem::take(&mut self.cur_sens[i]);
+        for (s, _ek) in &old {
+            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
+        }
+        for (s, ek) in &self.proc_sens[i] {
+            self.sens_index[*s as usize].push((pid, *ek));
+        }
+        self.cur_sens[i] = self.proc_sens[i].clone();
     }
 
     /// A `wait until ... for T` timeout expired. Pop the process's check
@@ -782,7 +830,7 @@ impl Simulator {
             self.flat.procs[pid as usize].origin
         ));
         self.proc_rt[pid as usize].frames.pop();
-        self.waiting.retain(|(w, _)| *w != pid);
+        self.unpark(pid);
         self.activate(pid);
     }
 
@@ -836,7 +884,7 @@ impl Simulator {
                         .push(Ev::Resume(pid));
                     break;
                 }
-                Control::Wait => break, // parked in self.waiting until an edge
+                Control::Wait => break, // parked (see self.parked) until an edge
             }
         }
         self.cur_proc = None;
@@ -2134,38 +2182,25 @@ impl Simulator {
             EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
             EdgeKind::Any => true,
         };
-        // Collect first (borrows self.proc_sens), then queue: a process runs at
-        // most once per delta no matter how many of its signals changed.
-        let mut to_activate: Vec<u32> = Vec::new();
-        for (pid, sens) in self.proc_sens.iter().enumerate() {
-            // Procs parked at an explicit `@(...)` are resumed via `waiting`.
-            if self.waiting.iter().any(|(w, _)| *w == pid as u32) {
-                continue;
-            }
-            if sens.iter().any(|(s, ek)| *s == sig && edge_of(ek)) {
-                to_activate.push(pid as u32);
+        // Fanout-driven wake: only processes whose CURRENT sensitivity (declared
+        // list, or the wait they are parked on) includes `sig` are considered —
+        // O(fanout) instead of scanning every process per write. Collect first
+        // (borrows self.sens_index), then wake.
+        let mut to_wake: Vec<u32> = Vec::new();
+        for (pid, ek) in self.sens_index[sig as usize].iter() {
+            if edge_of(ek) {
+                to_wake.push(*pid);
             }
         }
-        for pid in to_activate {
-            self.activate(pid);
-        }
-        // Processes parked at `@(...)` waits.
-        let mut i = 0;
-        while i < self.waiting.len() {
-            let hit = self.waiting[i]
-                .1
-                .iter()
-                .any(|(s, ek)| *s == sig && edge_of(ek));
-            if hit {
-                let (pid, _) = self.waiting.remove(i);
+        for pid in to_wake {
+            if self.parked[pid as usize] {
                 self.trace(format!(
                     "{}: woken by edge on signal {sig}",
                     self.flat.procs[pid as usize].origin
                 ));
-                self.activate(pid);
-            } else {
-                i += 1;
             }
+            self.unpark(pid);
+            self.activate(pid);
         }
     }
 

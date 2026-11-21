@@ -950,9 +950,14 @@ pub(crate) fn save(sim: &Simulator, out: &mut Vec<u8>) {
     for rt in &sim.proc_rt {
         w_proc_rt(&mut w, rt);
     }
-    w.u32(sim.waiting.len() as u32);
-    for (pid, edges) in &sim.waiting {
-        w.u32(*pid);
+    // Parked processes: pid + the wait's edges (their `cur_sens`).
+    let parked_list: Vec<(u32, &Vec<(_, _)>)> = (0..sim.parked.len())
+        .filter(|&i| sim.parked[i])
+        .map(|i| (i as u32, &sim.cur_sens[i]))
+        .collect();
+    w.u32(parked_list.len() as u32);
+    for (pid, edges) in parked_list {
+        w.u32(pid);
         w.u32(edges.len() as u32);
         for (sig, kind) in edges {
             w.u32(*sig);
@@ -1069,7 +1074,9 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     }
     sim.active.clear();
     for _ in 0..n {
-        sim.active.push_back(r.u32()?);
+        let p = r.u32()?;
+        sim.active.push_back(p);
+        sim.in_active[p as usize] = true;
     }
     let n = r.u32()? as usize;
     if n > (1 << 24) {
@@ -1130,7 +1137,6 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     if n > (1 << 24) {
         return Err("waiting too large".to_string());
     }
-    sim.waiting.clear();
     for _ in 0..n {
         let pid = r.u32()?;
         let m = r.u32()? as usize;
@@ -1141,7 +1147,9 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
         for _ in 0..m {
             edges.push((r.u32()?, r_edge_kind(&mut r)?));
         }
-        sim.waiting.push((pid, edges));
+        // Re-park: swaps the process's `sens_index` entries to the wait's
+        // edges, exactly as the original park did.
+        sim.park(pid, edges);
     }
     sim.finished = r.bool()?;
     sim.stopped = r.bool()?;
