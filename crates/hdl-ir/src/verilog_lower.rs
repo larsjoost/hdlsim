@@ -550,6 +550,7 @@ impl<'a> Lower<'a> {
                     name: format!("{}::{}", ci.name, m.name),
                     ret_width: m.ret_width,
                     args: m.args.clone(),
+                    defaults: m.defaults.clone(),
                     locals: m.locals.clone(),
                     body: m.body.clone(),
                 })
@@ -2689,6 +2690,7 @@ impl<'a> Lower<'a> {
             name,
             ret_width,
             args,
+            defaults: Vec::new(),
             locals,
             body,
         }
@@ -3701,6 +3703,17 @@ fn ce_impl(
             for a in args {
                 argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
             }
+            // A call may omit trailing actuals whose formals carry interface
+            // defaults (`w : natural := 8`); the real body qualifies, the
+            // interface-only spec stub does not.
+            let fits_defaults = |f: &FuncIr, n: usize| {
+                f.args.len() > n
+                    && f.defaults
+                        .get(n..f.args.len())
+                        .is_some_and(|t| t.iter().all(|d| d.is_some()))
+                    && !matches!(&f.body, Stmt::Block(ss) if ss.is_empty())
+                    && !matches!(f.body, Stmt::Null)
+            };
             let f = cands
                 .iter()
                 .filter(|f| f.args.len() == argv.len())
@@ -3711,7 +3724,18 @@ fn ce_impl(
                         .all(|((_, w), v)| *w == v.width() || *w <= 1)
                 })
                 .or_else(|| cands.iter().find(|f| f.args.len() == argv.len()))
+                .or_else(|| cands.iter().find(|f| fits_defaults(f, argv.len())))
                 .or_else(|| cands.first())?;
+            // Fill the omitted actuals from the recorded defaults.
+            for (j, d) in f.defaults.iter().enumerate().skip(argv.len()) {
+                match d {
+                    Some(v) => {
+                        let w = f.args.get(j).map(|a| a.1).unwrap_or(v.width()).max(1);
+                        argv.push(v.clone().resize(w));
+                    }
+                    None => break,
+                }
+            }
             let depth = CE_DEPTH.with(|d| d.get());
             if depth >= CE_MAX_DEPTH {
                 return None; // recursive const-eval: not constant

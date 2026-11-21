@@ -1731,6 +1731,7 @@ impl<'a> Lower<'a> {
                 name: n.to_string(),
                 ret_width: ret,
                 args: Vec::new(),
+                defaults: Vec::new(),
                 locals: Vec::new(),
                 body: Stmt::Null,
             });
@@ -2721,7 +2722,19 @@ impl<'a> Lower<'a> {
                 && c.args.iter().map(|a| a.1).eq(f.args.iter().map(|a| a.1))
         };
         match cands.iter().position(sig) {
-            Some(i) => cands[i] = f,
+            Some(i) => {
+                // A body following its spec: the spec's interface carries the
+                // formals' defaults (`w : natural := 8`), the body's usually
+                // omits them (its capture records all-None) — keep them when
+                // the replacement records none.
+                let mut f = f;
+                if !f.defaults.iter().any(|d| d.is_some())
+                    && cands[i].defaults.iter().any(|d| d.is_some())
+                {
+                    f.defaults = cands[i].defaults.clone();
+                }
+                cands[i] = f;
+            }
             None => cands.push(f),
         }
     }
@@ -3882,9 +3895,19 @@ impl<'a> Lower<'a> {
         let constraint = kids[colon + 1..]
             .iter()
             .find(|k| k.kind() == SyntaxKind::Range);
+        // The initializer follows `:=`; it may be a bare name (a constant or
+        // a parameterless function call — `SIGNAL w : natural := C_WIDTH;`),
+        // so look past the `=` rather than skipping Name nodes (same pattern
+        // as `lower_constant_decl`).
         let init = kids[colon + 1..]
             .iter()
-            .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+            .and_then(|e| {
+                kids[colon + 1 + e + 1..]
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .cloned()
+            });
         let span = d.span();
         let type_name = type_mark.map(|tm| self.text(tm).to_ascii_lowercase());
         let (width, signed, mem, real) = match type_mark {
@@ -3893,7 +3916,7 @@ impl<'a> Lower<'a> {
         };
         let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
-            let ex = self.lower_expr(e, &self.consts.clone());
+            let ex = self.lower_expr(&e, &self.consts.clone());
             self.ce(&ex)
         });
         for n in &names {
@@ -4255,6 +4278,7 @@ impl<'a> Lower<'a> {
             name,
             ret_width: ret_width.max(1),
             args,
+            defaults: Vec::new(),
             locals: Vec::new(),
             body: Stmt::Null,
         });
@@ -4447,6 +4471,7 @@ impl<'a> Lower<'a> {
                 name: format!("{}::new", name),
                 ret_width: 1,
                 args: Vec::new(),
+                defaults: Vec::new(),
                 locals: Vec::new(),
                 body: Stmt::Block(ctor_stmts),
             };
@@ -4689,6 +4714,7 @@ impl<'a> Lower<'a> {
             name,
             ret_width: 32,
             args: (0..nargs).map(|i| (format!("a{i}"), 32)).collect(),
+            defaults: Vec::new(),
             locals: Vec::new(),
             body: Stmt::Null,
         })
@@ -4740,9 +4766,11 @@ impl<'a> Lower<'a> {
             Some(tm) => self.resolve_type(tm, None, f.span()),
             None => (32, false, None, false),
         };
-        // Params: PortDecl `a, b : integer [range]` — names before ':', type after.
+        // Params: PortDecl `a, b : integer [range] [:= default]` — names
+        // before ':', type after.
         let mut args: Vec<(String, usize)> = Vec::new();
         let mut arg_types: Vec<(String, String)> = Vec::new();
+        let mut defaults: Vec<Option<Value>> = Vec::new();
         for pd in decl_nodes
             .iter()
             .filter(|d| d.kind() == SyntaxKind::PortDecl)
@@ -4771,11 +4799,30 @@ impl<'a> Lower<'a> {
                 Some(tm) => self.resolve_type(tm, constraint, pd.span()),
                 None => (32, false, None, false),
             };
+            // Interface default (`a, b : natural := 3`): const-eval now and
+            // record one entry per formal of this decl — a call may omit the
+            // corresponding actual. Defaults are static expressions; one
+            // referencing a formal or a later declaration stays unrecorded
+            // (an omitted actual then reads X, as before this feature).
+            // `:=` lexes as the `=` punct (same as declaration initializers).
+            let default_v = pk
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+                .and_then(|eq| {
+                    pk[eq + 1..]
+                        .iter()
+                        .find(|k| is_expr_node(k.kind()))
+                        .cloned()
+                })
+                .map(|e| self.lower_expr(&e, &self.consts.clone()))
+                .and_then(|ex| self.ce(&ex))
+                .map(|v| v.resize(w.max(1)));
             for n in names {
                 if let Some(tm) = &tmark {
                     arg_types.push((n.clone(), self.kw(tm)));
                 }
                 args.push((n, w));
+                defaults.push(default_v.clone());
             }
         }
         // Lower the body in slot space (slot 0 = return value). Install the
@@ -4978,6 +5025,7 @@ impl<'a> Lower<'a> {
             name,
             ret_width: ret_width.max(1),
             args,
+            defaults,
             locals,
             body,
         })
@@ -5141,9 +5189,17 @@ impl<'a> Lower<'a> {
         let constraint = kids[colon + 1..]
             .iter()
             .find(|k| k.kind() == SyntaxKind::Range);
+        // The initializer follows `:=` and may be a bare name (constant or
+        // parameterless call) — see `lower_signal_decl`.
         let init = kids[colon + 1..]
             .iter()
-            .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name);
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+            .and_then(|e| {
+                kids[colon + 1 + e + 1..]
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .cloned()
+            });
         let span = d.span();
         let type_name = type_mark.map(|tm| self.text(tm).to_ascii_lowercase());
         let (width, signed, _, real) = match type_mark {
@@ -5151,7 +5207,7 @@ impl<'a> Lower<'a> {
             None => (32, false, None, false),
         };
         let init_v = init.and_then(|e| {
-            let ex = self.lower_expr(e, &self.consts.clone());
+            let ex = self.lower_expr(&e, &self.consts.clone());
             self.ce(&ex)
         });
         for n in &names {
@@ -6816,13 +6872,22 @@ impl<'a> Lower<'a> {
                     return a.clone();
                 }
                 // Function referenced by name (parameterless call `c_hi`, or an
-                // alias target `alias a is f[...];`): resolve to a call — with
-                // placeholder args for parameterized functions, which are only
-                // legal as alias targets anyway.
+                // alias target `alias a is f[...];`): resolve to a call. When
+                // every formal carries a recorded default, the bare name is a
+                // legal parameterless call — emit no actuals, the omitted
+                // formals take their defaults. Otherwise placeholder actuals
+                // keep the reference a call (parameterized bare names are only
+                // legal as alias targets; they read X).
                 if let Some(f) = self.funcs.get(&key).and_then(|c| c.first()) {
+                    let n_actuals =
+                        if !f.defaults.is_empty() && f.defaults.iter().all(|d| d.is_some()) {
+                            0
+                        } else {
+                            f.args.len()
+                        };
                     return Expr::Call {
                         name: f.name.clone(),
-                        args: vec![Expr::Lit(Value::x(32)); f.args.len()],
+                        args: vec![Expr::Lit(Value::x(32)); n_actuals],
                     };
                 }
                 // `open` (reserved word) in a port/generic map association:

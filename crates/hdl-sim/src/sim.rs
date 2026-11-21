@@ -3258,6 +3258,17 @@ impl Simulator {
                 .iter()
                 .copied()
                 .find(|&i| self.flat.functions[i].arity == nargs)
+                // A call may omit trailing actuals whose formals carry
+                // interface defaults.
+                .or_else(|| {
+                    cands.iter().copied().find(|&i| {
+                        let f = &self.flat.functions[i];
+                        f.arity > nargs
+                            && f.defaults
+                                .get(nargs..f.arity)
+                                .is_some_and(|t| t.iter().all(|d| d.is_some()))
+                    })
+                })
                 .unwrap_or(cands[0]),
         )
     }
@@ -3282,6 +3293,18 @@ impl Simulator {
         for (i, a) in args.iter().enumerate() {
             let w = f.slots.get(i + 1).copied().unwrap_or(1);
             lvals.push(self.eval_expr(a, locals).resize(w));
+        }
+        // Omitted trailing actuals take the formals' recorded interface
+        // defaults (`w : natural := 8`); anything after the formals (locals)
+        // starts X as before.
+        while lvals.len() < (f.arity + 1).min(f.slots.len()) {
+            let j = lvals.len() - 1;
+            let w = f.slots.get(j + 1).copied().unwrap_or(1);
+            let v = match f.defaults.get(j).and_then(|d| d.as_ref()) {
+                Some(d) => d.clone().resize(w),
+                None => Value::x(w),
+            };
+            lvals.push(v);
         }
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));

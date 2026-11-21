@@ -169,6 +169,10 @@ pub struct FuncIr {
     pub ret_width: usize,
     /// (name, width) of arguments, in order.
     pub args: Vec<(String, usize)>,
+    /// Const-evaluated default value per formal (same order as `args`),
+    /// `None` where the formal has no default. A call may omit trailing
+    /// actuals whose formals carry `Some`. Empty when no formal has one.
+    pub defaults: Vec<Option<Value>>,
     pub locals: Vec<SignalIr>,
     pub body: Stmt,
 }
