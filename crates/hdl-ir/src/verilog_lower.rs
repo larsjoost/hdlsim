@@ -1555,6 +1555,7 @@ impl<'a> Lower<'a> {
                             module.params.push(ParamIr {
                                 name: pname.clone(),
                                 default: val.clone(),
+                                ty: None,
                             });
                         }
                         // Also visible as a constant to later items (e.g. decls

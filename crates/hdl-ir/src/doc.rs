@@ -383,6 +383,7 @@ mod tests {
             params: vec![ParamIr {
                 name: "WIDTH".to_string(),
                 default: Value::from_u64(8, 8),
+                ty: None,
             }],
             ports: vec![
                 PortIr {

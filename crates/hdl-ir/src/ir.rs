@@ -72,6 +72,10 @@ impl Default for ModuleIr {
 pub struct ParamIr {
     pub name: String,
     pub default: Value,
+    /// Record type name of a record-typed generic — restored into the
+    /// architecture scope so `G_PARAM.field` selects resolve when the
+    /// architecture is lowered in a fresh scope (separate file).
+    pub ty: Option<String>,
 }
 
 #[derive(Clone, Debug)]

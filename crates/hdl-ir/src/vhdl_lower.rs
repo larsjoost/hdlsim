@@ -661,7 +661,7 @@ impl<'a> Lower<'a> {
                 }
             } else if k.kind() == SyntaxKind::PortConn {
                 let ck = real_children(k);
-                let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+                let name_pos = self.assoc_formal(&ck);
                 // Indexed formal `i_data(0 to 1) => x`: keep the base name.
                 let assoc = name_pos.map(|i| {
                     let t = self.text(&ck[i]);
@@ -679,10 +679,16 @@ impl<'a> Lower<'a> {
                 self.suppress_err += 1;
                 let ex = self.lower_expr(e, &self.consts.clone());
                 self.suppress_err -= 1;
-                match assoc {
-                    Some(n) if in_generic => generic_map.push((n, ex)),
-                    Some(n) => port_map.push(Conn::Named(n, ex)),
-                    None => port_map.push(Conn::Positional(ex)),
+                match (assoc, in_generic) {
+                    (Some(n), true) => generic_map.push((n, ex)),
+                    (Some(n), false) => port_map.push(Conn::Named(n, ex)),
+                    (None, true) => {
+                        self.err(
+                            k.span(),
+                            "positional generic map association; use a named association",
+                        );
+                    }
+                    (None, false) => port_map.push(Conn::Positional(ex)),
                 }
             }
         }
@@ -889,18 +895,22 @@ pub fn lower_pending_architectures(
     still_pending
 }
 
-/// Re-lower one entity and its architectures (from the same file) with
-/// `generic map` overrides applied to the entity's generic clause, producing
-/// variant modules named `<entity><suffix>` and `<entity><suffix>/<arch>`.
-/// Used at elaboration so an instantiation's `generic map` actually re-binds
-/// the child's generics (generate ranges, port widths, ...). Returns the
-/// lowered modules (empty when the file does not declare `entity_name`).
+/// Re-lower one entity and its architectures with `generic map` overrides
+/// applied to the entity's generic clause, producing variant modules named
+/// `<entity><suffix>` and `<entity><suffix>/<arch>`. Architectures may live
+/// in sibling files (`arch_roots`, not including `root`); each gets a fresh
+/// scope seeded with the entity's context clauses plus its own file's (LRM
+/// 1076 §13.3). Used at elaboration so an instantiation's `generic map`
+/// actually re-binds the child's generics (generate ranges, port widths,
+/// ...). Returns the lowered modules (empty when `root` does not declare
+/// `entity_name`).
 pub fn lower_entity_variant(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     pkgs: &HashMap<String, Rc<PackageIr>>,
     cfgs: &HashMap<String, Rc<ConfigIr>>,
     root: &SyntaxNode,
+    arch_roots: &[SyntaxNode],
     entity_name: &str,
     overrides: &HashMap<String, Value>,
     suffix: &str,
@@ -954,6 +964,50 @@ pub fn lower_entity_variant(
                         lx.lower_architecture(&child, &mut modules, &entities)
                     {
                         last_arch.insert(ent, arch);
+                    }
+                }
+            }
+        }
+    }
+    // Architectures in sibling files: a fresh scope per file (the entity's
+    // context clauses plus the file's own), bound to the variant entity
+    // module just lowered.
+    let ent_maps = lx.entity_maps.clone();
+    let ent_maps_by_dir = lx.entity_maps_by_dir.clone();
+    for r in arch_roots {
+        let mut lax = Lower::new(db, diags);
+        lax.register_builtin_types();
+        lax.file_root = Some(r.clone());
+        lax.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lax.cfgs = cfgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        // The entity's signal/type snapshot (record fields, signedness,
+        // entity constants and types) — an architecture in another file
+        // needs it to resolve field selects (LRM 1076 §1.2).
+        lax.entity_maps = ent_maps.clone();
+        lax.entity_maps_by_dir = ent_maps_by_dir.clone();
+        lax.apply_context_clauses(root);
+        lax.apply_context_clauses(r);
+        lax.variant = Some(VariantSpec {
+            entity: lname.clone(),
+            suffix: suffix.to_string(),
+            overrides: overrides.clone(),
+        });
+        let ents: HashMap<String, usize> = [(lname.clone(), 0usize)].into_iter().collect();
+        for child in real_children(r) {
+            if child.kind() == SyntaxKind::Architecture {
+                if let Some((_, en)) = arch_entity(&child, db) {
+                    if en.eq_ignore_ascii_case(&lname) {
+                        if let Some((ent, arch)) =
+                            lax.lower_architecture(&child, &mut modules, &ents)
+                        {
+                            last_arch.insert(ent, arch);
+                        }
                     }
                 }
             }
@@ -1424,6 +1478,24 @@ impl<'a> Lower<'a> {
 
     fn kw(&self, n: &SyntaxNode) -> String {
         self.text(n).to_ascii_lowercase()
+    }
+
+    /// Index of the formal name of a named association (`formal => actual`),
+    /// or `None` for a positional one. The lexer emits `=>` as two
+    /// single-char puncts, so the arrow is the first adjacent `=` `>` pair.
+    /// A top-level association expression never yields a bare `=` followed
+    /// by `>` (binary ops parse into expr nodes; `>=` lexes in reverse
+    /// order), so the first pair is the association arrow when present.
+    fn assoc_formal(&self, ck: &[SyntaxNode]) -> Option<usize> {
+        let arrow = ck.windows(2).position(|w| {
+            w[0].kind() == SyntaxKind::Punct
+                && self.text(&w[0]) == "="
+                && w[1].kind() == SyntaxKind::Punct
+                && self.text(&w[1]) == ">"
+        })?;
+        ck[..arrow]
+            .iter()
+            .rposition(|c| c.kind() == SyntaxKind::Name)
     }
 
     /// `attribute name : type;` — register the attribute name as user-defined
@@ -2281,8 +2353,12 @@ impl<'a> Lower<'a> {
             .filter(|v| v.entity == self.cur_entity)
             .map(|v| v.overrides.clone())
             .unwrap_or_default();
-        for (name, def) in self.lower_generic_decls(g, &overrides) {
-            module.params.push(ParamIr { name, default: def });
+        for (name, def, ty) in self.lower_generic_decls(g, &overrides) {
+            module.params.push(ParamIr {
+                name,
+                default: def,
+                ty,
+            });
         }
     }
 
@@ -2294,7 +2370,7 @@ impl<'a> Lower<'a> {
         &mut self,
         g: &SyntaxNode,
         overrides: &HashMap<String, Value>,
-    ) -> Vec<(String, Value)> {
+    ) -> Vec<(String, Value, Option<String>)> {
         let mut out = Vec::new();
         for d in real_children(g)
             .into_iter()
@@ -2366,17 +2442,21 @@ impl<'a> Lower<'a> {
                 .flatten()
                 .unwrap_or(Value::x(width.max(1)));
             let _ = (width, signed);
+            // Record type of a record-typed generic, resolved (qualified
+            // `pkg.rec_t` marks reduce to the bare registered name) so field
+            // selects can find it in `types` — in this scope and, via
+            // `ParamIr.ty`, in the architecture's fresh scope.
+            let rec_ty = type_mark
+                .as_ref()
+                .and_then(|tm| self.as_record(&self.kw(tm)));
             for n in &names {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
-                if let Some(tm) = &type_mark {
-                    let tn = self.kw(tm);
-                    if self.as_record(&tn).is_some() {
-                        self.const_types.insert(key.clone(), tn);
-                    }
+                if let Some(tn) = &rec_ty {
+                    self.const_types.insert(key.clone(), tn.clone());
                 }
-                out.push((n.clone(), val));
+                out.push((n.clone(), val, rec_ty.clone()));
             }
         }
         out
@@ -2661,7 +2741,7 @@ impl<'a> Lower<'a> {
         let mut generics: Vec<(String, Value)> = Vec::new();
         for d in real_children(p) {
             if d.kind() == SyntaxKind::GenericClause {
-                for (n, v) in self.lower_generic_decls(&d, overrides) {
+                for (n, v, _ty) in self.lower_generic_decls(&d, overrides) {
                     generics.push((n.to_ascii_lowercase(), v));
                 }
             }
@@ -2902,7 +2982,21 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let ck = real_children(&k);
-            let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+            // `assoc_formal` logic inlined (self is borrowed by `lx2`); the
+            // arrow is the first adjacent `=` `>` punct pair.
+            let name_pos = ck
+                .windows(2)
+                .position(|w| {
+                    w[0].kind() == SyntaxKind::Punct
+                        && db.span_text(w[0].span()).trim() == "="
+                        && w[1].kind() == SyntaxKind::Punct
+                        && db.span_text(w[1].span()).trim() == ">"
+                })
+                .and_then(|arrow| {
+                    ck[..arrow]
+                        .iter()
+                        .rposition(|c| c.kind() == SyntaxKind::Name)
+                });
             let assoc = name_pos.map(|i| db.span_text(ck[i].span()).trim().to_ascii_lowercase());
             let expr = ck
                 .iter()
@@ -3030,10 +3124,17 @@ impl<'a> Lower<'a> {
         self.install_entity_maps(&entity_name);
         // Entity generics are constants in the architecture (also when the
         // architecture was deferred to a pending pass with a fresh scope).
+        // A record-typed generic's type name is restored into `const_types`
+        // so `G_PARAM.field` selects resolve out-of-file too (the record's
+        // `TypeInfo` arrives via the entity's context clauses above).
         for prm in &modules[midx].params {
+            let key = prm.name.to_ascii_lowercase();
             Rc::make_mut(&mut self.consts)
-                .entry(prm.name.to_ascii_lowercase())
+                .entry(key.clone())
                 .or_insert_with(|| prm.default.clone());
+            if let Some(ty) = &prm.ty {
+                self.const_types.entry(key).or_insert_with(|| ty.clone());
+            }
         }
         // Declarative part: everything before `begin`.
         let begin_pos = kids
@@ -3044,6 +3145,18 @@ impl<'a> Lower<'a> {
             None => kids.iter().collect(),
         };
         self.aliases.clear();
+        // Pre-register function stubs: a recursive call inside a body (or a
+        // forward reference to a later-declared sibling) must lower as a
+        // call, not as an index of the function-name result slot. Real
+        // bodies overwrite the stub in lower_function_decl (same mechanism
+        // as process-local functions).
+        for d in &decls {
+            if d.kind() == SyntaxKind::Function {
+                if let Some(stub) = self.subprogram_stub(d) {
+                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                }
+            }
+        }
         let mut config_specs: Vec<&SyntaxNode> = Vec::new();
         for d in &decls {
             // Arm the hidden-signal allocator per declarative item (decls push
@@ -3206,6 +3319,16 @@ impl<'a> Lower<'a> {
     /// set (for-generate iterations) existing signal bindings are dropped
     /// first, so each iteration gets its own signal.
     fn lower_gen_decls(&mut self, module: &mut ModuleIr, decls: &[SyntaxNode], fresh: bool) {
+        // Pre-register function stubs (see the architecture declarative
+        // pass): recursive calls inside a body must lower as calls, not as
+        // indexes of the function-name result slot.
+        for d in decls {
+            if d.kind() == SyntaxKind::Function && self.subprogram_is_function(d) {
+                if let Some(stub) = self.subprogram_stub(d) {
+                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                }
+            }
+        }
         for d in decls {
             if fresh && matches!(d.kind(), SyntaxKind::SignalDecl | SyntaxKind::VariableDecl) {
                 let dk = real_children(d);
@@ -5368,15 +5491,10 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::PortConn => {
                     let ck = real_children(k);
-                    // A `=>` punct marks a named association. In a positional
+                    // A `=>` arrow marks a named association; in a positional
                     // one the leading Name is the actual itself, not a formal —
                     // treating it as a formal would drop the connection.
-                    let is_named = ck
-                        .iter()
-                        .any(|c| c.kind() == SyntaxKind::Punct && self.text(c) == "=>");
-                    let name_pos = is_named
-                        .then(|| ck.iter().position(|c| c.kind() == SyntaxKind::Name))
-                        .flatten();
+                    let name_pos = self.assoc_formal(&ck);
                     // Indexed formal `i_data(0 to 1) => x`: keep the base name.
                     let assoc_name = name_pos.map(|i| {
                         let t = self.text(&ck[i]);
@@ -5392,10 +5510,20 @@ impl<'a> Lower<'a> {
                         .map(|(_, c)| c);
                     let Some(e) = expr else { continue };
                     let ex = self.lower_expr(e, &self.consts.clone());
-                    match assoc_name {
-                        Some(n) if in_generic => param_overrides.push((n, ex)),
-                        Some(n) => conns.push(Conn::Named(n, ex)),
-                        None => conns.push(Conn::Positional(ex)),
+                    match (assoc_name, in_generic) {
+                        (Some(n), true) => param_overrides.push((n, ex)),
+                        (Some(n), false) => conns.push(Conn::Named(n, ex)),
+                        // A positional generic association cannot be bound at
+                        // lowering time (the target's parameter list is not
+                        // visible here); fail closed instead of shifting the
+                        // port connections.
+                        (None, true) => {
+                            self.err(
+                                k.span(),
+                                "positional generic map association; use a named association",
+                            );
+                        }
+                        (None, false) => conns.push(Conn::Positional(ex)),
                     }
                 }
                 _ => {}
@@ -7181,7 +7309,11 @@ impl<'a> Lower<'a> {
         match fname.as_str() {
             // Indexed write/read of a signal: v(i) → Idx; multi-dimensional
             // v(i, j, …) → flat index ((i-lo0)*n1 + (j-lo1))*… via sig_dims.
-            _ if base_id.is_some() && !args.is_empty() => {
+            // A name that is also a declared function stays a call in call
+            // position: inside the function's own body the name resolves to
+            // the result slot (slot 0), which must not turn a recursive call
+            // into an index of that slot.
+            _ if base_id.is_some() && !args.is_empty() && self.funcs.get(&fname).is_none() => {
                 let base = base_id.unwrap();
                 if let Some(dims) = self.sig_dims.get(&base).cloned() {
                     if dims.len() == args.len() {

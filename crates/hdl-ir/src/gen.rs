@@ -311,6 +311,7 @@ mod tests {
         m.params = vec![ParamIr {
             name: "W".to_string(),
             default: Value::from_u64(32, 8),
+            ty: None,
         }];
         let v = testbench(&design_with(m.clone()), "counter", Language::Verilog).unwrap();
         assert!(v.contains("counter #("), "{}", v);

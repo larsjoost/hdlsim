@@ -744,11 +744,11 @@ impl Default for LibraryManager {
 /// On-demand dependency resolution for elaboration: find the unit in the
 /// indexed libraries, compile its file, and report what was searched on a miss.
 impl UnitResolver for LibraryManager {
-    /// VHDL `generic map` variant: re-lower the entity (and its architectures
-    /// from the same file) with the constant overrides applied, registered as
-    /// `<entity>#<k=v,...>` modules, so elaboration binds the child's generics
-    /// (generate ranges, port widths, ...). `unit` may be `entity` or
-    /// `entity/arch`.
+    /// VHDL `generic map` variant: re-lower the entity (and its architectures,
+    /// including ones split into sibling `*_behavior.vhd`/`*_rtl.vhd` files)
+    /// with the constant overrides applied, registered as `<entity>#<k=v,...>`
+    /// modules, so elaboration binds the child's generics (generate ranges,
+    /// port widths, ...). `unit` may be `entity` or `entity/arch`.
     fn resolve_variant(
         &mut self,
         design: &mut Design,
@@ -804,6 +804,11 @@ impl UnitResolver for LibraryManager {
         if cands.is_empty() {
             cands = self.search_project(&lname);
         }
+        // Classify the candidates: the entity's declaration file plus the
+        // sibling files holding its architectures (this codebase splits
+        // `*_entity.vhd` / `*_behavior.vhd` into separate files).
+        let mut ent_file: Option<(PathBuf, String)> = None;
+        let mut arch_files: Vec<(PathBuf, String)> = Vec::new();
         for path in cands {
             // VHDL variants only — a Verilog `#(...)` override keeps the
             // default-parameter behavior.
@@ -823,32 +828,65 @@ impl UnitResolver for LibraryManager {
             if !units.iter().any(|(n, _)| n.eq_ignore_ascii_case(&lname)) {
                 continue;
             }
-            let Ok(id) = self.db.add_file(path.display().to_string(), text) else {
+            // `(name, false)` = entity declaration, `(name, true)` = an
+            // architecture of it (see vhdl_units_in_file).
+            let has_ent = units
+                .iter()
+                .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && !*b);
+            let has_arch = units
+                .iter()
+                .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && *b);
+            if has_ent {
+                if ent_file.is_none() {
+                    ent_file = Some((path, text));
+                }
+            } else if has_arch {
+                arch_files.push((path, text));
+            }
+        }
+        let Some((epath, etext)) = ent_file else {
+            return Ok(None);
+        };
+        let Ok(eid) = self.db.add_file(epath.display().to_string(), etext) else {
+            return Ok(None);
+        };
+        let eparsed = hdl_syntax::vhdl::parser::parse_file(eid, self.db.file(eid));
+        let mut arch_roots: Vec<hdl_syntax::cst::SyntaxNode> = Vec::new();
+        let edir = epath.parent();
+        for (apath, atext) in arch_files {
+            // Sibling files only: a same-named entity in another directory
+            // must not bind its architectures to this one.
+            if apath.parent() != edir {
+                continue;
+            }
+            let Ok(aid) = self.db.add_file(apath.display().to_string(), atext) else {
                 continue;
             };
-            let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
-            let mut lower_diags = Vec::new();
-            let modules = hdl_ir::vhdl_lower::lower_entity_variant(
-                &self.db,
-                &mut lower_diags,
-                &design.packages,
-                &design.configurations,
-                &parsed.root,
-                &lname,
-                params,
-                &suffix,
-            );
-            self.diags.extend(lower_diags);
-            if modules.is_empty() {
-                continue;
-            }
-            design.modules.extend(modules);
-            if design.modules.iter().any(|m| m.name == want) {
-                return Ok(Some(want));
-            }
-            if arch.is_none() && design.modules.iter().any(|m| m.name == vbase) {
-                return Ok(Some(vbase));
-            }
+            let aparsed = hdl_syntax::vhdl::parser::parse_file(aid, self.db.file(aid));
+            arch_roots.push(aparsed.root);
+        }
+        let mut lower_diags = Vec::new();
+        let modules = hdl_ir::vhdl_lower::lower_entity_variant(
+            &self.db,
+            &mut lower_diags,
+            &design.packages,
+            &design.configurations,
+            &eparsed.root,
+            &arch_roots,
+            &lname,
+            params,
+            &suffix,
+        );
+        self.diags.extend(lower_diags);
+        if modules.is_empty() {
+            return Ok(None);
+        }
+        design.modules.extend(modules);
+        if design.modules.iter().any(|m| m.name == want) {
+            return Ok(Some(want));
+        }
+        if arch.is_none() && design.modules.iter().any(|m| m.name == vbase) {
+            return Ok(Some(vbase));
         }
         Ok(None)
     }
