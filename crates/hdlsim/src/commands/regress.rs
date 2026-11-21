@@ -205,6 +205,10 @@ fn run_one(opts: &CommonOpts, spec: &TestSpec, max_time_fs: u64, coverage: bool)
                 .to_string(),
         );
     }
+    match Simulator::alloc_report(&flat) {
+        Ok(()) => {}
+        Err(report) => return fail(report),
+    }
     let mut sim = Simulator::new(flat);
     let cap = Rc::new(RefCell::new(Capture {
         failures: Vec::new(),

@@ -102,6 +102,9 @@ impl Command for Debug {
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
+        // Refuse runaway allocations with the top-allocator report instead
+        // of aborting inside the first big `vec![…]`.
+        Simulator::alloc_report(&flat).map_err(anyhow::Error::msg)?;
         let mut sim = Simulator::new(flat);
         if let Some(s) = seed {
             sim.set_seed(s);

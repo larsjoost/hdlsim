@@ -131,6 +131,21 @@ impl Value {
         Some(v)
     }
 
+    /// Numeric value sign-extended from the value's own width: a width-32
+    /// `integer` holding -1 (`0xFFFF_FFFF`) is -1, not 4294967295. Range
+    /// bounds and other signed-integer contexts need this — `to_u64`
+    /// turns a negative bound into a near-2⁶⁴ count and range arithmetic
+    /// underflows into runaway widths/depths.
+    pub fn to_i64(&self) -> Option<i64> {
+        let u = self.to_u64()?;
+        let w = self.width().min(64) as u32;
+        if w > 0 && w < 64 && (u >> (w - 1)) & 1 == 1 {
+            Some(u as i64 - (1i64 << w))
+        } else {
+            Some(u as i64)
+        }
+    }
+
     pub fn is_known(&self) -> bool {
         self.bits.iter().all(|&b| is_known(b))
     }
@@ -661,6 +676,17 @@ mod tests {
         assert_eq!(v.bit(0), V1);
         assert_eq!(v.bit(1), V0);
         assert_eq!(v.bit(7), V1);
+    }
+
+    #[test]
+    fn to_i64_sign_extends_from_width() {
+        // A width-32 integer holding -1 must read as -1, not 4294967295:
+        // range-bound arithmetic (`0 to N-1` with N=0) depends on it.
+        assert_eq!(Value::from_u64(32, u32::MAX as u64).to_i64(), Some(-1));
+        assert_eq!(Value::from_u64(32, 5).to_i64(), Some(5));
+        assert_eq!(Value::from_u64(8, 0xFF).to_i64(), Some(-1));
+        assert_eq!(Value::from_u64(64, u64::MAX).to_i64(), Some(-1));
+        assert_eq!(Value::x(4).to_i64(), None);
     }
 
     #[test]
