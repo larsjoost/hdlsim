@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    about = "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
+    about = "cross-linked HTML documentation of entities and packages: hdlsim doc [files] [--out DIR]"
 )]
 struct DocArgs {
     #[command(flatten)]
@@ -30,7 +30,7 @@ impl Command for Doc {
         "doc"
     }
     fn about(&self) -> &'static str {
-        "generate cross-linked HTML docs: hdlsim doc [files...] [--out DIR] (default html-docs/)"
+        "cross-linked HTML documentation of entities and packages: hdlsim doc [files] [--out DIR]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DocArgs>("doc", args) {

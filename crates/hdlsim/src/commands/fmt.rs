@@ -13,7 +13,9 @@ use hdl_syntax::language::Language;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "format Verilog/VHDL sources: hdlsim fmt [--check] [-w] <file>...")]
+#[command(
+    about = "format sources; --check exits 1 when a file needs formatting: hdlsim fmt -w [files]"
+)]
 struct FmtArgs {
     /// List files that would change and exit 1 (CI gate).
     #[arg(long)]
@@ -32,7 +34,7 @@ impl Command for Fmt {
         "fmt"
     }
     fn about(&self) -> &'static str {
-        "format sources: hdlsim fmt [--check] [-w] file.v ... (default: print to stdout)"
+        "format sources; --check exits 1 when a file needs formatting: hdlsim fmt -w [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<FmtArgs>("fmt", args) {

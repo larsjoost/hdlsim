@@ -60,9 +60,31 @@ impl Command for Help {
             env!("CARGO_PKG_VERSION")
         );
         println!("usage: hdlsim <command> [args]");
-        println!("       hdlsim help <command>   detailed help for one command");
-        for c in COMMANDS {
-            println!("  {:<12} {}", c.name(), c.about());
+        println!("       hdlsim help <command>   how to use one command\n");
+        // Grouped by what you want to do, so the list answers "which
+        // command do I use for X?" without reading every entry.
+        for section in [
+            "Simulate & debug:",
+            "Check & clean up code:",
+            "Generate & document:",
+            "Inspect a design:",
+            "Project & tooling:",
+            "Help & bug reports:",
+            "Other commands:",
+        ] {
+            let title = section.trim_end_matches(':');
+            let cmds: Vec<_> = COMMANDS
+                .iter()
+                .filter(|c| section_of(c.name()) == title)
+                .collect();
+            if cmds.is_empty() {
+                continue;
+            }
+            println!("{section}");
+            for c in cmds {
+                println!("  {:<12} {}", c.name(), c.about());
+            }
+            println!();
         }
         println!("common flags: -L name=path   map a logical library to a directory");
         println!("              --config FILE  library config (default: ./hdlsim.ini if present)");
@@ -107,6 +129,21 @@ impl Command for Help {
         );
         println!("                                 without a message)");
         Ok(0)
+    }
+}
+
+/// Which task group a command belongs to in the top-level help. Keep in
+/// sync with `COMMANDS`: a command missing here falls under "Other
+/// commands" (a unit test asserts every command is mapped).
+fn section_of(name: &str) -> &'static str {
+    match name {
+        "run" | "debug" | "do" | "regress" | "wave" | "prove" => "Simulate & debug",
+        "check" | "lint" | "analyze" | "fmt" => "Check & clean up code",
+        "gen" | "doc" => "Generate & document",
+        "ast" | "deps" => "Inspect a design",
+        "init" | "doctor" | "project" | "lsp" | "completions" => "Project & tooling",
+        "help" | "--help" | "explain" | "assist" | "bundle" => "Help & bug reports",
+        _ => "Other commands",
     }
 }
 
@@ -385,9 +422,10 @@ impl Command for HelpCmd {
             .iter()
             .find(|c| c.name() == name.as_str())
             .ok_or_else(|| anyhow::anyhow!("unknown command '{name}' (try 'hdlsim --help')"))?;
-        println!("hdlsim {} — {}", cmd.name(), cmd.about());
+        // The one-liner is printed by clap's flag help below; here only the
+        // usage documentation (what/when/how).
         if let Some(long) = command_long_help(cmd.name()) {
-            println!("\n{long}");
+            println!("{long}\n");
         }
         println!(
             "\nflags (`hdlsim {} --help` shows the same list):",
@@ -398,34 +436,239 @@ impl Command for HelpCmd {
 }
 
 /// Detailed long-form documentation per command, shown by `hdlsim help <cmd>`.
+/// Usage only: what the command gets you, when to reach for it, how to call
+/// it — not how it is implemented.
 fn command_long_help(name: &str) -> Option<&'static str> {
     Some(match name {
-        "run" => "Compile the given sources and simulate the testbench --top until it\nstops (or --max-time). Waves: --vcd/--hwf/--fst files, --wave/--live HTML\nviewer. --seed N makes $random reproducible. Common library flags apply:\n-L name=path, --config, -I, -S, --lib-root (see `hdlsim help check`).",
-        "check" => "Parse + lower + resolve the given files and print rustc-style\ndiagnostics (errors/warnings) without simulating. Fast way to validate a\nproject; --progress shows library indexing / unit resolution on stderr.\nLibrary resolution: ./hdlsim.ini (written by `hdlsim init`) or\n--config FILE, then -L name=path mappings, then --lib-root DIR trees (each\nsubdir of DIR becomes a library named after it; Xilinx unisim/unimacro/...\nare auto-detected via HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS),\nthen -S DIR on-demand search roots, then `work = .` recursive scan of the\ncwd. Unit lookup is by design-unit name across all libraries (first match\nwins), so `use unisim.vcomponents.all;` works once unisim's dir is mapped.
-Library-wide `use lib.all;` compiles every unit of library `lib`.
-The default config is found by walking up from the cwd (like git),
-so running from a project subdirectory still loads the root hdlsim.ini.\nIndexing is lazy: libraries are indexed by file name without parsing;\nfiles are parsed only when a unit name does not match its file name.",
-        "wave" => "Render a .hwf (hdlsim binary) or .fst wave file to a standalone HTML\nviewer with -o out.html; without -o it prints the viewer path/serves it.",
-        "ast" => "Parse one file and print its lossless CST as an s-expression — the\nreusable syntax tree the lowerer consumes. Useful when debugging parser\nissues; spans are file:line:col.",
-        "init" => "Scan the project and write ./hdlsim.ini with a [Library] section.\nEach directory containing VHDL sources maps to a logical library named after\nthe directory's last component (one line per name; if several dirs share a\nname the shallowest path wins, so build-tree copies under vivado/... lose to\nthe real source dir). The project root is `work = .`. `library X;` clauses in\nsources are not used for naming (often stale). Vendor roots (--lib-root DIR,\nor HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS `data/vhdl/src`) are\npersisted as absolute `name = path` lines so e.g. Xilinx unisim resolves.\nUse --force to overwrite, --progress to watch the scan.",
-        "project" => "Emit a project file for an external tool: --format vivado writes a Tcl\nscript (add_files + vlog/vcom per library dir from hdlsim.ini/-L), --format\njson writes a machine-readable manifest of files, libraries and units.\n--top/--sim-top pick the elaboration/testbench tops.",
-        "prove" => "Bounded model checking over the elaborated IR with the built-in CDCL SAT\nsolver: hdlsim prove --top dut [--bmc N] files... explores up to N steps and\nreports a counterexample trace on failure.",
-        "debug" => "Interactive/one-shot debug of a simulation: --dump prints signal values at\nthe end, --watch sig prints every change of sig, --mem name dumps a memory,\n--all dumps everything, --max-time/--seed bound the run.",
-        "bundle" => "Pack the project (sources, hdlsim.ini, include dirs) into one .tar\nreproducer for a bug report: hdlsim bundle --out repro.tar [--top tb]\n[files...]. Re-open elsewhere with `--bundle repro.tar` on any command.",
-        "regress" => "Run a set of testbenches and emit JUnit XML (--junit out.xml):\n--list tests.txt reads tops from a file, --max-time bounds each, --coverage\nadds coverage info. Exit code reflects pass/fail.",
-        "lsp" => "Language-server on stdio: initialize advertises full document sync,\ncompletion, hover and go-to-definition over the project libraries.",
-        "fmt" => "Format Verilog/VHDL sources in place with -w, or print formatted output\nto stdout; --check exits non-zero if anything would change (CI gate).",
-        "lint" => "Lint sources (style + common-mistake rules); --fix applies safe fixes,\nexit code 1 if any finding remains. Codes are explained by `hdlsim explain`.",
-        "do" => "Run a mini-Tcl do-file (examine/force/run/quit/...) against a compiled\ndesign: hdlsim do script.do --top tb [files...].",
-        "deps" => "List every file the top unit transitively depends on (libraries resolved\nvia hdlsim.ini/-L/--lib-root), in compile order — useful for build scripts.",
-        "assist" => "Map a natural-language prompt to an hdlsim task (local router, --yes to\nskip confirmation): hdlsim assist \"why does tb.v fail\".",
-        "explain" => "Explain a diagnostic/lint code (E0301, W0502, ...): what it means, an\nexample, and how to fix it. No argument lists all codes.",
-        "gen" => "Generate a testbench skeleton from the design's top entity:\nhdlsim gen tb --top m [--lang verilog|vhdl] [-o out] [files...].",
-        "analyze" => "Static heuristics on the compiled design: undriven (W0501) / unread\n(W0502) signals and related warnings per module.",
-        "doc" => "Generate cross-linked HTML documentation from the sources into\nhtml-docs/ (--out DIR to change), linking entities, packages and instances.",
-        "doctor" => "Check the environment: embedded stdlib present, hdlsim.ini readable and\nits dirs existing, -L dirs existing, include dirs, cache dir writable.\nExit code reflects the worst finding.",
-        "completions" => "Print a shell completion script for bash/zsh/fish:\nhdlsim completions bash >> ~/.bashrc",
-        "help" => "Show detailed help for a command: hdlsim help <command>.\nWith no argument, prints the top-level help.",
+        "run" => {
+            "Compile the sources and simulate the testbench named by --top until it\n\
+             stops or --max-time is reached. This is the everyday command:\n\
+             \n\
+             \x20   hdlsim run --top tb src/tb.v src/dut.v\n\
+             \n\
+             Exit codes: 0 = simulation finished clean; a failed assert, report\n\
+             severity error, $error/$fatal or a compile error exits 1, so CI and\n\
+             scripts can rely on it.\n\
+             \n\
+             Record waves:\n\
+             \x20   --vcd f.vcd / --hwf f.hwf / --fst f.fst   write a wave file\n\
+             \x20   --wave f.html                             standalone HTML viewer page\n\
+             \x20   --live                                    open the live viewer in a browser (--port N)\n\
+             \n\
+             Reproducibility and limits:\n\
+             \x20   --seed N       same seed = same random stimulus sequence\n\
+             \x20   --max-time T   stop after T (10ns, 1us, 10ms); without it the run\n\
+             \x20                  goes until no more events are scheduled\n\
+             \n\
+             Saved state:\n\
+             \x20   --checkpoint f   save the simulator state when the run stops\n\
+             \x20   --restore f      resume from a saved checkpoint\n\
+             \n\
+             Coverage:\n\
+             \x20   --coverage            collect code coverage, print a report at the end\n\
+             \x20   --coverage-out f      write the report to a file instead\n\
+             \n\
+             Where sources and libraries are found: see `hdlsim help check`."
+        }
+        "check" => {
+            "Compile the files (with their dependencies) and print rustc-style\n\
+             errors/warnings. No simulation. Use it to answer \"does this compile?\":\n\
+             \n\
+             \x20   hdlsim check src/dut.vhd src/tb.vhd\n\
+             \n\
+             Just edited one file and want a quick syntax look?\n\
+             \n\
+             \x20   hdlsim check --syntax-only file.vhd\n\
+             \n\
+             parses only the named files (no dependency compilation, no library\n\
+             resolution) and reports lexical/syntax errors in milliseconds. A file\n\
+             that references units it does not define still passes; compile-level\n\
+             problems need the full check.\n\
+             \n\
+             check also elaborates every compiled top, so it reports missing\n\
+             dependencies even for units nothing instantiates.\n\
+             \n\
+             Where sources and libraries are found (all commands share this):\n\
+             \x20   1. --config FILE, else hdlsim.ini found by walking up from the cwd\n\
+             \x20      (written by `hdlsim init`)\n\
+             \x20   2. -L name=path logical library mappings\n\
+             \x20   3. --lib-root DIR: each subdir becomes a library named after the dir\n\
+             \x20      (Xilinx unisim/unimacro/... are auto-detected from\n\
+             \x20      HDLSIM_XILINX_LIBS / XILINX_VIVADO / XILINX_HLS)\n\
+             \x20   4. -S DIR on-demand search roots\n\
+             \x20   5. `work` = the current directory tree\n\
+             Units are found by design-unit name across all libraries, first match\n\
+             wins. `use lib.all;` compiles every unit of that library."
+        }
+        "wave" => {
+            "Turn a recorded wave file (.hwf or .fst) into a self-contained HTML\n\
+             page you can open in any browser (default: next to the input,\n\
+             waves.html):\n\
+             \n\
+             \x20   hdlsim wave waves.hwf\n\
+             \x20   hdlsim wave waves.fst -o out.html\n\
+             \n\
+             Record waves during a run with `hdlsim run --vcd/--hwf/--fst/--wave`."
+        }
+        "ast" => {
+            "Print how hdlsim parses one file: an s-expression tree whose nodes\n\
+             carry file:line:col spans. Use it when a diagnostic points somewhere\n\
+             odd, or when reporting a parser bug:\n\
+             \n\
+             \x20   hdlsim ast file.vhd"
+        }
+        "init" => {
+            "Set up a project: scan the current tree and write hdlsim.ini, mapping\n\
+             each source directory to a logical library. Run it once at the project\n\
+             root (or in a fresh checkout):\n\
+             \n\
+             \x20   hdlsim init [--force] [--progress]\n\
+             \n\
+             Afterwards all commands find your libraries through hdlsim.ini."
+        }
+        "project" => {
+            "Export the file list for other tools:\n\
+             \n\
+             \x20   --format vivado   Tcl script (add_files + vcom/vlog per library dir)\n\
+             \x20   --format json     machine-readable manifest of files, libraries, units\n\
+             \n\
+             \x20   hdlsim project --format vivado --top t --sim-top tb [--out f.tcl] [files]"
+        }
+        "prove" => {
+            "Bounded model check: does the DUT stay within its assertions? Explores\n\
+             every reachable state up to --bmc N steps and either proves the bound\n\
+             or prints a counterexample trace you can open with `hdlsim wave`:\n\
+             \n\
+             \x20   hdlsim prove --top dut [--bmc N] [files]"
+        }
+        "debug" => {
+            "Run a simulation with inspection output instead of just a transcript:\n\
+             \n\
+             \x20   --dump        print every signal's final value (width, memory, init)\n\
+             \x20   --watch sig   print every change of one signal\n\
+             \x20   --driver sig  trace what drives one signal\n\
+             \x20   --mem name    dump one memory\n\
+             \x20   --all         dump everything\n\
+             \x20   --max-time T / --seed N   as in run\n\
+             \n\
+             Use it when a run misbehaves: dump the elaborated design (widths,\n\
+             memories, instance tree), watch a suspect signal change by change, or\n\
+             inspect a memory at the end. Diagnostics and exit codes are the same\n\
+             as run."
+        }
+        "bundle" => {
+            "Pack the sources of a failing design into one .tar others can rerun:\n\
+             \n\
+             \x20   hdlsim bundle --out repro.tar [--top tb] [files]\n\
+             \n\
+             Open it anywhere with `--bundle repro.tar` on any command. Prefer a\n\
+             minimal reproducer from the bundled examples/ before attaching it to\n\
+             an issue — the tar contains your sources."
+        }
+        "regress" => {
+            "Run several testbenches in one go and summarize for CI:\n\
+             \n\
+             \x20   hdlsim regress tb_a tb_b          the named tops\n\
+             \x20   hdlsim regress --list tests.txt   tops from a file (one per line,\n\
+             \x20                                     `name=top` renames the case)\n\
+             \x20   --junit out.xml                   JUnit XML report for CI systems\n\
+             \x20   --max-time T                      bound each testbench\n\
+             \x20   --coverage                        per-test coverage, folded into the report\n\
+             \n\
+             Exit code is non-zero when any testbench fails (assertion/report\n\
+             errors, $error/$fatal — same rule as run)."
+        }
+        "lsp" => {
+            "Run the language server for editor integration (stdio): live parse\n\
+             diagnostics as you type, completion, hover, go-to-definition over the\n\
+             project libraries. Editors start it themselves (see README); you\n\
+             rarely run this by hand."
+        }
+        "fmt" => {
+            "Format sources:\n\
+             \n\
+             \x20   hdlsim fmt file.v           print the formatted result\n\
+             \x20   hdlsim fmt -w file.v        rewrite the file in place\n\
+             \x20   hdlsim fmt --check file.v   exit 1 if it would change (CI gate)"
+        }
+        "lint" => {
+            "Flag common mistakes and style issues with stable codes:\n\
+             \n\
+             \x20   hdlsim lint [files]         report findings\n\
+             \x20   hdlsim lint --fix [files]   apply the safe fixes automatically\n\
+             \n\
+             Exit 1 when any finding remains, so it gates CI. What a code means:\n\
+             `hdlsim explain W0502`."
+        }
+        "do" => {
+            "Run a ModelSim-style .do script against a design compiled by\n\
+             hdlsim. Supported simulator commands: run [time|-all], restart,\n\
+             back [N] (reverse debug — undo the last N run steps), vcd\n\
+             dumpfile PATH, examine NAME, seed N, quit:\n\
+             \n\
+             \x20   hdlsim do script.do --top tb [files]"
+        }
+        "deps" => {
+            "List every file the top unit needs, in compile order — the list you\n\
+             would pass to a compile step or a build script:\n\
+             \n\
+             \x20   hdlsim deps --top tb [files]"
+        }
+        "assist" => {
+            "Describe what you want in plain English; hdlsim proposes the command\n\
+             and, with --yes, runs it. Routing is local — your prompt does not\n\
+             leave the machine:\n\
+             \n\
+             \x20   hdlsim assist \"why does tb.v fail\"\n\
+             \x20   hdlsim assist --yes \"dump all signals of tb\""
+        }
+        "explain" => {
+            "Explain an error, warning or lint code: what it means, an example,\n\
+             and how to fix it.\n\
+             \n\
+             \x20   hdlsim explain E0301     one code\n\
+             \x20   hdlsim explain           list every code"
+        }
+        "gen" => {
+            "Write a testbench skeleton for a module: ports copied, one stimulus\n\
+             process to fill in.\n\
+             \n\
+             \x20   hdlsim gen tb --top m [files]                print it\n\
+             \x20   hdlsim gen tb --top m -o tb_m.vhd [files]    write it\n\
+             \x20   --lang verilog|vhdl                          output language"
+        }
+        "analyze" => {
+            "Report wiring problems in a compiled design: signals that are never\n\
+             driven (W0501), never read (W0502), and related warnings. Use it\n\
+             after wiring a new module to catch dangling logic:\n\
+             \n\
+             \x20   hdlsim analyze [files]"
+        }
+        "doc" => {
+            "Generate cross-linked HTML documentation (entities, packages,\n\
+             hierarchy) into html-docs/ (--out DIR changes it):\n\
+             \n\
+             \x20   hdlsim doc [files]"
+        }
+        "doctor" => {
+            "Verify the installation works in this project: stdlib present,\n\
+             hdlsim.ini readable, library and include directories existing, cache\n\
+             writable. Run it when units or packages cannot be found. Exit code\n\
+             reflects the worst finding:\n\
+             \n\
+             \x20   hdlsim doctor"
+        }
+        "completions" => {
+            "Print a shell completion script:\n\
+             \n\
+             \x20   hdlsim completions bash >> ~/.bashrc\n\
+             \n\
+             Supported: bash, zsh, fish."
+        }
+        "help" => {
+            "Show detailed help for a command: hdlsim help <command>.\n\
+             With no argument, prints the top-level help."
+        }
         "--help" => "Top-level help: command list plus the common flags.",
         _ => return None,
     })
@@ -534,6 +777,15 @@ mod tests {
             assert!(
                 command_long_help(c.name()).is_some(),
                 "missing long help for {}",
+                c.name()
+            );
+            // Grouped top-level help: a command without an explicit section
+            // would land under "Other commands", i.e. the mapping was
+            // forgotten when the command was registered.
+            assert_ne!(
+                section_of(c.name()),
+                "Other commands",
+                "command '{}' has no section in section_of()",
                 c.name()
             );
         }

@@ -10,7 +10,9 @@ use hdl_syntax::diagnostic::explain_code;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "static design heuristics (undriven/unread signals): hdlsim analyze [files...]")]
+#[command(
+    about = "report undriven/unread signals and other wiring warnings: hdlsim analyze [files]"
+)]
 struct AnalyzeArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -25,7 +27,7 @@ impl Command for Analyze {
         "analyze"
     }
     fn about(&self) -> &'static str {
-        "static design heuristics (undriven/unread signals): hdlsim analyze [files...]"
+        "report undriven/unread signals and other wiring warnings: hdlsim analyze [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AnalyzeArgs>("analyze", args) {

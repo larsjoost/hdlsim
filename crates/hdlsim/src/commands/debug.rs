@@ -67,7 +67,7 @@ impl Command for Debug {
         "debug"
     }
     fn about(&self) -> &'static str {
-        "debug a design: hdlsim debug --top tb [files] [--dump] [--watch sig]... [--all] [--mem name]... [--max-time 10us] [--seed N]"
+        "inspect a simulation — dump the design, watch signals, dump memories: hdlsim debug --top tb [files] --dump"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DebugArgs>("debug", args) {

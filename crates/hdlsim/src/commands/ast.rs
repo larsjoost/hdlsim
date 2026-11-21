@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "parse a file and print its CST (s-expression) — the reusable syntax tree")]
+#[command(
+    about = "print how hdlsim parses a file (s-expression tree, for parser debugging): hdlsim ast file.vhd"
+)]
 struct AstArgs {
     /// Source file to parse.
     file: PathBuf,
@@ -25,7 +27,7 @@ impl Command for Ast {
         "ast"
     }
     fn about(&self) -> &'static str {
-        "parse a file and print its CST (s-expression) — the reusable syntax tree"
+        "print how hdlsim parses a file (s-expression tree, for parser debugging): hdlsim ast file.vhd"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<AstArgs>("ast", args) {

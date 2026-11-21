@@ -10,7 +10,7 @@ use hdl_ir::Design;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "list all files a top unit depends on: hdlsim deps --top tb [files...]")]
+#[command(about = "list the files a design needs, in compile order: hdlsim deps --top tb [files]")]
 struct DepsArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -28,7 +28,7 @@ impl Command for Deps {
         "deps"
     }
     fn about(&self) -> &'static str {
-        "list all files a top unit depends on: hdlsim deps --top tb [files...]"
+        "list the files a design needs, in compile order: hdlsim deps --top tb [files]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<DepsArgs>("deps", args) {

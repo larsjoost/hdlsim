@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    about = "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
+    about = "write a testbench skeleton for a module's ports: hdlsim gen tb --top m [-o tb_m.vhd]"
 )]
 struct GenArgs {
     #[command(flatten)]
@@ -41,7 +41,7 @@ impl Command for Gen {
         "gen"
     }
     fn about(&self) -> &'static str {
-        "generate code from the design: hdlsim gen tb --top m [-o out] [--lang verilog|vhdl] [files...]"
+        "write a testbench skeleton for a module's ports: hdlsim gen tb --top m [-o tb_m.vhd]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<GenArgs>("gen", args) {

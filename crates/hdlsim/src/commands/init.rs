@@ -17,7 +17,7 @@ fn prefer_dir(current: &Path, candidate: &Path) -> bool {
 
 #[derive(Parser)]
 #[command(
-    about = "scan the project and write an hdlsim.ini library config in the current directory",
+    about = "set up this project: scan the sources, write hdlsim.ini",
     long_about = "Scan the project tree and write ./hdlsim.ini with a [Library] section.\n\
 \n\
 Each directory containing VHDL sources maps to a logical library named after\n\
@@ -61,7 +61,7 @@ impl Command for Init {
         "init"
     }
     fn about(&self) -> &'static str {
-        "scan the project and write an hdlsim.ini library config in the current directory"
+        "set up this project: scan the sources, write hdlsim.ini"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<InitArgs>("init", args) {

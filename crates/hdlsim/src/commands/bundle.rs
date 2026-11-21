@@ -29,6 +29,7 @@ struct BundleArgs {
     /// Output tar file (default: hdlsim-repro.tar).
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
+    /// Top unit: narrow the bundle to the files this design needs.
     #[arg(long)]
     top: Option<String>,
     /// Free-text label recorded in REPRO.md.
@@ -226,7 +227,7 @@ impl Command for Bundle {
         "bundle"
     }
     fn about(&self) -> &'static str {
-        "pack the project into one .tar reproducer for a bug report: hdlsim bundle --out repro.tar [--top tb] [files]"
+        "pack the sources into a reproducer .tar for a bug report: hdlsim bundle --out repro.tar [--top tb]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<BundleArgs>("bundle", args) {

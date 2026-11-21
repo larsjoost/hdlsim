@@ -9,23 +9,28 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    about = "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
+    about = "export the file list for Vivado (Tcl) or as a JSON manifest: hdlsim project --format vivado [--top t]"
 )]
 struct ProjectArgs {
     #[command(flatten)]
     common: CommonArgs,
     /// Output format (vivado-tcl|json).
+    /// Project file format: vivado (Tcl script) or json (file/unit manifest).
     #[arg(long, short = 'f')]
     format: Option<String>,
     /// Output file (default: stdout).
     #[arg(long, short = 'o')]
     out: Option<PathBuf>,
+    /// Design name recorded in the project file.
     #[arg(long, short = 'n')]
     name: Option<String>,
+    /// FPGA top entity recorded in the project file.
     #[arg(long)]
     top: Option<String>,
+    /// Testbench top recorded as the simulation top.
     #[arg(long)]
     sim_top: Option<String>,
+    /// FPGA part recorded in the project file (e.g. xc7a35tcpg236-1).
     #[arg(long)]
     part: Option<String>,
     /// Source files.
@@ -39,7 +44,7 @@ impl Command for Project {
         "project"
     }
     fn about(&self) -> &'static str {
-        "generate a project file for another tool: hdlsim project --format vivado|json [--out f.tcl] [--top t] [--sim-top tb] [files]"
+        "export the file list for Vivado (Tcl) or as a JSON manifest: hdlsim project --format vivado [--top t]"
     }
     fn run(&self, args: &[String]) -> anyhow::Result<i32> {
         let a = match parse_with::<ProjectArgs>("project", args) {
