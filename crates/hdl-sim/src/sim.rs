@@ -186,7 +186,10 @@ pub struct Simulator {
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
-    funcs: HashMap<String, usize>,
+    /// Function/procedure registry: name → indices into `flat.functions`.
+    /// Overloads share a bare name, so lookups with several candidates
+    /// resolve by formal count (`func_match`).
+    funcs: HashMap<String, Vec<usize>>,
     observers: Vec<Box<dyn Observer>>,
     finished: bool,
     stopped: bool,
@@ -208,6 +211,13 @@ pub struct Simulator {
     /// budget (see `exec_frames`). Override: `HDLSIM_MAX_PROC_STEPS`.
     proc_steps: u64,
     max_proc_steps: u64,
+    /// Nesting depth of user function/procedure calls — runaway-recursion
+    /// guard (see `run_func`). Override: `HDLSIM_MAX_FUNC_DEPTH`.
+    fn_depth: std::cell::Cell<usize>,
+    max_func_depth: usize,
+    /// Latched when `fn_depth` passes the budget: the name of the function
+    /// at detection. The pump reports it and stops the simulation.
+    fn_recursion: std::cell::RefCell<Option<String>>,
     /// Stopped by an internal error guard (combinational loop, delta/step
     /// limit): the run must fail the process exit code, not exit 0.
     error_stopped: bool,
@@ -328,6 +338,12 @@ impl Simulator {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000_000),
+            fn_depth: std::cell::Cell::new(0),
+            max_func_depth: std::env::var("HDLSIM_MAX_FUNC_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200),
+            fn_recursion: std::cell::RefCell::new(None),
             error_stopped: false,
             nba_exprs: Vec::new(),
             parked: vec![false; np],
@@ -337,7 +353,7 @@ impl Simulator {
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
-            sim.funcs.insert(f.name.clone(), i);
+            sim.funcs.entry(f.name.clone()).or_default().push(i);
         }
         sim.proc_rt = (0..sim.flat.procs.len())
             .map(|_| ProcRt::default())
@@ -531,6 +547,23 @@ impl Simulator {
                 i, p.kind, sens, p.origin
             );
         }
+        // Function and procedure bodies in slot space: slot 0 is the return
+        // value; the Debug rendering of the body makes lowered calls, slot
+        // reads and index expressions visible without a rebuild.
+        for (i, f) in self.flat.functions.iter().enumerate() {
+            let slots = f
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{}:w{}", if i == 0 { "ret" } else { "arg" }, w))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "  func #{:<3} {:<30} arity={} slots=[{}] body={:#?}",
+                i, f.name, f.arity, slots, f.body
+            );
+        }
         out
     }
 
@@ -554,6 +587,28 @@ impl Simulator {
         self.failures += 1;
         let time_fs = self.time;
         self.emit(SimEvent::TestFailed { text, time_fs });
+    }
+
+    /// Report a latched function-recursion stop (latched by
+    /// `run_func`/`run_procedure`, which only unwind with X): emits the
+    /// diagnostic and flags the run as error-stopped. Returns true when a
+    /// latch was pending. Checked at the top of the pump loop *and* before
+    /// the no-events exit — the latch is set while the last processes run,
+    /// and the loop can otherwise end without reporting it.
+    fn report_fn_recursion(&mut self) -> bool {
+        if let Some(name) = self.fn_recursion.take() {
+            self.emit(SimEvent::Message {
+                text: format!(
+                    "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (self-call or cyclic overloads); simulation stopped",
+                    self.max_func_depth, self.time
+                ),
+                time_fs: self.time,
+            });
+            self.stopped = true;
+            self.error_stopped = true;
+            return true;
+        }
+        false
     }
 
     // ---- main loop ------------------------------------------------------------
@@ -644,6 +699,11 @@ impl Simulator {
             if self.finished || self.stopped {
                 break;
             }
+            // Function recursion latched while evaluating expressions (the
+            // guard itself only unwinds with X — reporting needs &mut).
+            if self.report_fn_recursion() {
+                break;
+            }
             delta_count += 1;
             if delta_count > 10_000 {
                 self.emit(SimEvent::Message {
@@ -729,11 +789,17 @@ impl Simulator {
                     }
                 }
                 _ => {
-                    if soft {
-                        break; // pause at the target; simulation stays resumable
+                    // A recursion-guard latch set while the last processes
+                    // ran must be reported here: the loop-top check would
+                    // never run again once the event queue is empty.
+                    let latched = self.report_fn_recursion();
+                    if !latched {
+                        if soft {
+                            break; // pause at the target; simulation stays resumable
+                        }
+                        self.emit(SimEvent::Stop { time_fs: self.time });
+                        self.stopped = true;
                     }
-                    self.emit(SimEvent::Stop { time_fs: self.time });
-                    self.stopped = true;
                     break;
                 }
             }
@@ -1470,7 +1536,7 @@ impl Simulator {
                     self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
                 }
                 let fname = format!("{}::new", cn);
-                if let Some(fi) = self.funcs.get(&fname).copied() {
+                if let Some(fi) = self.func_match(&fname, args.len().saturating_sub(1)) {
                     let saved = self.cur_obj.replace(handle);
                     self.run_func(fi, &args[1..], None);
                     self.cur_obj.set(saved);
@@ -1479,7 +1545,7 @@ impl Simulator {
             // Void method call as a statement: `c.do(args);`
             m if m.starts_with("$callmethod::") => {
                 let rest = &m["$callmethod::".len()..]; // `C::m`
-                if let Some(fi) = self.funcs.get(rest).copied() {
+                if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
                     let obj = args
                         .first()
                         .map(|a| {
@@ -1884,7 +1950,7 @@ impl Simulator {
                 // User procedure / SV task called as a statement, if
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
-                if let Some(fi) = self.funcs.get(name).copied() {
+                if let Some(fi) = self.func_match(name, args.len()) {
                     self.run_procedure(fi, &args, locals.as_deref());
                 } else {
                     self.emit(SimEvent::Message {
@@ -2354,10 +2420,9 @@ impl Simulator {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { .. } => 1,
-            Expr::Call { name, .. } => self
-                .funcs
-                .get(name)
-                .map(|i| self.flat.functions[*i].ret_width)
+            Expr::Call { name, args } => self
+                .func_match(name, args.len())
+                .map(|i| self.flat.functions[i].ret_width)
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
             Expr::Rising(_) | Expr::Falling(_) => 1,
@@ -2745,14 +2810,16 @@ impl Simulator {
                     return Value::x(1);
                 };
                 match &**e {
-                    Expr::Sig(s) if self.is_mem[*s as usize] => {
+                    Expr::Sig(s)
+                        if (*s as usize) < self.is_mem.len() && self.is_mem[*s as usize] =>
+                    {
                         let sig = *s as usize;
                         self.mems[sig]
                             .get(a as usize)
                             .cloned()
                             .unwrap_or_else(|| Value::x(self.flat.signals[sig].width.max(1)))
                     }
-                    _ => {
+                    other => {
                         let v = self.eval_expr(e, locals);
                         Value::from_bit(v.bit(a as usize))
                     }
@@ -2959,7 +3026,7 @@ impl Simulator {
         }
         if let Some(rest) = name.strip_prefix("$method::") {
             // `c.m(args)` in expression position; funcs are keyed `C::m`.
-            if let Some(fi) = self.funcs.get(rest).copied() {
+            if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
                 let obj = args
                     .first()
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
@@ -2971,7 +3038,7 @@ impl Simulator {
             }
             return Value::x(32);
         }
-        if let Some(fi) = self.funcs.get(name).copied() {
+        if let Some(fi) = self.func_match(name, args.len()) {
             return self.run_func(fi, args, locals);
         }
         Value::x(32)
@@ -2980,8 +3047,40 @@ impl Simulator {
     /// Execute function `fi` with the given argument expressions; returns
     /// slot 0 (the function-name slot, i.e. the return value). Shared by
     /// plain calls and class method calls.
+    /// Resolve a name to one function. Overloads share a bare name; an
+    /// exact formal-count match wins (VHDL likewise prefers the overload
+    /// that binds without default values). Still-ambiguous overloads fall
+    /// back to the first-registered one — a width-mismatched argument reads
+    /// X rather than failing.
+    fn func_match(&self, name: &str, nargs: usize) -> Option<usize> {
+        let cands = self.funcs.get(name)?;
+        if cands.len() == 1 {
+            return Some(cands[0]);
+        }
+        Some(
+            cands
+                .iter()
+                .copied()
+                .find(|&i| self.flat.functions[i].arity == nargs)
+                .unwrap_or(cands[0]),
+        )
+    }
+
+    /// Execute function `fi` with the given argument expressions; returns
+    /// slot 0 (the function-name slot, i.e. the return value). Shared by
+    /// plain calls and class method calls.
     fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
         let f = &self.flat.functions[fi];
+        // Recursion guard: a self-recursive function (or a cycle of
+        // mutually recursive overloads) would otherwise overflow the
+        // stack. Latch the name and unwind with X; the pump reports the
+        // latch and stops the run.
+        let d = self.fn_depth.get() + 1;
+        if d > self.max_func_depth {
+            self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
+            return Value::x(f.ret_width.max(1));
+        }
+        self.fn_depth.set(d);
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
         for (i, a) in args.iter().enumerate() {
@@ -2998,7 +3097,9 @@ impl Simulator {
             returned: false,
         };
         runner.exec(&f.body);
-        lvals[0].clone()
+        let r = lvals[0].clone();
+        self.fn_depth.set(d - 1);
+        r
     }
 
     /// Run a user procedure called in statement position. Unlike `run_func`
@@ -3007,6 +3108,14 @@ impl Simulator {
     /// effect instead of being silently dropped.
     fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&Vec<Value>>) {
         let f = self.flat.functions[fi].clone();
+        // Same recursion guard as `run_func` (shared `fn_depth`, so function
+        // ↔ procedure call chains count together).
+        let d = self.fn_depth.get() + 1;
+        if d > self.max_func_depth {
+            self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
+            return;
+        }
+        self.fn_depth.set(d);
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width.max(1))); // slot 0 = return slot (unused)
         for (i, a) in args.iter().enumerate() {
@@ -3026,6 +3135,7 @@ impl Simulator {
             returned: false,
         };
         runner.exec(&f.body);
+        self.fn_depth.set(d - 1);
     }
 
     /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in

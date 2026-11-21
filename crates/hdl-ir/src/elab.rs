@@ -64,6 +64,9 @@ pub struct FlatAssign {
 pub struct FlatFunc {
     pub name: String,
     pub ret_width: usize,
+    /// Number of formal arguments — resolves overloads (same name,
+    /// different parameter count) when the simulator looks a call up.
+    pub arity: usize,
     /// Width of each slot; slot ids in the body index this vector.
     pub slots: Vec<usize>,
     /// Shared handle: the kernel can execute a body while mutably borrowing
@@ -285,6 +288,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
             f.functions.push(FlatFunc {
                 name: func.name.clone(),
                 ret_width: func.ret_width,
+                arity: func.args.len(),
                 slots,
                 body: Arc::new(func.body.clone()),
             });
@@ -500,6 +504,7 @@ impl Flat {
             self.functions.push(FlatFunc {
                 name: f.name.clone(),
                 ret_width: f.ret_width,
+                arity: f.args.len(),
                 slots,
                 body,
             });
