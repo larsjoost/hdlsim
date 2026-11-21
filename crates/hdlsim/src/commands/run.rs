@@ -123,17 +123,32 @@ impl Command for Run {
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();
+        let compile_phase = crate::phase::Phase::start("compile");
         mgr.compile_files(&mut design, &files);
+        compile_phase.done(format!("{} modules", design.modules.len()));
         if mgr.diags().has_errors() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
+            return Ok(1);
+        }
+        if crate::phase::over_mem_limit("compile") {
             return Ok(1);
         }
         let top_name = match top {
             Some(t) => t,
             None => super::pick_default_top(&design)?,
         };
+        let elab_phase = crate::phase::Phase::start("elaborate");
         let flat = elab::elaborate_with(&mut design, &top_name, &mut mgr)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
+        elab_phase.done(format!(
+            "{} signals, {} processes, {} assigns",
+            flat.signals.len(),
+            flat.procs.len(),
+            flat.assigns.len()
+        ));
+        if crate::phase::over_mem_limit("elaborate") {
+            return Ok(1);
+        }
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
@@ -143,10 +158,15 @@ impl Command for Run {
             // failed to compile produces garbage results (or hangs).
             return Ok(1);
         }
+        let init_phase = crate::phase::Phase::start("sim-init");
         let mut sim = match &restore {
             Some(p) => Simulator::restore_checkpoint(flat, p).map_err(anyhow::Error::msg)?,
             None => Simulator::new(flat),
         };
+        init_phase.done("state initialized");
+        if crate::phase::over_mem_limit("sim-init") {
+            return Ok(1);
+        }
         if let Some(s) = seed {
             sim.set_seed(s);
         }
@@ -219,7 +239,9 @@ impl Command for Run {
         } else {
             (None, None)
         };
+        let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
+        sim_phase.done(format!("t={}fs", sim.time()));
         println!(
             "hdlsim: simulation stopped at t={} fs ({} signals, {} processes)",
             sim.time(),

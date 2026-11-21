@@ -23,6 +23,7 @@ pub mod bmc;
 pub mod coverage;
 pub mod debug;
 pub mod events;
+pub mod meminfo;
 pub mod rand;
 pub mod sat;
 pub mod sim;
