@@ -1926,12 +1926,23 @@ impl<'a> Lower<'a> {
             .collect();
         if exprs.len() >= 2 {
             if let (Some(a), Some(b)) = (
-                self.ce_env(&exprs[0], &HashMap::new()),
-                self.ce_env(&exprs[1], &HashMap::new()),
+                self.ce_env(&exprs[0], &HashMap::new())
+                    .and_then(|v| v.to_i64()),
+                self.ce_env(&exprs[1], &HashMap::new())
+                    .and_then(|v| v.to_i64()),
             ) {
-                if let (Some(a), Some(b)) = (a.to_u64(), b.to_u64()) {
-                    return (a as i64 - b as i64).unsigned_abs() as usize + 1;
-                }
+                // Direction decides high/low (see `constraint_dims`): a null
+                // range is width 0, never an underflowed 2³².
+                let (low, high) = if self.text(r).contains("downto") {
+                    (b, a)
+                } else {
+                    (a, b)
+                };
+                return if high >= low {
+                    (high as i128 - low as i128 + 1).min(usize::MAX as i128) as usize
+                } else {
+                    0
+                };
             }
             1
         } else if exprs.len() == 1 {
@@ -1985,13 +1996,27 @@ impl<'a> Lower<'a> {
             if exprs.len() >= 2 {
                 let a = self
                     .ce_env(&exprs[0], &HashMap::new())
-                    .and_then(|v| v.to_u64());
+                    .and_then(|v| v.to_i64());
                 let b = self
                     .ce_env(&exprs[1], &HashMap::new())
-                    .and_then(|v| v.to_u64());
+                    .and_then(|v| v.to_i64());
                 if let (Some(a), Some(b)) = (a, b) {
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    dims.push((lo as i64, (hi - lo + 1) as usize));
+                    // Direction decides low/high: `5 to -1` (e.g. an
+                    // under-evaluated `0 to N-1`) is a null range of size 0,
+                    // not the descending range -1 to 5 — swapping bounds
+                    // without the keyword turned a null range into 2³² words
+                    // and OOM-killed the run.
+                    let (low, high) = if self.text(&r).contains("downto") {
+                        (b, a)
+                    } else {
+                        (a, b)
+                    };
+                    let size = if high >= low {
+                        (high as i128 - low as i128 + 1).min(usize::MAX as i128) as usize
+                    } else {
+                        0
+                    };
+                    dims.push((low, size));
                 } else {
                     dims.push((0, 1));
                 }
