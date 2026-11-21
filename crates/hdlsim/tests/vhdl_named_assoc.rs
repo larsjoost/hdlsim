@@ -2,8 +2,9 @@
 //! arrow as two punctuation tokens, so the lowerer must recognise the
 //! adjacent pair — otherwise named generic/port associations degrade to
 //! positional, the generic actuals leak into the port connections and shift
-//! them. Also pins the fail-closed rejection of positional generic map
-//! associations.
+//! them. Positional generic maps must bind to the entity's generics in
+//! declaration order (they were first mis-bound via the port path, then
+//! rejected outright, before getting their own resolution pass).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,7 +45,7 @@ fn named_assoc_maps_bind() {
 }
 
 #[test]
-fn positional_generic_map_rejected() {
+fn positional_generic_map_binds_in_order() {
     let out = hdlsim()
         .args(["run", "--top", "tb_positional_generic"])
         .arg(fixture("vhdl_named_assoc_positional_tb.vhd"))
@@ -53,14 +54,15 @@ fn positional_generic_map_rejected() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success(),
-        "expected failure, got success\n{}{}",
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
         stdout,
         stderr
     );
     assert!(
-        stderr.contains("positional generic map"),
-        "expected the positional-generic-map diagnostic, got:\n{}",
-        stderr
+        stdout.contains("PASS: positional and named generic maps bind correctly"),
+        "{}",
+        stdout
     );
 }

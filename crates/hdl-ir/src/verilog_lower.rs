@@ -2732,7 +2732,8 @@ impl<'a> Lower<'a> {
         }
         for c in &kids[1..] {
             if c.kind() == SyntaxKind::ParamAssign {
-                param_overrides.push(self.lower_param_assign(c, env));
+                let (n, e) = self.lower_param_assign(c, env);
+                param_overrides.push((Some(n), e));
             }
         }
         if inst_name.is_empty() {

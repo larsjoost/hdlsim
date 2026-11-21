@@ -158,6 +158,7 @@ pub fn elaborate_with_opts(
     }
     let mut tried: Vec<String> = Vec::new();
     loop {
+        resolve_positional_params(design)?;
         bind_param_variants(design, resolver).map_err(ElabError::Message)?;
         match try_elaborate(design, top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
@@ -190,6 +191,64 @@ pub fn elaborate_with_opts(
 /// params, ask the resolver for a variant module re-lowered with those
 /// overrides and point the instance at it. Repeats to a fixpoint (variants
 /// may carry their own instances with overrides).
+/// Bind positional generic-map actuals (`generic map (v1, v2, …)`) by name:
+/// the k-th positional actual maps to the target module's k-th parameter in
+/// declaration order. Runs before variant binding — generic values select
+/// the re-lowered variant, so overrides must carry names by then. Instances
+/// whose target unit is not compiled yet keep their positionals until the
+/// next pass round; config bindings applied during instantiation resolve in
+/// `instantiate`, which has the final child module at hand.
+fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
+    for mi in 0..design.modules.len() {
+        for ii in 0..design.modules[mi].instances.len() {
+            let has_pos = design.modules[mi].instances[ii]
+                .param_overrides
+                .iter()
+                .any(|(n, _)| n.is_none());
+            if !has_pos {
+                continue;
+            }
+            let unit = design.modules[mi].instances[ii].module.clone();
+            let where_ = design.modules[mi].instances[ii].name.clone();
+            let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+                continue;
+            };
+            if !design.modules[tid].is_vhdl {
+                continue; // Verilog `#(…)` overrides are always named
+            }
+            let names: Vec<String> = design.modules[tid]
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let inst = &mut design.modules[mi].instances[ii];
+            let mut k = 0usize;
+            for (n, _) in inst.param_overrides.iter_mut() {
+                if n.is_some() {
+                    continue;
+                }
+                match names.get(k) {
+                    Some(name) => *n = Some(name.clone()),
+                    None => {
+                        return Err(ElabError::Message(format!(
+                            "{}: more positional generic-map actuals than '{}' has generics ({})",
+                            if where_.is_empty() {
+                                design.modules[mi].name.clone()
+                            } else {
+                                format!("{}.{}", design.modules[mi].name, where_)
+                            },
+                            unit,
+                            names.len()
+                        )))
+                    }
+                }
+                k += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> Result<(), String> {
     loop {
         let mut changed = false;
@@ -208,6 +267,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                 }
                 let mut params: HashMap<String, Value> = HashMap::new();
                 for (n, e) in &design.modules[mi].instances[ii].param_overrides {
+                    let Some(n) = n else { continue }; // resolved by resolve_positional_params
                     if let Expr::Lit(v) = e {
                         params.insert(n.to_ascii_lowercase(), v.clone());
                     }
@@ -525,12 +585,27 @@ impl Flat {
             } else {
                 format!("{}.{}", prefix, inst.name)
             };
-            // Parameter overrides as values where constant.
+            // Parameter overrides as values where constant. Positional
+            // actuals (config bindings can inject them after the pre-pass)
+            // bind to the child's parameters in declaration order.
             let mut child_params = param_vals.clone();
+            let mut pos = 0usize;
             for (pname, pexpr) in &inst.param_overrides {
+                if pname.is_none() {
+                    pos += 1; // every positional actual consumes a formal slot
+                }
                 let e = remap_expr(pexpr, &map);
                 if let Expr::Lit(v) = e {
-                    child_params.insert(pname.clone(), v);
+                    match pname {
+                        Some(n) => {
+                            child_params.insert(n.clone(), v);
+                        }
+                        None => {
+                            if let Some(p) = m.params.get(pos - 1) {
+                                child_params.insert(p.name.clone(), v);
+                            }
+                        }
+                    }
                 }
             }
             let child_conns: Vec<Conn> = inst

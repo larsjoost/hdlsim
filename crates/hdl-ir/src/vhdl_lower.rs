@@ -168,7 +168,7 @@ pub enum Binding {
     Entity {
         name: String,
         arch: Option<String>,
-        generic_map: Vec<(String, Expr)>,
+        generic_map: Vec<(Option<String>, Expr)>,
         port_map: Vec<Conn>,
     },
     Configuration {
@@ -680,14 +680,13 @@ impl<'a> Lower<'a> {
                 let ex = self.lower_expr(e, &self.consts.clone());
                 self.suppress_err -= 1;
                 match (assoc, in_generic) {
-                    (Some(n), true) => generic_map.push((n, ex)),
+                    (Some(n), true) => generic_map.push((Some(n), ex)),
                     (Some(n), false) => port_map.push(Conn::Named(n, ex)),
-                    (None, true) => {
-                        self.err(
-                            k.span(),
-                            "positional generic map association; use a named association",
-                        );
-                    }
+                    // Positional generic actuals bind to the target's
+                    // generics in declaration order; the name is resolved
+                    // at elaboration, where the entity's parameter list is
+                    // visible (resolve_positional_params).
+                    (None, true) => generic_map.push((None, ex)),
                     (None, false) => port_map.push(Conn::Positional(ex)),
                 }
             }
@@ -5511,18 +5510,14 @@ impl<'a> Lower<'a> {
                     let Some(e) = expr else { continue };
                     let ex = self.lower_expr(e, &self.consts.clone());
                     match (assoc_name, in_generic) {
-                        (Some(n), true) => param_overrides.push((n, ex)),
+                        (Some(n), true) => param_overrides.push((Some(n), ex)),
                         (Some(n), false) => conns.push(Conn::Named(n, ex)),
-                        // A positional generic association cannot be bound at
-                        // lowering time (the target's parameter list is not
-                        // visible here); fail closed instead of shifting the
-                        // port connections.
-                        (None, true) => {
-                            self.err(
-                                k.span(),
-                                "positional generic map association; use a named association",
-                            );
-                        }
+                        // Positional generic actuals bind to the target's
+                        // generics in declaration order; the name is
+                        // resolved at elaboration, where the entity's
+                        // parameter list is visible
+                        // (resolve_positional_params).
+                        (None, true) => param_overrides.push((None, ex)),
                         (None, false) => conns.push(Conn::Positional(ex)),
                     }
                 }

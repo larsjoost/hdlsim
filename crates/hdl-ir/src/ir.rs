@@ -177,7 +177,11 @@ pub struct FuncIr {
 pub struct InstIr {
     pub module: String,
     pub name: String,
-    pub param_overrides: Vec<(String, Expr)>,
+    /// Generic/parameter overrides: `Some(name)` for a named association,
+    /// `None` for a positional one (bound to the target's parameters in
+    /// declaration order during elaboration — the target's list is not
+    /// visible while lowering).
+    pub param_overrides: Vec<(Option<String>, Expr)>,
     pub conns: Vec<Conn>,
     /// Configuration bound to this instance (`configuration work.cfg` or a
     /// `for label : comp use configuration ...;` specification); elaboration
