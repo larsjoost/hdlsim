@@ -293,13 +293,9 @@ impl Simulator {
             .unwrap_or(DEFAULT_MAX_SIGNAL_MB)
             * 1024
             * 1024;
-        // Shared with the peak-RSS guard's env contract (`HDLSIM_MAX_MEM_MB`
-        // in MiB, unset/zero disables the total check).
-        let total_limit = std::env::var("HDLSIM_MAX_MEM_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .map(|mb| mb * 1024 * 1024);
+        // Shared with the peak-RSS guard's env contract: `HDLSIM_MAX_MEM_MB`
+        // in MiB, unset or zero disables the total check.
+        let total_limit = crate::meminfo::mem_limit_kb().map(|kb| kb * 1024);
         Self::alloc_report_with_caps(flat, per_signal_limit, total_limit)
     }
 
