@@ -1947,12 +1947,10 @@ impl<'a> Lower<'a> {
                     .and_then(|v| v.to_i64()),
             ) {
                 // Direction decides high/low (see `constraint_dims`): a null
-                // range is width 0, never an underflowed 2³².
-                let (low, high) = if self.text(r).contains("downto") {
-                    (b, a)
-                } else {
-                    (a, b)
-                };
+                // range is width 0, never an underflowed 2³². VHDL keywords
+                // are case-insensitive — match `DOWNTO`/`downto`.
+                let descending = self.text(r).to_ascii_lowercase().contains("downto");
+                let (low, high) = if descending { (b, a) } else { (a, b) };
                 return if high >= low {
                     (high as i128 - low as i128 + 1).min(usize::MAX as i128) as usize
                 } else {
@@ -2020,12 +2018,10 @@ impl<'a> Lower<'a> {
                     // under-evaluated `0 to N-1`) is a null range of size 0,
                     // not the descending range -1 to 5 — swapping bounds
                     // without the keyword turned a null range into 2³² words
-                    // and OOM-killed the run.
-                    let (low, high) = if self.text(&r).contains("downto") {
-                        (b, a)
-                    } else {
-                        (a, b)
-                    };
+                    // and OOM-killed the run. VHDL keywords are
+                    // case-insensitive — match `DOWNTO`/`downto`.
+                    let descending = self.text(&r).to_ascii_lowercase().contains("downto");
+                    let (low, high) = if descending { (b, a) } else { (a, b) };
                     let size = if high >= low {
                         (high as i128 - low as i128 + 1).min(usize::MAX as i128) as usize
                     } else {
