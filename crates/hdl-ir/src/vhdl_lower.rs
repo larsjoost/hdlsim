@@ -772,6 +772,46 @@ fn apply_default_archs(
 /// order. Returns the architectures still unresolved; with `emit_errors`,
 /// those produce E0401 (caret on the entity name, did-you-mean help over all
 /// known entity names).
+/// Lowercased file stem with a trailing architecture/entity-role suffix
+/// (`-b`, `_rtl`, `-behavior`, ...) removed, so `foo.vhd`'s entity matches
+/// `foo_rtl.vhd`'s architecture — the sibling-file convention for designs
+/// that split entities and architectures across files. Longest suffix wins,
+/// and only one suffix is stripped.
+pub fn stem_key(path: &str) -> String {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    const SUFFIXES: [&str; 18] = [
+        "-behavior",
+        "_behavior",
+        "-behaviour",
+        "_behaviour",
+        "-rtl",
+        "_rtl",
+        "-arch",
+        "_arch",
+        "-struct",
+        "_struct",
+        "-entity",
+        "_entity",
+        "-ent",
+        "_ent",
+        "-b",
+        "_b",
+        "-a",
+        "_a",
+    ];
+    for suf in SUFFIXES {
+        if let Some(base) = stem.strip_suffix(suf) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    stem
+}
+
 pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
@@ -780,11 +820,22 @@ pub fn lower_pending_architectures(
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
     emit_errors: bool,
+    // Bind cross-file architectures as soon as their entity is visible.
+    // `false` while a compile batch is still running: the provenance maps
+    // are incomplete (later files may declare another same-named entity),
+    // so binding would latch onto a wrong twin — defer to the final pass.
+    bind_eager: bool,
     entity_roots: &HashMap<String, SyntaxNode>,
     entity_maps: &HashMap<String, SigMaps>,
     entity_maps_by_dir: &HashMap<(String, String), SigMaps>,
     entity_by_lib: &HashMap<(String, String), usize>,
     entity_by_dir: &HashMap<(String, String), usize>,
+    // (canonical dir, stem key, entity name) → module index — the
+    // sibling-file convention (`foo.vhd` entity ↔ `foo_rtl.vhd` arch).
+    // Tried before the dir/library maps: a whole-tree library holds several
+    // same-named entities, and stem matching is the only signal that pins
+    // an architecture file to ITS entity.
+    entity_by_stem: &HashMap<(String, String, String), usize>,
 ) -> Vec<PendingArch> {
     if pending.is_empty() {
         return Vec::new();
@@ -828,45 +879,62 @@ pub fn lower_pending_architectures(
         // several directories; sibling files belong together), then to the
         // entity compiled for the arch's own library (LRM 11.2). The
         // design-wide name lookup applies only when the resolver had no
-        // provenance for this file.
-        let ents: HashMap<String, usize> = match arch_entity(&p.arch, db) {
-            Some((_, en)) => {
-                let key = en.to_ascii_lowercase();
-                let arch_dir: Option<String> = file_dir(db, &p.root);
-                let dir_idx = arch_dir
-                    .as_ref()
-                    .and_then(|d| entity_by_dir.get(&(d.clone(), key.clone())));
-                let lib_idx = p
-                    .lib
-                    .as_ref()
-                    .and_then(|lib| entity_by_lib.get(&(lib.to_ascii_lowercase(), key.clone())));
-                match dir_idx.or(lib_idx) {
-                    Some(&i) => [(en, i)].into_iter().collect(),
-                    None if p.lib.is_none() && arch_dir.is_none() => match entities.get(&en) {
+        // provenance for this file. All of this waits for the final pass
+        // while a compile batch is still running (`!bind_eager`): the
+        // provenance maps only cover the files compiled so far, and binding
+        // to a same-named entity compiled earlier in the batch would latch
+        // onto the wrong twin.
+        let ents: HashMap<String, usize> = if !bind_eager {
+            HashMap::new()
+        } else {
+            match arch_entity(&p.arch, db) {
+                Some((_, en)) => {
+                    let key = en.to_ascii_lowercase();
+                    let arch_dir: Option<String> = file_dir(db, &p.root);
+                    let arch_file = db.file(p.root.span().file).name().to_string();
+                    // 1. Sibling-file convention: the arch file's stem with
+                    //    the role suffix stripped matches the entity file's
+                    //    stem (`reg-b.vhd` belongs to `reg.vhd`, even when
+                    //    several entities named `reg` share the directory).
+                    let stem_idx = arch_dir.as_ref().and_then(|d| {
+                        entity_by_stem.get(&(d.clone(), stem_key(&arch_file), key.clone()))
+                    });
+                    // 2. Same directory, last entity compiled; 3. same library.
+                    let dir_idx = arch_dir
+                        .as_ref()
+                        .and_then(|d| entity_by_dir.get(&(d.clone(), key.clone())));
+                    let lib_idx = p.lib.as_ref().and_then(|lib| {
+                        entity_by_lib.get(&(lib.to_ascii_lowercase(), key.clone()))
+                    });
+                    match stem_idx.or(dir_idx).or(lib_idx) {
                         Some(&i) => [(en, i)].into_iter().collect(),
-                        None => HashMap::new(),
-                    },
-                    // Provenance lookup failed. Bind design-wide by name only
-                    // when the name is unambiguous — exactly one such entity
-                    // was compiled (possibly in another directory). With
-                    // several same-named entities and no scope match, stay
-                    // pending: a later file may still provide the right one.
-                    None => {
-                        let matches: Vec<usize> = modules
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, m)| m.name.eq_ignore_ascii_case(&en))
-                            .map(|(i, _)| i)
-                            .collect();
-                        if matches.len() == 1 {
-                            [(en.clone(), matches[0])].into_iter().collect()
-                        } else {
-                            HashMap::new()
+                        None if p.lib.is_none() && arch_dir.is_none() => match entities.get(&en) {
+                            Some(&i) => [(en, i)].into_iter().collect(),
+                            None => HashMap::new(),
+                        },
+                        // Provenance lookup failed. Bind design-wide by name
+                        // only when the name is unambiguous — exactly one such
+                        // entity was compiled (possibly in another directory).
+                        // With several same-named entities and no scope match,
+                        // stay pending: a later file may still provide the
+                        // right one.
+                        None => {
+                            let matches: Vec<usize> = modules
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, m)| m.name.eq_ignore_ascii_case(&en))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if matches.len() == 1 {
+                                [(en.clone(), matches[0])].into_iter().collect()
+                            } else {
+                                HashMap::new()
+                            }
                         }
                     }
                 }
+                None => HashMap::new(),
             }
-            None => HashMap::new(),
         };
         match lx.lower_architecture(&p.arch, modules, &ents) {
             Some((ent, arch)) => {

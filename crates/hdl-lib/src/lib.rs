@@ -94,6 +94,19 @@ pub struct LibraryManager {
     /// libraries (`work = .`) hold same-named entities from several
     /// directories; sibling files (same dir) belong together.
     entity_module_by_dir: HashMap<(String, String), usize>,
+    /// (canonical dir, file-stem key, entity name) → module index. Pins an
+    /// architecture file to its own entity when several same-named entities
+    /// share one directory (`reg-b.vhd` ↔ `reg.vhd`), see [`stem_key`].
+    entity_module_by_stem: HashMap<(String, String, String), usize>,
+    /// A `compile_files` batch is running: context-clause resolves triggered
+    /// by one file must not bind cross-file architectures yet — the
+    /// provenance maps only cover the files compiled so far. Binding waits
+    /// for the batch's final pass.
+    batch: bool,
+    /// design-modules index → source file that lowered it. Variant
+    /// re-lowering starts from the bound module's own file so same-named
+    /// entities from other files (stem-index twins) cannot be picked.
+    module_source: HashMap<usize, PathBuf>,
     /// Project roots searched on a resolve miss (cwd, dirs of input files):
     /// the "out of the box" fallback when no library maps the unit.
     search_roots: Vec<PathBuf>,
@@ -130,6 +143,9 @@ impl LibraryManager {
             entity_maps_by_dir: HashMap::new(),
             entity_module_of: HashMap::new(),
             entity_module_by_dir: HashMap::new(),
+            entity_module_by_stem: HashMap::new(),
+            batch: false,
+            module_source: HashMap::new(),
             unresolved_units: Vec::new(),
             search_roots: Vec::new(),
             search_index: None,
@@ -611,6 +627,8 @@ impl LibraryManager {
             &mut self.entity_maps,
             &mut self.entity_maps_by_dir,
             &mut self.entity_module_by_dir,
+            &mut self.entity_module_by_stem,
+            &mut self.module_source,
             &mut self.verilog_scope,
         )
     }
@@ -633,6 +651,11 @@ impl LibraryManager {
         // references resolve no matter what order the files were given in.
         // Likewise VHDL package declarations before package bodies, so a body
         // in its own file sees the declaration's types/constants.
+        // Cross-file architecture binding defers to the final pass: with the
+        // batch still running, a file's context-clause resolves must not bind
+        // pending architectures against incomplete provenance (later files
+        // may declare another same-named entity).
+        self.batch = true;
         let mut pkgs: Vec<&PathBuf> = Vec::new();
         let mut rest: Vec<&PathBuf> = Vec::new();
         for p in paths {
@@ -666,6 +689,7 @@ impl LibraryManager {
                 self.diags.push(Diagnostic::error("E0501", None, e));
             }
         }
+        self.batch = false;
         self.retry_pending_architectures(design, true);
         self.warn_unresolved_context_units(design);
     }
@@ -705,11 +729,16 @@ impl LibraryManager {
             &mut design.modules,
             pending,
             emit_errors,
+            // Mid-batch retries (context-clause resolves) must not bind
+            // against incomplete provenance; only the final batch pass and
+            // single-file compile paths bind eagerly.
+            !self.batch,
             &self.entity_roots,
             &self.entity_maps,
             &self.entity_maps_by_dir,
             &self.entity_module_of,
             &self.entity_module_by_dir,
+            &self.entity_module_by_stem,
         );
         self.diags.extend(lower_diags);
         self.pending_archs = still;
@@ -754,6 +783,7 @@ impl UnitResolver for LibraryManager {
         design: &mut Design,
         unit: &str,
         params: &HashMap<String, hdl_ir::Value>,
+        bound: usize,
     ) -> Result<Option<String>, String> {
         let (ent, arch) = match unit.split_once('/') {
             Some((e, a)) => (e.to_string(), Some(a.to_ascii_lowercase())),
@@ -807,8 +837,26 @@ impl UnitResolver for LibraryManager {
         // Classify the candidates: the entity's declaration file plus the
         // sibling files holding its architectures (this codebase splits
         // `*_entity.vhd` / `*_behavior.vhd` into separate files).
+        //
+        // The entity file is the source file of the module the instantiation
+        // actually bound to (`bound`) when known: whole-tree libraries hold
+        // same-named entities from several files, and stem order would pick
+        // an unrelated twin (whose ports/generics differ). The stem-index
+        // scan remains the fallback for modules without provenance (e.g.
+        // previously created variants).
         let mut ent_file: Option<(PathBuf, String)> = None;
         let mut arch_files: Vec<(PathBuf, String)> = Vec::new();
+        if let Some(bpath) = self.module_source.get(&bound) {
+            if let Ok(text) = std::fs::read_to_string(bpath) {
+                let units = crate::providers::vhdl_units_in_file(bpath, &text);
+                if units
+                    .iter()
+                    .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && !*b)
+                {
+                    ent_file = Some((bpath.clone(), text));
+                }
+            }
+        }
         for path in cands {
             // VHDL variants only — a Verilog `#(...)` override keeps the
             // default-parameter behavior.
@@ -1040,6 +1088,7 @@ impl LibraryManager {
         for (i, m) in design.modules.iter().enumerate().skip(first_new_module) {
             self.entity_module_of
                 .insert((lib.to_ascii_lowercase(), m.name.to_ascii_lowercase()), i);
+            self.module_source.insert(i, path.clone());
         }
         self.stamp_pending_libs(&path, &lib);
         self.retry_pending_architectures(design, false);
@@ -1159,6 +1208,8 @@ pub fn compile_one(
     entity_maps: &mut HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
     entity_maps_by_dir: &mut HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
     entity_module_by_dir: &mut HashMap<(String, String), usize>,
+    entity_module_by_stem: &mut HashMap<(String, String, String), usize>,
+    module_source: &mut HashMap<usize, PathBuf>,
     verilog_scope: &mut verilog_lower::VerilogScope,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
@@ -1236,28 +1287,49 @@ pub fn compile_one(
             // Record which module each entity in this file produced, keyed by
             // the file's source directory — sibling architectures bind to
             // their own directory's entity when several libraries (or a
-            // whole-tree `work` library) declare same-named entities.
+            // whole-tree `work` library) declare same-named entities. The
+            // LAST same-named entity in a directory wins: an architecture
+            // file compiled after several same-named entities belongs to the
+            // entity closest before it (first-wins would bind it to an
+            // unrelated earlier twin).
             if let Some(dir) = std::fs::canonicalize(path)
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
             {
                 let base = design.modules.len();
                 for (i, m) in lowered.modules.iter().enumerate() {
-                    entity_module_by_dir
-                        .entry((dir.clone(), m.name.to_ascii_lowercase()))
-                        .or_insert(base + i);
+                    let lname = m.name.to_ascii_lowercase();
+                    entity_module_by_dir.insert((dir.clone(), lname.clone()), base + i);
+                    // Sibling-file convention: `reg-b.vhd` binds to `reg.vhd`
+                    // even when several entities named `reg` share the dir.
+                    let fname = std::path::Path::new(path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    entity_module_by_stem.insert(
+                        (dir.clone(), hdl_ir::vhdl_lower::stem_key(&fname), lname),
+                        base + i,
+                    );
                 }
             }
+            let mbase = design.modules.len();
+            let new_modules = lowered.modules.len();
             design.modules.extend(lowered.modules);
+            // Stamp each new module with its source file so variant
+            // re-lowering (generic-map overrides at elaboration) re-lowers
+            // the bound module's own entity file, not a stem-index twin.
+            for i in 0..new_modules {
+                module_source.insert(mbase + i, path.to_path_buf());
+            }
             pending_archs.extend(lowered.pending);
             for (name, root) in lowered.entity_roots {
-                entity_roots.entry(name).or_insert(root);
+                entity_roots.insert(name, root);
             }
             for (name, m) in lowered.entity_maps {
-                entity_maps.entry(name).or_insert(m);
+                entity_maps.insert(name, m);
             }
             for ((dir, name), m) in lowered.entity_maps_by_dir {
-                entity_maps_by_dir.entry((dir, name)).or_insert(m);
+                entity_maps_by_dir.insert((dir, name), m);
             }
             for c in lowered.configurations {
                 design

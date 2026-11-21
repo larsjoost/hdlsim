@@ -108,12 +108,15 @@ pub trait UnitResolver {
     /// `entity/arch`) re-lowered with the constant `params` overrides from an
     /// instantiation's `generic map` / `#(...)`; returns the variant module
     /// name, or `None` when unsupported (elaboration then falls back to the
-    /// default-generics module).
+    /// default-generics module). `bound` is the design-modules index of the
+    /// module the instantiation resolved to — its source file disambiguates
+    /// same-named entities from different files.
     fn resolve_variant(
         &mut self,
         _design: &mut Design,
         _unit: &str,
         _params: &HashMap<String, Value>,
+        _bound: usize,
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -275,7 +278,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                 if params.is_empty() {
                     continue;
                 }
-                if let Some(v) = resolver.resolve_variant(design, &unit, &params)? {
+                if let Some(v) = resolver.resolve_variant(design, &unit, &params, tid)? {
                     if v != unit {
                         design.modules[mi].instances[ii].module = v;
                         changed = true;
