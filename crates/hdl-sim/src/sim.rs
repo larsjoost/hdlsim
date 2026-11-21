@@ -218,6 +218,11 @@ pub struct Simulator {
     /// Latched when `fn_depth` passes the budget: the name of the function
     /// at detection. The pump reports it and stops the simulation.
     fn_recursion: std::cell::RefCell<Option<String>>,
+    /// Graceful memory guard (`HDLSIM_MAX_MEM_MB` in MiB): exceeding it
+    /// stops the run with an actionable diagnostic instead of an OOM kill.
+    max_mem_kb: Option<u64>,
+    /// Throttle counter for the guard's `/proc` reads.
+    mem_checks: std::cell::Cell<u64>,
     /// Stopped by an internal error guard (combinational loop, delta/step
     /// limit): the run must fail the process exit code, not exit 0.
     error_stopped: bool,
@@ -434,6 +439,8 @@ impl Simulator {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000_000),
+            max_mem_kb: crate::meminfo::mem_limit_kb(),
+            mem_checks: std::cell::Cell::new(0),
             fn_depth: std::cell::Cell::new(0),
             max_func_depth: std::env::var("HDLSIM_MAX_FUNC_DEPTH")
                 .ok()
@@ -720,6 +727,34 @@ impl Simulator {
         false
     }
 
+    /// Graceful memory guard (`HDLSIM_MAX_MEM_MB`): over the limit, stop
+    /// with an actionable diagnostic instead of being OOM-killed (exit 137,
+    /// no output). Throttled to every 128th call — the `/proc` read is not
+    /// free in the hot loop. Returns false when the run must stop.
+    fn check_mem(&mut self) -> bool {
+        let Some(limit_kb) = self.max_mem_kb else {
+            return true;
+        };
+        let n = self.mem_checks.get() + 1;
+        self.mem_checks.set(n);
+        if n > 1 && n % 128 != 0 {
+            return true;
+        }
+        let Some(peak_kb) = crate::meminfo::peak_rss_kb() else {
+            return true;
+        };
+        if peak_kb <= limit_kb {
+            return true;
+        }
+        self.emit(SimEvent::Message {
+            text: crate::meminfo::limit_message("simulate", peak_kb, limit_kb),
+            time_fs: self.time,
+        });
+        self.stopped = true;
+        self.error_stopped = true;
+        false
+    }
+
     // ---- main loop ------------------------------------------------------------
 
     /// Write the full dynamic simulator state to `path` (own binary format
@@ -887,6 +922,9 @@ impl Simulator {
                     }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
+                    if !self.check_mem() {
+                        break;
+                    }
                     let evs = self.time_events.remove(&t).unwrap_or_default();
                     for ev in evs {
                         match ev {
@@ -2981,7 +3019,7 @@ impl Simulator {
                             .cloned()
                             .unwrap_or_else(|| Value::x(self.flat.signals[sig].width.max(1)))
                     }
-                    other => {
+                    _ => {
                         let v = self.eval_expr(e, locals);
                         Value::from_bit(v.bit(a as usize))
                     }
