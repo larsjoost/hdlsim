@@ -222,7 +222,13 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
 /// Per-file status for a group compile: an error diagnostic counts against
 /// the file its span points into; spanless errors count against every file.
 fn group_statuses(sub: &str, files: &[PathBuf]) -> HashMap<String, &'static str> {
+    let t0 = std::time::Instant::now();
     let mgr = compile_group(sub, files);
+    eprintln!(
+        "corpus: group {sub}: {} files in {:.1}s",
+        files.len(),
+        t0.elapsed().as_secs_f32()
+    );
     let mut name_to_rel: HashMap<String, String> = HashMap::new();
     for f in files {
         name_to_rel.insert(f.display().to_string(), rel_path(f));
@@ -327,7 +333,13 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
         let mut with_diags = 0;
         for (sub, files) in corpus_groups() {
             // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
+            let t0 = std::time::Instant::now();
             let mgr = compile_group(&sub, &files);
+            eprintln!(
+                "corpus: group {sub}: {} files in {:.1}s",
+                files.len(),
+                t0.elapsed().as_secs_f32()
+            );
             checked += files.len();
             let rendered = mgr.diags().render_all(mgr.db());
             if !mgr.diags().is_empty() {

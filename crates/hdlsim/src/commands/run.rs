@@ -141,10 +141,11 @@ impl Command for Run {
         let flat = elab::elaborate_with(&mut design, &top_name, &mut mgr)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
         elab_phase.done(format!(
-            "{} signals, {} processes, {} assigns",
+            "{} signals, {} processes, {} assigns, max-mem-depth {}",
             flat.signals.len(),
             flat.procs.len(),
-            flat.assigns.len()
+            flat.assigns.len(),
+            flat.signals.iter().filter_map(|s| s.mem).max().unwrap_or(0)
         ));
         if crate::phase::over_mem_limit("elaborate") {
             return Ok(1);
