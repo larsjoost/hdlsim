@@ -64,6 +64,15 @@ pub struct LibraryManager {
     dir_scanned: bool,
     /// Print indexing/resolution progress to stderr (`--progress`).
     progress: bool,
+    /// Env-gated sub-phase timings (`HDLSIM_TIMING=1`): seconds spent
+    /// lowering files, retrying pending architectures, and resolving units.
+    t_lower: std::time::Duration,
+    t_retry: std::time::Duration,
+    t_resolve: std::time::Duration,
+    /// Resolve-call counts and the slowest individual resolves (unit, ms),
+    /// for `HDLSIM_TIMING=1`.
+    n_resolve: u64,
+    slow_resolves: Vec<(String, u128)>,
     /// Canonical paths already compiled this session.
     compiled: HashSet<PathBuf>,
     /// Persistent parse cache (`.hdlsim-cache/`); None unless enabled.
@@ -107,6 +116,10 @@ pub struct LibraryManager {
     /// re-lowering starts from the bound module's own file so same-named
     /// entities from other files (stem-index twins) cannot be picked.
     module_source: HashMap<usize, PathBuf>,
+    /// Mirror of `design.modules` names for O(1) unit-exists checks (the
+    /// design only grows; `module_names_n` is how many are mirrored).
+    module_names: HashSet<String>,
+    module_names_n: usize,
     /// Project roots searched on a resolve miss (cwd, dirs of input files):
     /// the "out of the box" fallback when no library maps the unit.
     search_roots: Vec<PathBuf>,
@@ -137,6 +150,11 @@ impl LibraryManager {
             compiled: HashSet::new(),
             cache: None,
             cache_hits: 0,
+            t_lower: std::time::Duration::ZERO,
+            t_retry: std::time::Duration::ZERO,
+            t_resolve: std::time::Duration::ZERO,
+            n_resolve: 0,
+            slow_resolves: Vec::new(),
             pending_archs: Vec::new(),
             entity_roots: HashMap::new(),
             entity_maps: HashMap::new(),
@@ -146,6 +164,8 @@ impl LibraryManager {
             entity_module_by_stem: HashMap::new(),
             batch: false,
             module_source: HashMap::new(),
+            module_names: HashSet::new(),
+            module_names_n: 0,
             unresolved_units: Vec::new(),
             search_roots: Vec::new(),
             search_index: None,
@@ -559,6 +579,7 @@ impl LibraryManager {
         // VHDL: resolve the units named in context clauses (`use lib.pkg.all;`)
         // first, so their packages are on the design and visible while lowering.
         if Language::from_path(path) == Some(Language::Vhdl) {
+            let t_ctx = std::time::Instant::now();
             let id = self
                 .db
                 .add_file(path.display().to_string(), text.to_string())
@@ -611,6 +632,7 @@ impl LibraryManager {
                     }
                 }
             }
+            self.t_resolve += t_ctx.elapsed();
         }
         let cache = self.cache.as_ref();
         compile_one(
@@ -629,6 +651,7 @@ impl LibraryManager {
             &mut self.entity_module_by_dir,
             &mut self.entity_module_by_stem,
             &mut self.module_source,
+            &mut self.t_lower,
             &mut self.verilog_scope,
         )
     }
@@ -692,6 +715,21 @@ impl LibraryManager {
         self.batch = false;
         self.retry_pending_architectures(design, true);
         self.warn_unresolved_context_units(design);
+        if self.progress || std::env::var("HDLSIM_TIMING").is_ok() {
+            eprintln!(
+                "hdlsim: compile breakdown lower {:.1}s / pending-retry {:.1}s / context-resolve {:.1}s / {} resolves",
+                self.t_lower.as_secs_f32(),
+                self.t_retry.as_secs_f32(),
+                self.t_resolve.as_secs_f32(),
+                self.n_resolve
+            );
+            if !self.slow_resolves.is_empty() {
+                eprintln!(
+                    "hdlsim: slowest resolves (unit, ms): {:?}",
+                    self.slow_resolves
+                );
+            }
+        }
     }
 
     /// Warn about `use`d library units that could not be resolved anywhere.
@@ -721,6 +759,7 @@ impl LibraryManager {
         }
         let pending = std::mem::take(&mut self.pending_archs);
         let mut lower_diags = Vec::new();
+        let t0 = std::time::Instant::now();
         let still = hdl_ir::vhdl_lower::lower_pending_architectures(
             &self.db,
             &mut lower_diags,
@@ -740,6 +779,7 @@ impl LibraryManager {
             &self.entity_module_by_dir,
             &self.entity_module_by_stem,
         );
+        self.t_retry += t0.elapsed();
         self.diags.extend(lower_diags);
         self.pending_archs = still;
     }
@@ -808,7 +848,10 @@ impl UnitResolver for LibraryManager {
             Some(a) => format!("{vbase}/{a}"),
             None => vbase.clone(),
         };
-        if design.modules.iter().any(|m| m.name == want) {
+        // Variant existence check by name: resolve_variant is called per
+        // instantiation, and a linear scan over ~2000 modules per call is
+        // seconds of String compares on big testbenches.
+        if self.module_exists(design, &want) {
             return Ok(Some(want));
         }
         self.ensure_stem_index();
@@ -930,16 +973,45 @@ impl UnitResolver for LibraryManager {
             return Ok(None);
         }
         design.modules.extend(modules);
-        if design.modules.iter().any(|m| m.name == want) {
+        if self.module_exists(design, &want) {
             return Ok(Some(want));
         }
-        if arch.is_none() && design.modules.iter().any(|m| m.name == vbase) {
+        if arch.is_none() && self.module_exists(design, &vbase) {
             return Ok(Some(vbase));
         }
         Ok(None)
     }
 
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
+        let t0 = std::time::Instant::now();
+        self.n_resolve += 1;
+        let r = self.resolve_inner(design, name);
+        let ms = t0.elapsed().as_millis();
+        if ms >= 20 {
+            self.slow_resolves.push((name.to_string(), ms));
+            self.slow_resolves
+                .sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+            self.slow_resolves.truncate(10);
+        }
+        r
+    }
+}
+
+impl LibraryManager {
+    /// True when a module named `name` is on the design. Mirrors module
+    /// names incrementally (the design only grows), so hot per-instantiation
+    /// lookups are O(1) instead of a linear scan.
+    fn module_exists(&mut self, design: &Design, name: &str) -> bool {
+        if self.module_names_n != design.modules.len() {
+            for m in &design.modules[self.module_names_n..] {
+                self.module_names.insert(m.name.clone());
+            }
+            self.module_names_n = design.modules.len();
+        }
+        self.module_names.contains(name)
+    }
+
+    fn resolve_inner(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
         // VHDL instantiation module names are `entity/arch` (the IR naming);
         // the units to load are the entity's and its architectures' files, so
         // look up the entity part only. Success still requires the full
@@ -1023,9 +1095,7 @@ impl UnitResolver for LibraryManager {
         }
         Ok(false)
     }
-}
 
-impl LibraryManager {
     /// True when the requested unit is on the design: a package with that
     /// name, a module named `base` (entity without architecture selected), or
     /// — for `entity/arch` requests — the bound `entity/arch` module.
@@ -1210,6 +1280,7 @@ pub fn compile_one(
     entity_module_by_dir: &mut HashMap<(String, String), usize>,
     entity_module_by_stem: &mut HashMap<(String, String, String), usize>,
     module_source: &mut HashMap<usize, PathBuf>,
+    t_lower: &mut std::time::Duration,
     verilog_scope: &mut verilog_lower::VerilogScope,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
@@ -1274,6 +1345,7 @@ pub fn compile_one(
             };
             diags.extend(parse_diags);
             let mut lower_diags = Vec::new();
+            let t0 = std::time::Instant::now();
             let lowered = hdl_ir::vhdl_lower::lower_file(
                 id,
                 &root,
@@ -1283,6 +1355,7 @@ pub fn compile_one(
                 &design.packages,
                 &design.configurations,
             );
+            *t_lower += t0.elapsed();
             diags.extend(lower_diags);
             // Record which module each entity in this file produced, keyed by
             // the file's source directory — sibling architectures bind to
