@@ -265,6 +265,102 @@ pub struct Simulator {
 }
 
 impl Simulator {
+    /// Pre-allocation guard for [`Simulator::new`]: estimate each signal's
+    /// footprint (a `Value` costs ~1 byte per bit; a memory repeats that per
+    /// word) and refuse before touching the allocator when a single signal
+    /// — or the total, when `HDLSIM_MAX_MEM_MB` is set — would exceed its
+    /// cap. The error names the largest allocators so the design can be
+    /// fixed: a width or depth in the GiB range is almost always a generic
+    /// or range that did not elaborate (an unpropagated generic-map actual,
+    /// a null range underflowing), and allocating it would otherwise abort
+    /// or be OOM-killed (exit 137) before any RSS-based guard could run.
+    ///
+    /// Caps: `HDLSIM_MAX_SIGNAL_MB` per signal (default 4096 MiB — far above
+    /// any legitimate unit-test or DUT sim, far below the runaway 2³²-width
+    /// class); `HDLSIM_MAX_MEM_MB` (shared with the peak-RSS guard) for the
+    /// total, only when set.
+    pub fn alloc_report(flat: &Flat) -> Result<(), String> {
+        const DEFAULT_MAX_SIGNAL_MB: u64 = 4096;
+        let per_signal_limit = std::env::var("HDLSIM_MAX_SIGNAL_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_SIGNAL_MB)
+            * 1024
+            * 1024;
+        // Shared with the peak-RSS guard's env contract (`HDLSIM_MAX_MEM_MB`
+        // in MiB, unset/zero disables the total check).
+        let total_limit = std::env::var("HDLSIM_MAX_MEM_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * 1024 * 1024);
+        Self::alloc_report_with_caps(flat, per_signal_limit, total_limit)
+    }
+
+    /// `alloc_report` with explicit caps (bytes); the env-reading wrapper
+    /// keeps this testable.
+    fn alloc_report_with_caps(
+        flat: &Flat,
+        per_signal_limit: u64,
+        total_limit: Option<u64>,
+    ) -> Result<(), String> {
+        let mut ests: Vec<(u64, usize)> = flat
+            .signals
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                // A stored word costs its Value header (~24 bytes) plus 1
+                // byte per bit — so even a 1-bit memory at 2³² words is
+                // ~96 GiB of headers alone.
+                let bytes_per_word = 24 + s.width.max(1) as u64;
+                let words = s.mem.unwrap_or(0) as u64 + 1;
+                (bytes_per_word.saturating_mul(words), i)
+            })
+            .collect();
+        let total: u64 = ests.iter().map(|(e, _)| *e).sum();
+        let over_signal = ests.iter().any(|(e, _)| *e > per_signal_limit);
+        let over_total = total_limit.is_some_and(|l| total > l);
+        if !over_signal && !over_total {
+            return Ok(());
+        }
+        ests.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let mut report = String::new();
+        if over_signal {
+            report.push_str(&format!(
+                "error: sim-init would allocate more than {} MB for a single signal \
+                 (HDLSIM_MAX_SIGNAL_MB={}); largest allocators:\n",
+                per_signal_limit / 1024 / 1024,
+                per_signal_limit / 1024 / 1024
+            ));
+        } else {
+            report.push_str(&format!(
+                "error: sim-init would allocate ~{} MB (HDLSIM_MAX_MEM_MB={}); \
+                 largest allocators:\n",
+                total / 1024 / 1024,
+                total_limit.unwrap() / 1024 / 1024
+            ));
+        }
+        for (e, i) in ests.iter().take(8) {
+            let s = &flat.signals[*i];
+            report.push_str(&format!(
+                "  {} : width {} bits, {} words, ~{} MB\n",
+                s.name,
+                s.width,
+                s.mem.unwrap_or(0),
+                (e / 1024 / 1024).max(1)
+            ));
+        }
+        report.push_str(
+            "a width or depth this large usually means a generic or range that did not \
+             elaborate — check the generic map actuals of the instances above \
+             (`hdlsim debug --dump` shows the elaborated widths); raise \
+             HDLSIM_MAX_SIGNAL_MB / HDLSIM_MAX_MEM_MB only if the design is \
+             genuinely this big\n",
+        );
+        Err(report)
+    }
+
     pub fn new(flat: Flat) -> Simulator {
         let n = flat.signals.len();
         let np = flat.procs.len();
@@ -1486,8 +1582,10 @@ impl Simulator {
                     let n = self.eval_expr(n, locals.as_deref()).to_u64().unwrap_or(0) as usize;
                     let sig = *sig as FlatSigId;
                     let w = self.flat.signals[sig as usize].width;
-                    self.mems[sig as usize].resize(n, Value::x(w.max(1)));
-                    self.vals[sig as usize] = Value::from_u64(32, n as u64);
+                    if self.mem_grow_ok(sig as usize, n.saturating_sub(1)) {
+                        self.mems[sig as usize].resize(n, Value::x(w.max(1)));
+                        self.vals[sig as usize] = Value::from_u64(32, n as u64);
+                    }
                 }
             }
             // Array method statement: `q.push_back(x)` — lowered to
@@ -2285,6 +2383,52 @@ impl Simulator {
 
     // ---- assignment targets -------------------------------------------------------------
 
+    /// Cap for growing a memory on an indexed write (`HDLSIM_MAX_SIGNAL_MB`,
+    /// shared with `alloc_report`'s per-signal estimate): a write at an index
+    /// in the 2³² range is an underflowed/negative address from an
+    /// unelaborated generic, and `resize` would abort the process (96 GiB
+    /// class) before any RSS guard could run. Over the cap: report the
+    /// signal, the index, and the declared depth, and stop the run.
+    fn mem_grow_ok(&mut self, sig: usize, a: usize) -> bool {
+        const DEFAULT_MAX_SIGNAL_MB: u64 = 4096;
+        let cap_bytes = std::env::var("HDLSIM_MAX_SIGNAL_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_SIGNAL_MB)
+            * 1024
+            * 1024;
+        // Same estimate as `alloc_report`: a stored word costs its Value
+        // header (~24 bytes) plus 1 byte per bit — a 1-bit memory at 2³²
+        // words is ~96 GiB of headers alone, so the cap must be on bytes,
+        // not word count.
+        let bytes = (24 + self.flat.signals[sig].width.max(1) as u64).saturating_mul(a as u64 + 1);
+        if bytes <= cap_bytes {
+            return true;
+        }
+        // Report the first violation only: a runaway loop writes thousands of
+        // out-of-range indexes within one delta, and each report is a full
+        // sentence.
+        if !self.error_stopped {
+            self.emit(SimEvent::Message {
+                text: format!(
+                    "error: memory write to '{}' at index {} would grow it past \
+                     HDLSIM_MAX_SIGNAL_MB (declared depth {} words) — the index is \
+                     probably an underflowed or negative address (an unelaborated \
+                     generic or range); raise HDLSIM_MAX_SIGNAL_MB only if the \
+                     design is genuinely this big",
+                    self.flat.signals[sig].name,
+                    a,
+                    self.flat.signals[sig].mem.unwrap_or(0)
+                ),
+                time_fs: self.time,
+            });
+        }
+        self.stopped = true;
+        self.error_stopped = true;
+        false
+    }
+
     /// Assign `v` to the target of `lhs`. Returns true if a signal changed.
     fn assign_to(&mut self, lhs: &Expr, v: Value, locals: Option<&Vec<Value>>) -> bool {
         match lhs {
@@ -2305,7 +2449,7 @@ impl Simulator {
                         let w = self.flat.signals[sig].width.max(1);
                         if (a as usize) < self.mems[sig].len() {
                             self.mems[sig][a as usize] = v.resize(w);
-                        } else {
+                        } else if self.mem_grow_ok(sig, a as usize) {
                             self.mems[sig].resize(a as usize + 1, Value::x(w));
                             self.mems[sig][a as usize] = v.resize(w);
                         }
@@ -2335,6 +2479,11 @@ impl Simulator {
                                 return false;
                             };
                             let w = self.flat.signals[sig].width.max(1);
+                            if (a as usize) >= self.mems[sig].len()
+                                && !self.mem_grow_ok(sig, a as usize)
+                            {
+                                return false;
+                            }
                             if (a as usize) >= self.mems[sig].len() {
                                 self.mems[sig].resize(a as usize + 1, Value::x(w));
                             }
@@ -3712,4 +3861,62 @@ fn string_of(v: &Value) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hdl_ir::elab::FlatSig;
+
+    fn flat_with(widths_mems: &[(usize, Option<usize>)]) -> Flat {
+        Flat {
+            signals: widths_mems
+                .iter()
+                .map(|(w, d)| FlatSig {
+                    name: "s".to_string(),
+                    width: *w,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: *d,
+                    scope: 0,
+                    signed: false,
+                    real_ranges: Vec::new(),
+                })
+                .collect(),
+            procs: Vec::new(),
+            assigns: Vec::new(),
+            functions: Vec::new(),
+            scopes: Vec::new(),
+            top_scope: 0,
+        }
+    }
+
+    #[test]
+    fn alloc_report_allows_ordinary_signals() {
+        let f = flat_with(&[(32, None), (8, Some(1024))]);
+        assert!(Simulator::alloc_report_with_caps(&f, 4096 << 20, None).is_ok());
+    }
+
+    #[test]
+    fn alloc_report_refuses_runaway_width_and_names_it() {
+        // A 2^32-bit signal — the classic underflowed `0 to N-1` range.
+        let f = flat_with(&[(32, None), (1usize << 32, None)]);
+        let err = Simulator::alloc_report_with_caps(&f, 4096 << 20, None)
+            .expect_err("runaway width must be refused");
+        assert!(err.contains("largest allocators"), "{err}");
+    }
+
+    #[test]
+    fn alloc_report_counts_value_headers_on_narrow_mems() {
+        // 2^32 one-bit words cost ~96 GiB of Value headers alone — the cap
+        // must be on bytes, not word count.
+        let f = flat_with(&[(1, Some((1usize << 32) - 2))]);
+        assert!(Simulator::alloc_report_with_caps(&f, 4096 << 20, None).is_err());
+    }
+
+    #[test]
+    fn alloc_report_honors_total_cap() {
+        let f = flat_with(&[(32, Some(1 << 20))]);
+        assert!(Simulator::alloc_report_with_caps(&f, 4096 << 20, Some(1 << 20)).is_err());
+    }
 }

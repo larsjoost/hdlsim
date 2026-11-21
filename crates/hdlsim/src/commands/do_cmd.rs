@@ -141,6 +141,9 @@ impl DoSession {
                 mgr.diags().render_all(mgr.db()).trim_end().to_string(),
             ));
         }
+        // Refuse runaway allocations with the top-allocator report instead
+        // of aborting inside the first big `vec![…]`.
+        Simulator::alloc_report(&flat).map_err(anyhow::Error::msg)?;
         let mut sim = Simulator::new(flat);
         if let Some(s) = self.seed {
             sim.set_seed(s);

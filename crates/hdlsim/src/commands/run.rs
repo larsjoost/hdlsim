@@ -145,7 +145,12 @@ impl Command for Run {
         }
         let mut sim = match &restore {
             Some(p) => Simulator::restore_checkpoint(flat, p).map_err(anyhow::Error::msg)?,
-            None => Simulator::new(flat),
+            None => {
+                // Refuse runaway allocations with the top-allocator report
+                // instead of aborting inside the first big `vec![…]`.
+                Simulator::alloc_report(&flat).map_err(anyhow::Error::msg)?;
+                Simulator::new(flat)
+            }
         };
         if let Some(s) = seed {
             sim.set_seed(s);

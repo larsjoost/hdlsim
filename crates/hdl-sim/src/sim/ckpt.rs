@@ -1034,6 +1034,9 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     if n_sig != flat.signals.len() || n_proc != flat.procs.len() {
         return Err("checkpoint design shape differs".to_string());
     }
+    // Refuse runaway allocations with the top-allocator report instead of
+    // aborting inside the first big `vec![…]`.
+    Simulator::alloc_report(&flat)?;
     let mut sim = Simulator::new(flat);
     sim.time = r.u64()?;
     let n = r.u32()? as usize;
