@@ -56,6 +56,9 @@ pub struct Lowered {
     /// architectures in other files see the entity's ports and declarative
     /// items (bound design-wide via [`lower_pending_architectures`]).
     pub entity_maps: HashMap<String, SigMaps>,
+    /// (source directory, lowercase entity name) → snapshot; disambiguates
+    /// same-named entities from different directories (see `Lower`).
+    pub entity_maps_by_dir: HashMap<(String, String), SigMaps>,
 }
 
 /// An architecture deferred until its entity is known design-wide (the entity
@@ -65,6 +68,10 @@ pub struct Lowered {
 pub struct PendingArch {
     pub root: SyntaxNode,
     pub arch: SyntaxNode,
+    /// Library the arch's file was compiled for (stamped by the resolver).
+    /// An architecture binds to its own library's entity — another library
+    /// may declare an entity with the same name (LRM 11.2).
+    pub lib: Option<String>,
 }
 
 /// Elaboration variant spec: re-lower `entity` with `overrides` applied to its
@@ -161,7 +168,7 @@ pub enum Binding {
     Entity {
         name: String,
         arch: Option<String>,
-        generic_map: Vec<(String, Expr)>,
+        generic_map: Vec<(Option<String>, Expr)>,
         port_map: Vec<Conn>,
     },
     Configuration {
@@ -257,6 +264,77 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                             .to_ascii_lowercase();
                         if !unit.is_empty() && !out.iter().any(|u| u == &unit) {
                             out.push(unit);
+                        }
+                    }
+                    stack.extend(real_children(&n));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `(unit, library)` pairs referenced by the context clauses of a design file —
+/// like [`context_units`], but carrying the library qualifier of the `use`
+/// clause so the library manager can resolve `use lib.unit` inside `lib`
+/// (LRM 11.2) before falling back to the global search. `None` means the
+/// library is unknown (package instantiations) and only the global search
+/// applies. Library-wide `use lib.all;` clauses are skipped: they carry no
+/// unit name and are handled via `context_libraries`.
+pub fn context_unit_libs(db: &SourceDb, root: &SyntaxNode) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    // Context declarations (`context c is use ...; end context;`) name their
+    // clause units too — descend so a context file pulls in what its clauses
+    // reference.
+    let mut stack: Vec<SyntaxNode> = real_children(root);
+    while let Some(child) = stack.pop() {
+        if child.kind() == SyntaxKind::ContextDecl {
+            stack.extend(real_children(&child));
+            continue;
+        }
+        match child.kind() {
+            SyntaxKind::ContextClause | SyntaxKind::UseClause => {
+                for n in real_children(&child) {
+                    if n.kind() == SyntaxKind::Name {
+                        let text = db.span_text(n.span()).trim();
+                        let parts: Vec<&str> = text.split('.').collect();
+                        // Same part split as `context_units`: `lib.unit.all` /
+                        // `lib.unit.item` name unit `unit` in library `lib`;
+                        // bare 2-part names are ambiguous but conventionally
+                        // `lib.unit` (see `context_units`).
+                        let (unit, lib) = match parts.len() {
+                            n if n >= 3 => (parts[n - 2], Some(parts[0])),
+                            2 if parts[1].eq_ignore_ascii_case("all") => continue,
+                            2 => (parts[1], Some(parts[0])),
+                            _ => continue,
+                        };
+                        if unit.is_empty() {
+                            continue;
+                        }
+                        let lib = lib.map(|l| l.to_ascii_lowercase());
+                        let unit = unit.to_ascii_lowercase();
+                        if !out.iter().any(|(u, l)| *u == unit && *l == lib) {
+                            out.push((unit, lib));
+                        }
+                    }
+                }
+            }
+            // `package p is new g generic map (...)` depends on `g` and on any
+            // package actuals in the map (`generic map (P => work.q)`).
+            SyntaxKind::PackageInst => {
+                let mut stack: Vec<SyntaxNode> = real_children(&child);
+                while let Some(n) = stack.pop() {
+                    if n.kind() == SyntaxKind::Name {
+                        let unit = db
+                            .span_text(n.span())
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if !unit.is_empty() && !out.iter().any(|(u, _)| *u == unit) {
+                            out.push((unit, None));
                         }
                     }
                     stack.extend(real_children(&n));
@@ -426,13 +504,14 @@ pub fn lower_file(
                     pending.push(PendingArch {
                         root: root.clone(),
                         arch: child.clone(),
+                        lib: None,
                     });
                 }
             }
             _ => {}
         }
     }
-    apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults);
+    apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults, None);
     // Package instantiations from declarative parts (registered on the fly).
     packages.extend(lx.inst_packages.drain(..));
     Lowered {
@@ -442,6 +521,7 @@ pub fn lower_file(
         pending,
         entity_roots,
         entity_maps: lx.entity_maps.clone(),
+        entity_maps_by_dir: lx.entity_maps_by_dir.clone(),
     }
 }
 
@@ -581,7 +661,7 @@ impl<'a> Lower<'a> {
                 }
             } else if k.kind() == SyntaxKind::PortConn {
                 let ck = real_children(k);
-                let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+                let name_pos = self.assoc_formal(&ck);
                 // Indexed formal `i_data(0 to 1) => x`: keep the base name.
                 let assoc = name_pos.map(|i| {
                     let t = self.text(&ck[i]);
@@ -599,10 +679,15 @@ impl<'a> Lower<'a> {
                 self.suppress_err += 1;
                 let ex = self.lower_expr(e, &self.consts.clone());
                 self.suppress_err -= 1;
-                match assoc {
-                    Some(n) if in_generic => generic_map.push((n, ex)),
-                    Some(n) => port_map.push(Conn::Named(n, ex)),
-                    None => port_map.push(Conn::Positional(ex)),
+                match (assoc, in_generic) {
+                    (Some(n), true) => generic_map.push((Some(n), ex)),
+                    (Some(n), false) => port_map.push(Conn::Named(n, ex)),
+                    // Positional generic actuals bind to the target's
+                    // generics in declaration order; the name is resolved
+                    // at elaboration, where the entity's parameter list is
+                    // visible (resolve_positional_params).
+                    (None, true) => generic_map.push((None, ex)),
+                    (None, false) => port_map.push(Conn::Positional(ex)),
                 }
             }
         }
@@ -657,8 +742,14 @@ fn apply_default_archs(
     entities: &HashMap<String, usize>,
     last_arch: &HashMap<String, String>,
     config_defaults: &HashMap<String, String>,
+    // Entity slot each entity's default arch was built from. `entities` is
+    // name-keyed last-wins, so with same-named entities in different
+    // libraries/directories it points at the WRONG slot — the arch module
+    // would overwrite a foreign entity and later archs would clone its
+    // ports. Callers that know the provenance pass the exact slots here.
+    arch_bases: Option<&HashMap<String, usize>>,
 ) {
-    for (ent, &base) in entities {
+    for (ent, &base_from_entities) in entities {
         let Some(ch) = config_defaults.get(ent).or_else(|| last_arch.get(ent)) else {
             continue;
         };
@@ -666,6 +757,10 @@ fn apply_default_archs(
         if let Some(vpos) = modules.iter().position(|m| m.name == vname) {
             let mut v = modules[vpos].clone();
             v.name = ent.clone();
+            let base = arch_bases
+                .and_then(|b| b.get(ent))
+                .copied()
+                .unwrap_or(base_from_entities);
             modules[base] = v;
         }
     }
@@ -677,6 +772,46 @@ fn apply_default_archs(
 /// order. Returns the architectures still unresolved; with `emit_errors`,
 /// those produce E0401 (caret on the entity name, did-you-mean help over all
 /// known entity names).
+/// Lowercased file stem with a trailing architecture/entity-role suffix
+/// (`-b`, `_rtl`, `-behavior`, ...) removed, so `foo.vhd`'s entity matches
+/// `foo_rtl.vhd`'s architecture — the sibling-file convention for designs
+/// that split entities and architectures across files. Longest suffix wins,
+/// and only one suffix is stripped.
+pub fn stem_key(path: &str) -> String {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    const SUFFIXES: [&str; 18] = [
+        "-behavior",
+        "_behavior",
+        "-behaviour",
+        "_behaviour",
+        "-rtl",
+        "_rtl",
+        "-arch",
+        "_arch",
+        "-struct",
+        "_struct",
+        "-entity",
+        "_entity",
+        "-ent",
+        "_ent",
+        "-b",
+        "_b",
+        "-a",
+        "_a",
+    ];
+    for suf in SUFFIXES {
+        if let Some(base) = stem.strip_suffix(suf) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    stem
+}
+
 pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
@@ -685,8 +820,22 @@ pub fn lower_pending_architectures(
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
     emit_errors: bool,
+    // Bind cross-file architectures as soon as their entity is visible.
+    // `false` while a compile batch is still running: the provenance maps
+    // are incomplete (later files may declare another same-named entity),
+    // so binding would latch onto a wrong twin — defer to the final pass.
+    bind_eager: bool,
     entity_roots: &HashMap<String, SyntaxNode>,
     entity_maps: &HashMap<String, SigMaps>,
+    entity_maps_by_dir: &HashMap<(String, String), SigMaps>,
+    entity_by_lib: &HashMap<(String, String), usize>,
+    entity_by_dir: &HashMap<(String, String), usize>,
+    // (canonical dir, stem key, entity name) → module index — the
+    // sibling-file convention (`foo.vhd` entity ↔ `foo_rtl.vhd` arch).
+    // Tried before the dir/library maps: a whole-tree library holds several
+    // same-named entities, and stem matching is the only signal that pins
+    // an architecture file to ITS entity.
+    entity_by_stem: &HashMap<(String, String, String), usize>,
 ) -> Vec<PendingArch> {
     if pending.is_empty() {
         return Vec::new();
@@ -699,11 +848,16 @@ pub fn lower_pending_architectures(
     let candidates: Vec<String> = entities.keys().cloned().collect();
     let mut still_pending = Vec::new();
     let mut last_arch: HashMap<String, String> = HashMap::new();
+    // Entity slot each bound arch cloned from — the slot its default-arch
+    // contents may overwrite (same-named entities must not clobber each
+    // other, see apply_default_archs).
+    let mut arch_bases: HashMap<String, usize> = HashMap::new();
     for p in pending {
         let mut lx = Lower::new(db, diags);
         lx.register_builtin_types();
         lx.file_root = Some(p.root.clone());
         lx.entity_maps = entity_maps.clone();
+        lx.entity_maps_by_dir = entity_maps_by_dir.clone();
         lx.pkgs = pkgs
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -720,9 +874,74 @@ pub fn lower_pending_architectures(
             }
         }
         lx.apply_context_clauses(&p.root);
-        match lx.lower_architecture(&p.arch, modules, &entities) {
+        // Bind to the entity from the arch's own source directory first
+        // (whole-tree libraries like `work = .` hold same-named entities from
+        // several directories; sibling files belong together), then to the
+        // entity compiled for the arch's own library (LRM 11.2). The
+        // design-wide name lookup applies only when the resolver had no
+        // provenance for this file. All of this waits for the final pass
+        // while a compile batch is still running (`!bind_eager`): the
+        // provenance maps only cover the files compiled so far, and binding
+        // to a same-named entity compiled earlier in the batch would latch
+        // onto the wrong twin.
+        let ents: HashMap<String, usize> = if !bind_eager {
+            HashMap::new()
+        } else {
+            match arch_entity(&p.arch, db) {
+                Some((_, en)) => {
+                    let key = en.to_ascii_lowercase();
+                    let arch_dir: Option<String> = file_dir(db, &p.root);
+                    let arch_file = db.file(p.root.span().file).name().to_string();
+                    // 1. Sibling-file convention: the arch file's stem with
+                    //    the role suffix stripped matches the entity file's
+                    //    stem (`reg-b.vhd` belongs to `reg.vhd`, even when
+                    //    several entities named `reg` share the directory).
+                    let stem_idx = arch_dir.as_ref().and_then(|d| {
+                        entity_by_stem.get(&(d.clone(), stem_key(&arch_file), key.clone()))
+                    });
+                    // 2. Same directory, last entity compiled; 3. same library.
+                    let dir_idx = arch_dir
+                        .as_ref()
+                        .and_then(|d| entity_by_dir.get(&(d.clone(), key.clone())));
+                    let lib_idx = p.lib.as_ref().and_then(|lib| {
+                        entity_by_lib.get(&(lib.to_ascii_lowercase(), key.clone()))
+                    });
+                    match stem_idx.or(dir_idx).or(lib_idx) {
+                        Some(&i) => [(en, i)].into_iter().collect(),
+                        None if p.lib.is_none() && arch_dir.is_none() => match entities.get(&en) {
+                            Some(&i) => [(en, i)].into_iter().collect(),
+                            None => HashMap::new(),
+                        },
+                        // Provenance lookup failed. Bind design-wide by name
+                        // only when the name is unambiguous — exactly one such
+                        // entity was compiled (possibly in another directory).
+                        // With several same-named entities and no scope match,
+                        // stay pending: a later file may still provide the
+                        // right one.
+                        None => {
+                            let matches: Vec<usize> = modules
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, m)| m.name.eq_ignore_ascii_case(&en))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if matches.len() == 1 {
+                                [(en.clone(), matches[0])].into_iter().collect()
+                            } else {
+                                HashMap::new()
+                            }
+                        }
+                    }
+                }
+                None => HashMap::new(),
+            }
+        };
+        match lx.lower_architecture(&p.arch, modules, &ents) {
             Some((ent, arch)) => {
-                last_arch.insert(ent, arch);
+                last_arch.insert(ent.clone(), arch);
+                if let Some(&base) = ents.get(&ent) {
+                    arch_bases.insert(ent, base);
+                }
             }
             None => {
                 if emit_errors {
@@ -733,22 +952,32 @@ pub fn lower_pending_architectures(
             }
         }
     }
-    apply_default_archs(modules, &entities, &last_arch, &HashMap::new());
+    apply_default_archs(
+        modules,
+        &entities,
+        &last_arch,
+        &HashMap::new(),
+        Some(&arch_bases),
+    );
     still_pending
 }
 
-/// Re-lower one entity and its architectures (from the same file) with
-/// `generic map` overrides applied to the entity's generic clause, producing
-/// variant modules named `<entity><suffix>` and `<entity><suffix>/<arch>`.
-/// Used at elaboration so an instantiation's `generic map` actually re-binds
-/// the child's generics (generate ranges, port widths, ...). Returns the
-/// lowered modules (empty when the file does not declare `entity_name`).
+/// Re-lower one entity and its architectures with `generic map` overrides
+/// applied to the entity's generic clause, producing variant modules named
+/// `<entity><suffix>` and `<entity><suffix>/<arch>`. Architectures may live
+/// in sibling files (`arch_roots`, not including `root`); each gets a fresh
+/// scope seeded with the entity's context clauses plus its own file's (LRM
+/// 1076 §13.3). Used at elaboration so an instantiation's `generic map`
+/// actually re-binds the child's generics (generate ranges, port widths,
+/// ...). Returns the lowered modules (empty when `root` does not declare
+/// `entity_name`).
 pub fn lower_entity_variant(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     pkgs: &HashMap<String, Rc<PackageIr>>,
     cfgs: &HashMap<String, Rc<ConfigIr>>,
     root: &SyntaxNode,
+    arch_roots: &[SyntaxNode],
     entity_name: &str,
     overrides: &HashMap<String, Value>,
     suffix: &str,
@@ -807,9 +1036,53 @@ pub fn lower_entity_variant(
             }
         }
     }
+    // Architectures in sibling files: a fresh scope per file (the entity's
+    // context clauses plus the file's own), bound to the variant entity
+    // module just lowered.
+    let ent_maps = lx.entity_maps.clone();
+    let ent_maps_by_dir = lx.entity_maps_by_dir.clone();
+    for r in arch_roots {
+        let mut lax = Lower::new(db, diags);
+        lax.register_builtin_types();
+        lax.file_root = Some(r.clone());
+        lax.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lax.cfgs = cfgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        // The entity's signal/type snapshot (record fields, signedness,
+        // entity constants and types) — an architecture in another file
+        // needs it to resolve field selects (LRM 1076 §1.2).
+        lax.entity_maps = ent_maps.clone();
+        lax.entity_maps_by_dir = ent_maps_by_dir.clone();
+        lax.apply_context_clauses(root);
+        lax.apply_context_clauses(r);
+        lax.variant = Some(VariantSpec {
+            entity: lname.clone(),
+            suffix: suffix.to_string(),
+            overrides: overrides.clone(),
+        });
+        let ents: HashMap<String, usize> = [(lname.clone(), 0usize)].into_iter().collect();
+        for child in real_children(r) {
+            if child.kind() == SyntaxKind::Architecture {
+                if let Some((_, en)) = arch_entity(&child, db) {
+                    if en.eq_ignore_ascii_case(&lname) {
+                        if let Some((ent, arch)) =
+                            lax.lower_architecture(&child, &mut modules, &ents)
+                        {
+                            last_arch.insert(ent, arch);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut ventities: HashMap<String, usize> = HashMap::new();
     ventities.insert(vent, 0);
-    apply_default_archs(&mut modules, &ventities, &last_arch, &HashMap::new());
+    apply_default_archs(&mut modules, &ventities, &last_arch, &HashMap::new(), None);
     modules
 }
 
@@ -838,6 +1111,18 @@ pub(crate) fn real_children(n: &SyntaxNode) -> Vec<SyntaxNode> {
     n.children()
         .filter(|c| !matches!(c.kind(), SyntaxKind::Whitespace | SyntaxKind::Comment))
         .collect()
+}
+
+/// Canonical source directory of the file a syntax node came from — the key
+/// that groups sibling design units (entity + its architectures) together.
+fn file_dir(db: &SourceDb, root: &SyntaxNode) -> Option<String> {
+    let name = db.file(root.span().file).name().to_string();
+    let parent = std::path::Path::new(&name).parent()?.to_path_buf();
+    Some(
+        std::fs::canonicalize(&parent)
+            .map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_else(|_| parent.to_string_lossy().to_string()),
+    )
 }
 
 /// Package declaration name: the first ident that is not a keyword —
@@ -1033,6 +1318,12 @@ struct Lower<'a> {
     /// otherwise leak across entities; the architecture of entity E installs
     /// E's snapshot (see lower_architecture).
     entity_maps: HashMap<String, SigMaps>,
+    /// Same snapshots keyed by (source directory, lowercase entity name).
+    /// Two libraries (or two directories of a whole-tree library) may declare
+    /// same-named entities with different ports; the name-keyed map alone is
+    /// first-wins and would install the wrong entity's scope into a pending
+    /// architecture. The dir-keyed entry disambiguates siblings.
+    entity_maps_by_dir: HashMap<(String, String), SigMaps>,
     /// Delta of `consts`/`types` declared in the entity declarative part,
     /// exported to the entity's architectures via `SigMaps`.
     entity_consts: HashMap<String, Value>,
@@ -1110,6 +1401,7 @@ impl<'a> Lower<'a> {
             file_root: None,
             inst_packages: Vec::new(),
             entity_maps: HashMap::new(),
+            entity_maps_by_dir: HashMap::new(),
             entity_consts: HashMap::new(),
             entity_types: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
@@ -1126,20 +1418,24 @@ impl<'a> Lower<'a> {
     /// Snapshot the current signal maps (called after an entity's ports are
     /// lowered) and clear them so the next entity starts fresh.
     fn snapshot_entity_maps(&mut self, entity: &str) {
-        self.entity_maps.insert(
-            entity.to_string(),
-            SigMaps {
-                mems: self.mems.clone(),
-                sig_signed: self.sig_signed.clone(),
-                sig_rec: self.sig_rec.clone(),
-                sig_elem_rec: self.sig_elem_rec.clone(),
-                sig_width: self.sig_width.clone(),
-                sig_dims: self.sig_dims.clone(),
-                uncon_ports: self.uncon_ports.clone(),
-                consts: self.entity_consts.clone(),
-                types: self.entity_types.clone(),
-            },
-        );
+        let maps = SigMaps {
+            mems: self.mems.clone(),
+            sig_signed: self.sig_signed.clone(),
+            sig_rec: self.sig_rec.clone(),
+            sig_elem_rec: self.sig_elem_rec.clone(),
+            sig_width: self.sig_width.clone(),
+            sig_dims: self.sig_dims.clone(),
+            uncon_ports: self.uncon_ports.clone(),
+            consts: self.entity_consts.clone(),
+            types: self.entity_types.clone(),
+        };
+        self.entity_maps.insert(entity.to_string(), maps.clone());
+        // Dir-keyed twin: the entity's own source directory disambiguates
+        // same-named entities from different libraries/directories.
+        if let Some(dir) = self.file_root.as_ref().and_then(|r| file_dir(self.db, r)) {
+            self.entity_maps_by_dir
+                .insert((dir, entity.to_ascii_lowercase()), maps);
+        }
         self.mems.clear();
         self.sig_signed.clear();
         self.sig_rec.clear();
@@ -1150,9 +1446,21 @@ impl<'a> Lower<'a> {
     }
 
     /// Install the signal maps of the entity whose architecture is being
-    /// lowered (SigId is module-relative).
+    /// lowered (SigId is module-relative). The (directory, entity) entry wins:
+    /// a sibling entity's snapshot is the correct scope even when another
+    /// directory declared an entity with the same name first.
     fn install_entity_maps(&mut self, entity: &str) {
-        let m = self.entity_maps.get(entity).cloned().unwrap_or_default();
+        let dir_key = self
+            .file_root
+            .as_ref()
+            .and_then(|r| file_dir(self.db, r))
+            .map(|d| (d, entity.to_ascii_lowercase()));
+        let m = dir_key
+            .as_ref()
+            .and_then(|k| self.entity_maps_by_dir.get(k))
+            .cloned()
+            .or_else(|| self.entity_maps.get(entity).cloned())
+            .unwrap_or_default();
         self.mems = m.mems;
         self.sig_signed = m.sig_signed;
         self.sig_rec = m.sig_rec;
@@ -1211,11 +1519,12 @@ impl<'a> Lower<'a> {
         if self.suppress_err > 0 {
             return;
         }
+        let msg = msg.into();
         self.diags.push(Diagnostic {
             code: "E0401",
             severity: Severity::Error,
             span: Some(span),
-            message: msg.into(),
+            message: msg,
             help: None,
         });
     }
@@ -1236,6 +1545,24 @@ impl<'a> Lower<'a> {
 
     fn kw(&self, n: &SyntaxNode) -> String {
         self.text(n).to_ascii_lowercase()
+    }
+
+    /// Index of the formal name of a named association (`formal => actual`),
+    /// or `None` for a positional one. The lexer emits `=>` as two
+    /// single-char puncts, so the arrow is the first adjacent `=` `>` pair.
+    /// A top-level association expression never yields a bare `=` followed
+    /// by `>` (binary ops parse into expr nodes; `>=` lexes in reverse
+    /// order), so the first pair is the association arrow when present.
+    fn assoc_formal(&self, ck: &[SyntaxNode]) -> Option<usize> {
+        let arrow = ck.windows(2).position(|w| {
+            w[0].kind() == SyntaxKind::Punct
+                && self.text(&w[0]) == "="
+                && w[1].kind() == SyntaxKind::Punct
+                && self.text(&w[1]) == ">"
+        })?;
+        ck[..arrow]
+            .iter()
+            .rposition(|c| c.kind() == SyntaxKind::Name)
     }
 
     /// `attribute name : type;` — register the attribute name as user-defined
@@ -1750,9 +2077,12 @@ impl<'a> Lower<'a> {
                         mem: None,
                         signed: false,
                     });
-                    self.names.insert(hidden, id);
+                    self.names.insert(hidden.clone(), id);
                     self.sig_width.insert(id, width);
-                    self.sig_rec.insert(id, tn);
+                    self.sig_rec.insert(id, tn.clone());
+                    module
+                        .real_ranges
+                        .insert(hidden, self.record_real_ranges(&tn));
                 }
                 _ => {}
             }
@@ -1805,14 +2135,29 @@ impl<'a> Lower<'a> {
     }
 
     fn sig_id(&self, name: &str) -> Option<SigId> {
+        // Innermost scope first: the current map, then enclosing scopes
+        // (blocks, subprograms) innermost-out — VHDL visibility (LRM 10.2).
         // VHDL is case-insensitive: fall back to a case-insensitive scan
         // (`delay` must find a parameter declared as `Delay`).
-        self.names.get(name).copied().or_else(|| {
-            self.names
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| *v)
-        })
+        if let Some(id) = self.names.get(name).copied() {
+            return Some(id);
+        }
+        if let Some((_, id)) = self
+            .names
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            return Some(*id);
+        }
+        for scope in self.names_stack.iter().rev() {
+            if let Some(id) = scope.get(name).copied() {
+                return Some(id);
+            }
+            if let Some((_, id)) = scope.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                return Some(*id);
+            }
+        }
+        None
     }
 
     /// Xilinx implicit globals (`GSR`/`GRESTORE`/`GTS` from the auto-instantiated
@@ -1938,6 +2283,41 @@ impl<'a> Lower<'a> {
         None
     }
 
+    /// Inclusive bit ranges of real-typed leaves within record type `tn`
+    /// (first field = MSB, like [`Self::record_fields_of_type`]). Nested
+    /// record fields recurse with the outer offset. The simulator decodes
+    /// those slices as IEEE-754 reals; everything else as a bit pattern.
+    fn record_real_ranges(&self, tn: &str) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        self.collect_real_ranges(tn, 0, &mut out);
+        out
+    }
+
+    fn collect_real_ranges(&self, tn: &str, base: usize, out: &mut Vec<(u32, u32)>) {
+        let Some(TypeInfo::Record { fields }) = self.types.get(tn) else {
+            return;
+        };
+        let total: usize = fields.iter().map(|f| f.1).sum();
+        let mut run = 0usize;
+        for (fn_, w, _) in fields {
+            let lsb = total - run - w;
+            let fty = self
+                .rec_field_ty
+                .get(&(tn.to_string(), fn_.clone()))
+                .cloned();
+            match fty.as_deref().map(|t| self.types.get(t)) {
+                Some(Some(TypeInfo::Real)) => {
+                    out.push(((base + lsb) as u32, (base + lsb + w - 1) as u32));
+                }
+                Some(Some(TypeInfo::Record { .. })) => {
+                    self.collect_real_ranges(fty.as_deref().unwrap_or(""), base + lsb, out);
+                }
+                _ => {}
+            }
+            run += w;
+        }
+    }
+
     /// Const-eval in the lowerer's constant scope, with visible package
     /// function bodies (for calls in constant initializers).
     fn ce(&self, e: &Expr) -> Option<Value> {
@@ -1973,6 +2353,7 @@ impl<'a> Lower<'a> {
             instances: Vec::new(),
             time_unit_fs: 1_000_000,
             is_vhdl: true,
+            real_ranges: HashMap::new(),
         };
         self.names.clear();
         self.cur_entity = module.name.to_ascii_lowercase();
@@ -2039,8 +2420,12 @@ impl<'a> Lower<'a> {
             .filter(|v| v.entity == self.cur_entity)
             .map(|v| v.overrides.clone())
             .unwrap_or_default();
-        for (name, def) in self.lower_generic_decls(g, &overrides) {
-            module.params.push(ParamIr { name, default: def });
+        for (name, def, ty) in self.lower_generic_decls(g, &overrides) {
+            module.params.push(ParamIr {
+                name,
+                default: def,
+                ty,
+            });
         }
     }
 
@@ -2052,7 +2437,7 @@ impl<'a> Lower<'a> {
         &mut self,
         g: &SyntaxNode,
         overrides: &HashMap<String, Value>,
-    ) -> Vec<(String, Value)> {
+    ) -> Vec<(String, Value, Option<String>)> {
         let mut out = Vec::new();
         for d in real_children(g)
             .into_iter()
@@ -2124,17 +2509,21 @@ impl<'a> Lower<'a> {
                 .flatten()
                 .unwrap_or(Value::x(width.max(1)));
             let _ = (width, signed);
+            // Record type of a record-typed generic, resolved (qualified
+            // `pkg.rec_t` marks reduce to the bare registered name) so field
+            // selects can find it in `types` — in this scope and, via
+            // `ParamIr.ty`, in the architecture's fresh scope.
+            let rec_ty = type_mark
+                .as_ref()
+                .and_then(|tm| self.as_record(&self.kw(tm)));
             for n in &names {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
-                if let Some(tm) = &type_mark {
-                    let tn = self.kw(tm);
-                    if self.as_record(&tn).is_some() {
-                        self.const_types.insert(key.clone(), tn);
-                    }
+                if let Some(tn) = &rec_ty {
+                    self.const_types.insert(key.clone(), tn.clone());
                 }
-                out.push((n.clone(), val));
+                out.push((n.clone(), val, rec_ty.clone()));
             }
         }
         out
@@ -2250,7 +2639,10 @@ impl<'a> Lower<'a> {
                 if let Some(tm) = &type_mark {
                     let tn = self.text(tm).to_ascii_lowercase();
                     if let Some(rn) = self.as_record(&tn) {
-                        self.sig_rec.insert(id, rn);
+                        self.sig_rec.insert(id, rn.clone());
+                        module
+                            .real_ranges
+                            .insert(n.clone(), self.record_real_ranges(&rn));
                     }
                     if let Some(en) = self.as_elem_record(&tn) {
                         self.sig_elem_rec.insert(id, en);
@@ -2416,7 +2808,7 @@ impl<'a> Lower<'a> {
         let mut generics: Vec<(String, Value)> = Vec::new();
         for d in real_children(p) {
             if d.kind() == SyntaxKind::GenericClause {
-                for (n, v) in self.lower_generic_decls(&d, overrides) {
+                for (n, v, _ty) in self.lower_generic_decls(&d, overrides) {
                     generics.push((n.to_ascii_lowercase(), v));
                 }
             }
@@ -2657,7 +3049,21 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let ck = real_children(&k);
-            let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+            // `assoc_formal` logic inlined (self is borrowed by `lx2`); the
+            // arrow is the first adjacent `=` `>` punct pair.
+            let name_pos = ck
+                .windows(2)
+                .position(|w| {
+                    w[0].kind() == SyntaxKind::Punct
+                        && db.span_text(w[0].span()).trim() == "="
+                        && w[1].kind() == SyntaxKind::Punct
+                        && db.span_text(w[1].span()).trim() == ">"
+                })
+                .and_then(|arrow| {
+                    ck[..arrow]
+                        .iter()
+                        .rposition(|c| c.kind() == SyntaxKind::Name)
+                });
             let assoc = name_pos.map(|i| db.span_text(ck[i].span()).trim().to_ascii_lowercase());
             let expr = ck
                 .iter()
@@ -2785,10 +3191,17 @@ impl<'a> Lower<'a> {
         self.install_entity_maps(&entity_name);
         // Entity generics are constants in the architecture (also when the
         // architecture was deferred to a pending pass with a fresh scope).
+        // A record-typed generic's type name is restored into `const_types`
+        // so `G_PARAM.field` selects resolve out-of-file too (the record's
+        // `TypeInfo` arrives via the entity's context clauses above).
         for prm in &modules[midx].params {
+            let key = prm.name.to_ascii_lowercase();
             Rc::make_mut(&mut self.consts)
-                .entry(prm.name.to_ascii_lowercase())
+                .entry(key.clone())
                 .or_insert_with(|| prm.default.clone());
+            if let Some(ty) = &prm.ty {
+                self.const_types.entry(key).or_insert_with(|| ty.clone());
+            }
         }
         // Declarative part: everything before `begin`.
         let begin_pos = kids
@@ -2799,6 +3212,18 @@ impl<'a> Lower<'a> {
             None => kids.iter().collect(),
         };
         self.aliases.clear();
+        // Pre-register function stubs: a recursive call inside a body (or a
+        // forward reference to a later-declared sibling) must lower as a
+        // call, not as an index of the function-name result slot. Real
+        // bodies overwrite the stub in lower_function_decl (same mechanism
+        // as process-local functions).
+        for d in &decls {
+            if d.kind() == SyntaxKind::Function {
+                if let Some(stub) = self.subprogram_stub(d) {
+                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                }
+            }
+        }
         let mut config_specs: Vec<&SyntaxNode> = Vec::new();
         for d in &decls {
             // Arm the hidden-signal allocator per declarative item (decls push
@@ -2961,6 +3386,16 @@ impl<'a> Lower<'a> {
     /// set (for-generate iterations) existing signal bindings are dropped
     /// first, so each iteration gets its own signal.
     fn lower_gen_decls(&mut self, module: &mut ModuleIr, decls: &[SyntaxNode], fresh: bool) {
+        // Pre-register function stubs (see the architecture declarative
+        // pass): recursive calls inside a body must lower as calls, not as
+        // indexes of the function-name result slot.
+        for d in decls {
+            if d.kind() == SyntaxKind::Function && self.subprogram_is_function(d) {
+                if let Some(stub) = self.subprogram_stub(d) {
+                    self.funcs.insert(stub.name.to_ascii_lowercase(), stub);
+                }
+            }
+        }
         for d in decls {
             if fresh && matches!(d.kind(), SyntaxKind::SignalDecl | SyntaxKind::VariableDecl) {
                 let dk = real_children(d);
@@ -3149,10 +3584,7 @@ impl<'a> Lower<'a> {
                     .unwrap_or(false)
             };
             if take {
-                self.lower_gen_decls(module, &seg.decls, false);
-                for st in &seg.stmts {
-                    self.lower_conc_stmt(module, st, proc_idx);
-                }
+                self.lower_scoped(module, &seg.decls, &seg.stmts, proc_idx);
                 return;
             }
         }
@@ -3204,10 +3636,7 @@ impl<'a> Lower<'a> {
                     })
                     .unwrap_or(false);
             if matches {
-                self.lower_gen_decls(module, &decls, false);
-                for st in &stmts {
-                    self.lower_conc_stmt(module, st, proc_idx);
-                }
+                self.lower_scoped(module, &decls, &stmts, proc_idx);
                 return;
             }
             if has_others {
@@ -3215,24 +3644,41 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((decls, stmts)) = others {
-            self.lower_gen_decls(module, &decls, false);
-            for st in &stmts {
-                self.lower_conc_stmt(module, st, proc_idx);
-            }
+            self.lower_scoped(module, &decls, &stmts, proc_idx);
         }
     }
 
+    /// Lower declarative items + concurrent statements in a NEW lexical scope
+    /// (blocks and generate alternatives, LRM 11.2): a block-local signal
+    /// SHADOWS an outer declaration of the same name instead of being dropped
+    /// by the duplicate guard, and is invisible after the scope ends. The
+    /// declarations still become signals/constants of the enclosing module —
+    /// only the name bindings are scoped.
+    fn lower_scoped(
+        &mut self,
+        module: &mut ModuleIr,
+        decls: &[SyntaxNode],
+        stmts: &[SyntaxNode],
+        proc_idx: &mut usize,
+    ) {
+        let saved = std::mem::take(&mut self.names);
+        self.names_stack.push(saved);
+        self.lower_gen_decls(module, decls, false);
+        for st in stmts {
+            self.lower_conc_stmt(module, st, proc_idx);
+        }
+        self.names = self.names_stack.pop().unwrap_or_default();
+    }
+
     /// `block [is] decls begin stmts end block;` — decls and statements are
-    /// lowered into the enclosing module (block scoping is not modeled).
+    /// lowered into the enclosing module; the declarations are lexically
+    /// scoped to the block (see `lower_scoped`).
     fn lower_block(&mut self, module: &mut ModuleIr, s: &SyntaxNode, proc_idx: &mut usize) {
         let kids = real_children(s);
         let (decls, stmts) = self.gen_body(&kids);
         // Block-header ports are handled by the PortClause arm in
         // lower_gen_decls: they become signals of the enclosing module.
-        self.lower_gen_decls(module, &decls, false);
-        for st in &stmts {
-            self.lower_conc_stmt(module, st, proc_idx);
-        }
+        self.lower_scoped(module, &decls, &stmts, proc_idx);
     }
 
     /// E0401 for an architecture naming an entity that is unknown design-wide:
@@ -3397,7 +3843,14 @@ impl<'a> Lower<'a> {
             self.ce(&ex)
         });
         for n in &names {
-            if self.sig_id(n).is_some() {
+            // Duplicate declaration in the SAME scope: keep the first
+            // registration. A declaration in an INNER scope (block, process)
+            // must shadow, not collide — the name is registered in the fresh
+            // scope map (see `lower_scoped`), so only `self.names` counts
+            // here; the enclosing scopes on `names_stack` are irrelevant.
+            let dup =
+                self.names.contains_key(n) || self.names.keys().any(|k| k.eq_ignore_ascii_case(n));
+            if dup {
                 continue;
             }
             let id = module.signals.len() as SigId;
@@ -3416,7 +3869,10 @@ impl<'a> Lower<'a> {
             self.sig_width.insert(id, width);
             if let Some(tn) = &type_name {
                 if let Some(rn) = self.as_record(tn) {
-                    self.sig_rec.insert(id, rn);
+                    self.sig_rec.insert(id, rn.clone());
+                    module
+                        .real_ranges
+                        .insert(n.clone(), self.record_real_ranges(&rn));
                 }
                 // Array: remember the element record type for
                 // `arr(i).field` selects (arrays of records), and the
@@ -4585,7 +5041,19 @@ impl<'a> Lower<'a> {
         // whenever they reach the end, suspending only at wait statements
         // (empty sens list = bare `always`, re-queued immediately).
         let kind = ProcKind::Always;
-        let origin = format!("process #{}", idx);
+        // Name the process by source location in diagnostics — an AI reading
+        // the transcript can jump straight to the source. (The parser drops
+        // `label :` before building the node, so labels don't reach the CST.)
+        let sp = p.span();
+        let origin = {
+            let f = self.db.file(sp.file);
+            format!(
+                "process #{} at {}:{}",
+                idx,
+                f.name(),
+                f.line_col(sp.start).0
+            )
+        };
         ProcessIr {
             kind,
             sens,
@@ -4643,7 +5111,10 @@ impl<'a> Lower<'a> {
             self.sig_width.insert(id, width);
             if let Some(tn) = &type_name {
                 if let Some(rn) = self.as_record(tn) {
-                    self.sig_rec.insert(id, rn);
+                    self.sig_rec.insert(id, rn.clone());
+                    module
+                        .real_ranges
+                        .insert(n.clone(), self.record_real_ranges(&rn));
                 }
                 if let Some(en) = self.as_elem_record(tn) {
                     self.sig_elem_rec.insert(id, en);
@@ -4671,8 +5142,9 @@ impl<'a> Lower<'a> {
         for c in real_children(s) {
             if c.kind() == SyntaxKind::Name {
                 let name = self.text(&c);
-                // VHDL-2008 `process(all)`: sensitive to every signal read.
-                if name == "all" {
+                // VHDL-2008 `process(all)`: sensitive to every signal read
+                // (case-insensitive — vendor code writes `PROCESS (ALL)`).
+                if name.eq_ignore_ascii_case("all") {
                     return Sens::All;
                 }
                 // Selected names (`bus_req_i.addr`, `arr(i).stb`) — sensitive to
@@ -5086,7 +5558,10 @@ impl<'a> Lower<'a> {
                 }
                 SyntaxKind::PortConn => {
                     let ck = real_children(k);
-                    let name_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+                    // A `=>` arrow marks a named association; in a positional
+                    // one the leading Name is the actual itself, not a formal —
+                    // treating it as a formal would drop the connection.
+                    let name_pos = self.assoc_formal(&ck);
                     // Indexed formal `i_data(0 to 1) => x`: keep the base name.
                     let assoc_name = name_pos.map(|i| {
                         let t = self.text(&ck[i]);
@@ -5102,10 +5577,16 @@ impl<'a> Lower<'a> {
                         .map(|(_, c)| c);
                     let Some(e) = expr else { continue };
                     let ex = self.lower_expr(e, &self.consts.clone());
-                    match assoc_name {
-                        Some(n) if in_generic => param_overrides.push((n, ex)),
-                        Some(n) => conns.push(Conn::Named(n, ex)),
-                        None => conns.push(Conn::Positional(ex)),
+                    match (assoc_name, in_generic) {
+                        (Some(n), true) => param_overrides.push((Some(n), ex)),
+                        (Some(n), false) => conns.push(Conn::Named(n, ex)),
+                        // Positional generic actuals bind to the target's
+                        // generics in declaration order; the name is
+                        // resolved at elaboration, where the entity's
+                        // parameter list is visible
+                        // (resolve_positional_params).
+                        (None, true) => param_overrides.push((None, ex)),
+                        (None, false) => conns.push(Conn::Positional(ex)),
                     }
                 }
                 _ => {}
@@ -6891,7 +7372,11 @@ impl<'a> Lower<'a> {
         match fname.as_str() {
             // Indexed write/read of a signal: v(i) → Idx; multi-dimensional
             // v(i, j, …) → flat index ((i-lo0)*n1 + (j-lo1))*… via sig_dims.
-            _ if base_id.is_some() && !args.is_empty() => {
+            // A name that is also a declared function stays a call in call
+            // position: inside the function's own body the name resolves to
+            // the result slot (slot 0), which must not turn a recursive call
+            // into an index of that slot.
+            _ if base_id.is_some() && !args.is_empty() && self.funcs.get(&fname).is_none() => {
                 let base = base_id.unwrap();
                 if let Some(dims) = self.sig_dims.get(&base).cloned() {
                     if dims.len() == args.len() {

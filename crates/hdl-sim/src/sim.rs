@@ -186,7 +186,10 @@ pub struct Simulator {
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
-    funcs: HashMap<String, usize>,
+    /// Function/procedure registry: name → indices into `flat.functions`.
+    /// Overloads share a bare name, so lookups with several candidates
+    /// resolve by formal count (`func_match`).
+    funcs: HashMap<String, Vec<usize>>,
     observers: Vec<Box<dyn Observer>>,
     finished: bool,
     stopped: bool,
@@ -204,6 +207,20 @@ pub struct Simulator {
     monitor: Vec<Vec<Expr>>,
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
+    /// Interpreter steps in the current process activation — runaway-loop
+    /// budget (see `exec_frames`). Override: `HDLSIM_MAX_PROC_STEPS`.
+    proc_steps: u64,
+    max_proc_steps: u64,
+    /// Nesting depth of user function/procedure calls — runaway-recursion
+    /// guard (see `run_func`). Override: `HDLSIM_MAX_FUNC_DEPTH`.
+    fn_depth: std::cell::Cell<usize>,
+    max_func_depth: usize,
+    /// Latched when `fn_depth` passes the budget: the name of the function
+    /// at detection. The pump reports it and stops the simulation.
+    fn_recursion: std::cell::RefCell<Option<String>>,
+    /// Stopped by an internal error guard (combinational loop, delta/step
+    /// limit): the run must fail the process exit code, not exit 0.
+    error_stopped: bool,
     /// Deferred NBA writes to non-scalar targets (part-selects, memories).
     nba_exprs: Vec<(Expr, Value, Option<u32>)>,
     /// Process currently executing (for driver tracing); `None` outside
@@ -211,8 +228,21 @@ pub struct Simulator {
     cur_proc: Option<u32>,
     /// Per-signal last driver: (proc, time_fs). proc == u32::MAX = assign.
     last_driver: Vec<Option<(u32, u64)>>,
-    /// Processes parked at `@(...)` event waits: (proc, edges).
-    waiting: Vec<(u32, Vec<(FlatSigId, EdgeKind)>)>,
+    /// "Parked at a wait" per process — O(1) park check and wake. The wait's
+    /// wake edges live in `sens_index` while parked (see `park`).
+    parked: Vec<bool>,
+    /// Inverse of the processes' CURRENT sensitivity: signal → (proc, edge)
+    /// entries woken by a change on it. Non-parked processes contribute their
+    /// declared list; parked ones the edges of the wait they are parked on
+    /// (see `park`). Scheduling a changed signal is O(fanout) instead of
+    /// scanning every process's sensitivity list — the dominant cost on big
+    /// designs.
+    sens_index: Vec<Vec<(u32, EdgeKind)>>,
+    /// Each process's entries currently in `sens_index` — `park` swaps them
+    /// out for the parked wait's edges; wake swaps them back.
+    cur_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
+    /// "Already queued in `active`" per process — O(1) activate dedupe.
+    in_active: Vec<bool>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
     rng: std::cell::Cell<u64>,
     /// Object memory signal for SV classes: class name → `__objmem_<Class>`
@@ -237,6 +267,7 @@ pub struct Simulator {
 impl Simulator {
     pub fn new(flat: Flat) -> Simulator {
         let n = flat.signals.len();
+        let np = flat.procs.len();
         let objmem: HashMap<String, FlatSigId> = flat
             .signals
             .iter()
@@ -302,39 +333,56 @@ impl Simulator {
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
+            proc_steps: 0,
+            max_proc_steps: std::env::var("HDLSIM_MAX_PROC_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000_000),
+            fn_depth: std::cell::Cell::new(0),
+            max_func_depth: std::env::var("HDLSIM_MAX_FUNC_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200),
+            fn_recursion: std::cell::RefCell::new(None),
+            error_stopped: false,
             nba_exprs: Vec::new(),
-            waiting: Vec::new(),
+            parked: vec![false; np],
+            sens_index: vec![Vec::new(); n],
+            cur_sens: Vec::new(),
+            in_active: vec![false; np],
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
-            sim.funcs.insert(f.name.clone(), i);
+            sim.funcs.entry(f.name.clone()).or_default().push(i);
         }
         sim.proc_rt = (0..sim.flat.procs.len())
             .map(|_| ProcRt::default())
             .collect();
-        for (i, p) in sim.flat.procs.iter().enumerate() {
-            match &p.sens {
+        for (pid, p) in sim.flat.procs.iter().enumerate() {
+            let list: Vec<(FlatSigId, EdgeKind)> = match &p.sens {
                 Sens::List(es) => {
-                    sim.proc_sens
-                        .push(es.iter().map(|e| (e.sig, e.kind)).collect());
                     // Keep `proc_all` index-aligned with `procs`.
                     sim.proc_all.push(Vec::new());
+                    es.iter().map(|e| (e.sig, e.kind)).collect()
                 }
                 Sens::All => {
                     let mut sigs = Vec::new();
                     p.body.collect_sigs(&mut sigs);
                     sigs.sort_unstable();
                     sigs.dedup();
-                    sim.proc_sens.push(
-                        sigs.iter()
-                            .map(|s| (*s as FlatSigId, EdgeKind::Any))
-                            .collect(),
-                    );
                     sim.proc_all
                         .push(sigs.iter().map(|s| *s as FlatSigId).collect());
+                    sigs.iter()
+                        .map(|s| (*s as FlatSigId, EdgeKind::Any))
+                        .collect()
                 }
+            };
+            // Non-parked processes wake on their declared sensitivity.
+            for (s, ek) in &list {
+                sim.sens_index[*s as usize].push((pid as u32, *ek));
             }
-            let _ = i;
+            sim.cur_sens.push(list.clone());
+            sim.proc_sens.push(list);
         }
         sim
     }
@@ -365,6 +413,12 @@ impl Simulator {
     /// CLI runners exit non-zero when this is > 0 after `run`.
     pub fn failures(&self) -> u64 {
         self.failures
+    }
+
+    /// True when the run was stopped by an internal error guard
+    /// (combinational loop, delta-cycle/process-step limit): exit nonzero.
+    pub fn error_stopped(&self) -> bool {
+        self.error_stopped
     }
 
     /// STATUS argument passed to VHDL `std.env.finish(status)` (VHDL-2008),
@@ -493,6 +547,23 @@ impl Simulator {
                 i, p.kind, sens, p.origin
             );
         }
+        // Function and procedure bodies in slot space: slot 0 is the return
+        // value; the Debug rendering of the body makes lowered calls, slot
+        // reads and index expressions visible without a rebuild.
+        for (i, f) in self.flat.functions.iter().enumerate() {
+            let slots = f
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{}:w{}", if i == 0 { "ret" } else { "arg" }, w))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "  func #{:<3} {:<30} arity={} slots=[{}] body={:#?}",
+                i, f.name, f.arity, slots, f.body
+            );
+        }
         out
     }
 
@@ -516,6 +587,28 @@ impl Simulator {
         self.failures += 1;
         let time_fs = self.time;
         self.emit(SimEvent::TestFailed { text, time_fs });
+    }
+
+    /// Report a latched function-recursion stop (latched by
+    /// `run_func`/`run_procedure`, which only unwind with X): emits the
+    /// diagnostic and flags the run as error-stopped. Returns true when a
+    /// latch was pending. Checked at the top of the pump loop *and* before
+    /// the no-events exit — the latch is set while the last processes run,
+    /// and the loop can otherwise end without reporting it.
+    fn report_fn_recursion(&mut self) -> bool {
+        if let Some(name) = self.fn_recursion.take() {
+            self.emit(SimEvent::Message {
+                text: format!(
+                    "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (self-call or cyclic overloads); simulation stopped",
+                    self.max_func_depth, self.time
+                ),
+                time_fs: self.time,
+            });
+            self.stopped = true;
+            self.error_stopped = true;
+            return true;
+        }
+        false
     }
 
     // ---- main loop ------------------------------------------------------------
@@ -598,8 +691,30 @@ impl Simulator {
     }
 
     fn pump(&mut self, max_time_fs: u64, soft: bool) {
+        // Delta cycles since the last time advance: a design whose processes
+        // or assigns keep re-triggering without time moving would otherwise
+        // loop forever (time-based limits like --max-time cannot see it).
+        let mut delta_count: u64 = 0;
         loop {
             if self.finished || self.stopped {
+                break;
+            }
+            // Function recursion latched while evaluating expressions (the
+            // guard itself only unwinds with X — reporting needs &mut).
+            if self.report_fn_recursion() {
+                break;
+            }
+            delta_count += 1;
+            if delta_count > 10_000 {
+                self.emit(SimEvent::Message {
+                    text: format!(
+                        "error: delta-cycle limit exceeded ({} iterations without time advance) at t={} — the design keeps producing zero-delay events (e.g. `wait for 0 ns` in a loop, or processes re-triggering each other with no delay); simulation stopped",
+                        delta_count, self.time
+                    ),
+                    time_fs: self.time,
+                });
+                self.stopped = true;
+                self.error_stopped = true;
                 break;
             }
             if let Some(f) = &self.stop_flag {
@@ -610,6 +725,7 @@ impl Simulator {
             }
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
+                self.in_active[pid as usize] = false;
                 drain_guard += 1;
                 if drain_guard > 1_000_000 {
                     self.emit(SimEvent::Message {
@@ -617,6 +733,7 @@ impl Simulator {
                         time_fs: self.time,
                     });
                     self.stopped = true;
+                    self.error_stopped = true;
                     break;
                 }
                 self.run_proc(pid);
@@ -652,6 +769,13 @@ impl Simulator {
             let next = self.time_events.keys().next().copied();
             match next {
                 Some(t) if t <= max_time_fs => {
+                    // Only a real advance resets the delta budget: same-time
+                    // event batches (delta cycles, `wait for 0 ns` loops) must
+                    // keep counting, or a process that keeps scheduling events
+                    // at one timestamp would spin forever.
+                    if t > self.time {
+                        delta_count = 0;
+                    }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
                     let evs = self.time_events.remove(&t).unwrap_or_default();
@@ -665,11 +789,17 @@ impl Simulator {
                     }
                 }
                 _ => {
-                    if soft {
-                        break; // pause at the target; simulation stays resumable
+                    // A recursion-guard latch set while the last processes
+                    // ran must be reported here: the loop-top check would
+                    // never run again once the event queue is empty.
+                    let latched = self.report_fn_recursion();
+                    if !latched {
+                        if soft {
+                            break; // pause at the target; simulation stays resumable
+                        }
+                        self.emit(SimEvent::Stop { time_fs: self.time });
+                        self.stopped = true;
                     }
-                    self.emit(SimEvent::Stop { time_fs: self.time });
-                    self.stopped = true;
                     break;
                 }
             }
@@ -691,26 +821,29 @@ impl Simulator {
     /// parked. Without this, several sensitivity signals changing in one delta
     /// would queue the process several times and re-run its body repeatedly.
     fn activate(&mut self, pid: u32) {
-        if self.active.iter().any(|p| *p == pid) || self.waiting.iter().any(|(w, _)| *w == pid) {
+        if self.in_active[pid as usize] || self.parked[pid as usize] {
             self.trace(format!(
-                "activate {} skipped (in active={}, waiting={})",
+                "activate {} skipped (in active={}, parked={})",
                 self.flat.procs[pid as usize].origin,
-                self.active.iter().any(|p| *p == pid),
-                self.waiting.iter().any(|(w, _)| *w == pid)
+                self.in_active[pid as usize],
+                self.parked[pid as usize]
             ));
             return;
         }
         self.trace(format!("activate {}", self.flat.procs[pid as usize].origin));
+        self.in_active[pid as usize] = true;
         self.active.push_back(pid);
     }
 
-    /// Park a process on an event list, at most once per process.
+    /// Park a process on an event list, at most once per process. The
+    /// process's `sens_index` entries swap from its declared sensitivity to
+    /// the wait's edges — while parked, only those can wake it.
     fn park(&mut self, pid: u32, edges: Vec<(FlatSigId, EdgeKind)>) {
-        if self.waiting.iter().any(|(w, _)| *w == pid) {
+        let i = pid as usize;
+        if self.parked[i] {
             self.trace(format!(
-                "{}: park SKIPPED, already parked ({} entries)",
-                self.flat.procs[pid as usize].origin,
-                self.waiting.iter().filter(|(w, _)| *w == pid).count()
+                "{}: park SKIPPED, already parked",
+                self.flat.procs[pid as usize].origin
             ));
             return;
         }
@@ -718,7 +851,32 @@ impl Simulator {
             "{}: park on {:?}",
             self.flat.procs[pid as usize].origin, edges
         ));
-        self.waiting.push((pid, edges));
+        let old = std::mem::replace(&mut self.cur_sens[i], edges.clone());
+        for (s, _ek) in &old {
+            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
+        }
+        for (s, ek) in &edges {
+            self.sens_index[*s as usize].push((pid, *ek));
+        }
+        self.parked[i] = true;
+    }
+
+    /// Release a process from its wait, swapping its `sens_index` entries back
+    /// to the declared sensitivity. Called before re-activation.
+    fn unpark(&mut self, pid: u32) {
+        let i = pid as usize;
+        if !self.parked[i] {
+            return;
+        }
+        self.parked[i] = false;
+        let old = std::mem::take(&mut self.cur_sens[i]);
+        for (s, _ek) in &old {
+            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
+        }
+        for (s, ek) in &self.proc_sens[i] {
+            self.sens_index[*s as usize].push((pid, *ek));
+        }
+        self.cur_sens[i] = self.proc_sens[i].clone();
     }
 
     /// A `wait until ... for T` timeout expired. Pop the process's check
@@ -738,11 +896,12 @@ impl Simulator {
             self.flat.procs[pid as usize].origin
         ));
         self.proc_rt[pid as usize].frames.pop();
-        self.waiting.retain(|(w, _)| *w != pid);
+        self.unpark(pid);
         self.activate(pid);
     }
 
     fn run_proc(&mut self, pid: u32) {
+        self.proc_steps = 0; // per-activation budget (see exec_frames)
         self.emit(SimEvent::ProcActive {
             proc: pid,
             active: true,
@@ -791,7 +950,7 @@ impl Simulator {
                         .push(Ev::Resume(pid));
                     break;
                 }
-                Control::Wait => break, // parked in self.waiting until an edge
+                Control::Wait => break, // parked (see self.parked) until an edge
             }
         }
         self.cur_proc = None;
@@ -815,6 +974,32 @@ impl Simulator {
             WaitCheck,
         }
         loop {
+            // Per-activation interpreter-step budget: a `loop`/`while` whose
+            // body never waits would otherwise spin inside this loop forever —
+            // no scheduler guard (delta limit, --max-time) can fire because
+            // control never returns to `pump`. Modelsim reports the same
+            // condition as "iteration limit". HDLSIM_MAX_PROC_STEPS lowers
+            // the budget (tests, CI); read once at construction.
+            self.proc_steps += 1;
+            if self.proc_steps > self.max_proc_steps {
+                let origin = self.flat.procs[pid as usize].origin.clone();
+                let budget = if self.max_proc_steps % 1_000_000 == 0 {
+                    format!("{}M", self.max_proc_steps / 1_000_000)
+                } else {
+                    format!("{}", self.max_proc_steps)
+                };
+                self.emit(SimEvent::Message {
+                    text: format!(
+                        "error: process step limit exceeded ({} interpreter steps in one activation) at t={} — process '{origin}' loops without waiting (e.g. `loop`/`while` with no `wait`); simulation stopped",
+                        budget,
+                        self.time
+                    ),
+                    time_fs: self.time,
+                });
+                self.stopped = true;
+                self.error_stopped = true;
+                return Control::Done;
+            }
             let n = self.proc_rt[pid as usize].frames.len();
             if n == 0 {
                 return Control::Done;
@@ -1351,7 +1536,7 @@ impl Simulator {
                     self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
                 }
                 let fname = format!("{}::new", cn);
-                if let Some(fi) = self.funcs.get(&fname).copied() {
+                if let Some(fi) = self.func_match(&fname, args.len().saturating_sub(1)) {
                     let saved = self.cur_obj.replace(handle);
                     self.run_func(fi, &args[1..], None);
                     self.cur_obj.set(saved);
@@ -1360,7 +1545,7 @@ impl Simulator {
             // Void method call as a statement: `c.do(args);`
             m if m.starts_with("$callmethod::") => {
                 let rest = &m["$callmethod::".len()..]; // `C::m`
-                if let Some(fi) = self.funcs.get(rest).copied() {
+                if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
                     let obj = args
                         .first()
                         .map(|a| {
@@ -1765,7 +1950,7 @@ impl Simulator {
                 // User procedure / SV task called as a statement, if
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
-                if let Some(fi) = self.funcs.get(name).copied() {
+                if let Some(fi) = self.func_match(name, args.len()) {
                     self.run_procedure(fi, &args, locals.as_deref());
                 } else {
                     self.emit(SimEvent::Message {
@@ -2018,6 +2203,11 @@ impl Simulator {
             text: format!("error: combinational loop detected at t={}", self.time),
             time_fs: self.time,
         });
+        // Unconverged continuous assigns will oscillate every delta — an
+        // unbounded failure would otherwise spin the delta loop forever
+        // without time ever advancing (so --max-time could not stop it).
+        self.stopped = true;
+        self.error_stopped = true;
         any
     }
 
@@ -2058,38 +2248,25 @@ impl Simulator {
             EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
             EdgeKind::Any => true,
         };
-        // Collect first (borrows self.proc_sens), then queue: a process runs at
-        // most once per delta no matter how many of its signals changed.
-        let mut to_activate: Vec<u32> = Vec::new();
-        for (pid, sens) in self.proc_sens.iter().enumerate() {
-            // Procs parked at an explicit `@(...)` are resumed via `waiting`.
-            if self.waiting.iter().any(|(w, _)| *w == pid as u32) {
-                continue;
-            }
-            if sens.iter().any(|(s, ek)| *s == sig && edge_of(ek)) {
-                to_activate.push(pid as u32);
+        // Fanout-driven wake: only processes whose CURRENT sensitivity (declared
+        // list, or the wait they are parked on) includes `sig` are considered —
+        // O(fanout) instead of scanning every process per write. Collect first
+        // (borrows self.sens_index), then wake.
+        let mut to_wake: Vec<u32> = Vec::new();
+        for (pid, ek) in self.sens_index[sig as usize].iter() {
+            if edge_of(ek) {
+                to_wake.push(*pid);
             }
         }
-        for pid in to_activate {
-            self.activate(pid);
-        }
-        // Processes parked at `@(...)` waits.
-        let mut i = 0;
-        while i < self.waiting.len() {
-            let hit = self.waiting[i]
-                .1
-                .iter()
-                .any(|(s, ek)| *s == sig && edge_of(ek));
-            if hit {
-                let (pid, _) = self.waiting.remove(i);
+        for pid in to_wake {
+            if self.parked[pid as usize] {
                 self.trace(format!(
                     "{}: woken by edge on signal {sig}",
                     self.flat.procs[pid as usize].origin
                 ));
-                self.activate(pid);
-            } else {
-                i += 1;
             }
+            self.unpark(pid);
+            self.activate(pid);
         }
     }
 
@@ -2243,10 +2420,9 @@ impl Simulator {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { .. } => 1,
-            Expr::Call { name, .. } => self
-                .funcs
-                .get(name)
-                .map(|i| self.flat.functions[*i].ret_width)
+            Expr::Call { name, args } => self
+                .func_match(name, args.len())
+                .map(|i| self.flat.functions[i].ret_width)
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
             Expr::Rising(_) | Expr::Falling(_) => 1,
@@ -2273,6 +2449,29 @@ impl Simulator {
                 }
                 i < self.flat.signals.len() && self.flat.signals[i].kind == SigKind::Real
             }
+            // Record-field select on a real-typed field (`r.re`): decode the
+            // slice as IEEE-754 instead of an integer bit pattern. Constant
+            // bounds only — the lowerer emits literals for record fields.
+            Expr::Sel { e, msb, lsb } => {
+                let (Expr::Sig(s), Some(m), Some(l)) = (
+                    &**e,
+                    self.const_bound(msb, locals),
+                    self.const_bound(lsb, locals),
+                ) else {
+                    return false;
+                };
+                let i = *s as usize;
+                if let Some(lc) = locals {
+                    if i < lc.len() {
+                        return false;
+                    }
+                }
+                self.flat
+                    .signals
+                    .get(i)
+                    .map(|s| s.real_ranges.iter().any(|&(lo, hi)| lo == l && hi == m))
+                    .unwrap_or(false)
+            }
             // Only arithmetic propagates realness; comparisons/logical ops
             // yield 1-bit results even on real operands.
             Expr::Bin { op, l, r } => match op {
@@ -2291,6 +2490,15 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// Constant bound of a select (record-field bounds are literals from the
+    /// lowerer); dynamic bounds conservatively report None.
+    fn const_bound(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Option<u32> {
+        if matches!(e, Expr::Lit(_)) {
+            return self.eval_expr(e, locals).to_u64().map(|v| v as u32);
+        }
+        None
     }
 
     /// One operand of a real-typed binop as f64: real operands decode their
@@ -2602,14 +2810,16 @@ impl Simulator {
                     return Value::x(1);
                 };
                 match &**e {
-                    Expr::Sig(s) if self.is_mem[*s as usize] => {
+                    Expr::Sig(s)
+                        if (*s as usize) < self.is_mem.len() && self.is_mem[*s as usize] =>
+                    {
                         let sig = *s as usize;
                         self.mems[sig]
                             .get(a as usize)
                             .cloned()
                             .unwrap_or_else(|| Value::x(self.flat.signals[sig].width.max(1)))
                     }
-                    _ => {
+                    other => {
                         let v = self.eval_expr(e, locals);
                         Value::from_bit(v.bit(a as usize))
                     }
@@ -2816,7 +3026,7 @@ impl Simulator {
         }
         if let Some(rest) = name.strip_prefix("$method::") {
             // `c.m(args)` in expression position; funcs are keyed `C::m`.
-            if let Some(fi) = self.funcs.get(rest).copied() {
+            if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
                 let obj = args
                     .first()
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
@@ -2828,7 +3038,7 @@ impl Simulator {
             }
             return Value::x(32);
         }
-        if let Some(fi) = self.funcs.get(name).copied() {
+        if let Some(fi) = self.func_match(name, args.len()) {
             return self.run_func(fi, args, locals);
         }
         Value::x(32)
@@ -2837,8 +3047,40 @@ impl Simulator {
     /// Execute function `fi` with the given argument expressions; returns
     /// slot 0 (the function-name slot, i.e. the return value). Shared by
     /// plain calls and class method calls.
+    /// Resolve a name to one function. Overloads share a bare name; an
+    /// exact formal-count match wins (VHDL likewise prefers the overload
+    /// that binds without default values). Still-ambiguous overloads fall
+    /// back to the first-registered one — a width-mismatched argument reads
+    /// X rather than failing.
+    fn func_match(&self, name: &str, nargs: usize) -> Option<usize> {
+        let cands = self.funcs.get(name)?;
+        if cands.len() == 1 {
+            return Some(cands[0]);
+        }
+        Some(
+            cands
+                .iter()
+                .copied()
+                .find(|&i| self.flat.functions[i].arity == nargs)
+                .unwrap_or(cands[0]),
+        )
+    }
+
+    /// Execute function `fi` with the given argument expressions; returns
+    /// slot 0 (the function-name slot, i.e. the return value). Shared by
+    /// plain calls and class method calls.
     fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
         let f = &self.flat.functions[fi];
+        // Recursion guard: a self-recursive function (or a cycle of
+        // mutually recursive overloads) would otherwise overflow the
+        // stack. Latch the name and unwind with X; the pump reports the
+        // latch and stops the run.
+        let d = self.fn_depth.get() + 1;
+        if d > self.max_func_depth {
+            self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
+            return Value::x(f.ret_width.max(1));
+        }
+        self.fn_depth.set(d);
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
         for (i, a) in args.iter().enumerate() {
@@ -2855,7 +3097,9 @@ impl Simulator {
             returned: false,
         };
         runner.exec(&f.body);
-        lvals[0].clone()
+        let r = lvals[0].clone();
+        self.fn_depth.set(d - 1);
+        r
     }
 
     /// Run a user procedure called in statement position. Unlike `run_func`
@@ -2864,6 +3108,14 @@ impl Simulator {
     /// effect instead of being silently dropped.
     fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&Vec<Value>>) {
         let f = self.flat.functions[fi].clone();
+        // Same recursion guard as `run_func` (shared `fn_depth`, so function
+        // ↔ procedure call chains count together).
+        let d = self.fn_depth.get() + 1;
+        if d > self.max_func_depth {
+            self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
+            return;
+        }
+        self.fn_depth.set(d);
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width.max(1))); // slot 0 = return slot (unused)
         for (i, a) in args.iter().enumerate() {
@@ -2883,6 +3135,7 @@ impl Simulator {
             returned: false,
         };
         runner.exec(&f.body);
+        self.fn_depth.set(d - 1);
     }
 
     /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in

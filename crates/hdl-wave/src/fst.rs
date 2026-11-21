@@ -1039,6 +1039,7 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
             mem: None,
             scope,
             signed: false,
+            real_ranges: Vec::new(),
         });
     }
 

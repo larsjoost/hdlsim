@@ -299,6 +299,7 @@ mod tests {
                 instances: vec![],
                 time_unit_fs: 1_000_000,
                 is_vhdl: false,
+                real_ranges: HashMap::new(),
             }],
         };
         let (lines, branches) = coverage_universe(&design);
