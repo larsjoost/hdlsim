@@ -303,6 +303,15 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
 /// there lets on-demand resolution compile `X_entity.vhd` + `X_rtl.vhd`
 /// together (the common vendor file layout).
 pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
+    // Cheap line scan first: design-unit headers are line-oriented
+    // (`entity foo is`, `package body p is`, `architecture rtl of e is`).
+    // Parsing 5000+ files just to index unit names costs seconds; the scan
+    // costs milliseconds. Files where the scan finds nothing (unusual
+    // formatting, package instances) fall back to the full parse.
+    let (scanned, ambiguous) = vhdl_units_line_scan(text);
+    if !ambiguous && !scanned.is_empty() {
+        return scanned;
+    }
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
         return Vec::new();
@@ -362,6 +371,82 @@ pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)>
     out
 }
 
+/// Unit names by line scan: `entity N is`, `package [body] N is`,
+/// `configuration N of`, `context N is`, and `architecture A of E is`
+/// (tagged body-only, keyed on the entity). `--` comments are stripped
+/// first. Returns the names plus an `ambiguous` flag set when a
+/// design-unit keyword line could not be confidently parsed; the caller
+/// then falls back to the full parse so no unit is missed.
+fn vhdl_units_line_scan(text: &str) -> (Vec<(String, bool)>, bool) {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    // A design-unit keyword line the scan cannot confidently parse (unusual
+    // formatting, escaped identifiers, multi-line headers). Any such line
+    // makes the caller fall back to the full parse so no unit is missed.
+    let mut ambiguous = false;
+    let kw = |w: &str| {
+        matches!(
+            w,
+            "entity" | "package" | "configuration" | "context" | "architecture"
+        )
+    };
+    for raw in text.lines() {
+        let line = match raw.find("--") {
+            Some(p) => &raw[..p],
+            None => raw,
+        };
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(w0) = words.first().map(|w| w.to_ascii_lowercase()) else {
+            continue;
+        };
+        if !kw(&w0) {
+            continue;
+        }
+        if words.len() < 2 {
+            ambiguous = true;
+            continue;
+        }
+        let name_of = |i: usize| -> Option<String> {
+            words
+                .get(i)
+                .map(|w| w.trim_matches(';').trim().to_string())
+                .filter(|n| !n.is_empty())
+        };
+        match w0.as_str() {
+            "entity" => match name_of(1) {
+                Some(n) => out.push((n, false)),
+                None => ambiguous = true,
+            },
+            "package" => {
+                let is_body = words[1].eq_ignore_ascii_case("body");
+                let name_pos = if is_body { 2 } else { 1 };
+                match name_of(name_pos) {
+                    // `package p is new …` (an instantiation) also defines a
+                    // unit named `p`; only skip the word `instance` itself.
+                    Some(n) if !n.eq_ignore_ascii_case("instance") => out.push((n, is_body)),
+                    Some(_) => {}
+                    None => ambiguous = true,
+                }
+            }
+            "configuration" | "context" => match name_of(1) {
+                Some(n) => out.push((n, false)),
+                None => ambiguous = true,
+            },
+            "architecture" => {
+                match words
+                    .iter()
+                    .position(|w| w.eq_ignore_ascii_case("of"))
+                    .and_then(|p| name_of(p + 1))
+                {
+                    Some(e) => out.push((e, true)),
+                    None => ambiguous = true,
+                }
+            }
+            _ => {}
+        }
+    }
+    (out, ambiguous)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +484,27 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn units_line_scan_matches_full_parse_and_flags_ambiguity() {
+        // Normal formatting: the scan agrees with the full parse.
+        let normal = "library ieee;\nuse ieee.std_logic_1164.all;\n-- entity fake is\nentity e is\n  port (c : in std_logic);\nend entity;\narchitecture rtl of e is\nbegin\nend architecture;\npackage p is\nend package;\npackage body p is\nend package body;\ncontext ctx is\nend context;\n";
+        let (names, ambiguous) = vhdl_units_line_scan(normal);
+        assert!(!ambiguous);
+        assert!(names.contains(&("e".to_string(), false)));
+        assert!(names.contains(&("e".to_string(), true)));
+        assert!(names.contains(&("p".to_string(), false)));
+        assert!(names.contains(&("p".to_string(), true)));
+        assert!(names.contains(&("ctx".to_string(), false)));
+        // A multi-line header the scan cannot parse must be flagged, so the
+        // caller falls back to the full parse instead of missing the unit.
+        let odd = "package p is\nend package;\nentity\ne2\nis\nend;\n";
+        let (_, ambiguous) = vhdl_units_line_scan(odd);
+        assert!(ambiguous, "multi-line entity header must be flagged");
+        // Cross-check the normal case against the full parse result.
+        let parsed = vhdl_units_in_file(std::path::Path::new("normal.vhd"), normal);
+        assert_eq!(parsed, names, "line scan must match the full parse");
     }
 
     #[test]
