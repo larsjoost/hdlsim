@@ -160,11 +160,28 @@ pub fn elaborate_with_opts(
         resolver.resolve(design, top).map_err(ElabError::Message)?;
     }
     let mut tried: Vec<String> = Vec::new();
+    // `HDLSIM_TIMING=1` (or `--progress`, mirrored into the env by the CLI)
+    // prints per-round bind/flatten split: bind rounds re-scan the design and
+    // compile one missing dependency each; flatten is the actual elaboration.
+    let timing = std::env::var("HDLSIM_TIMING").is_ok();
+    let mut round: usize = 0;
     loop {
-        resolve_positional_params(design)?;
-        bind_param_variants(design, resolver).map_err(ElabError::Message)?;
+        let t_round = std::time::Instant::now();
+        resolve_positional_params(design, round)?;
+        bind_param_variants(design, resolver, round).map_err(ElabError::Message)?;
+        let t_bind = t_round.elapsed();
         match try_elaborate(design, top, register_pkg_funcs) {
-            Ok(f) => return Ok(f),
+            Ok(f) => {
+                if timing {
+                    eprintln!(
+                        "hdlsim: elaborate round bind {:.2}s / flatten {:.2}s ({} modules)",
+                        t_bind.as_secs_f32(),
+                        (t_round.elapsed() - t_bind).as_secs_f32(),
+                        design.modules.len()
+                    );
+                }
+                return Ok(f);
+            }
             Err(ElabError::UnknownUnit { name, .. }) => {
                 if tried.iter().any(|t| *t == name) {
                     return Err(ElabError::Message(format!(
@@ -177,6 +194,15 @@ pub fn elaborate_with_opts(
                     .resolve(design, &name)
                     .map_err(ElabError::Message)?
                 {
+                    if timing {
+                        eprintln!(
+                            "hdlsim: elaborate round (resolved '{}') bind {:.2}s ({} modules)",
+                            name,
+                            t_round.elapsed().as_secs_f32(),
+                            design.modules.len()
+                        );
+                    }
+                    round += 1;
                     continue;
                 }
                 return Err(ElabError::UnknownUnit {
@@ -201,7 +227,45 @@ pub fn elaborate_with_opts(
 /// whose target unit is not compiled yet keep their positionals until the
 /// next pass round; config bindings applied during instantiation resolve in
 /// `instantiate`, which has the final child module at hand.
-fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
+/// First-wins module-name → index lookup for the generic-override passes.
+/// The passes run per fixpoint round over thousands of modules and
+/// instances, and a linear `position()` per instance is quadratic there
+/// (43s on a 19k-instance testbench, most of it in String compares).
+/// `check` calls the passes once per candidate top with a single round each
+/// — building the map every time costs more than the scans it saves — so
+/// round 0 scans linearly and the map kicks in from the second round on.
+enum Lookup {
+    Scan,
+    Map(HashMap<String, usize>),
+}
+
+impl Lookup {
+    fn new(round: usize, design: &Design) -> Self {
+        if round == 0 {
+            Lookup::Scan
+        } else {
+            Lookup::Map(mod_index(design))
+        }
+    }
+
+    fn get(&self, design: &Design, name: &str) -> Option<usize> {
+        match self {
+            Lookup::Scan => design.modules.iter().position(|m| m.name == name),
+            Lookup::Map(m) => m.get(name).copied(),
+        }
+    }
+}
+
+fn mod_index(design: &Design) -> HashMap<String, usize> {
+    let mut idx: HashMap<String, usize> = HashMap::with_capacity(design.modules.len());
+    for (i, m) in design.modules.iter().enumerate() {
+        idx.entry(m.name.clone()).or_insert(i);
+    }
+    idx
+}
+
+fn resolve_positional_params(design: &mut Design, round: usize) -> Result<(), ElabError> {
+    let lookup = Lookup::new(round, design);
     for mi in 0..design.modules.len() {
         for ii in 0..design.modules[mi].instances.len() {
             let has_pos = design.modules[mi].instances[ii]
@@ -213,7 +277,7 @@ fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
             }
             let unit = design.modules[mi].instances[ii].module.clone();
             let where_ = design.modules[mi].instances[ii].name.clone();
-            let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+            let Some(tid) = lookup.get(design, &unit) else {
                 continue;
             };
             if !design.modules[tid].is_vhdl {
@@ -252,7 +316,14 @@ fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
     Ok(())
 }
 
-fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> Result<(), String> {
+fn bind_param_variants(
+    design: &mut Design,
+    resolver: &mut dyn UnitResolver,
+    round: usize,
+) -> Result<(), String> {
+    let mut lookup = Lookup::new(round, design);
+    // Modules up to this index are already reflected in the map (Map mode).
+    let mut n_indexed = design.modules.len();
     loop {
         let mut changed = false;
         for mi in 0..design.modules.len() {
@@ -261,7 +332,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                     continue;
                 }
                 let unit = design.modules[mi].instances[ii].module.clone();
-                let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+                let Some(tid) = lookup.get(design, &unit) else {
                     continue;
                 };
                 // Only VHDL entities can be re-lowered as generic-map variants.
@@ -284,6 +355,15 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                         changed = true;
                     }
                 }
+                // resolve_variant may have appended variant modules: keep the
+                // map current so later sites in this round find their targets.
+                // (Scan mode reads the design live — nothing to patch.)
+                if let Lookup::Map(map) = &mut lookup {
+                    for (i, m) in design.modules.iter().enumerate().skip(n_indexed) {
+                        map.entry(m.name.clone()).or_insert(i);
+                    }
+                    n_indexed = design.modules.len();
+                }
             }
         }
         if !changed {
@@ -295,6 +375,9 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
 fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result<Flat, ElabError> {
     // The top may be a configuration declaration: elaborate its bound entity
     // with the configuration's block bindings applied at the top scope.
+    // A linear scan beats a map here: `check` elaborates every module as a
+    // candidate top (one lookup each), so building a full name map per top
+    // would cost more than the scans it saves.
     let (top_id, top_cfg) = if let Some(pos) = design.modules.iter().position(|m| m.name == top) {
         (pos, None)
     } else if let Some(c) = design.configurations.get(&top.to_ascii_lowercase()) {

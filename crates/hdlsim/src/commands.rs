@@ -212,6 +212,11 @@ pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Optio
     let mut mgr = LibraryManager::new();
     mgr.use_env_cache(); // `.hdlsim-cache/` unless HDLSIM_NO_CACHE / HDLSIM_CACHE_DIR
     mgr.set_progress(opts.progress);
+    // `--progress` also enables the phase/sub-phase timing prints (they are
+    // env-gated in hdl-lib/hdl-ir); mirror the flag so those crates see it.
+    if opts.progress && std::env::var_os("HDLSIM_TIMING").is_none() {
+        std::env::set_var("HDLSIM_TIMING", "1");
+    }
     let mut root: Option<PathBuf> = None;
     if let Some(b) = &opts.bundle {
         let bytes =
