@@ -43,12 +43,39 @@ pub struct ModuleIr {
     /// Source language: VHDL modules can be re-lowered as elaboration
     /// variants (generic-map overrides); Verilog modules cannot.
     pub is_vhdl: bool,
+    /// Signal name → inclusive bit ranges of real-typed record fields
+    /// (`type c is record re, im : real; end record;` → the whole signal).
+    /// The simulator decodes those slices as IEEE-754; everything else as an
+    /// integer bit pattern (VHDL records flatten to one vector per signal).
+    pub real_ranges: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl Default for ModuleIr {
+    fn default() -> Self {
+        ModuleIr {
+            name: String::new(),
+            params: Vec::new(),
+            ports: Vec::new(),
+            signals: Vec::new(),
+            assigns: Vec::new(),
+            processes: Vec::new(),
+            functions: Vec::new(),
+            instances: Vec::new(),
+            time_unit_fs: 1_000_000,
+            is_vhdl: false,
+            real_ranges: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ParamIr {
     pub name: String,
     pub default: Value,
+    /// Record type name of a record-typed generic — restored into the
+    /// architecture scope so `G_PARAM.field` selects resolve when the
+    /// architecture is lowered in a fresh scope (separate file).
+    pub ty: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,7 +177,11 @@ pub struct FuncIr {
 pub struct InstIr {
     pub module: String,
     pub name: String,
-    pub param_overrides: Vec<(String, Expr)>,
+    /// Generic/parameter overrides: `Some(name)` for a named association,
+    /// `None` for a positional one (bound to the target's parameters in
+    /// declaration order during elaboration — the target's list is not
+    /// visible while lowering).
+    pub param_overrides: Vec<(Option<String>, Expr)>,
     pub conns: Vec<Conn>,
     /// Configuration bound to this instance (`configuration work.cfg` or a
     /// `for label : comp use configuration ...;` specification); elaboration

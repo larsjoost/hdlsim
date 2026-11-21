@@ -38,6 +38,9 @@ pub struct FlatSig {
     pub scope: ScopeId,
     /// Signed arithmetic/comparison (VHDL `signed`, Verilog `signed`).
     pub signed: bool,
+    /// Inclusive bit ranges of real-typed record fields: the simulator
+    /// decodes those slices as IEEE-754 (see `ModuleIr::real_ranges`).
+    pub real_ranges: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +64,9 @@ pub struct FlatAssign {
 pub struct FlatFunc {
     pub name: String,
     pub ret_width: usize,
+    /// Number of formal arguments — resolves overloads (same name,
+    /// different parameter count) when the simulator looks a call up.
+    pub arity: usize,
     /// Width of each slot; slot ids in the body index this vector.
     pub slots: Vec<usize>,
     /// Shared handle: the kernel can execute a body while mutably borrowing
@@ -102,12 +108,15 @@ pub trait UnitResolver {
     /// `entity/arch`) re-lowered with the constant `params` overrides from an
     /// instantiation's `generic map` / `#(...)`; returns the variant module
     /// name, or `None` when unsupported (elaboration then falls back to the
-    /// default-generics module).
+    /// default-generics module). `bound` is the design-modules index of the
+    /// module the instantiation resolved to — its source file disambiguates
+    /// same-named entities from different files.
     fn resolve_variant(
         &mut self,
         _design: &mut Design,
         _unit: &str,
         _params: &HashMap<String, Value>,
+        _bound: usize,
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -152,6 +161,7 @@ pub fn elaborate_with_opts(
     }
     let mut tried: Vec<String> = Vec::new();
     loop {
+        resolve_positional_params(design)?;
         bind_param_variants(design, resolver).map_err(ElabError::Message)?;
         match try_elaborate(design, top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
@@ -184,6 +194,64 @@ pub fn elaborate_with_opts(
 /// params, ask the resolver for a variant module re-lowered with those
 /// overrides and point the instance at it. Repeats to a fixpoint (variants
 /// may carry their own instances with overrides).
+/// Bind positional generic-map actuals (`generic map (v1, v2, …)`) by name:
+/// the k-th positional actual maps to the target module's k-th parameter in
+/// declaration order. Runs before variant binding — generic values select
+/// the re-lowered variant, so overrides must carry names by then. Instances
+/// whose target unit is not compiled yet keep their positionals until the
+/// next pass round; config bindings applied during instantiation resolve in
+/// `instantiate`, which has the final child module at hand.
+fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
+    for mi in 0..design.modules.len() {
+        for ii in 0..design.modules[mi].instances.len() {
+            let has_pos = design.modules[mi].instances[ii]
+                .param_overrides
+                .iter()
+                .any(|(n, _)| n.is_none());
+            if !has_pos {
+                continue;
+            }
+            let unit = design.modules[mi].instances[ii].module.clone();
+            let where_ = design.modules[mi].instances[ii].name.clone();
+            let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+                continue;
+            };
+            if !design.modules[tid].is_vhdl {
+                continue; // Verilog `#(…)` overrides are always named
+            }
+            let names: Vec<String> = design.modules[tid]
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let inst = &mut design.modules[mi].instances[ii];
+            let mut k = 0usize;
+            for (n, _) in inst.param_overrides.iter_mut() {
+                if n.is_some() {
+                    continue;
+                }
+                match names.get(k) {
+                    Some(name) => *n = Some(name.clone()),
+                    None => {
+                        return Err(ElabError::Message(format!(
+                            "{}: more positional generic-map actuals than '{}' has generics ({})",
+                            if where_.is_empty() {
+                                design.modules[mi].name.clone()
+                            } else {
+                                format!("{}.{}", design.modules[mi].name, where_)
+                            },
+                            unit,
+                            names.len()
+                        )))
+                    }
+                }
+                k += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> Result<(), String> {
     loop {
         let mut changed = false;
@@ -202,6 +270,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                 }
                 let mut params: HashMap<String, Value> = HashMap::new();
                 for (n, e) in &design.modules[mi].instances[ii].param_overrides {
+                    let Some(n) = n else { continue }; // resolved by resolve_positional_params
                     if let Expr::Lit(v) = e {
                         params.insert(n.to_ascii_lowercase(), v.clone());
                     }
@@ -209,7 +278,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                 if params.is_empty() {
                     continue;
                 }
-                if let Some(v) = resolver.resolve_variant(design, &unit, &params)? {
+                if let Some(v) = resolver.resolve_variant(design, &unit, &params, tid)? {
                     if v != unit {
                         design.modules[mi].instances[ii].module = v;
                         changed = true;
@@ -282,6 +351,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
             f.functions.push(FlatFunc {
                 name: func.name.clone(),
                 ret_width: func.ret_width,
+                arity: func.args.len(),
                 slots,
                 body: Arc::new(func.body.clone()),
             });
@@ -318,6 +388,7 @@ impl Flat {
             mem: None,
             signed,
             scope,
+            real_ranges: Vec::new(),
         });
         id
     }
@@ -377,6 +448,10 @@ impl Flat {
             };
             let id = self.new_sig(name, s.width, s.kind, s.init.clone(), scope, s.signed);
             self.signals[id as usize].mem = s.mem;
+            // Real-typed record fields decode as IEEE-754 in the simulator.
+            if let Some(r) = m.real_ranges.get(&s.name) {
+                self.signals[id as usize].real_ranges = r.clone();
+            }
             map.push(id);
         }
 
@@ -401,6 +476,11 @@ impl Flat {
                                 scope,
                                 m.signals[port.sig as usize].signed,
                             );
+                            // Record-typed port bridged by an expression: keep
+                            // the real-field layout for field selects.
+                            if let Some(r) = m.real_ranges.get(&m.signals[port.sig as usize].name) {
+                                self.signals[imp as usize].real_ranges = r.clone();
+                            }
                             map[port.sig as usize] = imp;
                             match port.dir {
                                 Dir::In => self.assigns.push(FlatAssign {
@@ -487,6 +567,7 @@ impl Flat {
             self.functions.push(FlatFunc {
                 name: f.name.clone(),
                 ret_width: f.ret_width,
+                arity: f.args.len(),
                 slots,
                 body,
             });
@@ -507,12 +588,27 @@ impl Flat {
             } else {
                 format!("{}.{}", prefix, inst.name)
             };
-            // Parameter overrides as values where constant.
+            // Parameter overrides as values where constant. Positional
+            // actuals (config bindings can inject them after the pre-pass)
+            // bind to the child's parameters in declaration order.
             let mut child_params = param_vals.clone();
+            let mut pos = 0usize;
             for (pname, pexpr) in &inst.param_overrides {
+                if pname.is_none() {
+                    pos += 1; // every positional actual consumes a formal slot
+                }
                 let e = remap_expr(pexpr, &map);
                 if let Expr::Lit(v) = e {
-                    child_params.insert(pname.clone(), v);
+                    match pname {
+                        Some(n) => {
+                            child_params.insert(n.clone(), v);
+                        }
+                        None => {
+                            if let Some(p) = m.params.get(pos - 1) {
+                                child_params.insert(p.name.clone(), v);
+                            }
+                        }
+                    }
                 }
             }
             let child_conns: Vec<Conn> = inst
@@ -813,6 +909,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         child.assigns.push(AssignIr {
             lhs: Expr::Sig(0),
@@ -835,6 +932,7 @@ mod tests {
             }],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         Design {
             modules: vec![top, child],
@@ -866,6 +964,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         other.assigns.push(AssignIr {
             lhs: Expr::Sig(0),

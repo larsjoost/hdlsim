@@ -348,6 +348,7 @@ impl<'a> Lower<'a> {
             instances: Vec::new(),
             time_unit_fs: self.time_unit_fs,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         // The name map is per-module: without this, a declaration in the second
         // module of a file would be skipped as "already known" from the first.
@@ -1554,6 +1555,7 @@ impl<'a> Lower<'a> {
                             module.params.push(ParamIr {
                                 name: pname.clone(),
                                 default: val.clone(),
+                                ty: None,
                             });
                         }
                         // Also visible as a constant to later items (e.g. decls
@@ -2730,7 +2732,8 @@ impl<'a> Lower<'a> {
         }
         for c in &kids[1..] {
             if c.kind() == SyntaxKind::ParamAssign {
-                param_overrides.push(self.lower_param_assign(c, env));
+                let (n, e) = self.lower_param_assign(c, env);
+                param_overrides.push((Some(n), e));
             }
         }
         if inst_name.is_empty() {

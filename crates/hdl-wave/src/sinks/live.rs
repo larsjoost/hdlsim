@@ -423,6 +423,7 @@ mod tests {
                 mem: None,
                 scope: 0,
                 signed: false,
+                real_ranges: Vec::new(),
             }],
             procs: vec![],
             assigns: vec![],

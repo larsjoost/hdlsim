@@ -409,6 +409,7 @@ mod tests {
                     mem: None,
                     scope: 0,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
                 FlatSig {
                     name: "tb.q".into(),
@@ -418,6 +419,7 @@ mod tests {
                     mem: None,
                     scope: 0,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
             ],
             procs: vec![],

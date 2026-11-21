@@ -472,6 +472,7 @@ mod tests {
                     mem: None,
                     scope: 0,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
                 FlatSig {
                     name: "tb.dut.q".to_string(),
@@ -481,6 +482,7 @@ mod tests {
                     mem: None,
                     scope: 1,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
                 FlatSig {
                     name: "tb.dut.busy".to_string(),
@@ -490,6 +492,7 @@ mod tests {
                     mem: None,
                     scope: 1,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
             ],
             procs: Vec::new(),
@@ -637,6 +640,7 @@ mod tests {
             mem: None,
             scope: 0,
             signed: false,
+            real_ranges: Vec::new(),
         });
         let vsig = 3u32; // flat index of tb.v
         let mut buf: Vec<u8> = Vec::new();

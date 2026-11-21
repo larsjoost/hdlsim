@@ -137,6 +137,12 @@ impl Command for Run {
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
+        if mgr.diags().has_errors() {
+            // On-demand resolution compiles dependencies during elaboration;
+            // their errors must stop the run here — simulating a design that
+            // failed to compile produces garbage results (or hangs).
+            return Ok(1);
+        }
         let mut sim = match &restore {
             Some(p) => Simulator::restore_checkpoint(flat, p).map_err(anyhow::Error::msg)?,
             None => Simulator::new(flat),
@@ -247,6 +253,12 @@ impl Command for Run {
                     &format!("hdlsim: FAILED — {} test failure(s)", sim.failures())
                 )
             );
+            return Ok(1);
+        }
+        if sim.error_stopped() {
+            // Stopped by an internal guard (combinational loop, delta-cycle or
+            // process-step limit): the transcript already carries the `error:`
+            // line — fail the run so CI does not read a truncated run as pass.
             return Ok(1);
         }
         // std.env.finish(status): the STATUS argument becomes the process exit

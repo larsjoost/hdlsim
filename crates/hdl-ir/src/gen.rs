@@ -215,6 +215,7 @@ fn vhdl_tb(m: &ModuleIr) -> String {
 mod tests {
     use super::*;
     use crate::ir::{ParamIr, SigKind, SignalIr};
+    use std::collections::HashMap;
 
     fn sig(name: &str, width: usize, kind: SigKind) -> SignalIr {
         SignalIr {
@@ -259,6 +260,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1_000_000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         }
     }
 
@@ -309,6 +311,7 @@ mod tests {
         m.params = vec![ParamIr {
             name: "W".to_string(),
             default: Value::from_u64(32, 8),
+            ty: None,
         }];
         let v = testbench(&design_with(m.clone()), "counter", Language::Verilog).unwrap();
         assert!(v.contains("counter #("), "{}", v);

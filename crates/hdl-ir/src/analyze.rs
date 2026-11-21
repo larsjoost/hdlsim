@@ -240,6 +240,7 @@ mod tests {
     use super::*;
     use crate::ir::{AssignIr, Edge, EdgeKind, PortIr, ProcKind, ProcessIr, SignalIr};
     use crate::value::Value;
+    use std::collections::HashMap;
 
     fn sig(name: &str, width: usize, kind: SigKind) -> SignalIr {
         SignalIr {
@@ -292,6 +293,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1_000_000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         }
     }
 
