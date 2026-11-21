@@ -38,6 +38,9 @@ pub struct FlatSig {
     pub scope: ScopeId,
     /// Signed arithmetic/comparison (VHDL `signed`, Verilog `signed`).
     pub signed: bool,
+    /// Inclusive bit ranges of real-typed record fields: the simulator
+    /// decodes those slices as IEEE-754 (see `ModuleIr::real_ranges`).
+    pub real_ranges: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +321,7 @@ impl Flat {
             mem: None,
             signed,
             scope,
+            real_ranges: Vec::new(),
         });
         id
     }
@@ -377,6 +381,10 @@ impl Flat {
             };
             let id = self.new_sig(name, s.width, s.kind, s.init.clone(), scope, s.signed);
             self.signals[id as usize].mem = s.mem;
+            // Real-typed record fields decode as IEEE-754 in the simulator.
+            if let Some(r) = m.real_ranges.get(&s.name) {
+                self.signals[id as usize].real_ranges = r.clone();
+            }
             map.push(id);
         }
 
@@ -401,6 +409,11 @@ impl Flat {
                                 scope,
                                 m.signals[port.sig as usize].signed,
                             );
+                            // Record-typed port bridged by an expression: keep
+                            // the real-field layout for field selects.
+                            if let Some(r) = m.real_ranges.get(&m.signals[port.sig as usize].name) {
+                                self.signals[imp as usize].real_ranges = r.clone();
+                            }
                             map[port.sig as usize] = imp;
                             match port.dir {
                                 Dir::In => self.assigns.push(FlatAssign {
@@ -813,6 +826,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         child.assigns.push(AssignIr {
             lhs: Expr::Sig(0),
@@ -835,6 +849,7 @@ mod tests {
             }],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         Design {
             modules: vec![top, child],
@@ -866,6 +881,7 @@ mod tests {
             instances: vec![],
             time_unit_fs: 1000,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         other.assigns.push(AssignIr {
             lhs: Expr::Sig(0),

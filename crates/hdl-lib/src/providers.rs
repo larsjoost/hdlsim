@@ -250,11 +250,16 @@ pub fn walk_sources_tagged(dir: &Path) -> Vec<(String, PathBuf, bool)> {
 }
 
 /// Design-unit names defined by one source file. Verilog: `module` names.
+/// VHDL architectures report under their entity's name, deduplicated — a file
+/// holding `entity x` + `architecture rtl of x` provides the unit `x` once.
 pub fn units_in_file(path: &Path) -> Vec<String> {
-    units_in_file_tagged(path)
-        .into_iter()
-        .map(|(u, _)| u)
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for (u, _) in units_in_file_tagged(path) {
+        if !out.iter().any(|e| e == &u) {
+            out.push(u);
+        }
+    }
+    out
 }
 
 /// Like `units_in_file`, but each unit is tagged with whether its file holds
@@ -293,13 +298,17 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
 /// Design-unit names defined by a VHDL file, tagged with body-ness: entities,
 /// packages, and configurations (the name is the first identifier that isn't
 /// a keyword); a `package body p;` tags `p` as a body-only file.
+/// Architectures report their *entity's* name tagged as body-only: an
+/// architecture is only meaningful together with its entity, and indexing it
+/// there lets on-demand resolution compile `X_entity.vhd` + `X_rtl.vhd`
+/// together (the common vendor file layout).
 pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)> {
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
         return Vec::new();
     };
     let parsed = hdl_syntax::vhdl::parser::parse_file(id, db.file(id));
-    parsed
+    let mut out: Vec<(String, bool)> = parsed
         .root
         .children()
         .filter(|c| {
@@ -328,7 +337,29 @@ pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)>
                 })
                 .map(|n| (db.span_text(n.span()).trim().to_string(), is_body))
         })
-        .collect()
+        .collect();
+    // Architectures: `ARCHITECTURE rtl OF ent IS` — index under `ent`, tagged
+    // body-only so the entity's declaration file sorts first.
+    for a in parsed
+        .root
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::Architecture)
+    {
+        let idents: Vec<String> = a
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::Ident)
+            .map(|n| db.span_text(n.span()).trim().to_ascii_lowercase())
+            .collect();
+        // [arch_name, "of", entity_name] — take the ident after "of".
+        if let Some(pos) = idents.iter().position(|s| s == "of") {
+            if let Some(ent) = idents.get(pos + 1) {
+                if !ent.is_empty() {
+                    out.push((ent.clone(), true));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

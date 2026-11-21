@@ -348,6 +348,7 @@ impl<'a> Lower<'a> {
             instances: Vec::new(),
             time_unit_fs: self.time_unit_fs,
             is_vhdl: false,
+            real_ranges: HashMap::new(),
         };
         // The name map is per-module: without this, a declaration in the second
         // module of a file would be skipped as "already known" from the first.

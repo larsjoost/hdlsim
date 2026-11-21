@@ -43,6 +43,29 @@ pub struct ModuleIr {
     /// Source language: VHDL modules can be re-lowered as elaboration
     /// variants (generic-map overrides); Verilog modules cannot.
     pub is_vhdl: bool,
+    /// Signal name → inclusive bit ranges of real-typed record fields
+    /// (`type c is record re, im : real; end record;` → the whole signal).
+    /// The simulator decodes those slices as IEEE-754; everything else as an
+    /// integer bit pattern (VHDL records flatten to one vector per signal).
+    pub real_ranges: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl Default for ModuleIr {
+    fn default() -> Self {
+        ModuleIr {
+            name: String::new(),
+            params: Vec::new(),
+            ports: Vec::new(),
+            signals: Vec::new(),
+            assigns: Vec::new(),
+            processes: Vec::new(),
+            functions: Vec::new(),
+            instances: Vec::new(),
+            time_unit_fs: 1_000_000,
+            is_vhdl: false,
+            real_ranges: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

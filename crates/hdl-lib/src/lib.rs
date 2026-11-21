@@ -57,6 +57,9 @@ pub struct LibraryManager {
     /// case) over filesystem providers — built without parsing any file.
     stem_index: HashMap<String, Vec<(usize, PathBuf)>>,
     stem_indexed: bool,
+    /// Filesystem providers whose units were parse-scanned into `index` by
+    /// `resolve_in_library` (one-time, per provider).
+    lib_scanned: HashSet<usize>,
     /// Whether filesystem providers have been fully scanned (parsed) yet.
     dir_scanned: bool,
     /// Print indexing/resolution progress to stderr (`--progress`).
@@ -76,10 +79,21 @@ pub struct LibraryManager {
     /// Entity name → signal maps + entity-declarative items, so pending
     /// architectures (entity in another file) see the entity's scope.
     entity_maps: HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
+    /// (source directory, lowercase entity name) → signal maps; disambiguates
+    /// same-named entities from different directories (sibling binding).
+    entity_maps_by_dir: HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
     /// `use`d library units that failed to resolve while compiling a file:
     /// (unit name, resolve error). Warned about at the end of `compile_files`
     /// if still unresolved (a later explicit file may still provide them).
     unresolved_units: Vec<(String, String)>,
+    /// (library, entity name) → index in `design.modules` of the module that
+    /// library compiled for that entity. Architectures bind to their own
+    /// library's entity when several libraries declare the same name.
+    entity_module_of: HashMap<(String, String), usize>,
+    /// (canonical source directory, entity name) → module index. Whole-tree
+    /// libraries (`work = .`) hold same-named entities from several
+    /// directories; sibling files (same dir) belong together.
+    entity_module_by_dir: HashMap<(String, String), usize>,
     /// Project roots searched on a resolve miss (cwd, dirs of input files):
     /// the "out of the box" fallback when no library maps the unit.
     search_roots: Vec<PathBuf>,
@@ -104,6 +118,7 @@ impl LibraryManager {
             indexed: false,
             stem_index: HashMap::new(),
             stem_indexed: false,
+            lib_scanned: HashSet::new(),
             dir_scanned: false,
             progress: false,
             compiled: HashSet::new(),
@@ -112,6 +127,9 @@ impl LibraryManager {
             pending_archs: Vec::new(),
             entity_roots: HashMap::new(),
             entity_maps: HashMap::new(),
+            entity_maps_by_dir: HashMap::new(),
+            entity_module_of: HashMap::new(),
+            entity_module_by_dir: HashMap::new(),
             unresolved_units: Vec::new(),
             search_roots: Vec::new(),
             search_index: None,
@@ -185,6 +203,7 @@ impl LibraryManager {
     /// Add a named filesystem library directory (Verilog + VHDL sources).
     pub fn add_library_dir(&mut self, name: &str, path: &Path) {
         self.add_provider(Box::new(DirProvider::mixed(name, path)));
+        self.lib_scanned.clear();
     }
 
     /// Add a "library root" (e.g. `$XILINX_VIVADO/data/vhdl/src`): each
@@ -386,6 +405,102 @@ impl LibraryManager {
         }
     }
 
+    /// Parse-scan one filesystem provider's files for unit names and add the
+    /// results to `index` (declarations before bodies). The per-library
+    /// variant of `full_scan_dir_providers`, used by `resolve_in_library` so
+    /// `use lib.unit` can look inside multi-unit files of just `lib`.
+    fn scan_provider_into_index(&mut self, pi: usize) {
+        // Collect the scan under an immutable borrow, then index mutably.
+        let scanned: Vec<(String, PathBuf, bool)> = {
+            let p = self.all_providers().nth(pi).unwrap();
+            if p.source_files().is_empty() {
+                Vec::new() // in-memory providers are indexed eagerly already
+            } else {
+                if self.progress {
+                    eprintln!(
+                        "  scanning library '{}' for unit names (parsing)…",
+                        p.name()
+                    );
+                }
+                p.scan_tagged()
+            }
+        };
+        // Declarations first per unit: candidates are compiled in order, and
+        // a package body must be lowered after its declaration is registered
+        // (same invariant as `full_scan_dir_providers`).
+        let mut grouped: HashMap<String, (Vec<(usize, PathBuf)>, Vec<(usize, PathBuf)>)> =
+            HashMap::new();
+        for (unit, file, is_body) in scanned {
+            let e = grouped.entry(unit.to_ascii_lowercase()).or_default();
+            if is_body {
+                e.1.push((pi, file));
+            } else {
+                e.0.push((pi, file));
+            }
+        }
+        for (unit, (mut decls, mut bodies)) in grouped {
+            decls.append(&mut bodies);
+            self.index.entry(unit).or_default().extend(decls);
+        }
+        self.lib_scanned.insert(pi);
+    }
+
+    /// Resolve `use lib.unit...` inside the named library (LRM 11.2): try
+    /// that library's own files first — stem candidates, in-memory index
+    /// entries, then a one-time content scan of the library — so units in
+    /// other libraries (vendor trees mapped under different names, built-ins)
+    /// cannot shadow it. Returns true when the unit is on the design after
+    /// the scoped attempt; false means the caller should fall back to the
+    /// global search (the library is unknown, or lacks the unit).
+    fn resolve_in_library(
+        &mut self,
+        design: &mut Design,
+        name: &str,
+        lname: &str,
+        lib: &str,
+    ) -> Result<bool, String> {
+        let Some(pi) = self
+            .all_providers()
+            .position(|p| p.name().eq_ignore_ascii_case(lib))
+        else {
+            return Ok(false);
+        };
+        self.ensure_stem_index();
+        let stem_cands: Vec<(usize, PathBuf)> = self
+            .stem_index
+            .get(lname)
+            .map(|v| v.iter().filter(|(i, _)| *i == pi).cloned().collect())
+            .unwrap_or_default();
+        if !stem_cands.is_empty() && self.try_candidates(design, name, lname, stem_cands)? {
+            return Ok(true);
+        }
+        // In-memory (built-in) providers are indexed eagerly; directory
+        // providers land here after their content scan below.
+        self.ensure_index();
+        let idx_cands: Vec<(usize, PathBuf)> = self
+            .index
+            .get(lname)
+            .map(|v| v.iter().filter(|(i, _)| *i == pi).cloned().collect())
+            .unwrap_or_default();
+        if !idx_cands.is_empty() && self.try_candidates(design, name, lname, idx_cands)? {
+            return Ok(true);
+        }
+        // Last scoped chance: a unit whose name differs from its file name
+        // (multi-unit files) — parse-scan this library once.
+        if !self.lib_scanned.contains(&pi) {
+            self.scan_provider_into_index(pi);
+            let scan_cands: Vec<(usize, PathBuf)> = self
+                .index
+                .get(lname)
+                .map(|v| v.iter().filter(|(i, _)| *i == pi).cloned().collect())
+                .unwrap_or_default();
+            if !scan_cands.is_empty() && self.try_candidates(design, name, lname, scan_cands)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The file that defines `unit` according to the library index, if any.
     pub fn unit_file(&mut self, unit: &str) -> Option<PathBuf> {
         let lunit = unit.to_ascii_lowercase();
@@ -444,26 +559,39 @@ impl LibraryManager {
                 }
                 for unit in self.library_unit_names(lib) {
                     if !design.packages.contains_key(&unit) {
-                        if let Err(e) = self.resolve(design, &unit) {
-                            if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
-                                self.unresolved_units.push((unit, e));
+                        // The units of `lib` live in `lib` — resolve there
+                        // directly (falls back to the global search when the
+                        // library lacks the unit file).
+                        let resolved = self.resolve_in_library(design, &unit, &unit, lib)?;
+                        if !resolved {
+                            if let Err(e) = self.resolve(design, &unit) {
+                                if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
+                                    self.unresolved_units.push((unit, e));
+                                }
                             }
                         }
                     }
                 }
             }
-            for unit in hdl_ir::vhdl_lower::context_units(&self.db, &parsed.root) {
-                // A 2-part `use X.all;` where X names a (non-work) library was
-                // handled above.
-                if unit != "work" && ctx_libs.contains(&unit) && self.has_library(&unit) {
-                    continue;
+            for (unit, lib) in hdl_ir::vhdl_lower::context_unit_libs(&self.db, &parsed.root) {
+                // LRM 11.2: `use lib.unit` names the unit in library `lib` —
+                // resolve inside `lib` first so units in other libraries
+                // (vendor trees mapped under different names) cannot shadow
+                // it. Falls back to the global search when `lib` is unknown
+                // or lacks the unit.
+                let mut resolved = false;
+                if let Some(lib) = &lib {
+                    resolved = self.resolve_in_library(design, &unit, &unit, lib)?;
                 }
-                // Resolve even when a same-named unit is already on the design:
-                // duplicate units across files must ALL be compiled so their
-                // items merge (try_one skips already-compiled candidates).
-                if let Err(e) = self.resolve(design, &unit) {
-                    if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
-                        self.unresolved_units.push((unit, e));
+                if !resolved {
+                    // Resolve even when a same-named unit is already on the
+                    // design: duplicate units across files must ALL be
+                    // compiled so their items merge (try_one skips
+                    // already-compiled candidates).
+                    if let Err(e) = self.resolve(design, &unit) {
+                        if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
+                            self.unresolved_units.push((unit, e));
+                        }
                     }
                 }
             }
@@ -481,6 +609,8 @@ impl LibraryManager {
             &mut self.pending_archs,
             &mut self.entity_roots,
             &mut self.entity_maps,
+            &mut self.entity_maps_by_dir,
+            &mut self.entity_module_by_dir,
             &mut self.verilog_scope,
         )
     }
@@ -577,9 +707,31 @@ impl LibraryManager {
             emit_errors,
             &self.entity_roots,
             &self.entity_maps,
+            &self.entity_maps_by_dir,
+            &self.entity_module_of,
+            &self.entity_module_by_dir,
         );
         self.diags.extend(lower_diags);
         self.pending_archs = still;
+    }
+
+    /// Stamp pending architectures whose source file is `path` with the
+    /// library that just compiled it (`UnitProvider::name()`), so the binding
+    /// step can pick the entity from that library.
+    fn stamp_pending_libs(&mut self, path: &Path, lib: &str) {
+        for p in self.pending_archs.iter_mut() {
+            if p.lib.is_some() {
+                continue;
+            }
+            let fid = p.root.span().file;
+            let from_here = {
+                let f = self.db.file(fid);
+                Path::new(f.name()) == path
+            };
+            if from_here {
+                p.lib = Some(lib.to_string());
+            }
+        }
     }
 }
 
@@ -702,31 +854,39 @@ impl UnitResolver for LibraryManager {
     }
 
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
+        // VHDL instantiation module names are `entity/arch` (the IR naming);
+        // the units to load are the entity's and its architectures' files, so
+        // look up the entity part only. Success still requires the full
+        // module on the design.
+        let lname = name.to_ascii_lowercase();
+        let (base, want_arch) = match lname.split_once('/') {
+            Some((b, a)) => (b.to_string(), Some(a.to_string())),
+            None => (lname.clone(), None),
+        };
         // Staged lookup: cheap file-stem index (no parsing) → in-memory
         // built-ins → full parse scan of directory providers → project search.
         self.ensure_stem_index();
-        let lname = name.to_ascii_lowercase();
-        if let Some(cands) = self.stem_index.get(&lname).cloned() {
+        if let Some(cands) = self.stem_index.get(&base).cloned() {
             if self.progress {
                 eprintln!("  resolving '{name}' via library index (file-name match)");
             }
-            if self.try_candidates(design, name, &lname, cands)? {
+            if self.try_candidates(design, &base, &base, cands)? {
                 return Ok(true);
             }
         }
         self.ensure_index();
-        let candidates = self.index.get(&lname).cloned();
+        let candidates = self.index.get(&base).cloned();
         if candidates.is_none() {
             // Not in the stem index or the built-ins: fully scan (parse) the
             // directory providers once — needed when a unit's name differs
             // from its file name (multi-unit files).
             self.full_scan_dir_providers();
         }
-        let candidates = self.index.get(&lname).cloned();
+        let candidates = self.index.get(&base).cloned();
         if candidates.is_none() {
             // Out-of-the-box fallback: search the project roots (cwd, input
             // file dirs) for a file defining this unit.
-            let paths = self.search_project(name);
+            let paths = self.search_project(&base);
             if !paths.is_empty() {
                 if self.search_warned.insert(name.to_ascii_lowercase()) {
                     let root = self
@@ -749,9 +909,7 @@ impl UnitResolver for LibraryManager {
                     self.compile_text(design, path, &text)?;
                 }
                 self.retry_pending_architectures(design, false);
-                if design.modules.iter().any(|m| m.name == name)
-                    || design.packages.contains_key(&name.to_ascii_lowercase())
-                {
+                if self.unit_available(design, &base, want_arch.as_deref()) {
                     return Ok(true);
                 }
                 return Ok(false);
@@ -775,13 +933,30 @@ impl UnitResolver for LibraryManager {
             ));
         }
         if let Some(cands) = candidates {
-            return self.try_candidates(design, name, &lname, cands);
+            return self.try_candidates(design, &base, &base, cands);
         }
         Ok(false)
     }
 }
 
 impl LibraryManager {
+    /// True when the requested unit is on the design: a package with that
+    /// name, a module named `base` (entity without architecture selected), or
+    /// — for `entity/arch` requests — the bound `entity/arch` module.
+    fn unit_available(&self, design: &Design, base: &str, want_arch: Option<&str>) -> bool {
+        if design.packages.contains_key(base) {
+            return true;
+        }
+        match want_arch {
+            Some(a) => {
+                let want = format!("{base}/{a}");
+                design.modules.iter().any(|m| m.name == want)
+                    || design.modules.iter().any(|m| m.name == base)
+            }
+            None => design.modules.iter().any(|m| m.name == base),
+        }
+    }
+
     /// Try one (provider, file) candidate: compile it and check the unit is now
     /// on the design (module or package).
     fn try_one(
@@ -812,7 +987,23 @@ impl LibraryManager {
         if self.progress {
             eprintln!("  compiling {} for unit '{name}'", path.display());
         }
+        let lib = self
+            .all_providers()
+            .nth(pi)
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|| "work".to_string());
+        let first_new_module = design.modules.len();
         self.compile_text(design, &path, &text)?;
+        // Record which design module this provider compiled for each entity
+        // it declares (library-keyed; the directory-keyed twin is recorded in
+        // compile_one for every compile path), and stamp this file's pending
+        // architectures with the library. The binding step prefers the
+        // sibling-directory entity, then same-library.
+        for (i, m) in design.modules.iter().enumerate().skip(first_new_module) {
+            self.entity_module_of
+                .insert((lib.to_ascii_lowercase(), m.name.to_ascii_lowercase()), i);
+        }
+        self.stamp_pending_libs(&path, &lib);
         self.retry_pending_architectures(design, false);
         Ok(design
             .modules
@@ -928,6 +1119,8 @@ pub fn compile_one(
     pending_archs: &mut Vec<hdl_ir::vhdl_lower::PendingArch>,
     entity_roots: &mut HashMap<String, hdl_syntax::cst::SyntaxNode>,
     entity_maps: &mut HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
+    entity_maps_by_dir: &mut HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
+    entity_module_by_dir: &mut HashMap<(String, String), usize>,
     verilog_scope: &mut verilog_lower::VerilogScope,
 ) -> Result<(), String> {
     let lang = Language::from_path(path)
@@ -1002,6 +1195,21 @@ pub fn compile_one(
                 &design.configurations,
             );
             diags.extend(lower_diags);
+            // Record which module each entity in this file produced, keyed by
+            // the file's source directory — sibling architectures bind to
+            // their own directory's entity when several libraries (or a
+            // whole-tree `work` library) declare same-named entities.
+            if let Some(dir) = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+            {
+                let base = design.modules.len();
+                for (i, m) in lowered.modules.iter().enumerate() {
+                    entity_module_by_dir
+                        .entry((dir.clone(), m.name.to_ascii_lowercase()))
+                        .or_insert(base + i);
+                }
+            }
             design.modules.extend(lowered.modules);
             pending_archs.extend(lowered.pending);
             for (name, root) in lowered.entity_roots {
@@ -1009,6 +1217,9 @@ pub fn compile_one(
             }
             for (name, m) in lowered.entity_maps {
                 entity_maps.entry(name).or_insert(m);
+            }
+            for ((dir, name), m) in lowered.entity_maps_by_dir {
+                entity_maps_by_dir.entry((dir, name)).or_insert(m);
             }
             for c in lowered.configurations {
                 design

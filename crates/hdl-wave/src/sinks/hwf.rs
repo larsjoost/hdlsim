@@ -174,6 +174,7 @@ pub fn read_hwf(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
             mem: (flags & FLAG_MEM != 0).then_some(0),
             scope: 0,
             signed: false,
+            real_ranges: Vec::new(),
         });
     }
     let mut events = Vec::new();
@@ -235,6 +236,7 @@ mod tests {
                     mem: None,
                     scope: 0,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
                 FlatSig {
                     name: "q".to_string(),
@@ -244,6 +246,7 @@ mod tests {
                     mem: None,
                     scope: 0,
                     signed: false,
+                    real_ranges: Vec::new(),
                 },
             ],
             procs: Vec::new(),

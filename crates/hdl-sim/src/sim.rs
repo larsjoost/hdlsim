@@ -204,6 +204,13 @@ pub struct Simulator {
     monitor: Vec<Vec<Expr>>,
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
+    /// Interpreter steps in the current process activation — runaway-loop
+    /// budget (see `exec_frames`). Override: `HDLSIM_MAX_PROC_STEPS`.
+    proc_steps: u64,
+    max_proc_steps: u64,
+    /// Stopped by an internal error guard (combinational loop, delta/step
+    /// limit): the run must fail the process exit code, not exit 0.
+    error_stopped: bool,
     /// Deferred NBA writes to non-scalar targets (part-selects, memories).
     nba_exprs: Vec<(Expr, Value, Option<u32>)>,
     /// Process currently executing (for driver tracing); `None` outside
@@ -302,6 +309,12 @@ impl Simulator {
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
+            proc_steps: 0,
+            max_proc_steps: std::env::var("HDLSIM_MAX_PROC_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000_000),
+            error_stopped: false,
             nba_exprs: Vec::new(),
             waiting: Vec::new(),
         };
@@ -365,6 +378,12 @@ impl Simulator {
     /// CLI runners exit non-zero when this is > 0 after `run`.
     pub fn failures(&self) -> u64 {
         self.failures
+    }
+
+    /// True when the run was stopped by an internal error guard
+    /// (combinational loop, delta-cycle/process-step limit): exit nonzero.
+    pub fn error_stopped(&self) -> bool {
+        self.error_stopped
     }
 
     /// STATUS argument passed to VHDL `std.env.finish(status)` (VHDL-2008),
@@ -598,8 +617,25 @@ impl Simulator {
     }
 
     fn pump(&mut self, max_time_fs: u64, soft: bool) {
+        // Delta cycles since the last time advance: a design whose processes
+        // or assigns keep re-triggering without time moving would otherwise
+        // loop forever (time-based limits like --max-time cannot see it).
+        let mut delta_count: u64 = 0;
         loop {
             if self.finished || self.stopped {
+                break;
+            }
+            delta_count += 1;
+            if delta_count > 10_000 {
+                self.emit(SimEvent::Message {
+                    text: format!(
+                        "error: delta-cycle limit exceeded ({} iterations without time advance) at t={} — the design keeps producing zero-delay events (e.g. `wait for 0 ns` in a loop, or processes re-triggering each other with no delay); simulation stopped",
+                        delta_count, self.time
+                    ),
+                    time_fs: self.time,
+                });
+                self.stopped = true;
+                self.error_stopped = true;
                 break;
             }
             if let Some(f) = &self.stop_flag {
@@ -617,6 +653,7 @@ impl Simulator {
                         time_fs: self.time,
                     });
                     self.stopped = true;
+                    self.error_stopped = true;
                     break;
                 }
                 self.run_proc(pid);
@@ -652,6 +689,13 @@ impl Simulator {
             let next = self.time_events.keys().next().copied();
             match next {
                 Some(t) if t <= max_time_fs => {
+                    // Only a real advance resets the delta budget: same-time
+                    // event batches (delta cycles, `wait for 0 ns` loops) must
+                    // keep counting, or a process that keeps scheduling events
+                    // at one timestamp would spin forever.
+                    if t > self.time {
+                        delta_count = 0;
+                    }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
                     let evs = self.time_events.remove(&t).unwrap_or_default();
@@ -743,6 +787,7 @@ impl Simulator {
     }
 
     fn run_proc(&mut self, pid: u32) {
+        self.proc_steps = 0; // per-activation budget (see exec_frames)
         self.emit(SimEvent::ProcActive {
             proc: pid,
             active: true,
@@ -815,6 +860,32 @@ impl Simulator {
             WaitCheck,
         }
         loop {
+            // Per-activation interpreter-step budget: a `loop`/`while` whose
+            // body never waits would otherwise spin inside this loop forever —
+            // no scheduler guard (delta limit, --max-time) can fire because
+            // control never returns to `pump`. Modelsim reports the same
+            // condition as "iteration limit". HDLSIM_MAX_PROC_STEPS lowers
+            // the budget (tests, CI); read once at construction.
+            self.proc_steps += 1;
+            if self.proc_steps > self.max_proc_steps {
+                let origin = self.flat.procs[pid as usize].origin.clone();
+                let budget = if self.max_proc_steps % 1_000_000 == 0 {
+                    format!("{}M", self.max_proc_steps / 1_000_000)
+                } else {
+                    format!("{}", self.max_proc_steps)
+                };
+                self.emit(SimEvent::Message {
+                    text: format!(
+                        "error: process step limit exceeded ({} interpreter steps in one activation) at t={} — process '{origin}' loops without waiting (e.g. `loop`/`while` with no `wait`); simulation stopped",
+                        budget,
+                        self.time
+                    ),
+                    time_fs: self.time,
+                });
+                self.stopped = true;
+                self.error_stopped = true;
+                return Control::Done;
+            }
             let n = self.proc_rt[pid as usize].frames.len();
             if n == 0 {
                 return Control::Done;
@@ -2018,6 +2089,11 @@ impl Simulator {
             text: format!("error: combinational loop detected at t={}", self.time),
             time_fs: self.time,
         });
+        // Unconverged continuous assigns will oscillate every delta — an
+        // unbounded failure would otherwise spin the delta loop forever
+        // without time ever advancing (so --max-time could not stop it).
+        self.stopped = true;
+        self.error_stopped = true;
         any
     }
 
@@ -2273,6 +2349,29 @@ impl Simulator {
                 }
                 i < self.flat.signals.len() && self.flat.signals[i].kind == SigKind::Real
             }
+            // Record-field select on a real-typed field (`r.re`): decode the
+            // slice as IEEE-754 instead of an integer bit pattern. Constant
+            // bounds only — the lowerer emits literals for record fields.
+            Expr::Sel { e, msb, lsb } => {
+                let (Expr::Sig(s), Some(m), Some(l)) = (
+                    &**e,
+                    self.const_bound(msb, locals),
+                    self.const_bound(lsb, locals),
+                ) else {
+                    return false;
+                };
+                let i = *s as usize;
+                if let Some(lc) = locals {
+                    if i < lc.len() {
+                        return false;
+                    }
+                }
+                self.flat
+                    .signals
+                    .get(i)
+                    .map(|s| s.real_ranges.iter().any(|&(lo, hi)| lo == l && hi == m))
+                    .unwrap_or(false)
+            }
             // Only arithmetic propagates realness; comparisons/logical ops
             // yield 1-bit results even on real operands.
             Expr::Bin { op, l, r } => match op {
@@ -2291,6 +2390,15 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// Constant bound of a select (record-field bounds are literals from the
+    /// lowerer); dynamic bounds conservatively report None.
+    fn const_bound(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Option<u32> {
+        if matches!(e, Expr::Lit(_)) {
+            return self.eval_expr(e, locals).to_u64().map(|v| v as u32);
+        }
+        None
     }
 
     /// One operand of a real-typed binop as f64: real operands decode their
