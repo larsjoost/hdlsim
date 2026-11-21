@@ -42,6 +42,12 @@ edit → simulate → diagnose cycle.
   version), so repeated runs skip lexing/parsing unchanged files. Control with
   `HDLSIM_NO_CACHE=1` or `HDLSIM_CACHE_DIR=path`. Within one run, each file is
   compiled at most once regardless.
+- **Phase timing and peak-RSS reporting.** Every `run`/`debug` prints one stderr
+  line per phase — `hdlsim: compile 1.8s (524 modules) peak-rss 210 MB`, then
+  `elaborate`, `sim-init`, `simulate` — so a slow or hungry run localizes itself
+  without external sampling. `HDLSIM_MAX_MEM_MB=<MiB>` turns the peak reading
+  into a guard: crossing it stops the run with an actionable diagnostic instead
+  of the OS OOM-killer (exit 137, no output).
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; `--fst`
