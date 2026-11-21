@@ -92,23 +92,34 @@ impl Command for Debug {
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
         let mut design = Design::default();
+        let compile_phase = crate::phase::Phase::start("compile");
         mgr.compile_files(&mut design, &files);
+        compile_phase.done(format!("{} modules", design.modules.len()));
         if mgr.diags().has_errors() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
             return Ok(1);
         }
+        let elab_phase = crate::phase::Phase::start("elaborate");
         let flat = elab::elaborate_with(&mut design, &top, &mut mgr)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
+        elab_phase.done(format!(
+            "{} signals, {} processes, {} assigns",
+            flat.signals.len(),
+            flat.procs.len(),
+            flat.assigns.len()
+        ));
         if !mgr.diags().is_empty() {
             eprint!("{}", mgr.diags().render_all(mgr.db()));
         }
         // Refuse runaway allocations with the top-allocator report instead
         // of aborting inside the first big `vec![…]`.
         Simulator::alloc_report(&flat).map_err(anyhow::Error::msg)?;
+        let init_phase = crate::phase::Phase::start("sim-init");
         let mut sim = Simulator::new(flat);
         if let Some(s) = seed {
             sim.set_seed(s);
         }
+        init_phase.done("state initialized");
         if dump {
             print!("{}", sim.dump_design());
         }
@@ -121,7 +132,9 @@ impl Command for Debug {
         }
         sim.add_observer(Box::new(watcher));
         sim.add_observer(Box::new(Transcript));
+        let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
+        sim_phase.done(format!("t={}", fmt_time(sim.time())));
         println!("hdlsim debug: stopped at t={}", fmt_time(sim.time()));
         if sim.failures() > 0 {
             println!("hdlsim debug: FAILED — {} test failure(s)", sim.failures());
