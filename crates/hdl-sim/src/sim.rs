@@ -353,7 +353,20 @@ impl Simulator {
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
-            sim.funcs.entry(f.name.clone()).or_default().push(i);
+            let cands = sim.funcs.entry(f.name.clone()).or_default();
+            // A package-spec declaration lowers as an empty stub before the
+            // package-body definition of the same function lands. The body
+            // must win: matching the pre-overload single-value `insert`
+            // semantics, a later definition with the same formal count
+            // replaces the earlier candidate, and only differing counts
+            // coexist as genuine overloads.
+            match cands
+                .iter()
+                .position(|&j| sim.flat.functions[j].arity == f.arity)
+            {
+                Some(pos) => cands[pos] = i,
+                None => cands.push(i),
+            }
         }
         sim.proc_rt = (0..sim.flat.procs.len())
             .map(|_| ProcRt::default())
