@@ -17,16 +17,30 @@ use crate::value::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::Serialize;
+
+/// Field-level serializer for `FlatFunc::body` (`Arc<Stmt>`): serde needs the
+/// `rc` feature for `Arc<T>`, which this crate does not enable — serialize
+/// through the inner `Stmt` instead.
+pub mod serde_arc {
+    use super::Stmt;
+    use serde::{Serialize, Serializer};
+    use std::sync::Arc;
+    pub fn stmt<S: Serializer>(b: &Arc<Stmt>, s: S) -> Result<S::Ok, S::Error> {
+        Stmt::serialize(&**b, s)
+    }
+}
+
 pub type FlatSigId = u32;
 pub type ScopeId = u32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Scope {
     pub name: String,
     pub parent: Option<ScopeId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FlatSig {
     /// Full hierarchical name, e.g. `tb.dut.q`.
     pub name: String,
@@ -43,7 +57,7 @@ pub struct FlatSig {
     pub real_ranges: Vec<(u32, u32)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FlatProc {
     pub kind: ProcKind,
     pub sens: Sens,
@@ -53,14 +67,14 @@ pub struct FlatProc {
     pub initial: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FlatAssign {
     pub lhs: Expr,
     pub rhs: Expr,
 }
 
 /// A function body with its local slot space (`args` then `locals`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FlatFunc {
     pub name: String,
     pub ret_width: usize,
@@ -81,10 +95,13 @@ pub struct FlatFunc {
     pub defaults: Vec<Option<Value>>,
     /// Shared handle: the kernel can execute a body while mutably borrowing
     /// the simulator (procedure calls re-enter), and cloning stays cheap.
+    #[serde(serialize_with = "serde_arc::stmt")]
     pub body: Arc<Stmt>,
 }
 
-#[derive(Clone, Debug, Default)]
+/// The elaborated design for one top: flat signals, processes, continuous
+/// assigns, and package/function bodies — what the kernel executes.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Flat {
     pub signals: Vec<FlatSig>,
     pub procs: Vec<FlatProc>,

@@ -107,6 +107,8 @@ name = "hdl-ir"
 version = "0.2.0"
 dependencies = [
  "hdl-syntax",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

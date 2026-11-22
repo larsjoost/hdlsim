@@ -7,7 +7,30 @@
 
 use crate::value::{BinOp, UnOp, Value};
 use hdl_syntax::source::Span;
+use serde::Serialize;
 use std::collections::HashMap;
+
+/// Field-level serializer for `Stmt::Spanned::span`: `Span`/`FileId` live in
+/// `hdl-syntax`, which is deliberately dependency-free — serialize the parts
+/// as plain numbers instead of adding serde to that crate.
+pub mod serde_span {
+    use hdl_syntax::source::Span;
+    use serde::{Serialize, Serializer};
+    pub fn span<S: Serializer>(sp: &Span, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Parts {
+            file: u32,
+            start: u32,
+            end: u32,
+        }
+        Parts {
+            file: sp.file.0,
+            start: sp.start,
+            end: sp.end,
+        }
+        .serialize(s)
+    }
+}
 
 pub type SigId = u32;
 pub type ModId = u32;
@@ -27,7 +50,7 @@ pub struct Design {
     pub configurations: HashMap<String, std::rc::Rc<crate::vhdl_lower::ConfigIr>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ModuleIr {
     pub name: String,
     pub params: Vec<ParamIr>,
@@ -68,7 +91,7 @@ impl Default for ModuleIr {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ParamIr {
     pub name: String,
     pub default: Value,
@@ -78,21 +101,21 @@ pub struct ParamIr {
     pub ty: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PortIr {
     pub name: String,
     pub dir: Dir,
     pub sig: SigId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum Dir {
     In,
     Out,
     Inout,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SignalIr {
     pub name: String,
     pub width: usize,
@@ -105,7 +128,7 @@ pub struct SignalIr {
     pub signed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum SigKind {
     Wire,
     Reg,
@@ -118,13 +141,13 @@ pub enum SigKind {
     Real,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AssignIr {
     pub lhs: Expr,
     pub rhs: Expr,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProcessIr {
     pub kind: ProcKind,
     pub sens: Sens,
@@ -136,13 +159,13 @@ pub struct ProcessIr {
     pub initial: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum ProcKind {
     Always,
     Initial,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Sens {
     /// Explicit sensitivity list with edge kinds.
     List(Vec<Edge>),
@@ -150,20 +173,20 @@ pub enum Sens {
     All,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Edge {
     pub sig: SigId,
     pub kind: EdgeKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum EdgeKind {
     Pos,
     Neg,
     Any,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FuncIr {
     pub name: String,
     pub ret_width: usize,
@@ -182,7 +205,7 @@ pub struct FuncIr {
     pub body: Stmt,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct InstIr {
     pub module: String,
     pub name: String,
@@ -198,13 +221,13 @@ pub struct InstIr {
     pub config: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Conn {
     Named(String, Expr),
     Positional(Expr),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Stmt {
     Block(Vec<Stmt>),
     If {
@@ -282,12 +305,13 @@ pub enum Stmt {
     /// Source-span wrapper attached by the lowerers to every statement — used
     /// for line/branch coverage, never changes semantics.
     Spanned {
+        #[serde(serialize_with = "serde_span::span")]
         span: Span,
         inner: Box<Stmt>,
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Expr {
     Lit(Value),
     /// Real (floating-point) literal, e.g. Verilog `1.5`, VHDL `1.5`.

@@ -23,6 +23,7 @@ mod doctor;
 mod fmt;
 mod gen;
 mod init;
+mod ir;
 mod lint;
 pub mod lsp;
 mod project;
@@ -164,9 +165,9 @@ impl Command for Help {
 fn section_of(name: &str) -> &'static str {
     match name {
         "run" | "debug" | "do" | "regress" | "wave" | "prove" => "Simulate & debug",
-        "check" | "lint" | "analyze" | "fmt" => "Check & clean up code",
+        "check" | "syntax" | "lint" | "analyze" | "fmt" => "Check & clean up code",
         "gen" | "doc" => "Generate & document",
-        "ast" | "deps" => "Inspect a design",
+        "ast" | "deps" | "ir" => "Inspect a design",
         "init" | "doctor" | "project" | "lsp" | "completions" => "Project & tooling",
         "help" | "--help" | "explain" | "assist" | "bundle" => "Help & bug reports",
         _ => "Other commands",
@@ -714,6 +715,24 @@ fn command_long_help(name: &str) -> Option<&'static str> {
              \n\
              Supported: bash, zsh, fish."
         }
+        "ir" => {
+            "Dump the elaborated IR of one top as pretty JSON:\n\
+             \n\
+             \x20   hdlsim ir --top tb file.vhd [--out ir.json]\n\
+             \n\
+             Signals, processes, continuous assigns, and function bodies —\n\
+             the same structures and indices the simulation traces report,\n\
+             so a trace like Sig(4635) can be looked up in the dump."
+        }
+        "syntax" => {
+            "Parse-only check of the named files — short for check --syntax-only:\n\
+             \n\
+             \x20   hdlsim syntax file.vhd [more.vhd ...]\n\
+             \n\
+             Reports lexical/syntax errors per file; no libraries, no\n\
+             compilation, no elaboration. Same output and exit codes as\n\
+             `check --syntax-only`."
+        }
         "help" => {
             "Show detailed help for a command: hdlsim help <command>.\n\
              With no argument, prints the top-level help."
@@ -730,7 +749,9 @@ pub const COMMANDS: &[&dyn Command] = &[
     &run::Run,
     &wave::Wave,
     &check::Check,
+    &check::SyntaxCmd,
     &ast::Ast,
+    &ir::Ir,
     &init::Init,
     &project::Project,
     &prove::Prove,
@@ -790,14 +811,87 @@ fn parse_color_mode(v: &str) -> hdl_syntax::diagnostic::ColorMode {
     }
 }
 
+/// Resolve the command name the user typed to a registered command: exact
+/// match first, then a unique prefix (`syn` → syntax), then a single close
+/// typo (`chekc` → check). Ambiguous or unknown names are an error that
+/// lists the candidates — a guess never silently runs the wrong subcommand.
+fn resolve_command(typed: &str) -> anyhow::Result<&'static dyn Command> {
+    if let Some(c) = COMMANDS.iter().find(|c| c.name() == typed) {
+        return Ok(*c);
+    }
+    let prefixed: Vec<&dyn Command> = COMMANDS
+        .iter()
+        .copied()
+        .filter(|c| c.name().starts_with(typed))
+        .collect();
+    if prefixed.len() == 1 {
+        let c = prefixed[0];
+        eprintln!(
+            "note: no command '{typed}' — running '{}' ({})",
+            c.name(),
+            c.about()
+        );
+        return Ok(c);
+    }
+    if prefixed.len() > 1 {
+        let mut names: Vec<&str> = prefixed.iter().map(|c| c.name()).collect();
+        names.sort_unstable();
+        anyhow::bail!(
+            "command '{}' is ambiguous: {}; use more characters or `hdlsim --help`",
+            typed,
+            names.join(", ")
+        );
+    }
+    // No prefix: accept a single close typo as the intended command.
+    let max_d = if typed.len() < 4 { 1 } else { 2 };
+    let close: Vec<&dyn Command> = COMMANDS
+        .iter()
+        .copied()
+        .filter(|c| edit_distance(c.name(), typed) <= max_d)
+        .collect();
+    if close.len() == 1 {
+        let c = close[0];
+        eprintln!(
+            "note: no command '{typed}' — running closest match '{}' ({})",
+            c.name(),
+            c.about()
+        );
+        return Ok(c);
+    }
+    if close.len() > 1 {
+        let mut names: Vec<&str> = close.iter().map(|c| c.name()).collect();
+        names.sort_unstable();
+        anyhow::bail!(
+            "no command '{}' — closest matches: {}; see `hdlsim --help`",
+            typed,
+            names.join(", ")
+        );
+    }
+    anyhow::bail!("unknown command '{}'; see `hdlsim --help`", typed)
+}
+
+/// Levenshtein distance (insert/delete/substitute), stdlib-only.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(sub);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 pub fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     match args.first() {
         None => COMMANDS[0].run(&[]),
         Some(name) => {
-            let cmd = COMMANDS
-                .iter()
-                .find(|c| c.name() == name.as_str())
-                .ok_or_else(|| anyhow::anyhow!("unknown command '{}'", name))?;
+            let cmd = resolve_command(name)?;
             cmd.run(&args[1..])
         }
     }
@@ -843,6 +937,32 @@ mod tests {
     #[test]
     fn unknown_command_is_an_error() {
         assert!(dispatch(&["frobnicate".to_string()]).is_err());
+    }
+
+    #[test]
+    fn partial_command_resolves_to_unique_prefix() {
+        // `wav` → wave; the routed command prints its own help, exit 0.
+        assert_eq!(
+            dispatch(&["wav".to_string(), "--help".to_string()]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ambiguous_prefix_lists_candidates() {
+        let err = dispatch(&["d".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(msg.contains("deps") && msg.contains("doctor"), "{msg}");
+    }
+
+    #[test]
+    fn single_typo_resolves_to_closest_command() {
+        // `chekc` is edit distance 2 from `check` and from nothing else.
+        assert_eq!(
+            dispatch(&["chekc".to_string(), "--help".to_string()]).unwrap(),
+            0
+        );
     }
 
     #[test]
