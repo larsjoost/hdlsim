@@ -138,7 +138,7 @@ impl Command for Help {
 fn section_of(name: &str) -> &'static str {
     match name {
         "run" | "debug" | "do" | "regress" | "wave" | "prove" => "Simulate & debug",
-        "check" | "lint" | "analyze" | "fmt" => "Check & clean up code",
+        "check" | "syntax" | "lint" | "analyze" | "fmt" => "Check & clean up code",
         "gen" | "doc" => "Generate & document",
         "ast" | "deps" => "Inspect a design",
         "init" | "doctor" | "project" | "lsp" | "completions" => "Project & tooling",
@@ -665,6 +665,15 @@ fn command_long_help(name: &str) -> Option<&'static str> {
              \n\
              Supported: bash, zsh, fish."
         }
+        "syntax" => {
+            "Parse-only check of the named files — short for check --syntax-only:\n\
+             \n\
+             \x20   hdlsim syntax file.vhd [more.vhd ...]\n\
+             \n\
+             Reports lexical/syntax errors per file; no libraries, no\n\
+             compilation, no elaboration. Same output and exit codes as\n\
+             `check --syntax-only`."
+        }
         "help" => {
             "Show detailed help for a command: hdlsim help <command>.\n\
              With no argument, prints the top-level help."
@@ -681,6 +690,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &run::Run,
     &wave::Wave,
     &check::Check,
+    &check::SyntaxCmd,
     &ast::Ast,
     &init::Init,
     &project::Project,
