@@ -28,6 +28,9 @@ struct Inner {
     sigs: Mutex<String>,
     closed: AtomicBool,
     stop: Arc<AtomicBool>,
+    /// Total events dropped by the history cap — reported to clients in
+    /// bounded increments so they can label the reconstructed waves.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 /// Shared bus between the simulator (producer) and the HTTP server (consumers).
@@ -59,6 +62,7 @@ impl LiveBus {
                 sigs: Mutex::new(sigs),
                 closed: AtomicBool::new(false),
                 stop: Arc::new(AtomicBool::new(false)),
+                dropped: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -76,12 +80,26 @@ impl LiveBus {
     }
 
     fn push(&self, payload: String) {
+        const CAP: usize = 500_000;
+        const TRUNC_EVERY: u64 = 100_000;
         let mut ev = self.inner.events.lock().unwrap();
         ev.push(payload);
         // Cap history so long sims do not grow memory without bound.
-        if ev.len() > 500_000 {
-            let drop = ev.len() - 500_000;
+        if ev.len() > CAP {
+            let drop = ev.len() - CAP;
             ev.drain(..drop);
+            // Mark the trim so viewers know waves reconstructed after this
+            // point begin at the first surviving event (a clock must not be
+            // read as flat from t=0). Report at most one marker per 100k
+            // dropped events — one per push would flood the stream.
+            let prev = self
+                .inner
+                .dropped
+                .fetch_add(drop as u64, std::sync::atomic::Ordering::Relaxed);
+            let total = prev + drop as u64;
+            if prev / TRUNC_EVERY != total / TRUNC_EVERY {
+                ev.push(format!("{{\"e\":\"trunc\",\"n\":{total}}}"));
+            }
         }
         drop(ev);
         self.inner.cond.notify_all();
@@ -296,42 +314,67 @@ const PAGE: &str = r##"<!DOCTYPE html>
 <title>hdlsim live</title>
 <style>
   body { margin:0; background:#14171c; color:#d7dde6; font:13px/1.4 Menlo,Consolas,monospace; }
-  header { display:flex; gap:10px; align-items:center; padding:6px 12px; background:#1c2129; border-bottom:1px solid #2b323d; }
+  header { display:flex; gap:8px; align-items:center; padding:6px 12px; background:#1c2129; border-bottom:1px solid #2b323d; }
   header b { color:#4da3ff; }
   header span { color:#8a94a3; }
   button { background:#14171c; border:1px solid #2b323d; color:#d7dde6; padding:3px 10px; border-radius:4px; cursor:pointer; }
   button:hover { border-color:#4da3ff; }
-  #wrap { display:flex; height:calc(100vh - 120px); }
-  #list { width:280px; overflow-y:auto; background:#1c2129; border-right:1px solid #2b323d; padding:4px 0; }
-  #list div { padding:2px 8px; white-space:nowrap; }
-  #list .v { color:#4da3ff; display:inline-block; min-width:90px; }
-  canvas { flex:1; background:#14171c; }
+  /* One scroller for names AND waves so they always stay in sync. */
+  #wrap { height:calc(100vh - 120px); }
+  #scroller { height:100%; overflow-y:auto; }
+  #inner { display:flex; align-items:flex-start; }
+  #names { width:280px; flex:none; background:#1c2129; border-right:1px solid #2b323d; }
+  #names .row { height:29px; line-height:26px; padding:0 8px; white-space:nowrap; overflow:hidden; box-sizing:border-box; }
+  #names .v { color:#4da3ff; display:inline-block; min-width:90px; }
+  canvas { flex:1; min-width:0; display:block; background:#14171c; cursor:grab; }
   #log { height:80px; overflow-y:auto; border-top:1px solid #2b323d; background:#1c2129; padding:4px 12px; white-space:pre-wrap; color:#8a94a3; }
 </style>
 </head>
 <body>
-<header><b>hdlsim</b> live <span id="time"></span>
+<header><b>hdlsim</b> live <span id="time"></span> <span id="note"></span>
+  <button onclick="zoomCenter(0.8)">+</button>
+  <button onclick="zoomCenter(1.25)">&minus;</button>
   <button onclick="fit()">fit</button>
+  <button onclick="follow()">follow</button>
   <button onclick="stop()">stop simulation</button>
 </header>
-<div id="wrap"><div id="list"></div><canvas id="cv"></canvas></div>
+<div id="wrap"><div id="scroller"><div id="inner"><div id="names"></div><canvas id="cv"></canvas></div></div></div>
 <div id="log"></div>
 <script>
-let sigs = [], bySig = [], tmax = 0, t0 = 0, span = 1, latest = 0;
-fetch('/signals').then(r => r.json()).then(j => { sigs = j; bySig = j.map(() => []);
-  const list = document.getElementById('list');
-  j.forEach((s, i) => { const d = document.createElement('div');
-    d.innerHTML = '<span class="v" id="v'+i+'"></span>' + s.w + ' ' + s.name.replace(/</g,'&lt;'); list.appendChild(d); });
+let sigs = [], bySig = [], tmax = 0, t0 = 0, span = 1, latest = 0, pin = true, fitted = false;
+const PADX = 10, PADY = 6, ROW = 24, GAP = 5, PITCH = ROW + GAP;
+fetch('/signals').then(r => r.json()).then(j => {
+  sigs = j; bySig = j.map(() => []);
+  const names = document.getElementById('names');
+  let html = '';
+  j.forEach((s, i) => { html += '<div class="row"><span class="v" id="v'+i+'"></span>'
+    + s.w + ' ' + s.name.replace(/</g,'&lt;') + '</div>'; });
+  names.innerHTML = html;
+  document.getElementById('cv').height = PADY*2 + j.length*PITCH;
+  draw();
 });
 const es = new EventSource('/events');
+let dirty = false;
+function schedule() { if (!dirty) { dirty = true; requestAnimationFrame(() => { dirty = false; draw(); }); } }
 es.onmessage = e => {
   const d = JSON.parse(e.data);
-  if (d.e === 't') { latest = d.t; if (d.t > tmax) tmax = d.t; document.getElementById('time').textContent = fmt(d.t); }
-  else if (d.e === 's') { bySig[d.s].push([d.t, d.v]); if (d.t > tmax) tmax = d.t; latest = Math.max(latest, d.t); }
-  else if (d.e === 'm') { const l = document.getElementById('log'); l.textContent += '@' + fmt(d.t) + '  ' + d.m + '\n'; l.scrollTop = l.scrollHeight; }
+  if (d.e === 't') {
+    latest = Math.max(latest, d.t); if (d.t > tmax) tmax = d.t;
+    document.getElementById('time').textContent = fmt(d.t);
+    // Auto-fit once the first real timestamp arrives: a 1 fs default
+    // window would show nothing until the user pressed fit.
+    if (!fitted && d.t > 0) { fitted = true; span = Math.max(d.t, 1); t0 = 0; }
+  }
+  else if (d.e === 's') { bySig[d.s].push([d.t, d.v]); if (d.t > tmax) tmax = d.t; if (d.t > latest) latest = d.t; }
+  else if (d.e === 'm') { logline('@' + fmt(d.t) + '  ' + d.m); }
+  else if (d.e === 'trunc') {
+    logline('note: history truncated — ' + d.n + ' early event(s) dropped; waves before that are incomplete');
+    document.getElementById('note').textContent = 'history truncated';
+  }
   else if (d.e === 'f' || d.e === 'x') { document.getElementById('time').textContent = fmt(d.t) + (d.e==='f' ? ' (finished)' : ' (stopped)'); }
-  draw();
+  schedule();
 };
+function logline(s) { const l = document.getElementById('log'); l.textContent += s + '\n'; l.scrollTop = l.scrollHeight; }
 function fmt(t) { if (t>=1e15) return (t/1e15).toFixed(2)+'s'; if (t>=1e12) return (t/1e12).toFixed(2)+'ms';
   if (t>=1e9) return (t/1e9).toFixed(2)+'us'; if (t>=1e6) return (t/1e6).toFixed(2)+'ns';
   if (t>=1e3) return (t/1e3).toFixed(2)+'ps'; return t+'fs'; }
@@ -339,67 +382,131 @@ function hex(v) { if (/[xz]/.test(v)) return /^[xz]+$/.test(v) ? v[0] : 'x'; ret
 function valAt(s, t) { const evs = bySig[s]; let lo=0, hi=evs.length-1, ans=evs.length?evs[0][1]:'x';
   while (lo<=hi){const m=(lo+hi)>>1; if(evs[m][0]<=t){ans=evs[m][1];lo=m+1;}else hi=m-1;} return ans; }
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
-function draw() {
-  const W = cv.clientWidth, H = cv.clientHeight;
-  if (cv.width !== W) { cv.width = W; cv.height = H; }
-  ctx.fillStyle = '#14171c'; ctx.fillRect(0, 0, W, H);
-  if (!tmax) return;
-  if (span > tmax) span = tmax;
-  if (t0 + span > tmax && span < tmax) t0 = tmax - span;   // auto-follow
-  const x = t => 10 + (t - t0) / span * (W - 20);
-  const ROW = 24, GAP = 5;
-  sigs.forEach((s, i) => {
-    const y = 6 + i * (ROW + GAP); if (y > H) return;
-    const evs = bySig[i];
-    if (s.real) {
-      let lo = Infinity, hi = -Infinity;
-      for (const [t, v] of evs) { const f = parseFloat(v); if (!isNaN(f)) { if (f<lo) lo=f; if (f>hi) hi=f; } }
-      if (!isFinite(lo)) { lo = 0; hi = 1; }
-      if (hi - lo < 1e-12) { const m=(hi+lo)/2; lo=m-0.5; hi=m+0.5; }
-      const yOf = f => y + (ROW-5) - (f-lo)/(hi-lo)*(ROW-5);
-      ctx.strokeStyle = '#5fd38a'; ctx.lineWidth = 1.4; ctx.beginPath();
-      let started = false;
-      for (const [t, v] of evs) {
-        const f = parseFloat(v); if (isNaN(f)) continue;
-        if (t < t0) continue;
-        if (t > t0 + span) break;
-        const xx = x(t);
-        if (!started) { ctx.moveTo(xx, yOf(f)); started = true; } else ctx.lineTo(xx, yOf(f));
-      }
-      if (started) ctx.lineTo(x(t0+span), yOf(parseFloat(valAt(i, t0+span))));
-      ctx.stroke();
-    } else if (s.w === 1) {
-      ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 1.5; ctx.beginPath();
-      let cur = null;
-      for (const [t, v] of evs) {
-        if (t < t0) { cur = v; continue; }
-        if (t > t0 + span) break;
-        const xx = x(t), bit = v[v.length-1];
-        if (cur === null) ctx.moveTo(xx, bit==='1' ? y : y+ROW-5);
-        else if (bit !== cur) { ctx.lineTo(xx, cur==='1'?y:y+ROW-5); ctx.lineTo(xx, bit==='1'?y:y+ROW-5); }
-        cur = bit;
-      }
-      if (cur !== null) ctx.lineTo(x(t0+span), cur==='1'?y:y+ROW-5);
-      ctx.stroke();
-    } else {
-      let segT = t0, segV = valAt(i, t0);
-      ctx.fillStyle = '#2a3140'; ctx.strokeStyle = '#c9a24d'; ctx.fillStyle = '#c9a24d';
-      const flush = tEnd => { const x0=x(segT), x1=x(tEnd); if (x1-x0<1) return;
-        ctx.fillStyle='#2a3140'; ctx.fillRect(x0, y, x1-x0, ROW-5);
-        ctx.strokeStyle='#c9a24d'; ctx.strokeRect(x0, y, x1-x0, ROW-5);
-        ctx.fillStyle = /[xz]/.test(segV) ? '#b06ab3' : '#c9a24d';
-        ctx.font = '10px monospace'; ctx.textAlign='center'; ctx.fillText(hex(segV), (x0+x1)/2, y+ROW/2+3); };
-      for (const [t, v] of evs) { if (t <= t0) { segV = v; continue; } if (t >= t0+span) break; if (v !== segV) { flush(t); segT = t; segV = v; } }
-      flush(t0 + span);
-    }
-    const el = document.getElementById('v'+i);
-    if (el) el.textContent = s.real ? valAt(i, latest) : (s.w === 1 ? valAt(i, latest).slice(-1) : hex(valAt(i, latest)));
-  });
+const scroller = document.getElementById('scroller');
+function clampView() {
+  const smax = Math.max(tmax, 1);
+  span = Math.max(1, Math.min(span, smax));
+  if (pin && tmax) t0 = Math.max(0, tmax - span);
+  t0 = Math.max(0, Math.min(t0, Math.max(0, tmax - span)));
 }
-function fit() { t0 = 0; span = tmax || 1; draw(); }
+function draw() {
+  const W = cv.clientWidth, H = scroller.clientHeight;
+  if (!W) return;
+  if (cv.width !== W) { cv.width = W; }
+  clampView();
+  ctx.fillStyle = '#14171c'; ctx.fillRect(0, 0, W, cv.height);
+  if (!tmax) return;
+  const x = t => PADX + (t - t0) / span * (W - 2*PADX);
+  // Only visible rows: with tens of thousands of signals, a full-table
+  // sweep (and a value lookup per signal) per frame swamps the page.
+  const st = scroller.scrollTop;
+  const first = Math.max(0, Math.floor((st - PADY) / PITCH));
+  const last = Math.min(sigs.length, Math.ceil((st + H) / PITCH) + 1);
+  for (let i = first; i < last; i++) {
+    const s = sigs[i], evs = bySig[i], y = PADY + i*PITCH;
+    if (s.real) drawReal(i, evs, y, x);
+    else if (s.w === 1) drawBit(evs, y, x);
+    else drawBus(i, evs, y, x);
+    const el = document.getElementById('v'+i);
+    if (el) el.textContent = s.real ? valAt(i, latest)
+      : (s.w === 1 ? valAt(i, latest).slice(-1) : hex(valAt(i, latest)));
+  }
+}
+function drawReal(i, evs, y, x) {
+  let lo = Infinity, hi = -Infinity;
+  for (const [t, v] of evs) { const f = parseFloat(v); if (!isNaN(f)) { if (f<lo) lo=f; if (f>hi) hi=f; } }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (hi - lo < 1e-12) { const m=(hi+lo)/2; lo=m-0.5; hi=m+0.5; }
+  const yOf = f => y + (ROW-5) - (f-lo)/(hi-lo)*(ROW-5);
+  ctx.strokeStyle = '#5fd38a'; ctx.lineWidth = 1.4; ctx.beginPath();
+  let started = false;
+  for (const [t, v] of evs) {
+    const f = parseFloat(v); if (isNaN(f)) continue;
+    if (t < t0) continue;
+    if (t > t0 + span) break;
+    const xx = x(t);
+    if (!started) { ctx.moveTo(xx, yOf(f)); started = true; } else ctx.lineTo(xx, yOf(f));
+  }
+  if (started) ctx.lineTo(x(t0+span), yOf(parseFloat(valAt(i, t0+span))));
+  ctx.stroke();
+}
+function drawBit(evs, y, x) {
+  const HI = y, LO = y + ROW - 5, XB = y + ROW - 9;
+  // Level segments within the window; events at the same timestamp
+  // (delta-cycle transitions) become separate segments.
+  const segs = [];
+  let segT = null, segB = null;
+  for (const [t, v] of evs) {
+    if (t > t0 + span) break;
+    const b = v[v.length-1];
+    if (segB === null) { segT = Math.max(t, t0); segB = b; }
+    else if (b !== segB) { segs.push([segT, t, segB]); segT = t; segB = b; }
+  }
+  if (segB !== null) segs.push([segT, t0 + span, segB]);
+  // X/Z bands: a distinct marker, never a valid low level.
+  ctx.fillStyle = '#b06ab3';
+  for (const [ta, tb, b] of segs) if (b !== '0' && b !== '1') {
+    let x0 = x(ta), x1 = x(tb); if (x1 - x0 < 2) x1 = x0 + 2;
+    ctx.fillRect(x0, XB, x1 - x0, 4);
+  }
+  // Level lines; a zero-width segment widens to 1px so a pulse that fits
+  // entirely inside one timestamp stays visible when zoomed out.
+  ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 1.5; ctx.beginPath();
+  let plv = null;
+  for (const [ta, tb, b] of segs) {
+    if (b !== '0' && b !== '1') continue;
+    const lv = b === '1' ? HI : LO;
+    let x0 = x(ta), x1 = x(tb);
+    if (x1 - x0 < 1) x1 = x0 + 1;
+    if (plv === null) ctx.moveTo(x0, lv);
+    else { ctx.lineTo(x0, plv); ctx.lineTo(x0, lv); }
+    ctx.lineTo(x1, lv);
+    plv = lv;
+  }
+  ctx.stroke();
+}
+function drawBus(i, evs, y, x) {
+  let segT = t0, segV = valAt(i, t0);
+  const flush = tEnd => { const x0=x(segT), x1=x(tEnd); if (x1-x0<1) return;
+    ctx.fillStyle='#2a3140'; ctx.fillRect(x0, y, x1-x0, ROW-5);
+    ctx.strokeStyle='#c9a24d'; ctx.strokeRect(x0, y, x1-x0, ROW-5);
+    ctx.fillStyle = /[xz]/.test(segV) ? '#b06ab3' : '#c9a24d';
+    ctx.font = '10px monospace'; ctx.textAlign='center'; ctx.fillText(hex(segV), (x0+x1)/2, y+ROW/2+3); };
+  for (const [t, v] of evs) { if (t <= t0) { segV = v; continue; } if (t >= t0+span) break; if (v !== segV) { flush(t); segT = t; segV = v; } }
+  flush(t0 + span);
+}
+function zoomCenter(f) {
+  const W = cv.clientWidth, af = 0.5;
+  const at = t0 + af*span;
+  span = Math.max(1, Math.min(Math.max(tmax, 1), span*f));
+  t0 = at - af*span;
+  pin = !!tmax && t0 + span >= tmax;
+  draw();
+}
+function fit() { span = Math.max(tmax, 1); t0 = 0; pin = true; draw(); }
+function follow() { pin = !pin; if (pin) t0 = Math.max(0, tmax - span); draw(); }
 function stop() { fetch('/stop', { method: 'POST' }); }
-cv.onwheel = e => { e.preventDefault(); const f = e.deltaY > 0 ? 1.25 : 0.8;
-  span = Math.max(1, Math.min(tmax || 1, span * f)); draw(); };
+// Wheel zooms around the cursor position; drag pans. Pinning to the live
+// edge only resumes automatically when the view is already at the end.
+cv.onwheel = e => {
+  e.preventDefault();
+  const W = cv.clientWidth, af = (e.offsetX - PADX) / (W - 2*PADX);
+  const at = t0 + af*span;
+  span = Math.max(1, Math.min(Math.max(tmax, 1), span * (e.deltaY > 0 ? 1.25 : 0.8)));
+  t0 = at - af*span;
+  pin = !!tmax && t0 + span >= tmax;
+  draw();
+};
+let drag = null;
+cv.onmousedown = e => { drag = [e.clientX, t0]; };
+window.onmousemove = e => {
+  if (!drag) return;
+  const W = cv.clientWidth;
+  t0 = drag[1] - (e.clientX - drag[0]) / (W - 2*PADX) * span;
+  pin = false;
+  draw();
+};
+window.onmouseup = () => { drag = null; };
 setInterval(draw, 200);
 </script>
 </body>
@@ -461,6 +568,34 @@ mod tests {
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0], "{\"e\":\"s\",\"t\":1000000,\"s\":0,\"v\":\"1\"}");
         assert_eq!(ev[1], "{\"e\":\"m\",\"t\":2000000,\"m\":\"hi\"}");
+    }
+
+    #[test]
+    fn live_bus_marks_trimmed_history() {
+        let flat = flat1();
+        let bus = LiveBus::new(&flat);
+        // Cross the history cap by >100k events: the stream must carry a
+        // trunc marker so viewers do not read the surviving waves as
+        // "constant from t=0" (clocks would show a wrong phase/duty).
+        for i in 0..600_005u64 {
+            bus.push(format!("{{\"e\":\"t\",\"t\":{i}}}"));
+        }
+        let ev = bus.inner.events.lock().unwrap();
+        assert_eq!(ev.len(), 500_000);
+        assert!(!ev[0].contains("\"e\":\"trunc\""));
+        // The marker is not necessarily last (later pushes append after it).
+        assert!(
+            ev.iter().any(|l| l.contains("\"e\":\"trunc\"")),
+            "no trunc marker in {} events",
+            ev.len()
+        );
+    }
+
+    #[test]
+    fn live_page_has_zoom_pan_and_scroll_sync() {
+        for marker in ["zoomCenter(", "cv.onmousedown", "id=\"scroller\"", "'trunc'"] {
+            assert!(PAGE.contains(marker), "page missing {marker}");
+        }
     }
 
     #[test]
