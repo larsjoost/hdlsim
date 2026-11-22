@@ -589,7 +589,27 @@ impl LibraryManager {
                     }
                 }
             }
+            // Package instantiation targets anywhere in the file (incl. nested
+            // in declarative parts) resolve library-only — see resolve_opts.
+            // Units the file declares itself are skipped (pass 0 lowers them,
+            // and resolving them externally could pull in a same-named unit
+            // from another file).
+            let inst_units = hdl_ir::vhdl_lower::package_inst_target_units(&self.db, &parsed.root);
+            let local_units = hdl_ir::vhdl_lower::declared_unit_names(&self.db, &parsed.root);
+            for unit in &inst_units {
+                if local_units.contains(unit) {
+                    continue;
+                }
+                if let Err(e) = self.resolve_opts(design, unit, false) {
+                    if !self.unresolved_units.iter().any(|(u, _)| u == unit) {
+                        self.unresolved_units.push((unit.clone(), e));
+                    }
+                }
+            }
             for (unit, lib) in hdl_ir::vhdl_lower::context_unit_libs(&self.db, &parsed.root) {
+                if inst_units.contains(&unit) {
+                    continue;
+                }
                 // LRM 11.2: `use lib.unit` names the unit in library `lib` —
                 // resolve inside `lib` first so units in other libraries
                 // (vendor trees mapped under different names) cannot shadow
@@ -940,6 +960,21 @@ impl UnitResolver for LibraryManager {
     }
 
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
+        self.resolve_opts(design, name, true)
+    }
+}
+
+impl LibraryManager {
+    /// `resolve` with control over the project-search fallback. Package
+    /// instantiation targets (`package p is new lib.g ...`) are resolved
+    /// library-only: a project-wide search would pull in unrelated same-named
+    /// units from the source tree (e.g. other testbenches' fixtures).
+    fn resolve_opts(
+        &mut self,
+        design: &mut Design,
+        name: &str,
+        allow_project_search: bool,
+    ) -> Result<bool, String> {
         // VHDL instantiation module names are `entity/arch` (the IR naming);
         // the units to load are the entity's and its architectures' files, so
         // look up the entity part only. Success still requires the full
@@ -972,7 +1007,11 @@ impl UnitResolver for LibraryManager {
         if candidates.is_none() {
             // Out-of-the-box fallback: search the project roots (cwd, input
             // file dirs) for a file defining this unit.
-            let paths = self.search_project(&base);
+            let paths = if allow_project_search {
+                self.search_project(&base)
+            } else {
+                Vec::new()
+            };
             if !paths.is_empty() {
                 if self.search_warned.insert(name.to_ascii_lowercase()) {
                     let root = self
@@ -1355,6 +1394,7 @@ pub fn compile_one(
                             }
                         }
                         e.sig_types.extend(p.sig_types);
+                        e.sig_widths.extend(p.sig_widths);
                         e.const_tys.extend(p.const_tys);
                         if e.generics.is_empty() {
                             e.generics = p.generics;
