@@ -32,7 +32,7 @@ fn pack_str_value(s: &str) -> Value {
             bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
         }
     }
-    Value { bits }
+    Value { bits, real: false }
 }
 
 /// Inverse of [`pack_str_value`]: bytes of a packed string Value → String.
@@ -452,16 +452,30 @@ impl Simulator {
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
-            let cands = sim.funcs.entry(f.name.clone()).or_default();
-            // A package-spec declaration lowers as an empty stub before the
-            // package-body definition of the same function lands. The body
-            // must win: matching the pre-overload single-value `insert`
-            // semantics, a later definition with the same formal count
-            // replaces the earlier candidate, and only differing counts
-            // coexist as genuine overloads.
+            let cands = sim.funcs.entry(f.name.to_ascii_lowercase()).or_default();
+            // Stub shape: an interface-only spec declaration lowered without
+            // a body (`Stmt::Null` or an empty block). Elaboration already
+            // merges a spec stub with its same-signature body; what can
+            // still coexist here are GENUINE overloads sharing a formal
+            // count (`conv_float(integer)` vs `conv_float(unsigned)`), which
+            // width dispatch separates at the call site. A body replaces a
+            // stub of the same formal count; a stub never displaces a body.
+            let is_stub = |j: usize| match &*sim.flat.functions[j].body {
+                Stmt::Null => true,
+                Stmt::Block(ss) => ss.is_empty(),
+                _ => false,
+            };
+            let new_is_stub = is_stub(i);
+            if new_is_stub
+                && cands
+                    .iter()
+                    .any(|&j| sim.flat.functions[j].arity == f.arity && !is_stub(j))
+            {
+                continue;
+            }
             match cands
                 .iter()
-                .position(|&j| sim.flat.functions[j].arity == f.arity)
+                .position(|&j| sim.flat.functions[j].arity == f.arity && is_stub(j))
             {
                 Some(pos) => cands[pos] = i,
                 None => cands.push(i),
@@ -1681,7 +1695,9 @@ impl Simulator {
                     self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
                 }
                 let fname = format!("{}::new", cn);
-                if let Some(fi) = self.func_match(&fname, args.len().saturating_sub(1)) {
+                if let Some(fi) =
+                    self.func_match(&fname, args.get(1..).unwrap_or(&[]), None)
+                {
                     let saved = self.cur_obj.replace(handle);
                     self.run_func(fi, &args[1..], None);
                     self.cur_obj.set(saved);
@@ -1690,7 +1706,9 @@ impl Simulator {
             // Void method call as a statement: `c.do(args);`
             m if m.starts_with("$callmethod::") => {
                 let rest = &m["$callmethod::".len()..]; // `C::m`
-                if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
+                if let Some(fi) =
+                    self.func_match(rest, args.get(1..).unwrap_or(&[]), locals.as_deref())
+                {
                     let obj = args
                         .first()
                         .map(|a| {
@@ -1944,7 +1962,7 @@ impl Simulator {
                             nb[(add - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                         }
                     }
-                    self.store_value(target, Value { bits: nb }, locals.as_deref_mut());
+                    self.store_value(target, Value { bits: nb, real: false }, locals.as_deref_mut());
                 }
             }
             // `writeline(f, l)` — print the line (stdout) or append to the file.
@@ -2095,7 +2113,7 @@ impl Simulator {
                 // User procedure / SV task called as a statement, if
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
-                if let Some(fi) = self.func_match(name, args.len()) {
+                if let Some(fi) = self.func_match(name, &args, locals.as_deref()) {
                     self.run_procedure(fi, &args, locals.as_deref());
                 } else {
                     self.emit(SimEvent::Message {
@@ -2617,7 +2635,7 @@ impl Simulator {
             }
             Expr::Idx { .. } => 1,
             Expr::Call { name, args } => self
-                .func_match(name, args.len())
+                .func_match(name, args, locals)
                 .map(|i| self.flat.functions[i].ret_width)
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
@@ -2700,7 +2718,7 @@ impl Simulator {
     /// One operand of a real-typed binop as f64: real operands decode their
     /// bit pattern, integer operands convert their integer value.
     fn operand_f64(&self, e: &Expr, v: &Value, locals: Option<&Vec<Value>>) -> Option<f64> {
-        if self.expr_real(e, locals) {
+        if self.expr_real(e, locals) || v.real {
             v.to_f64()
         } else {
             v.to_u64().map(|n| n as f64)
@@ -2787,6 +2805,21 @@ impl Simulator {
             Expr::Real(x) => Value::from_f64(*x),
             Expr::SigAttr { sig, attr } => {
                 let sig = *sig as usize;
+                // Function-local slots share the id space with flat signals
+                // (Expr::Sig resolves locals first); a formal's `sig'length`
+                // must come from the bound value, not an unrelated flat
+                // signal.
+                if let Some(l) = locals {
+                    if sig < l.len() {
+                        let w = l[sig].width().max(1);
+                        let v = match *attr {
+                            "length" => w as u64,
+                            "high" | "left" => (w as u64).saturating_sub(1),
+                            _ => 0, // low | right
+                        };
+                        return Value::from_u64(32, v);
+                    }
+                }
                 let w = self.flat.signals[sig].width.max(1);
                 let n = self
                     .mems
@@ -2817,7 +2850,14 @@ impl Simulator {
                 let lv = self.eval_expr(l, locals);
                 let rv = self.eval_expr(r, locals);
                 // Real-typed expression: IEEE-754 arithmetic on f64 operands.
-                if self.expr_real(l, locals) || self.expr_real(r, locals) {
+                // A value-level marker covers function frames, whose slots
+                // have no type metadata (`expr_real` cannot see a real
+                // formal/variable behind a slot id).
+                if self.expr_real(l, locals)
+                    || self.expr_real(r, locals)
+                    || lv.real
+                    || rv.real
+                {
                     return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
                 }
                 // VHDL signed operands: sign-extend both to the wider width
@@ -2915,8 +2955,9 @@ impl Simulator {
             Expr::ToInt(e) => {
                 let v = self.eval_expr(e, locals);
                 // Real operand (`integer(r)`, `to_integer(r)`): round to the
-                // nearest integer, ties away from zero (VHDL LRM).
-                if self.expr_real(e, locals) {
+                // nearest integer, ties away from zero (VHDL LRM). The value
+                // marker covers real formals/locals in function frames.
+                if self.expr_real(e, locals) || v.real {
                     return match v.to_f64() {
                         Some(f) => Value::from_u64(32, (f.round() as i64) as u64),
                         None => Value::x(32),
@@ -2958,7 +2999,7 @@ impl Simulator {
             }
             Expr::Un { op, e } => {
                 let v = self.eval_expr(e, locals);
-                if self.expr_real(e, locals) {
+                if self.expr_real(e, locals) || v.real {
                     return match (op, v.to_f64()) {
                         (UnOp::Neg, Some(x)) => Value::from_f64(-x),
                         (UnOp::Pos, Some(x)) => Value::from_f64(x),
@@ -3222,7 +3263,9 @@ impl Simulator {
         }
         if let Some(rest) = name.strip_prefix("$method::") {
             // `c.m(args)` in expression position; funcs are keyed `C::m`.
-            if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
+            if let Some(fi) =
+                self.func_match(rest, args.get(1..).unwrap_or(&[]), locals)
+            {
                 let obj = args
                     .first()
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
@@ -3234,7 +3277,7 @@ impl Simulator {
             }
             return Value::x(32);
         }
-        if let Some(fi) = self.func_match(name, args.len()) {
+        if let Some(fi) = self.func_match(name, args, locals) {
             return self.run_func(fi, args, locals);
         }
         Value::x(32)
@@ -3243,34 +3286,226 @@ impl Simulator {
     /// Execute function `fi` with the given argument expressions; returns
     /// slot 0 (the function-name slot, i.e. the return value). Shared by
     /// plain calls and class method calls.
-    /// Resolve a name to one function. Overloads share a bare name; an
-    /// exact formal-count match wins (VHDL likewise prefers the overload
-    /// that binds without default values). Still-ambiguous overloads fall
-    /// back to the first-registered one — a width-mismatched argument reads
-    /// X rather than failing.
-    fn func_match(&self, name: &str, nargs: usize) -> Option<usize> {
-        let cands = self.funcs.get(name)?;
+    /// Resolve a name to one function. Overloads share a bare name. Among
+    /// the candidates a call fits (exact formal count, or every omitted
+    /// trailing formal carries an interface default), prefer the one whose
+    /// provided-formal widths match the actual widths — width is the only
+    /// type signal, and it is what separates `conv_float(integer)` from
+    /// `conv_float(real)` (`real(x)` lowers to a w64 expression). Then an
+    /// exact formal-count match (VHDL likewise prefers the overload that
+    /// binds without default values), then any fitting candidate, then the
+    /// first-registered one — a width-mismatched argument reads X rather
+    /// than failing.
+    fn func_match(
+        &self,
+        name: &str,
+        args: &[Expr],
+        locals: Option<&Vec<Value>>,
+    ) -> Option<usize> {
+        let nargs = args.len();
+        // VHDL identifiers are case-insensitive (LRM 1076 §15.2); the table
+        // is keyed lowercase so a `ROUND(signed)` body answers a `round(...)`
+        // call site. The lowerer's table is keyed the same way.
+        let cands = self.funcs.get(&name.to_ascii_lowercase())?;
         if cands.len() == 1 {
             return Some(cands[0]);
         }
-        Some(
-            cands
-                .iter()
+        // Interface-only stubs (spec declarations whose body never landed —
+        // e.g. the built-in ieee.math_real spec) must never win a width tie
+        // against a real body: they execute as empty bodies returning X,
+        // which callers loop on forever. Try real bodies first; stubs are a
+        // last resort.
+        let is_stub_fn = |i: usize| match &*self.flat.functions[i].body {
+            Stmt::Null => true,
+            Stmt::Block(ss) => ss.is_empty(),
+            _ => false,
+        };
+        let mut ordered: Vec<usize> = cands.iter().copied().filter(|&i| !is_stub_fn(i)).collect();
+        ordered.extend(cands.iter().copied().filter(|&i| is_stub_fn(i)));
+        let cands = &ordered;
+        let fits = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            f.arity == nargs
+                || (f.arity > nargs
+                    && f.defaults
+                        .get(nargs..f.arity)
+                        .is_some_and(|t| t.iter().all(|d| d.is_some())))
+        };
+        // Width agreement on the provided actuals; formal width <= 1 is
+        // unconstrained/unknown and fits anything. A Sig id resolves in the
+        // caller's locals first (function slots), then global signals; an id
+        // in neither must not panic — it counts as width-unknown.
+        let arg_w = |a: &Expr| match a {
+            Expr::Sig(s)
+                if locals.map_or(true, |l| (*s as usize) >= l.len())
+                    && (*s as usize) >= self.flat.signals.len() =>
+            {
+                0
+            }
+            _ => self.expr_width(a, locals),
+        };
+        // Exact width first: an unconstrained (w <= 1) formal is a wildcard
+        // that must not absorb a call an exact-width overload can take —
+        // `conv_float(real_arg)` must reach the w64 real overload, not the
+        // w1 std_ulogic_vector overload that then recurses through
+        // bit-identical type conversions.
+        let width_exact = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter().enumerate().all(|(j, a)| {
+                matches!(f.slots.get(j + 1), Some(&fw) if fw == arg_w(a))
+            })
+        };
+        let width_wild = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter().enumerate().all(|(j, a)| match f.slots.get(j + 1) {
+                Some(&fw) => fw == arg_w(a) || fw <= 1,
+                None => true,
+            })
+        };
+        // A conversion-marked actual carries the declared type of the value
+        // it wraps: `signed(data)` lowers to `Expr::Signed` (bit-identical),
+        // the same signal VHDL overload resolution keys on. Same-width
+        // unconstrained overloads (`signed`/`unsigned`/`std_ulogic_vector`,
+        // all w1) are told apart only by the formal's declared type
+        // (`FlatFunc::formal_types`) — widths tie, and picking a wrong one
+        // lets the delegating overload bodies recurse forever
+        // (`conv_float_phase(signed(data))` re-entering the
+        // std_ulogic_vector overload). Prefer candidates whose formals match
+        // every hint; fall back to the width-only rules when none does
+        // (unknown formal types, or the hinted overload is not registered).
+        let arg_hint = |a: &Expr| match a {
+            Expr::Signed(_) | Expr::Resize { signed: true, .. } => Some("signed"),
+            _ => None,
+        };
+        let type_ok = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter().enumerate().all(|(j, a)| match arg_hint(a) {
+                None => true,
+                Some(h) => f
+                    .formal_types
+                    .get(j)
+                    .map_or(true, |t| t.is_empty() || t == h),
+            })
+        };
+        let pick_in = |pool: &[usize]| -> Option<usize> {
+            pool.iter()
                 .copied()
-                .find(|&i| self.flat.functions[i].arity == nargs)
-                // A call may omit trailing actuals whose formals carry
-                // interface defaults.
+                .find(|i| width_exact(i))
+                .or_else(|| pool.iter().copied().find(|i| width_wild(i)))
                 .or_else(|| {
-                    cands.iter().copied().find(|&i| {
-                        let f = &self.flat.functions[i];
-                        f.arity > nargs
-                            && f.defaults
-                                .get(nargs..f.arity)
-                                .is_some_and(|t| t.iter().all(|d| d.is_some()))
-                    })
+                    pool.iter()
+                        .copied()
+                        .find(|&i| self.flat.functions[i].arity == nargs)
                 })
-                .unwrap_or(cands[0]),
-        )
+                .or_else(|| pool.iter().copied().find(fits))
+        };
+        let fitting: Vec<usize> = cands.iter().copied().filter(|i| fits(i)).collect();
+        let typed: Vec<usize> = fitting.iter().copied().filter(|i| type_ok(i)).collect();
+        let picked = pick_in(&typed)
+            .or_else(|| pick_in(&fitting))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .copied()
+                    .find(|&i| self.flat.functions[i].arity == nargs)
+            })
+            .or_else(|| cands.iter().copied().find(fits))
+            .unwrap_or(cands[0]);
+        // A self-call that passes a formal through UNCHANGED — the body
+        // lowered `f(unsigned(x))` to `f(Sig(x))` (bit-identical type
+        // conversion) or `f(signed(x))` to `f(Signed(Sig(x)))` — receives
+        // the same value every time and can never make progress: it
+        // recurses to the depth guard. Overload families with same-width
+        // unconstrained formals (`conv_float(signed)` vs
+        // `conv_float(unsigned)`, both w1) hit exactly this. Dispatch to
+        // the next fitting candidate instead of the executing function.
+        let picked = if Some(picked) == self.cur_fn.get() {
+            // A formal passed through a bare `Sig` or through the
+            // bit-identical `Signed` marker reaches this function with the
+            // same value every time — unwrap both to the slot id.
+            let pass_through = match args {
+                [Expr::Sig(s)] => Some(*s),
+                [Expr::Signed(inner)] => match inner.as_ref() {
+                    Expr::Sig(s) => Some(*s),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match pass_through {
+                Some(s) if locals.map_or(false, |l| (s as usize) < l.len()) => {
+                    let alt = |j: &usize| *j != picked && fits(j);
+                    let alts: Vec<usize> = cands.iter().copied().filter(|j| alt(j)).collect();
+                    let typed_alts: Vec<usize> =
+                        alts.iter().copied().filter(|j| type_ok(j)).collect();
+                    pick_in(&typed_alts)
+                        .or_else(|| pick_in(&alts))
+                        .unwrap_or(picked)
+                }
+                _ => picked,
+            }
+        } else {
+            picked
+        };
+        if std::env::var_os("HDLSIM_TRACE_DISPATCH").is_some() {
+            fn find_span(s: &Stmt) -> Option<(u32, u32)> {
+                match s {
+                    Stmt::Spanned { span, .. } => Some((span.file.0, span.start)),
+                    Stmt::Block(ss) => ss.iter().find_map(find_span),
+                    _ => None,
+                }
+            }
+            let sp = find_span(&self.flat.functions[picked].body);
+            let caller = self
+                .cur_fn
+                .get()
+                .map(|i| self.flat.functions[i].name.clone())
+                .unwrap_or_else(|| "<proc>".to_string());
+            eprintln!(
+                "dispatch {name} nargs={nargs} -> {} (caller {caller}, cands {:?}, sigs [{}], argw {:?}, span {:?})",
+                picked,
+                cands,
+                cands.iter()
+                    .map(|&i| {
+                        let f = &self.flat.functions[i];
+                        format!(
+                            "{} ar{} ret{} {}",
+                            f.name,
+                            f.arity,
+                            f.ret_width,
+                            f.slots.iter()
+                                .map(|w| w.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                args.iter().map(|a| arg_w(a)).collect::<Vec<_>>(),
+                sp,
+            );
+            // HDLSIM_TRACE_PICKED=1: dump the picked body (Debug) for the
+            // first few picks per name — identifies which overload a hot
+            // call site binds to without flooding multi-million-line logs.
+            if std::env::var_os("HDLSIM_TRACE_PICKED").is_some() {
+                use std::cell::RefCell;
+                use std::collections::HashMap;
+                thread_local! {
+                    static PICKED: RefCell<HashMap<(String, usize), u32>> =
+                        RefCell::new(HashMap::new());
+                }
+                let dump = PICKED.with(|m| {
+                    let mut m = m.borrow_mut();
+                    let n = m.entry((name.to_ascii_lowercase(), picked)).or_insert(0);
+                    *n += 1;
+                    *n <= 1
+                });
+                if dump {
+                    let body = format!("{:?}", self.flat.functions[picked].body);
+                    eprintln!("picked {name} #{picked} body {}", &body[..body.len().min(900)]);
+                }
+            }
+        }
+        Some(picked)
     }
 
     /// Execute function `fi` with the given argument expressions; returns
@@ -3371,7 +3606,7 @@ impl Simulator {
                     *b = v;
                 }
             }
-            return Value { bits };
+            return Value { bits, real: false };
         }
         Value::x(w)
     }
@@ -3497,7 +3732,7 @@ impl<'a> FnRunner<'a> {
                                     if self.locals[s].bits.len() < a + w {
                                         let mut bits = self.locals[s].bits.clone();
                                         bits.resize(a + w, VX);
-                                        self.locals[s] = Value { bits };
+                                        self.locals[s] = Value { bits, real: false };
                                     }
                                     for b in 0..w {
                                         self.locals[s].set_bit(a + b, v.bit(b));
@@ -3518,7 +3753,7 @@ impl<'a> FnRunner<'a> {
                                     if self.locals[s].bits.len() < l + w {
                                         let mut bits = self.locals[s].bits.clone();
                                         bits.resize(l + w, VX);
-                                        self.locals[s] = Value { bits };
+                                        self.locals[s] = Value { bits, real: false };
                                     }
                                     for b in 0..w {
                                         self.locals[s].set_bit(l + b, v.bit(b));
@@ -3832,7 +4067,7 @@ impl<'a> ProcRunner<'a> {
                             if self.locals[s].bits.len() < a + w {
                                 let mut bits = self.locals[s].bits.clone();
                                 bits.resize(a + w, VX);
-                                self.locals[s] = Value { bits };
+                                self.locals[s] = Value { bits, real: false };
                             }
                             for b in 0..w {
                                 self.locals[s].set_bit(a + b, v.bit(b));
@@ -3853,7 +4088,7 @@ impl<'a> ProcRunner<'a> {
                             if self.locals[s].bits.len() < l + w {
                                 let mut bits = self.locals[s].bits.clone();
                                 bits.resize(l + w, VX);
-                                self.locals[s] = Value { bits };
+                                self.locals[s] = Value { bits, real: false };
                             }
                             for b in 0..w {
                                 self.locals[s].set_bit(l + b, v.bit(b));
@@ -3884,7 +4119,20 @@ fn sign_extend(v: &Value, width: usize) -> Value {
             bits[i] = V1;
         }
     }
-    Value { bits }
+    Value { bits, real: false }
+}
+
+/// HDLSIM_PROGRESS_SEC=<seconds> — set once per process; when > 0, the pump
+/// prints a periodic "still running" heartbeat (see `maybe_heartbeat`).
+fn progress_interval() -> std::time::Duration {
+    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let secs = *SECS.get_or_init(|| {
+        std::env::var("HDLSIM_PROGRESS_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    });
+    std::time::Duration::from_secs_f64(secs.max(0.0))
 }
 
 fn truthy(v: &Value) -> bool {

@@ -69,6 +69,12 @@ pub struct FlatFunc {
     pub arity: usize,
     /// Width of each slot; slot ids in the body index this vector.
     pub slots: Vec<usize>,
+    /// Lowercase declared type name per formal (`""` = unknown). Same-width
+    /// unconstrained overloads (`signed` vs `unsigned` vs
+    /// `std_ulogic_vector`, all w1) are distinguished by this at dispatch —
+    /// widths alone cannot separate them, and a wrong pick lets the
+    /// delegating overload bodies recurse to the depth guard.
+    pub formal_types: Vec<String>,
     /// Recorded interface defaults, one per formal (`None` where the formal
     /// has none). A call may omit trailing actuals whose entries are `Some`;
     /// empty means no formal carries a default.
@@ -351,13 +357,14 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
         }
         for func in &p.functions {
             let mut slots: Vec<usize> = vec![func.ret_width.max(1)];
-            slots.extend(func.args.iter().map(|(_, w)| *w));
+            slots.extend(func.args.iter().map(|(_, w, _)| *w));
             slots.extend(func.locals.iter().map(|l| l.width));
             f.functions.push(FlatFunc {
                 name: func.name.clone(),
                 ret_width: func.ret_width,
                 arity: func.args.len(),
                 slots,
+                formal_types: func.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: func.defaults.clone(),
                 body: Arc::new(func.body.clone()),
             });
@@ -382,8 +389,10 @@ fn func_body_is_stub(f: &FlatFunc) -> bool {
 /// reach this list. The body wins (matching the simulator's overload table,
 /// where a later same-signature registration replaces the earlier one), and
 /// the interface defaults recorded on the spec (`w : natural := 8`) carry
-/// over when the body's interface omits them. Genuine overloads differ in
-/// formal count or formal widths and are kept apart.
+/// over when the body's interface omits them. A real body replaces an
+/// interface-only stub; two real bodies with the same formal widths are
+/// genuine overloads and coexist (dispatch separates them by actual width
+/// where it can, and the recursion deviation covers the rest).
 fn dedup_functions(f: &mut Flat) {
     let same_sig = |a: &FlatFunc, b: &FlatFunc| {
         a.name.eq_ignore_ascii_case(&b.name)
@@ -400,14 +409,17 @@ fn dedup_functions(f: &mut Flat) {
                 if !has_defaults(&func.defaults) {
                     func.defaults = merged[i].defaults.clone();
                 }
-                // The real body must win over an interface-only stub;
-                // otherwise the later registration wins.
-                if func_body_is_stub(&func) && !func_body_is_stub(&merged[i]) {
-                    if !has_defaults(&merged[i].defaults) {
-                        merged[i].defaults = func.defaults;
-                    }
-                } else {
+                // A real body replaces an interface-only stub; a stub never
+                // displaces a real body. Two REAL bodies with the same
+                // formal widths are genuine overloads the width model
+                // cannot separate (`conj(complex_t)` vs
+                // `conj(complex_float_array)`, both w194) — they must
+                // coexist, or element-wise recursion inside one of them
+                // resolves back to itself and never terminates.
+                if func_body_is_stub(&merged[i]) {
                     merged[i] = func;
+                } else if !func_body_is_stub(&func) {
+                    merged.push(func);
                 }
             }
             None => merged.push(func),
@@ -610,7 +622,7 @@ impl Flat {
         for f in &m.functions {
             // Slot 0 is the function name (return value), then args, then locals.
             let mut slots: Vec<usize> = vec![f.ret_width.max(1)];
-            slots.extend(f.args.iter().map(|(_, w)| *w));
+            slots.extend(f.args.iter().map(|(_, w, _)| *w));
             let arg_ids: Vec<SigId> = (0..f.args.len() as SigId).collect();
             let local_base = f.args.len() as SigId;
             for l in &f.locals {
@@ -625,6 +637,7 @@ impl Flat {
                 ret_width: f.ret_width,
                 arity: f.args.len(),
                 slots,
+                formal_types: f.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: f.defaults.clone(),
                 body,
             });

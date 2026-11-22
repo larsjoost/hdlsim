@@ -136,6 +136,7 @@ impl<'a> R<'a> {
         }
         Ok(Value {
             bits: self.take(n)?.to_vec(),
+            real: false,
         })
     }
 }

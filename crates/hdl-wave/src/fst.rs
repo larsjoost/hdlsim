@@ -492,6 +492,7 @@ fn char_to_bit(c: u8) -> u8 {
 fn value_from_chars(chars: &[u8]) -> Value {
     Value {
         bits: chars.iter().rev().map(|&c| char_to_bit(c)).collect(),
+        real: false,
     }
 }
 

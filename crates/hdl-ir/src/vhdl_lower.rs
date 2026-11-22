@@ -1596,8 +1596,8 @@ impl<'a> Lower<'a> {
     }
 
     fn register_builtin_types(&mut self) {
-        Rc::make_mut(&mut self.consts).insert("true".into(), Value { bits: vec![V1] });
-        Rc::make_mut(&mut self.consts).insert("false".into(), Value { bits: vec![V0] });
+        Rc::make_mut(&mut self.consts).insert("true".into(), Value { bits: vec![V1], real: false });
+        Rc::make_mut(&mut self.consts).insert("false".into(), Value { bits: vec![V0], real: false });
         // severity_level literals (std.standard) — passed to vital_*/assert
         // helper procedures as plain values, e.g. `MsgSeverity => ERROR`.
         Rc::make_mut(&mut self.consts).insert("note".into(), Value::from_u64(32, 0));
@@ -1711,7 +1711,7 @@ impl<'a> Lower<'a> {
                     bits.push(if b >> i & 1 == 1 { V1 } else { V0 });
                 }
             }
-            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value { bits });
+            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value { bits, real: false });
         }
         // std.env assert API (VHDL-2008) — stubs so `alias x is std.env.f[...]`
         // resolves.
@@ -2721,12 +2721,48 @@ impl<'a> Lower<'a> {
             c.args.len() == f.args.len()
                 && c.args.iter().map(|a| a.1).eq(f.args.iter().map(|a| a.1))
         };
-        match cands.iter().position(sig) {
+        let is_stub = |c: &FuncIr| match &c.body {
+            Stmt::Null => true,
+            Stmt::Block(ss) => ss.is_empty(),
+            _ => false,
+        };
+        // A spec stub followed by its body: the body replaces the stub and
+        // inherits the spec's interface defaults (`w : natural := 8`); a
+        // stub never displaces a real body. Two REAL bodies with the same
+        // formal widths are genuine overloads the width model cannot
+        // separate (`round(signed)` vs `round(std_ulogic_vector)`, both
+        // w1) — they must coexist, or a type-conversion call inside one of
+        // them (`round(signed(arg))` in the suv body) resolves back to the
+        // executing function itself and recurses forever.
+        if is_stub(&f) && cands.iter().any(|c| sig(c) && !is_stub(c)) {
+            return;
+        }
+        if std::env::var_os("HDLSIM_TRACE_OVERLOAD").is_some()
+            && !is_stub(&f)
+            && cands.iter().any(|c| sig(c) && !is_stub(c))
+        {
+            let span_of = |c: &FuncIr| match &c.body {
+                Stmt::Spanned { span, .. } => Some((span.file.0, span.start)),
+                _ => None,
+            };
+            eprintln!(
+                "overload {:?} arity={} widths {:?} spans {:?}",
+                f.name,
+                f.args.len(),
+                f.args.iter().map(|a| a.1).collect::<Vec<_>>(),
+                cands
+                    .iter()
+                    .filter(|c| sig(c) && !is_stub(c))
+                    .filter_map(span_of)
+                    .chain(span_of(&f))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        match cands.iter().position(|c| sig(c) && is_stub(c)) {
             Some(i) => {
-                // A body following its spec: the spec's interface carries the
-                // formals' defaults (`w : natural := 8`), the body's usually
-                // omits them (its capture records all-None) — keep them when
-                // the replacement records none.
+                // The spec's interface carries the formals' defaults, the
+                // body's capture usually records none — keep them when the
+                // replacement records none.
                 let mut f = f;
                 if !f.defaults.iter().any(|d| d.is_some())
                     && cands[i].defaults.iter().any(|d| d.is_some())
@@ -3563,6 +3599,21 @@ impl<'a> Lower<'a> {
             );
             return;
         };
+        if std::env::var_os("HDLSIM_TRACE_GENRANGE").is_some() && n > 64 {
+            let sf = self.db.file(s.span().file);
+            let (line, _col) = sf.line_col(s.span().start);
+            eprintln!(
+                "genrange lo={} hi={} downto={} n={} {}:{} lo_expr {:.80?} hi_expr {:.80?}",
+                lo,
+                hi,
+                downto,
+                n,
+                sf.name(),
+                line,
+                exprs[0],
+                exprs[1],
+            );
+        }
         let vals: Vec<u64> = if downto {
             (hi..=lo).rev().take(n as usize).collect()
         } else {
@@ -4253,7 +4304,7 @@ impl<'a> Lower<'a> {
         let ret_width = ret_mark
             .map(|tm| self.resolve_type(&tm, None, f.span()).0)
             .unwrap_or(32);
-        let mut args: Vec<(String, usize)> = Vec::new();
+        let mut args: Vec<(String, usize, String)> = Vec::new();
         for pd in &param_decls {
             let pk = real_children(pd);
             let colon = pk
@@ -4271,7 +4322,14 @@ impl<'a> Lower<'a> {
                 .map(|tm| self.resolve_type(tm, None, pd.span()).0)
                 .unwrap_or(32);
             for n in names {
-                args.push((n, w));
+                args.push((
+                    n,
+                    w,
+                    tmark
+                        .as_ref()
+                        .map(|tm| self.text(tm).to_ascii_lowercase())
+                        .unwrap_or_default(),
+                ));
             }
         }
         self.register_func(FuncIr {
@@ -4629,13 +4687,19 @@ impl<'a> Lower<'a> {
         if let Some(base) = base {
             let span = d.span();
             let base_name = self.kw(&base);
-            let (w, signed, mem, _r) = self.resolve_type(&base, constraint.as_ref(), span);
+            let (w, signed, mem, is_real) = self.resolve_type(&base, constraint.as_ref(), span);
             let _ = mem;
-            // Keep record/array base types as-is; vectors remember the
-            // constrained width for use sites without their own constraint.
+            // Keep record/array base types as-is; a REAL subtype stays REAL
+            // (LRM 1076 §5.3: a subtype has its base's type — the range
+            // constraint does not change the representation, so
+            // `subtype POSITIVE_REAL is REAL range 0.0 to REAL'HIGH`
+            // must still be a 64-bit real, not a width-from-range vector).
             match self.types.get(&base_name).cloned() {
                 Some(ti @ (TypeInfo::Record { .. } | TypeInfo::Array { .. })) => {
                     self.types.insert(name, ti);
+                }
+                _ if is_real => {
+                    self.types.insert(name, TypeInfo::Real);
                 }
                 _ => {
                     if constraint.is_some() {
@@ -4713,7 +4777,7 @@ impl<'a> Lower<'a> {
         Some(FuncIr {
             name,
             ret_width: 32,
-            args: (0..nargs).map(|i| (format!("a{i}"), 32)).collect(),
+            args: (0..nargs).map(|i| (format!("a{i}"), 32, String::new())).collect(),
             defaults: Vec::new(),
             locals: Vec::new(),
             body: Stmt::Null,
@@ -4768,7 +4832,7 @@ impl<'a> Lower<'a> {
         };
         // Params: PortDecl `a, b : integer [range] [:= default]` — names
         // before ':', type after.
-        let mut args: Vec<(String, usize)> = Vec::new();
+        let mut args: Vec<(String, usize, String)> = Vec::new();
         let mut arg_types: Vec<(String, String)> = Vec::new();
         let mut defaults: Vec<Option<Value>> = Vec::new();
         for pd in decl_nodes
@@ -4799,12 +4863,21 @@ impl<'a> Lower<'a> {
                 Some(tm) => self.resolve_type(tm, constraint, pd.span()),
                 None => (32, false, None, false),
             };
+            // The declared type name disambiguates same-width overloads at
+            // dispatch (see FlatFunc::formal_types).
+            let ty = tmark
+                .as_ref()
+                .map(|tm| self.text(tm).to_ascii_lowercase())
+                .unwrap_or_default();
             // Interface default (`a, b : natural := 3`): const-eval now and
             // record one entry per formal of this decl — a call may omit the
             // corresponding actual. Defaults are static expressions; one
-            // referencing a formal or a later declaration stays unrecorded
-            // (an omitted actual then reads X, as before this feature).
-            // `:=` lexes as the `=` punct (same as declaration initializers).
+            // referencing a formal, a later declaration, or a name from a
+            // package hdlsim does not have (ieee.fixed_pkg formal styles)
+            // stays unrecorded (an omitted actual then reads X, as before
+            // this feature). Lower leniently: a diagnostic here would fail
+            // files that never omit these actuals. `:=` lexes as the `=`
+            // punct (same as declaration initializers).
             let default_v = pk
                 .iter()
                 .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
@@ -4814,14 +4887,19 @@ impl<'a> Lower<'a> {
                         .find(|k| is_expr_node(k.kind()))
                         .cloned()
                 })
-                .map(|e| self.lower_expr(&e, &self.consts.clone()))
+                .map(|e| {
+                    self.suppress_err += 1;
+                    let ex = self.lower_expr(&e, &self.consts.clone());
+                    self.suppress_err -= 1;
+                    ex
+                })
                 .and_then(|ex| self.ce(&ex))
                 .map(|v| v.resize(w.max(1)));
             for n in names {
                 if let Some(tm) = &tmark {
                     arg_types.push((n.clone(), self.kw(tm)));
                 }
-                args.push((n, w));
+                args.push((n, w, ty.clone()));
                 defaults.push(default_v.clone());
             }
         }
@@ -4831,7 +4909,7 @@ impl<'a> Lower<'a> {
         let saved_names = std::mem::take(&mut self.names);
         self.names_stack.push(saved_names);
         let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
-        slots.extend(args.iter().cloned());
+        slots.extend(args.iter().map(|(n, w, _)| (n.clone(), *w)));
         self.names = slots
             .iter()
             .enumerate()
@@ -7133,10 +7211,31 @@ impl<'a> Lower<'a> {
                                     },
                                 };
                             }
+                            let dims = self.sig_dims.get(&id);
+                            let mem_w = self.mems.get(&id).copied();
+                            let sig_w = self.sig_width.get(&id).copied();
+                            if dims.is_none() && mem_w.is_none() && sig_w.is_none() {
+                                // Function formals and other not-yet-sized
+                                // signals: the width is only known from the
+                                // bound value at runtime (`arg'length` inside
+                                // an unconstrained-function body). A baked
+                                // constant truncated
+                                // `conv_unsigned(count, arg'length)` to a
+                                // 1-bit shift count.
+                                return Expr::SigAttr {
+                                    sig: id,
+                                    attr: match attr.as_str() {
+                                        "length" => "length",
+                                        "high" => "high",
+                                        "low" => "low",
+                                        "left" => "left",
+                                        _ => "right",
+                                    },
+                                };
+                            }
                             // Arrays: element count = product of dimension sizes
                             // (sig_dims when present, else mem depth); vectors: bit
                             // width. `low` is the first dimension's left.
-                            let dims = self.sig_dims.get(&id);
                             let n: usize = dims
                                 .and_then(|d| {
                                     if d.is_empty() {
@@ -7145,8 +7244,8 @@ impl<'a> Lower<'a> {
                                         Some(d.iter().map(|(_, s)| (*s).max(1)).product::<usize>())
                                     }
                                 })
-                                .or_else(|| self.mems.get(&id).copied())
-                                .or_else(|| self.sig_width.get(&id).copied())
+                                .or(mem_w)
+                                .or(sig_w)
                                 .unwrap_or(1);
                             let lo: i64 =
                                 dims.and_then(|d| d.first().map(|(l, _)| *l)).unwrap_or(0);
@@ -7272,6 +7371,21 @@ impl<'a> Lower<'a> {
     /// or subtype name (no signal involved), e.g. `integer'high`, `my_arr'length`.
     fn type_attr(&self, name: &str, attr: &str) -> Expr {
         let n = name.to_ascii_lowercase();
+        // REAL bounds are f64 extremes and must carry the real flag: an X(32)
+        // literal would read as X and — worse — fail overload width matching,
+        // so `LOG(REAL'HIGH)` fell back to the first-registered (complex)
+        // LOG overload and created a dispatch cycle. (LRM 1076 §3.1.4:
+        // REAL'HIGH/REAL'LOW are the largest/smallest representable reals.)
+        if n == "real"
+            || matches!(self.types.get(&n), Some(TypeInfo::Real))
+        {
+            return match attr {
+                "high" | "right" => Expr::Lit(Value::from_f64(f64::MAX)),
+                "low" | "left" => Expr::Lit(Value::from_f64(f64::MIN)),
+                // 'length of a scalar type is 1.
+                _ => Expr::Lit(Value::from_u64(32, 1)),
+            };
+        }
         let bounds: Option<(i64, i64)> = match n.as_str() {
             "integer" => Some((i32::MIN as i64, i32::MAX as i64)),
             "natural" | "positive" => Some((0, i32::MAX as i64)),
@@ -7565,6 +7679,36 @@ impl<'a> Lower<'a> {
                 l: Box::new(args[0].clone()),
                 r: Box::new(args[1].clone()),
             },
+            // Vendor-package vector shifts: `SHR(vec, n)` / `SHL(vec, n)`
+            // from the std_logic_arith idiom play the same role as
+            // shift_right/shift_left — fold them to plain shifts so they
+            // never reach runtime dispatch. Delegating overload bodies
+            // (`RETURN SHR(arg, conv_unsigned(count, arg'length))`) have no
+            // type-correct dispatch target — the visible overloads are the
+            // delegators themselves — and a folded shift terminates by
+            // construction. A record-typed first actual
+            // (shr(float_t, natural) families) must stay a real call: the
+            // record's flattened width can coincide with a vector's, and a
+            // folded shift would mangle the record's fields.
+            "shr" | "shl" if args.len() == 2 => {
+                let record = match &args[0] {
+                    Expr::Sig(s) => self.sig_rec.contains_key(s),
+                    _ => false,
+                };
+                if record {
+                    Expr::Call { name: fname, args }
+                } else {
+                    Expr::Bin {
+                        op: if fname == "shl" {
+                            BinOp::Shl
+                        } else {
+                            BinOp::Shr
+                        },
+                        l: Box::new(args[0].clone()),
+                        r: Box::new(args[1].clone()),
+                    }
+                }
+            }
             "rising_edge" if args.len() == 1 => {
                 Expr::Rising(Box::new(args.into_iter().next().unwrap()))
             }
@@ -7577,7 +7721,11 @@ impl<'a> Lower<'a> {
                 Expr::ToInt(Box::new(args.into_iter().next().unwrap()))
             }
             // Real/fixed/float conversions: `x * 1.0` (real-typed f64).
-            "to_real" | "to_ufixed" | "to_sfixed" | "to_float" if !args.is_empty() => {
+            // `real(x)` is a value conversion (LRM 8.6) — integer bits do
+            // NOT pass through unchanged; a bit-identical passthrough made
+            // `RETURN conv_float(real(arg))` call itself with the same
+            // integer and recurse forever.
+            "to_real" | "real" | "to_ufixed" | "to_sfixed" | "to_float" if !args.is_empty() => {
                 as_real(args.into_iter().next().unwrap())
             }
             "resize" if args.len() == 3 => as_real(args.into_iter().next().unwrap()),
@@ -7627,7 +7775,7 @@ impl<'a> Lower<'a> {
             "signed" if args.len() == 1 => Expr::Signed(Box::new(args.into_iter().next().unwrap())),
             // Other type conversions are bit-identical.
             "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "bit_vector" | "std_logic"
-            | "bit" | "boolean" | "string" | "char" | "real"
+            | "bit" | "boolean" | "string" | "char"
                 if args.len() == 1 =>
             {
                 args.into_iter().next().unwrap()
@@ -7973,7 +8121,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            return Expr::Lit(Value { bits });
+            return Expr::Lit(Value { bits, real: false });
         }
         if t.starts_with('\'') && t.ends_with('\'') && t.len() == 3 {
             // Character literal: std_logic value.
@@ -7984,7 +8132,7 @@ impl<'a> Lower<'a> {
                 b'z' => VZ,
                 _ => VX,
             };
-            return Expr::Lit(Value { bits: vec![b] });
+            return Expr::Lit(Value { bits: vec![b], real: false });
         }
         if t.starts_with('"') {
             let inner = t.trim_matches('"').replace("\"\"", "\"");
@@ -8005,7 +8153,7 @@ impl<'a> Lower<'a> {
                         _ => VX,
                     };
                 }
-                return Expr::Lit(Value { bits });
+                return Expr::Lit(Value { bits, real: false });
             }
             // String literal: first char in the high byte (MSB-first), so
             // `&`-concatenation and string_of read left to right.
@@ -8017,7 +8165,7 @@ impl<'a> Lower<'a> {
                     bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                 }
             }
-            return Expr::Lit(Value { bits });
+            return Expr::Lit(Value { bits, real: false });
         }
         if let Some(v) = self.parse_int_literal(&t) {
             return Expr::Lit(v);
@@ -8333,7 +8481,7 @@ pub(crate) fn string_value(s: &str) -> Value {
             bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
         }
     }
-    Value { bits }
+    Value { bits, real: false }
 }
 
 /// Build a Value from a u128 with the minimal width that holds it.
@@ -8342,7 +8490,7 @@ fn value_from_u128(width: usize, v: u128) -> Value {
     for i in 0..width.min(128) {
         bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
     }
-    Value { bits }
+    Value { bits, real: false }
 }
 
 #[cfg(test)]
