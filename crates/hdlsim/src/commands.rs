@@ -403,6 +403,29 @@ pub fn parse_time(s: &str) -> anyhow::Result<u64> {
     Ok((v * mult) as u64)
 }
 
+/// Parse a wall-clock duration like `30` (bare = seconds), `30s`, `1.5m`,
+/// `2m` into seconds.
+pub fn parse_wall_secs(s: &str) -> anyhow::Result<f64> {
+    let (num, unit) = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|i| (&s[..i], &s[i..]))
+        .unwrap_or((s, ""));
+    let v: f64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration value '{}'", s))?;
+    let mult: f64 = match unit {
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        _ => return Err(anyhow::anyhow!("unknown duration unit '{}'", unit)),
+    };
+    let secs = v * mult;
+    if !(secs.is_finite() && secs > 0.0) {
+        return Err(anyhow::anyhow!("bad duration value '{}'", s));
+    }
+    Ok(secs)
+}
+
 /// `hdlsim help <command>` — detailed per-command documentation.
 struct HelpCmd;
 

@@ -32,6 +32,10 @@ serde = { version = "1", features = ["derive"] }
 # arbitrary_precision keeps number lexemes verbatim (JSON-RPC ids round-trip).
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 log = "0.4"
+# Ctrl-C / SIGTERM handling for the CLI: one handler closure, cross-platform.
+# The handler only sets an atomic flag; the kernel dumps the location at a
+# safe point (justification for leaving the vetted set in the PR description).
+ctrlc = { version = "3", features = ["termination"] }
 
 [profile.release]
 opt-level = 3
