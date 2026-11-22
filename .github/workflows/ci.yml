@@ -48,8 +48,33 @@ jobs:
       - name: Build (debug)
         run: cargo build
 
+      # The corpus tests compile thousands of third-party sources —
+      # minutes in release, hours in debug (the kernel is the hot path).
+      # The debug job covers everything else; the corpus job runs the
+      # corpus with the release profile and a hard timeout.
       - name: Run tests
-        run: cargo test
+        run: cargo test -- --skip corpus
+
+  corpus:
+    name: corpus (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Same release cache as the smoke job: the corpus compiles the
+      # whole workspace in release anyway.
+      - name: Cache cargo (release)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: v0-rust-release
+
+      - name: Run corpus tests
+        run: cargo test --release --test corpus
 
   release-smoke:
     name: release binary smoke test
