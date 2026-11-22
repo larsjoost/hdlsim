@@ -5331,8 +5331,23 @@ impl<'a> Lower<'a> {
     fn lower_sens_list(&mut self, s: &SyntaxNode) -> Sens {
         let mut edges = Vec::new();
         for c in real_children(s) {
-            if c.kind() == SyntaxKind::Name {
-                let name = self.text(&c);
+            // The parser wraps postfix indexing (`arr(i)`, `data(7 downto 0)`)
+            // in a Call/PartSelect node with the base Name nested first, so a
+            // bare `SyntaxKind::Name` check silently drops indexed entries —
+            // leaving the process with an empty sensitivity list, which the
+            // sim treats as a bare `always` (infinite zero-delay re-run).
+            // LRM 1076.4 puts the longest static prefix of each name in the
+            // sensitivity set: for `arr(i)` that is `arr` itself.
+            let name_node = match c.kind() {
+                SyntaxKind::Name => Some(c.clone()),
+                SyntaxKind::Call | SyntaxKind::PartSelect => real_children(&c)
+                    .into_iter()
+                    .find(|k| k.kind() == SyntaxKind::Name),
+                _ => None,
+            };
+            let Some(name_node) = name_node else { continue };
+            let name = self.text(&name_node);
+            {
                 // VHDL-2008 `process(all)`: sensitive to every signal read
                 // (case-insensitive — vendor code writes `PROCESS (ALL)`).
                 if name.eq_ignore_ascii_case("all") {
@@ -5364,7 +5379,7 @@ impl<'a> Lower<'a> {
                     });
                 } else {
                     self.err(
-                        c.span(),
+                        name_node.span(),
                         format!("unknown signal '{}' in sensitivity list", name),
                     );
                 }

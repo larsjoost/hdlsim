@@ -2405,7 +2405,39 @@ impl Simulator {
         true
     }
 
+    /// Wake processes sensitive to a memory (array) signal after an element
+    /// write. Memory words live in `mems`, not `vals`, so element writes
+    /// bypass `set_sig` — but a VHDL event on any element is still an event
+    /// on the signal (LRM 1076.4 sensitivity sets use the longest static
+    /// prefix), so a process parked on the array must wake. Only a value
+    /// change wakes, matching the scalar path.
+    fn wake_mem_watchers(&mut self, sig: usize, a: usize, old_elem: Value) {
+        let new_elem = self.mems[sig][a].clone();
+        if old_elem != new_elem {
+            self.schedule_sensitive(sig as FlatSigId, &old_elem, &new_elem);
+        }
+    }
+
     fn schedule_sensitive(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
+        // Lowering-internal signals (`__for_i` loop variables, `__pN_var_*`
+        // variable mirrors) are not VHDL signals: writing them must never
+        // wake a process. A (ALL) process's collect_sigs sensitivity
+        // includes them — the loop reads its own variable, the body reads
+        // its variables — so an unfiltered wake lets a process wake on its
+        // own loop/variable writes: an infinite zero-delay loop (observed
+        // as a (ALL) tb stimulus process re-running on every `__for_i`
+        // iteration write). Flat names are instance-qualified
+        // (`inst.__p0_var_x`), so test the last path segment. VHDL
+        // identifiers cannot begin with `__`, so the prefix is
+        // unambiguous.
+        if self.flat.signals[sig as usize]
+            .name
+            .rsplit('.')
+            .next()
+            .map_or(false, |n| n.starts_with("__"))
+        {
+            return;
+        }
         let edge_of = |ek: &EdgeKind| match ek {
             EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
             EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
@@ -2424,8 +2456,9 @@ impl Simulator {
         for pid in to_wake {
             if self.parked[pid as usize] {
                 self.trace(format!(
-                    "{}: woken by edge on signal {sig}",
-                    self.flat.procs[pid as usize].origin
+                    "{}: woken by edge on signal {sig} ({})",
+                    self.flat.procs[pid as usize].origin,
+                    self.flat.signals[sig as usize].name
                 ));
             }
             self.unpark(pid);
@@ -2500,10 +2533,14 @@ impl Simulator {
                         let sig = *s as usize;
                         let w = self.flat.signals[sig].width.max(1);
                         if (a as usize) < self.mems[sig].len() {
+                            let old = self.mems[sig][a as usize].clone();
                             self.mems[sig][a as usize] = v.resize(w);
+                            self.wake_mem_watchers(sig, a as usize, old);
                         } else if self.mem_grow_ok(sig, a as usize) {
+                            let old = Value::x(w);
                             self.mems[sig].resize(a as usize + 1, Value::x(w));
                             self.mems[sig][a as usize] = v.resize(w);
+                            self.wake_mem_watchers(sig, a as usize, old);
                         }
                         false // memory element: no scalar event phase 1
                     }
@@ -2539,12 +2576,14 @@ impl Simulator {
                             if (a as usize) >= self.mems[sig].len() {
                                 self.mems[sig].resize(a as usize + 1, Value::x(w));
                             }
-                            let mut cur = self.mems[sig][a as usize].clone();
+                            let old = self.mems[sig][a as usize].clone();
+                            let mut cur = old.clone();
                             let v = v.resize(msb - lsb + 1);
                             for j in 0..=(msb - lsb) {
                                 cur.set_bit(lsb + j, v.bit(j));
                             }
                             self.mems[sig][a as usize] = cur;
+                            self.wake_mem_watchers(sig, a as usize, old);
                             return false; // memory element: no scalar event phase 1
                         }
                     }
