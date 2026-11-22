@@ -31,7 +31,7 @@ pub struct Check;
 /// Parse each file standalone and report lexical/syntax diagnostics. No
 /// libraries, no dependency compilation: a file that references units it
 /// does not define still passes if its syntax is valid.
-fn syntax_only(files: &[PathBuf]) -> anyhow::Result<i32> {
+fn syntax_only(label: &str, files: &[PathBuf]) -> anyhow::Result<i32> {
     let mut db = SourceDb::new();
     let mut all_diags = hdl_syntax::diagnostic::Diagnostics::new();
     for f in files {
@@ -62,16 +62,13 @@ fn syntax_only(files: &[PathBuf]) -> anyhow::Result<i32> {
         .filter(|d| d.severity == Severity::Error)
         .count();
     if all_diags.has_errors() {
-        println!("hdlsim check --syntax-only: {errors} error(s)");
+        println!("{label}: {errors} error(s)");
         Ok(1)
     } else if all_diags.is_empty() {
-        println!("hdlsim check --syntax-only: ok ({} file(s))", files.len());
+        println!("{label}: ok ({} file(s))", files.len());
         Ok(0)
     } else {
-        println!(
-            "hdlsim check --syntax-only: ok ({} warning(s))",
-            all_diags.items.len()
-        );
+        println!("{label}: ok ({} warning(s))", all_diags.items.len());
         Ok(0)
     }
 }
@@ -93,7 +90,7 @@ impl Command for Check {
             return Err(anyhow::anyhow!("no input files"));
         }
         if a.syntax_only {
-            return syntax_only(&a.files);
+            return syntax_only("hdlsim check --syntax-only", &a.files);
         }
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = a
@@ -143,5 +140,38 @@ impl Command for Check {
             );
             Ok(0)
         }
+    }
+}
+
+/// `hdlsim syntax` — short form of `check --syntax-only`: parse the named
+/// files, report lexical/syntax diagnostics, nothing else. The fast check
+/// for an edit→check loop (no libraries, no compilation, no elaboration).
+pub struct SyntaxCmd;
+
+#[derive(Parser)]
+#[command(
+    about = "parse-only check of the named files (short for check --syntax-only): hdlsim syntax file.vhd"
+)]
+struct SyntaxArgs {
+    /// Source files to parse.
+    files: Vec<PathBuf>,
+}
+
+impl Command for SyntaxCmd {
+    fn name(&self) -> &'static str {
+        "syntax"
+    }
+    fn about(&self) -> &'static str {
+        "parse-only check of the named files (short for check --syntax-only): hdlsim syntax file.vhd"
+    }
+    fn run(&self, args: &[String]) -> anyhow::Result<i32> {
+        let a = match parse_with::<SyntaxArgs>("syntax", args) {
+            Ok(a) => a,
+            Err(code) => return Ok(code),
+        };
+        if a.files.is_empty() {
+            return Err(anyhow::anyhow!("no input files"));
+        }
+        syntax_only("hdlsim syntax", &a.files)
     }
 }
