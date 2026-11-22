@@ -69,7 +69,10 @@ impl CompileWatch {
         if interval.is_zero() {
             return None;
         }
-        let shared = std::sync::Arc::new(std::sync::Mutex::new((String::new(), std::time::Instant::now())));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new((
+            String::new(),
+            std::time::Instant::now(),
+        )));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sh = shared.clone();
         let st = stop.clone();
@@ -102,8 +105,7 @@ impl CompileWatch {
     }
 
     fn end(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

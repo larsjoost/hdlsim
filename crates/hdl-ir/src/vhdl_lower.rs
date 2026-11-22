@@ -1596,8 +1596,20 @@ impl<'a> Lower<'a> {
     }
 
     fn register_builtin_types(&mut self) {
-        Rc::make_mut(&mut self.consts).insert("true".into(), Value { bits: vec![V1], real: false });
-        Rc::make_mut(&mut self.consts).insert("false".into(), Value { bits: vec![V0], real: false });
+        Rc::make_mut(&mut self.consts).insert(
+            "true".into(),
+            Value {
+                bits: vec![V1],
+                real: false,
+            },
+        );
+        Rc::make_mut(&mut self.consts).insert(
+            "false".into(),
+            Value {
+                bits: vec![V0],
+                real: false,
+            },
+        );
         // severity_level literals (std.standard) — passed to vital_*/assert
         // helper procedures as plain values, e.g. `MsgSeverity => ERROR`.
         Rc::make_mut(&mut self.consts).insert("note".into(), Value::from_u64(32, 0));
@@ -4777,7 +4789,9 @@ impl<'a> Lower<'a> {
         Some(FuncIr {
             name,
             ret_width: 32,
-            args: (0..nargs).map(|i| (format!("a{i}"), 32, String::new())).collect(),
+            args: (0..nargs)
+                .map(|i| (format!("a{i}"), 32, String::new()))
+                .collect(),
             defaults: Vec::new(),
             locals: Vec::new(),
             body: Stmt::Null,
@@ -7391,9 +7405,7 @@ impl<'a> Lower<'a> {
         // so `LOG(REAL'HIGH)` fell back to the first-registered (complex)
         // LOG overload and created a dispatch cycle. (LRM 1076 §3.1.4:
         // REAL'HIGH/REAL'LOW are the largest/smallest representable reals.)
-        if n == "real"
-            || matches!(self.types.get(&n), Some(TypeInfo::Real))
-        {
+        if n == "real" || matches!(self.types.get(&n), Some(TypeInfo::Real)) {
             return match attr {
                 "high" | "right" => Expr::Lit(Value::from_f64(f64::MAX)),
                 "low" | "left" => Expr::Lit(Value::from_f64(f64::MIN)),
@@ -8147,7 +8159,10 @@ impl<'a> Lower<'a> {
                 b'z' => VZ,
                 _ => VX,
             };
-            return Expr::Lit(Value { bits: vec![b], real: false });
+            return Expr::Lit(Value {
+                bits: vec![b],
+                real: false,
+            });
         }
         if t.starts_with('"') {
             let inner = t.trim_matches('"').replace("\"\"", "\"");

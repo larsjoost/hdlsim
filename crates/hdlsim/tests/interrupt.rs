@@ -28,7 +28,10 @@ fn wall_budget_stops_and_reports_location() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let code = out.status.code().expect("exits by signal only on crash");
-    assert_eq!(code, 124, "wall budget exit code, output:\n{stdout}\n{stderr}");
+    assert_eq!(
+        code, 124,
+        "wall budget exit code, output:\n{stdout}\n{stderr}"
+    );
     assert!(
         stdout.contains("wall-time budget of 0.3s exceeded"),
         "must name the reason:\n{stdout}\n{stderr}"

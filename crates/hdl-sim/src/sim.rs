@@ -93,8 +93,8 @@ fn vhdl_radix_string(v: &Value, radix: u32) -> String {
     }
     out
 }
-use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use hdl_ir::fmt_time;
+use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Scheduled future event.
@@ -586,7 +586,11 @@ impl Simulator {
     /// stops with a location dump (see [`Self::where_am_i`]) and exits with
     /// `rc` — an agent (or human) staring at a hung run gets file:line of
     /// the active process and the function chain instead of a bare kill.
-    pub fn set_interrupt_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>, rc: i32) {
+    pub fn set_interrupt_flag(
+        &mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        rc: i32,
+    ) {
         self.interrupt_flag = Some(flag);
         self.interrupt_rc = rc;
     }
@@ -616,10 +620,7 @@ impl Simulator {
             }
         }
         if let Some(budget) = self.wall_budget {
-            if self
-                .wall_start
-                .map_or(false, |s| s.elapsed() >= budget)
-            {
+            if self.wall_start.map_or(false, |s| s.elapsed() >= budget) {
                 return true;
             }
         }
@@ -837,7 +838,15 @@ impl Simulator {
                 .unwrap_or_else(|| "?".to_string());
             // Tail of the chain captured at latch time; a repeating suffix
             // is the overload-dispatch cycle.
-            let tail: Vec<String> = self.fn_chain.borrow().iter().rev().take(14).rev().cloned().collect();
+            let tail: Vec<String> = self
+                .fn_chain
+                .borrow()
+                .iter()
+                .rev()
+                .take(14)
+                .rev()
+                .cloned()
+                .collect();
             self.emit(SimEvent::Message {
                 text: format!(
                     "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (call tree rooted at '{root}', chain tail: {}); simulation stopped\n",
@@ -1973,9 +1982,7 @@ impl Simulator {
                     self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
                 }
                 let fname = format!("{}::new", cn);
-                if let Some(fi) =
-                    self.func_match(&fname, args.get(1..).unwrap_or(&[]), None)
-                {
+                if let Some(fi) = self.func_match(&fname, args.get(1..).unwrap_or(&[]), None) {
                     let saved = self.cur_obj.replace(handle);
                     self.run_func(fi, &args[1..], None);
                     self.cur_obj.set(saved);
@@ -2240,7 +2247,14 @@ impl Simulator {
                             nb[(add - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                         }
                     }
-                    self.store_value(target, Value { bits: nb, real: false }, locals.as_deref_mut());
+                    self.store_value(
+                        target,
+                        Value {
+                            bits: nb,
+                            real: false,
+                        },
+                        locals.as_deref_mut(),
+                    );
                 }
             }
             // `writeline(f, l)` — print the line (stdout) or append to the file.
@@ -2765,8 +2779,7 @@ impl Simulator {
             if self.parked[pid as usize] {
                 self.trace(format!(
                     "{}: woken by edge on signal {sig} ({})",
-                    self.flat.procs[pid as usize].origin,
-                    self.flat.signals[sig as usize].name
+                    self.flat.procs[pid as usize].origin, self.flat.signals[sig as usize].name
                 ));
             }
             self.unpark(pid);
@@ -3200,11 +3213,7 @@ impl Simulator {
                 // A value-level marker covers function frames, whose slots
                 // have no type metadata (`expr_real` cannot see a real
                 // formal/variable behind a slot id).
-                if self.expr_real(l, locals)
-                    || self.expr_real(r, locals)
-                    || lv.real
-                    || rv.real
-                {
+                if self.expr_real(l, locals) || self.expr_real(r, locals) || lv.real || rv.real {
                     return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
                 }
                 // VHDL signed operands: sign-extend both to the wider width
@@ -3610,9 +3619,7 @@ impl Simulator {
         }
         if let Some(rest) = name.strip_prefix("$method::") {
             // `c.m(args)` in expression position; funcs are keyed `C::m`.
-            if let Some(fi) =
-                self.func_match(rest, args.get(1..).unwrap_or(&[]), locals)
-            {
+            if let Some(fi) = self.func_match(rest, args.get(1..).unwrap_or(&[]), locals) {
                 let obj = args
                     .first()
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
@@ -3643,12 +3650,7 @@ impl Simulator {
     /// binds without default values), then any fitting candidate, then the
     /// first-registered one — a width-mismatched argument reads X rather
     /// than failing.
-    fn func_match(
-        &self,
-        name: &str,
-        args: &[Expr],
-        locals: Option<&Vec<Value>>,
-    ) -> Option<usize> {
+    fn func_match(&self, name: &str, args: &[Expr], locals: Option<&Vec<Value>>) -> Option<usize> {
         let nargs = args.len();
         // VHDL identifiers are case-insensitive (LRM 1076 §15.2); the table
         // is keyed lowercase so a `ROUND(signed)` body answers a `round(...)`
@@ -3698,16 +3700,18 @@ impl Simulator {
         // bit-identical type conversions.
         let width_exact = |&i: &usize| {
             let f = &self.flat.functions[i];
-            args.iter().enumerate().all(|(j, a)| {
-                matches!(f.slots.get(j + 1), Some(&fw) if fw == arg_w(a))
-            })
+            args.iter()
+                .enumerate()
+                .all(|(j, a)| matches!(f.slots.get(j + 1), Some(&fw) if fw == arg_w(a)))
         };
         let width_wild = |&i: &usize| {
             let f = &self.flat.functions[i];
-            args.iter().enumerate().all(|(j, a)| match f.slots.get(j + 1) {
-                Some(&fw) => fw == arg_w(a) || fw <= 1,
-                None => true,
-            })
+            args.iter()
+                .enumerate()
+                .all(|(j, a)| match f.slots.get(j + 1) {
+                    Some(&fw) => fw == arg_w(a) || fw <= 1,
+                    None => true,
+                })
         };
         // A conversion-marked actual carries the declared type of the value
         // it wraps: `signed(data)` lowers to `Expr::Signed` (bit-identical),
@@ -3848,7 +3852,10 @@ impl Simulator {
                 });
                 if dump {
                     let body = format!("{:?}", self.flat.functions[picked].body);
-                    eprintln!("picked {name} #{picked} body {}", &body[..body.len().min(900)]);
+                    eprintln!(
+                        "picked {name} #{picked} body {}",
+                        &body[..body.len().min(900)]
+                    );
                 }
             }
         }

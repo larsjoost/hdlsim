@@ -268,10 +268,8 @@ impl Command for Run {
         let interrupt_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let f = interrupt_flag.clone();
-            if ctrlc::set_handler(move || {
-                f.store(true, std::sync::atomic::Ordering::Relaxed)
-            })
-            .is_err()
+            if ctrlc::set_handler(move || f.store(true, std::sync::atomic::Ordering::Relaxed))
+                .is_err()
             {
                 eprintln!("hdlsim: note: Ctrl-C handler unavailable; interrupt dumps disabled");
             }

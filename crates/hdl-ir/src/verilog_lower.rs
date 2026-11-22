@@ -3716,8 +3716,7 @@ fn ce_impl(
                 Stmt::Block(ss) => ss.is_empty(),
                 _ => false,
             };
-            let mut ordered: Vec<&FuncIr> =
-                cands.iter().filter(|f| !is_stub_ir(f)).collect();
+            let mut ordered: Vec<&FuncIr> = cands.iter().filter(|f| !is_stub_ir(f)).collect();
             ordered.extend(cands.iter().filter(|f| is_stub_ir(f)));
             let cands = &ordered;
             let mut argv = Vec::with_capacity(args.len());
@@ -3742,9 +3741,10 @@ fn ce_impl(
             // w64, must reach the real overload, not a same-name
             // std_ulogic_vector overload registered first).
             let width_ok = |f: &FuncIr, wild: bool| {
-                f.args.iter().zip(argv.iter()).all(|((_, w, _), v)| {
-                    *w == v.width() || (wild && *w <= 1)
-                })
+                f.args
+                    .iter()
+                    .zip(argv.iter())
+                    .all(|((_, w, _), v)| *w == v.width() || (wild && *w <= 1))
             };
             let viable = |f: &FuncIr| f.args.len() == argv.len() || fits_defaults(f, argv.len());
             let f = cands

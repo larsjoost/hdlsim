@@ -173,10 +173,7 @@ fn progress_note(stage: &str, done: usize, total: usize, f: &Path) {
 }
 
 fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
-    eprintln!(
-        "corpus: group {sub}: compiling {} files…",
-        files.len()
-    );
+    eprintln!("corpus: group {sub}: compiling {} files…", files.len());
     let dir = corpus_dir().join(sub);
     let mut mgr = LibraryManager::new();
     if let Some(c) = hdl_lib::cache::Cache::open(shared_cache_dir().clone()) {

@@ -40,9 +40,5 @@ fn run_clean(top: &str, file: &PathBuf, marker: &str) {
 /// signal and the process wakes when any element changes.
 #[test]
 fn indexed_sensitivity_entry_in_generate_wakes_the_process() {
-    run_clean(
-        "sens_idx_tb",
-        &fixture("sens_idx_tb.vhd"),
-        "SENSIDX done",
-    );
+    run_clean("sens_idx_tb", &fixture("sens_idx_tb.vhd"), "SENSIDX done");
 }

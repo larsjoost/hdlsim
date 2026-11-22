@@ -130,10 +130,16 @@ impl Command for Help {
         println!("                                 without a message)");
         println!();
         println!("  Environment variables:");
-        println!("    HDLSIM_TRACE=1              scheduler trace on stderr (park/wake/timeout lines)");
+        println!(
+            "    HDLSIM_TRACE=1              scheduler trace on stderr (park/wake/timeout lines)"
+        );
         println!("    HDLSIM_PROGRESS_SEC=<s>     heartbeat for long compiles and simulations:");
-        println!("                                \"still running (N s without time advance) at …\"");
-        println!("    HDLSIM_MAX_MEM_MB=<MiB>     stop with a diagnostic instead of the OS OOM-killer");
+        println!(
+            "                                \"still running (N s without time advance) at …\""
+        );
+        println!(
+            "    HDLSIM_MAX_MEM_MB=<MiB>     stop with a diagnostic instead of the OS OOM-killer"
+        );
         println!("    HDLSIM_MAX_SIGNAL_MB=<MiB>  per-signal allocation guard (default 4096)");
         println!("    HDLSIM_MAX_PROC_STEPS=<n>   interpreter steps per process activation (default 100M)");
         println!("    HDLSIM_MAX_FUNC_DEPTH=<n>   function call nesting limit (default 200)");
