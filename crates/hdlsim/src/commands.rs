@@ -23,6 +23,7 @@ mod doctor;
 mod fmt;
 mod gen;
 mod init;
+mod ir;
 mod lint;
 pub mod lsp;
 mod project;
@@ -140,7 +141,7 @@ fn section_of(name: &str) -> &'static str {
         "run" | "debug" | "do" | "regress" | "wave" | "prove" => "Simulate & debug",
         "check" | "syntax" | "lint" | "analyze" | "fmt" => "Check & clean up code",
         "gen" | "doc" => "Generate & document",
-        "ast" | "deps" => "Inspect a design",
+        "ast" | "deps" | "ir" => "Inspect a design",
         "init" | "doctor" | "project" | "lsp" | "completions" => "Project & tooling",
         "help" | "--help" | "explain" | "assist" | "bundle" => "Help & bug reports",
         _ => "Other commands",
@@ -665,6 +666,15 @@ fn command_long_help(name: &str) -> Option<&'static str> {
              \n\
              Supported: bash, zsh, fish."
         }
+        "ir" => {
+            "Dump the elaborated IR of one top as pretty JSON:\n\
+             \n\
+             \x20   hdlsim ir --top tb file.vhd [--out ir.json]\n\
+             \n\
+             Signals, processes, continuous assigns, and function bodies —\n\
+             the same structures and indices the simulation traces report,\n\
+             so a trace like Sig(4635) can be looked up in the dump."
+        }
         "syntax" => {
             "Parse-only check of the named files — short for check --syntax-only:\n\
              \n\
@@ -692,6 +702,7 @@ pub const COMMANDS: &[&dyn Command] = &[
     &check::Check,
     &check::SyntaxCmd,
     &ast::Ast,
+    &ir::Ir,
     &init::Init,
     &project::Project,
     &prove::Prove,
