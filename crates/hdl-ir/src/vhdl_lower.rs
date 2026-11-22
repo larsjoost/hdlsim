@@ -113,6 +113,10 @@ pub struct PackageIr {
     /// Package-level signals / shared variables `(name, type mark)` — exported
     /// so `use work.com_pkg.all;` also exposes bare reads of `net` etc.
     pub sig_types: Vec<(String, String)>,
+    /// Package-level signal widths `(name, width)` — resolved with the
+    /// package's generic values at instantiation, so `pkg.sig'length` is right
+    /// for `package p is new g generic map (width => 16)`.
+    pub sig_widths: Vec<(String, usize)>,
     /// Typed constants `(name, type mark)` — exported so `pkg_const.field`
     /// (record-typed constant select) resolves in files that `use` the package.
     pub const_tys: Vec<(String, String)>,
@@ -249,27 +253,73 @@ pub fn context_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
                     }
                 }
             }
-            // `package p is new g generic map (...)` depends on `g` and on any
-            // package actuals in the map (`generic map (P => work.q)`).
-            SyntaxKind::PackageInst => {
-                let mut stack: Vec<SyntaxNode> = real_children(&child);
-                while let Some(n) = stack.pop() {
-                    if n.kind() == SyntaxKind::Name {
-                        let unit = db
-                            .span_text(n.span())
-                            .trim()
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if !unit.is_empty() && !out.iter().any(|u| u == &unit) {
-                            out.push(unit);
-                        }
-                    }
-                    stack.extend(real_children(&n));
+            _ => {}
+        }
+    }
+    out.extend(package_inst_target_units(db, root));
+    out
+}
+
+/// Lowercased names of the design units declared in this file (packages,
+/// package instantiations, context declarations, entities, architectures,
+/// configurations) — so resolution can skip units the file declares itself
+/// (they are lowered by pass 0 of this file, and resolving them externally
+/// could pull in a same-named unit from another file).
+pub fn declared_unit_names(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<SyntaxNode> = real_children(root);
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            SyntaxKind::Package => {
+                let name = package_decl_name(&n, db).to_ascii_lowercase();
+                if !name.is_empty() && !out.contains(&name) {
+                    out.push(name);
                 }
             }
-            _ => {}
+            SyntaxKind::PackageInst | SyntaxKind::ContextDecl => {
+                if let Some(id) = real_children(&n)
+                    .iter()
+                    .filter(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| db.span_text(k.span()).trim().to_ascii_lowercase())
+                    .find(|w| !matches!(w.as_str(), "package" | "body" | "context" | "is" | "new"))
+                {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+            _ => stack.extend(real_children(&n)),
+        }
+    }
+    out
+}
+
+/// Generic-package targets of all `package p is new g [generic map (...)]`
+/// instantiations anywhere in the file (possibly nested in declarative
+/// parts) — the first Name child of each PackageInst node (`lib.g` → `g`).
+/// The generic map is not descended into: its actuals may name local items.
+pub fn package_inst_target_units(db: &SourceDb, root: &SyntaxNode) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<SyntaxNode> = real_children(root);
+    while let Some(n) = stack.pop() {
+        if n.kind() == SyntaxKind::PackageInst {
+            if let Some(t) = real_children(&n)
+                .into_iter()
+                .find(|c| c.kind() == SyntaxKind::Name)
+            {
+                let unit = db
+                    .span_text(t.span())
+                    .trim()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !unit.is_empty() && !out.iter().any(|u| u == &unit) {
+                    out.push(unit);
+                }
+            }
+        } else {
+            stack.extend(real_children(&n));
         }
     }
     out
@@ -443,6 +493,7 @@ pub fn lower_file(
                         rec_field_tys: Vec::new(),
                         prot_tys: Vec::new(),
                         sig_types: Vec::new(),
+                        sig_widths: Vec::new(),
                         const_tys: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
@@ -1275,6 +1326,8 @@ struct Lower<'a> {
     /// `name.field` (record field) and `name.method(...)` (protected type)
     /// resolve when lowering package bodies.
     pkg_sig_types: HashMap<String, String>,
+    /// Package-level signal widths (name → width) from merged packages.
+    pkg_sig_widths: HashMap<String, usize>,
     /// Signal id → element record type name for arrays of records, so
     /// `arr(i).field` lowers to a slice of the memory element.
     sig_elem_rec: HashMap<SigId, String>,
@@ -1346,6 +1399,13 @@ struct Lower<'a> {
     /// exported to the entity's architectures via `SigMaps`.
     entity_consts: HashMap<String, Value>,
     entity_types: HashMap<String, TypeInfo>,
+    /// Delta of `aliases`/`alias_rec` declared in the entity declarative part,
+    /// exported to the entity's architectures via `SigMaps` (entity-level
+    /// `alias`/`signal` declarations are visible in every architecture of the
+    /// entity, LRM 1076 §1.2 — the entity's declarative region encompasses
+    /// its architectures).
+    entity_aliases: HashMap<String, Expr>,
+    entity_alias_rec: HashMap<String, String>,
     /// Set when re-lowering one entity as an elaboration variant (generic-map
     /// overrides); modules get the `<entity><suffix>` name.
     variant: Option<VariantSpec>,
@@ -1384,6 +1444,12 @@ pub struct SigMaps {
     /// its architectures, LRM 1076 §1.2).
     consts: HashMap<String, Value>,
     types: HashMap<String, TypeInfo>,
+    /// Aliases (and their record types) declared in the entity's declarative
+    /// part — visible in its architectures too. `SigId`s are module-relative
+    /// and the architecture reuses the entity module's signal table, so the
+    /// ids need no remapping.
+    aliases: HashMap<String, Expr>,
+    alias_rec: HashMap<String, String>,
 }
 
 impl<'a> Lower<'a> {
@@ -1401,6 +1467,7 @@ impl<'a> Lower<'a> {
             sig_signed: HashMap::new(),
             sig_rec: HashMap::new(),
             pkg_sig_types: HashMap::new(),
+            pkg_sig_widths: HashMap::new(),
             sig_elem_rec: HashMap::new(),
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
@@ -1422,6 +1489,8 @@ impl<'a> Lower<'a> {
             entity_maps_by_dir: HashMap::new(),
             entity_consts: HashMap::new(),
             entity_types: HashMap::new(),
+            entity_aliases: HashMap::new(),
+            entity_alias_rec: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
             variant: None,
             cur_entity: String::new(),
@@ -1446,6 +1515,8 @@ impl<'a> Lower<'a> {
             uncon_ports: self.uncon_ports.clone(),
             consts: self.entity_consts.clone(),
             types: self.entity_types.clone(),
+            aliases: self.entity_aliases.clone(),
+            alias_rec: self.entity_alias_rec.clone(),
         };
         self.entity_maps.insert(entity.to_string(), maps.clone());
         // Dir-keyed twin: the entity's own source directory disambiguates
@@ -1847,19 +1918,39 @@ impl<'a> Lower<'a> {
                 let w = self.sig_width.get(&id).copied().unwrap_or(1).max(1);
                 return (w, false, None, false);
             }
-            self.diags.push(Diagnostic {
-                code: "E0401",
-                severity: Severity::Error,
-                span: Some(span),
-                message: format!("unknown type '{}'", name),
-                help: Some(
-                    "known type marks: bit, boolean, character, integer, natural, positive, \
-                     real, time, string, bit_vector, std_logic, std_ulogic, std_logic_vector, \
-                     std_ulogic_vector, unsigned, signed \
-                     (std.standard / ieee.std_logic_1164 / ieee.numeric_std)"
-                        .to_string(),
-                ),
-            });
+            // Selected type mark `obj.field[.field...]` (`AxiBus.WriteAddress'subtype`,
+            // `LocalWD.Data'subtype`): resolve the base object (signal/port or
+            // record alias) and adopt the field's width. A record-typed field
+            // (e.g. `AxiBus.WriteAddress`) yields the record's total width;
+            // `as_record` on the same dotted name gives the record type for
+            // member selects on the declared object.
+            if let Some((b, rest)) = name.split_once('.') {
+                let path: Vec<&str> = rest.split('.').collect();
+                let tn = self
+                    .sig_id(b)
+                    .and_then(|i| self.sig_rec.get(&i).cloned())
+                    .or_else(|| self.alias_rec.get(b).cloned());
+                if let Some(tn) = tn {
+                    if let Some((_, w)) = self.record_field_offset(&tn, &path) {
+                        return (w.max(1), false, None, false);
+                    }
+                }
+            }
+            if self.suppress_err == 0 {
+                self.diags.push(Diagnostic {
+                    code: "E0401",
+                    severity: Severity::Error,
+                    span: Some(span),
+                    message: format!("unknown type '{}'", name),
+                    help: Some(
+                        "known type marks: bit, boolean, character, integer, natural, positive, \
+                         real, time, string, bit_vector, std_logic, std_ulogic, std_logic_vector, \
+                         std_ulogic_vector, unsigned, signed \
+                         (std.standard / ieee.std_logic_1164 / ieee.numeric_std)"
+                            .to_string(),
+                    ),
+                });
+            }
             return (1, false, None, false);
         };
         match base {
@@ -2268,8 +2359,11 @@ impl<'a> Lower<'a> {
     /// Record type at the end of a field path rooted at a record-typed signal
     /// (`sig.a.b` → the type of field `b`).
     fn record_type_at_path(&self, base: &str, path: &[&str]) -> Option<String> {
-        let id = self.sig_id(base)?;
-        let mut cur = self.sig_rec.get(&id)?.clone();
+        let mut cur = match self.sig_id(base) {
+            Some(id) => self.sig_rec.get(&id)?.clone(),
+            // Record alias base (`alias LAW is AxiBus.WriteAddress;`).
+            None => self.alias_rec.get(base)?.clone(),
+        };
         for seg in path {
             cur = self
                 .rec_field_ty
@@ -2398,6 +2492,10 @@ impl<'a> Lower<'a> {
         let consts_before: std::collections::HashSet<String> =
             self.consts.keys().cloned().collect();
         let types_before: std::collections::HashSet<String> = self.types.keys().cloned().collect();
+        let aliases_before: std::collections::HashSet<String> =
+            self.aliases.keys().cloned().collect();
+        let alias_rec_before: std::collections::HashSet<String> =
+            self.alias_rec.keys().cloned().collect();
         for k in &kids {
             // Arm the hidden-signal allocator for this phase (ports/generics
             // push directly into `module.signals`, so re-arm per item).
@@ -2407,6 +2505,13 @@ impl<'a> Lower<'a> {
                 SyntaxKind::GenericClause => self.lower_generic_clause(&mut module, k),
                 SyntaxKind::PortClause => self.lower_port_clause(&mut module, k),
                 SyntaxKind::ConstantDecl => self.lower_constant_decl(k),
+                // Entity-level signals/variables are real module signals: an
+                // architecture sees the entity's declarative region, so e.g.
+                // `signal TransRec : RecType(...);` in the entity is usable
+                // (and its record member selects resolve) in every
+                // architecture of the entity.
+                SyntaxKind::SignalDecl => self.lower_signal_decl(&mut module, k),
+                SyntaxKind::VariableDecl => self.lower_signal_decl(&mut module, k),
                 SyntaxKind::TypeDecl => self.lower_type_decl(k),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
                 SyntaxKind::ViewDecl => self.lower_view_decl(k),
@@ -2414,6 +2519,9 @@ impl<'a> Lower<'a> {
                 SyntaxKind::AttrDecl => {
                     self.register_attr_decl(k);
                 }
+                SyntaxKind::UseClause => self.merge_use_clause(k),
+                SyntaxKind::PackageInst => self.register_package_inst(k),
+                SyntaxKind::FileDecl => self.lower_file_decl(k),
                 _ => {}
             }
             for sig in self.extra_signals.drain(..) {
@@ -2438,6 +2546,18 @@ impl<'a> Lower<'a> {
             .types
             .iter()
             .filter(|(k, _)| !types_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.entity_aliases = self
+            .aliases
+            .iter()
+            .filter(|(k, _)| !aliases_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.entity_alias_rec = self
+            .alias_rec
+            .iter()
+            .filter(|(k, _)| !alias_rec_before.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.snapshot_entity_maps(&module.name);
@@ -2790,6 +2910,9 @@ impl<'a> Lower<'a> {
                 .entry(n.clone())
                 .or_insert_with(|| tn.clone());
         }
+        for (n, w) in &p.sig_widths {
+            self.pkg_sig_widths.entry(n.clone()).or_insert(*w);
+        }
         for (n, tn) in &p.const_tys {
             if item.is_none_or(|i| i == n) {
                 self.const_types
@@ -2869,6 +2992,7 @@ impl<'a> Lower<'a> {
         }
         let mut functions: Vec<FuncIr> = Vec::new();
         let mut sig_types: Vec<(String, String)> = Vec::new();
+        let mut sig_widths: Vec<(String, usize)> = Vec::new();
         let mut uses: Vec<String> = context_units(self.db, root);
         uses.retain(|u| u != &name.to_ascii_lowercase());
         let mut attr_decls: Vec<String> = Vec::new();
@@ -2940,9 +3064,19 @@ impl<'a> Lower<'a> {
                                 .next()
                                 .unwrap_or_default()
                                 .to_string();
+                            let constraint =
+                                dk[c + 1..].iter().find(|k| k.kind() == SyntaxKind::Range);
+                            // Width is best-effort here (package-level signals are
+                            // not simulated): never emit "unknown type" from this
+                            // bookkeeping — the declaration itself was checked
+                            // when the package body was lowered.
+                            self.suppress_err += 1;
+                            let (w, _, _, _) = self.resolve_type(tm, constraint, d.span());
+                            self.suppress_err -= 1;
                             for n in names {
                                 self.pkg_sig_types.insert(n.clone(), tn.clone());
-                                sig_types.push((n, tn.clone()));
+                                sig_types.push((n.clone(), tn.clone()));
+                                sig_widths.push((n, w));
                             }
                         }
                     }
@@ -3022,6 +3156,7 @@ impl<'a> Lower<'a> {
             rec_field_tys,
             prot_tys,
             sig_types,
+            sig_widths,
             const_tys,
             decl: Some(p.clone()),
             src: Some(root.clone()),
@@ -3088,9 +3223,26 @@ impl<'a> Lower<'a> {
         lx2.register_builtin_types();
         lx2.pkgs = self.pkgs.clone();
         // The enclosing scope (entity generics, constants, types) is visible in
-        // the `generic map` associations.
-        lx2.consts = self.consts.clone();
-        lx2.types = self.types.clone();
+        // the `generic map` associations — but seed it WITHOUT the generic
+        // package's own exports: pass-0 merges each instantiation into the
+        // enclosing scope with force, so a second `package p2 is new g ...` in
+        // the same file would otherwise see g's items as pre-existing and
+        // export an empty delta.
+        let tp_t: std::collections::HashSet<&String> = tp.types.iter().map(|(k, _)| k).collect();
+        let tp_c: std::collections::HashSet<&String> = tp.consts.iter().map(|(k, _)| k).collect();
+        lx2.consts = Rc::new(
+            self.consts
+                .iter()
+                .filter(|(k, _)| !tp_c.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
+        lx2.types = self
+            .types
+            .iter()
+            .filter(|(k, _)| !tp_t.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         if let Some(r) = &file_root {
             lx2.apply_context_clauses(r);
         }
@@ -3168,6 +3320,7 @@ impl<'a> Lower<'a> {
             pkg.rec_field_tys.extend(part.rec_field_tys);
             pkg.prot_tys.extend(part.prot_tys);
             pkg.sig_types.extend(part.sig_types);
+            pkg.sig_widths.extend(part.sig_widths);
             pkg.const_tys.extend(part.const_tys);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
@@ -3265,7 +3418,15 @@ impl<'a> Lower<'a> {
             Some(b) => kids[..b].iter().collect(),
             None => kids.iter().collect(),
         };
+        // Start from the entity declarative part's aliases (an architecture
+        // sees the entity's declarative region, LRM 1076 §1.2), then add the
+        // architecture's own.
         self.aliases.clear();
+        self.alias_rec.clear();
+        if let Some(m) = self.entity_maps.get(&entity_name) {
+            self.aliases.extend(m.aliases.clone());
+            self.alias_rec.extend(m.alias_rec.clone());
+        }
         // Pre-register function stubs: a recursive call inside a body (or a
         // forward reference to a later-declared sibling) must lower as a
         // call, not as an index of the function-name result slot. Real
@@ -5366,8 +5527,12 @@ impl<'a> Lower<'a> {
                         match self.ce(&dv) {
                             Some(v) => v.to_u64().unwrap_or(0), // X (unoverridden generic) -> 0
                             None => {
-                                self.err(d.span(), "waveform delay must be constant");
-                                return None;
+                                // Non-constant delay (e.g. `after Baud/2` with Baud a
+                                // signal): not schedulable exactly — apply the
+                                // transaction with no delay instead of dropping the
+                                // whole assignment.
+                                self.warn(d.span(), "non-constant waveform delay; treated as 0");
+                                0
                             }
                         }
                     }
@@ -6884,6 +7049,35 @@ impl<'a> Lower<'a> {
                             if p.types.iter().any(|(n, _)| *n == item) {
                                 return Expr::Lit(Value::x(32));
                             }
+                            // Package-level signal selected through the package
+                            // (`Manager.Cyc`, `Subordinate.Adr`): materialize a
+                            // module signal under the qualified name so two
+                            // instances of the same generic package stay distinct.
+                            if let Some((_, tn)) = p.sig_types.iter().find(|(n, _)| *n == item) {
+                                let tn = tn.clone();
+                                let w = p
+                                    .sig_widths
+                                    .iter()
+                                    .find(|(n, _)| *n == item)
+                                    .map(|(_, w)| *w)
+                                    .unwrap_or(0)
+                                    .max(match self.types.get(&tn) {
+                                        Some(TypeInfo::Vector { .. }) => {
+                                            self.type_widths.get(&tn).copied().unwrap_or(1).max(1)
+                                        }
+                                        Some(TypeInfo::Record { fields }) => {
+                                            fields.iter().map(|f| f.1).sum::<usize>().max(1)
+                                        }
+                                        _ => 1,
+                                    });
+                                let qname = format!("{pkg}.{item}");
+                                let id = self.ensure_global_sig(&qname);
+                                self.sig_width.insert(id, w);
+                                if let Some(rn) = self.as_record(&tn) {
+                                    self.sig_rec.insert(id, rn);
+                                }
+                                return Expr::Sig(id);
+                            }
                         }
                         // A package used as a value (package actual in a generic
                         // map: `generic map (P => work.my_pkg)`) — inert placeholder.
@@ -7091,6 +7285,42 @@ impl<'a> Lower<'a> {
                                 _ => lo.max(0) as u64, // low | right
                             };
                             return Expr::Lit(Value::from_u64(32, v));
+                        }
+                        // `sig.field[.field...]'length` — record field select on a
+                        // record-typed signal/port or record alias: the field's
+                        // packed width (first field = MSB).
+                        if let Some((b0, rest)) = bn.split_once('.') {
+                            let path: Vec<&str> = rest.split('.').collect();
+                            let tn = self
+                                .sig_id(b0)
+                                .and_then(|i| self.sig_rec.get(&i).cloned())
+                                .or_else(|| self.alias_rec.get(b0).cloned());
+                            if let Some(tn) = tn {
+                                if let Some((lsb, w)) = self.record_field_offset(&tn, &path) {
+                                    let v = match attr.as_str() {
+                                        "length" => w as u64,
+                                        "high" | "left" => (lsb + w - 1) as u64,
+                                        _ => lsb as u64, // low | right
+                                    };
+                                    return Expr::Lit(Value::from_u64(32, v));
+                                }
+                            }
+                        }
+                        // `alias'length` where the alias targets a field/slice
+                        // select with literal bounds.
+                        if let Some(Expr::Sel { msb, lsb, .. }) =
+                            self.aliases.get(&bn.to_ascii_lowercase())
+                        {
+                            if let (Some(m), Some(l)) = (self.ce(msb), self.ce(lsb)) {
+                                if let (Some(m), Some(l)) = (m.to_u64(), l.to_u64()) {
+                                    let v = match attr.as_str() {
+                                        "length" => (m as i64 - l as i64).unsigned_abs() + 1,
+                                        "high" | "left" => m,
+                                        _ => l, // low | right
+                                    };
+                                    return Expr::Lit(Value::from_u64(32, v));
+                                }
+                            }
                         }
                         // Type marks and subtypes: `integer'high`, `my_arr'length`, ...
                         return self.type_attr(&bn, &attr);

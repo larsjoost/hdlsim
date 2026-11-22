@@ -95,9 +95,35 @@ fn corpus_groups() -> Vec<(String, Vec<PathBuf>)> {
             } else {
                 vec![repo.clone()]
             };
-            for g in groups {
+            // A `testcases` directory belongs to the sibling `testbench`
+            // directory's `work` library: its files are architectures `of
+            // TestCtrl`, and the `TestCtrl` entity lives in the testbench dir.
+            let is_named = |g: &PathBuf, name: &str| {
+                g.file_name()
+                    .map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case(name))
+            };
+            let has_tb = groups.iter().any(|g| is_named(g, "testbench"));
+            let tc_pos = groups.iter().position(|g| is_named(g, "testcases"));
+            let mut group_roots: Vec<(PathBuf, Vec<PathBuf>)> = groups
+                .iter()
+                .map(|g| (g.clone(), vec![g.clone()]))
+                .collect();
+            if has_tb {
+                if let Some(pos) = tc_pos {
+                    let tc = groups[pos].clone();
+                    let tb_pos = groups
+                        .iter()
+                        .position(|g| is_named(g, "testbench"))
+                        .unwrap();
+                    group_roots[tb_pos].1.push(tc);
+                    group_roots.remove(pos);
+                }
+            }
+            for (g, roots) in group_roots {
                 let mut dirs = Vec::new();
-                collect_group_dirs(&g, &mut dirs);
+                for r in &roots {
+                    collect_group_dirs(r, &mut dirs);
+                }
                 let mut files = Vec::new();
                 for d in dirs {
                     files.extend(dir_sources(&d));
