@@ -13,8 +13,10 @@ development.** hdlsim is built for coding agents that write and debug HDL. An
 agent needs a simulator it can trust and drive programmatically: LRM-conformant
 semantics pinned by regression fixtures, deterministic reproducible runs,
 unambiguous pass/fail (exit code plus a zero-errors/zero-warnings bar), fast
-failure instead of deadlock (`--max-time`), and machine-readable diagnosis
-(`HDLSIM_TRACE=1` scheduler trace, rustc-style diagnostics, JUnit XML). The
+failure instead of deadlock (`--max-time`, `--max-wall`), and machine-readable diagnosis
+(`HDLSIM_TRACE=1` scheduler trace, rustc-style diagnostics, JUnit XML). Interrupting a
+hung run (Ctrl-C/SIGTERM) dumps the active process, file:line, and function chain before
+exiting 130. The
 human-facing surface — wave windows, LSP, formatter — serves the same loop from
 the other side; every feature is judged by how well it shortens the agent's
 edit → simulate → diagnose cycle.
@@ -48,6 +50,12 @@ edit → simulate → diagnose cycle.
   without external sampling. `HDLSIM_MAX_MEM_MB=<MiB>` turns the peak reading
   into a guard: crossing it stops the run with an actionable diagnostic instead
   of the OS OOM-killer (exit 137, no output).
+- **Interrupt diagnosis.** Ctrl-C or SIGTERM stops the kernel and prints where
+  it was — current time, active process origin (file:line), function call
+  chain — then exits 130; `--max-wall 30s` does the same on a wall-clock
+  budget with exit 124. `HDLSIM_PROGRESS_SEC=<seconds>` additionally prints a
+  periodic "still running" heartbeat with the same location for runs that
+  grind without time advance.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; `--fst`
