@@ -593,7 +593,12 @@ mod tests {
 
     #[test]
     fn live_page_has_zoom_pan_and_scroll_sync() {
-        for marker in ["zoomCenter(", "cv.onmousedown", "id=\"scroller\"", "'trunc'"] {
+        for marker in [
+            "zoomCenter(",
+            "cv.onmousedown",
+            "id=\"scroller\"",
+            "'trunc'",
+        ] {
             assert!(PAGE.contains(marker), "page missing {marker}");
         }
     }
