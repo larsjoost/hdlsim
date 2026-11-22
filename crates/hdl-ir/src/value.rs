@@ -8,6 +8,8 @@
 //! - Arithmetic/bitwise results propagate X/Z: if any operand bit is not 0/1,
 //!   the corresponding result bit is X (except `===`/`!==`, which compare X/Z).
 
+use serde::{Serialize, Serializer};
+
 /// Bit state constants (matching VHDL std_logic ordering where applicable).
 pub const V0: u8 = 0;
 pub const V1: u8 = 1;
@@ -59,6 +61,47 @@ fn eq_string_loose(a: &Value, b: &Value) -> bool {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Value {
     pub bits: Vec<u8>,
+}
+
+/// JSON output mirrors the VCD sink's two formats: an all-0/1 value is
+/// `{"w": <bits>, "hex": "<value>"}` (4 bits per digit, MSB first, like every
+/// hex tool), anything with x/z/metavalues is `{"w": <bits>, "bits": "<states>"}`
+/// (one lowercase state letter per bit, MSB first, weak values included —
+/// they must not alias to strong 0/1). Signal initializers dominate an IR
+/// dump; per-bit JSON number arrays would be ~8× larger.
+impl Serialize for Value {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        const D: &[u8; 16] = b"0123456789abcdef";
+        const L: &[u8; 9] = b"01xzwlh-u";
+        let mut st = s.serialize_struct("Value", 2)?;
+        st.serialize_field("w", &self.bits.len())?;
+        if self.bits.iter().all(|&b| b == V0 || b == V1) {
+            let mut hex = String::with_capacity(self.bits.len().div_ceil(4));
+            let (mut nib, mut n) = (0u8, 0u32);
+            for &b in self.bits.iter().rev() {
+                nib = (nib << 1) | u8::from(b == V1);
+                n += 1;
+                if n == 4 {
+                    hex.push(D[nib as usize] as char);
+                    (nib, n) = (0, 0);
+                }
+            }
+            if n > 0 {
+                hex.push(D[nib as usize] as char);
+            }
+            st.serialize_field("hex", &hex)?;
+        } else {
+            let bits: String = self
+                .bits
+                .iter()
+                .rev()
+                .map(|&b| L[b as usize] as char)
+                .collect();
+            st.serialize_field("bits", &bits)?;
+        }
+        st.end()
+    }
 }
 
 impl Value {
@@ -603,7 +646,7 @@ fn bit_op(op: BinOp, a: u8, b: u8) -> u8 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -649,7 +692,7 @@ pub enum BinOp {
     LogOr,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum UnOp {
     Not,
     BNot,
@@ -668,6 +711,52 @@ pub enum UnOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_hex_for_clean_values_msb_first() {
+        assert_eq!(
+            serde_json::to_string(&Value::from_u64(8, 0xA5)).unwrap(),
+            r#"{"w":8,"hex":"a5"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Value::from_u64(12, 0xABC)).unwrap(),
+            r#"{"w":12,"hex":"abc"}"#
+        );
+        // Width not a multiple of 4: the top digit holds the leftover bits.
+        assert_eq!(
+            serde_json::to_string(&Value::from_u64(6, 0b11_1111)).unwrap(),
+            r#"{"w":6,"hex":"f3"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Value { bits: vec![V1] }).unwrap(),
+            r#"{"w":1,"hex":"1"}"#
+        );
+    }
+
+    #[test]
+    fn json_bits_string_for_x_z_and_metavalues() {
+        // LSB-first [1,0,x,z] reads MSB-first as "zx01".
+        let v = Value {
+            bits: vec![V1, V0, VX, VZ],
+        };
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"w":4,"bits":"zx01"}"#
+        );
+        // Weak and metavalue states keep their own letters — no aliasing to
+        // strong 0/1 (W must not look low, U must not look like a zero init).
+        let v = Value {
+            bits: vec![VW, VL, VH, VDASH, VU, V0, V1, VZ],
+        };
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"w":8,"bits":"z10u-hlw"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Value { bits: vec![VZ] }).unwrap(),
+            r#"{"w":1,"bits":"z"}"#
+        );
+    }
 
     #[test]
     fn from_u64_roundtrip() {

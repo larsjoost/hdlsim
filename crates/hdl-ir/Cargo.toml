@@ -14,6 +14,10 @@ categories = ["parser-implementations", "simulation"]
 
 [dependencies]
 hdl-syntax.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 # Note: hdl-ir deliberately does NOT depend on hdl-lib (that would be circular).
 # Name resolution is injected via a ResolveCtx trait implemented by hdl-lib users.
