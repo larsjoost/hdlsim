@@ -311,6 +311,13 @@ pub struct Simulator {
     /// Most recently dispatched process — the between-events fallback for
     /// `where_am_i` (nothing is executing at the check point itself).
     last_proc: Option<u32>,
+    /// Live fixpoint progress, shown by the heartbeat/`where_am_i` while the
+    /// concurrent-assign sweep runs (cur_proc holds the u32::MAX sentinel):
+    /// sweep number within the current fixpoint, and how many assigns
+    /// changed in the previous sweep. A shrinking count = converging
+    /// settling; a constant nonzero count = oscillating combinational loop.
+    fix_sweep: u64,
+    fix_changed: u64,
 }
 
 impl Simulator {
@@ -480,6 +487,8 @@ impl Simulator {
             last_heartbeat: None,
             interrupt_info: None,
             last_proc: None,
+            fix_sweep: 0,
+            fix_changed: 0,
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -1019,6 +1028,12 @@ impl Simulator {
                 format!("in {}", self.flat.procs[p as usize].origin)
             }
             // eval_assigns_fixpoint runs assigns under a sentinel proc id.
+            Some(_) if self.fix_sweep > 0 => format!(
+                "in concurrent assign sweep #{}, {} of {} assigns changed in the last pass",
+                self.fix_sweep,
+                self.fix_changed,
+                self.flat.assigns.len()
+            ),
             Some(_) => "in concurrent assign sweep".to_string(),
             // Between events: nothing is executing right now — name the most
             // recently dispatched process instead.
@@ -2637,11 +2652,14 @@ impl Simulator {
         let mut any = false;
         self.cur_proc = Some(u32::MAX);
         self.fn_calls.set(0); // per-fixpoint call budget (see run_func)
-        for _sweep in 0..10_000 {
+        for sweep in 0..10_000 {
             self.delta_guard += 1;
+            self.fix_sweep = sweep as u64 + 1;
             self.maybe_heartbeat();
             let mut changed = false;
-            for ai in 0..self.flat.assigns.len() {
+            let mut n_changed = 0u64;
+            let n_assigns = self.flat.assigns.len();
+            for ai in 0..n_assigns {
                 let a = self.flat.assigns[ai].clone();
                 let t0 = std::time::Instant::now();
                 let rhs = self.eval_expr(&a.rhs, None);
@@ -2658,22 +2676,28 @@ impl Simulator {
                 }
                 if self.assign_to(&a.lhs, rhs, None) {
                     changed = true;
+                    n_changed += 1;
                 }
                 // A non-converging fixpoint whose assigns call heavy
                 // functions would grind through all 10_000 sweeps before
                 // the pump can report the latched runaway-call budget —
                 // surface it mid-sweep (a check per assign is cheap).
-                if ai % 64 == 0 && self.report_fn_runaway() {
-                    self.cur_proc = None;
-                    return any;
-                }
-                // Same for an external interrupt: report it at the pump
-                // level (with the location) instead of grinding on. Keep
-                // the sentinel cur_proc so the dump names the sweep.
-                if ai % 64 == 0 && self.stop_requested() {
-                    return any;
+                if ai % 64 == 0 {
+                    self.fix_changed = n_changed;
+                    if self.report_fn_runaway() {
+                        self.cur_proc = None;
+                        return any;
+                    }
+                    // Same for an external interrupt: report it at the pump
+                    // level (with the location) instead of grinding on. Keep
+                    // the sentinel cur_proc so the dump names the sweep.
+                    if self.stop_requested() {
+                        return any;
+                    }
+                    self.maybe_heartbeat();
                 }
             }
+            self.fix_changed = n_changed;
             any |= changed;
             if !changed {
                 self.cur_proc = None;
