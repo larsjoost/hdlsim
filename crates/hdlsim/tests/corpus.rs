@@ -381,36 +381,67 @@ fn corpus_files_lex_and_parse_without_errors() {
 fn corpus_group_compiles_meet_expected_status_with_rustc_diags() {
     run_with_big_stack(|| {
         let expected_path = corpus_dir().join("expected.json");
-        let mut actual: HashMap<String, String> = HashMap::new();
-        let mut checked = 0;
-        let mut with_diags = 0;
-        for (sub, files) in corpus_groups() {
-            // One library compile per group, like `hdlsim check -L lib=dir dir/*`.
-            let t0 = std::time::Instant::now();
-            let mgr = compile_group(&sub, &files);
-            eprintln!(
-                "corpus: group {sub}: {} files in {:.1}s",
-                files.len(),
-                t0.elapsed().as_secs_f32()
-            );
-            checked += files.len();
-            // rustc-style: every error line carries a stable `error[Exxxx]` code.
-            let rendered = mgr.diags().render_all(mgr.db());
-            if !mgr.diags().is_empty() {
-                with_diags += 1;
-                for line in rendered.lines().filter(|l| l.starts_with("error")) {
-                    assert!(
-                        line.starts_with("error[") || line.starts_with("error:"),
-                        "{}: non-rustc-style line: {}",
-                        sub,
-                        line
-                    );
-                }
+        let groups = corpus_groups();
+        let group_count = groups.len();
+        // Groups are independent libraries in fresh managers, so they compile
+        // concurrently on a worker pool — each compile is single-threaded and
+        // CPU-bound, and the corpus has ~100+ groups. Each worker gets the
+        // big stack the sequential loop needed (parse+lower recursion depth).
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(group_count.max(1));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let checked = std::sync::atomic::AtomicUsize::new(0);
+        let with_diags = std::sync::atomic::AtomicUsize::new(0);
+        let actual = std::sync::Mutex::new(HashMap::new());
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                std::thread::Builder::new()
+                    .stack_size(512 * 1024 * 1024)
+                    .spawn_scoped(s, || {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if i >= group_count {
+                                break;
+                            }
+                            let (sub, files) = &groups[i];
+                            // One library compile per group, like
+                            // `hdlsim check -L lib=dir dir/*`.
+                            let t0 = std::time::Instant::now();
+                            let mgr = compile_group(sub, files);
+                            eprintln!(
+                                "corpus: group {sub}: {} files in {:.1}s",
+                                files.len(),
+                                t0.elapsed().as_secs_f32()
+                            );
+                            checked.fetch_add(files.len(), std::sync::atomic::Ordering::SeqCst);
+                            // rustc-style: every error line carries a stable
+                            // `error[Exxxx]` code.
+                            let rendered = mgr.diags().render_all(mgr.db());
+                            if !mgr.diags().is_empty() {
+                                with_diags.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                for line in rendered.lines().filter(|l| l.starts_with("error")) {
+                                    assert!(
+                                        line.starts_with("error[") || line.starts_with("error:"),
+                                        "{}: non-rustc-style line: {}",
+                                        sub,
+                                        line
+                                    );
+                                }
+                            }
+                            let mut map = actual.lock().unwrap();
+                            for (rel, status) in statuses_from(&mgr, files) {
+                                map.insert(rel, status.to_string());
+                            }
+                        }
+                    })
+                    .expect("spawn corpus worker");
             }
-            for (rel, status) in statuses_from(&mgr, &files) {
-                actual.insert(rel, status.to_string());
-            }
-        }
+        });
+        let actual = actual.into_inner().unwrap();
+        let checked = checked.load(std::sync::atomic::Ordering::SeqCst);
+        let with_diags = with_diags.load(std::sync::atomic::Ordering::SeqCst);
         // Sanity: the corpus is real code, so at least some files should produce
         // diagnostics for constructs outside the current subset (no panics either way).
         eprintln!(
