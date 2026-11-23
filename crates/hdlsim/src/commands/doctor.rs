@@ -4,7 +4,7 @@
 
 use super::{parse_with, Command, CommonArgs};
 use clap::Parser;
-use hdl_lib::doctor::{cache_from_env, checks, Status};
+use hdl_lib::doctor::{cache_setting, checks, Status};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -31,6 +31,7 @@ impl Command for Doctor {
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
+        let ro = crate::commands::run_options();
         let config = match &opts.config {
             Some(c) => Some(c.clone()),
             None => {
@@ -42,7 +43,7 @@ impl Command for Doctor {
             config.as_deref(),
             &opts.libs,
             &opts.incdirs,
-            cache_from_env(),
+            cache_setting(ro.no_cache, ro.cache_dir.clone()),
         );
         let mut fails = 0usize;
         let mut warns = 0usize;

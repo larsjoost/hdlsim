@@ -38,7 +38,7 @@ fn main() {
     log::set_max_level(log::LevelFilter::Info);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (args, color) = hdlsim::commands::apply_color_args(&args);
+    let (args, color) = hdlsim::commands::apply_global_args(&args);
     if let Some(mode) = color {
         hdl_syntax::diagnostic::set_color_mode(mode);
     }
