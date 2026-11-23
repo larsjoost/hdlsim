@@ -2661,12 +2661,18 @@ impl<'a> Lower<'a> {
                         .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
                         .cloned()
                 });
-            // Generic *type* parameter: `type ExpectedType;` — register an
-            // opaque placeholder so uses of the name resolve.
-            if dk
+            // Generic *type* parameter (box): `type ExpectedType;` or the
+            // `T : type` form (the parser reads the `type` keyword as the
+            // type mark) — register an opaque placeholder so uses of the
+            // name resolve.
+            let is_box = dk
                 .iter()
                 .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "type")
-            {
+                || after
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map_or(false, |k| self.kw(k) == "type");
+            if is_box {
                 for n in &names {
                     self.types.insert(n.to_ascii_lowercase(), TypeInfo::Scalar);
                 }
@@ -4021,9 +4027,19 @@ impl<'a> Lower<'a> {
         else {
             return;
         };
-        let Some(target) = kids[is_pos + 1..].iter().find(|k| is_expr_node(k.kind())) else {
+        let Some(target) = kids[is_pos + 1..]
+            .iter()
+            .find(|k| is_expr_node(k.kind()) || k.kind() == SyntaxKind::ExtName)
+        else {
             return;
         };
+        // External-name alias: `alias a is << signal ^.dut.s : t >>;` (also
+        // with an absolute `.dut.s` path). The hierarchical target is not
+        // simulated — register a placeholder so uses of the alias resolve.
+        if target.kind() == SyntaxKind::ExtName {
+            self.aliases.insert(name.clone(), Expr::Lit(Value::x(1)));
+            return;
+        }
         // Type alias: `alias ptr_t is integer_vector_ptr_t;` registers the
         // alias name as a type.
         let tname = self.kw(target);
@@ -5703,6 +5719,12 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `unaffected` waveform element (a bare keyword child of the assignment
+    /// statement, not an expression node).
+    fn is_unaffected_val(&self, n: &SyntaxNode) -> bool {
+        n.kind() == SyntaxKind::Ident && self.kw(n) == "unaffected"
+    }
+
     /// One waveform element: `expr [after t] [when c]`.
     fn waveform_elems(&self, kids: &[SyntaxNode], start: usize) -> Vec<WaveElem> {
         // Waveform elements: `expr [after t] [when c]`, comma-separated, or the
@@ -5741,6 +5763,17 @@ impl<'a> Lower<'a> {
                     } else {
                         i += 1;
                     }
+                }
+                "unaffected" if k.kind() == SyntaxKind::Ident => {
+                    if let Some(c) = cur.take() {
+                        elems.push(c);
+                    }
+                    cur = Some(WaveElem {
+                        val: k.clone(),
+                        delay: None,
+                        cond: None,
+                    });
+                    i += 1;
                 }
                 _ if is_expr_node(k.kind()) => {
                     if let Some(c) = cur.take() {
@@ -5787,6 +5820,10 @@ impl<'a> Lower<'a> {
             let mut stmts = Vec::new();
             let mut rhs_sigs: Vec<SigId> = Vec::new();
             for e in &elems {
+                // `unaffected` element: schedules no transaction.
+                if self.is_unaffected_val(&e.val) {
+                    continue;
+                }
                 let mut val = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
                 if let Some(c) = &e.cond {
                     // `v after t when c` — fold the condition into the value.
@@ -5819,6 +5856,9 @@ impl<'a> Lower<'a> {
                     rhs: val,
                     delay: Expr::Lit(Value::from_u64(64, t_fs)),
                 });
+            }
+            if stmts.is_empty() {
+                return None; // every element `unaffected`: no assignment
             }
             let body = if stmts.len() == 1 {
                 stmts.pop().unwrap()
@@ -5867,7 +5907,13 @@ impl<'a> Lower<'a> {
             // Conditional waveform → nested ternary, first true condition wins.
             let mut rhs: Option<Expr> = None;
             for e in elems.iter().rev() {
-                let v = self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone());
+                // A trailing `else unaffected` keeps the current value:
+                // lower it as a self-assignment (no event).
+                let v = if self.is_unaffected_val(&e.val) {
+                    lhs.clone()
+                } else {
+                    self.lower_rhs(&kids[lhs_pos], &e.val, &self.consts.clone())
+                };
                 rhs = Some(match (&e.cond, rhs) {
                     (Some(c), Some(r)) => Expr::Cond {
                         c: Box::new(self.lower_expr(c, &self.consts.clone())),
@@ -5884,7 +5930,12 @@ impl<'a> Lower<'a> {
             }
             return Some(ConcOut::Assign(AssignIr { lhs, rhs: rhs? }));
         }
-        // Plain waveform: the last element at t=0 wins.
+        // Plain waveform: the last element at t=0 wins (`unaffected`
+        // elements add no transaction and are dropped).
+        let elems: Vec<WaveElem> = elems
+            .into_iter()
+            .filter(|e| !self.is_unaffected_val(&e.val))
+            .collect();
         let rhs = self.lower_rhs(&kids[lhs_pos], &elems.last()?.val, &self.consts.clone());
         Some(ConcOut::Assign(AssignIr { lhs, rhs }))
     }
@@ -6204,7 +6255,12 @@ impl<'a> Lower<'a> {
                     // delay (VHDL waveform delays are relative to the statement
                     // execution, not cumulative) — the process is not suspended.
                     if let (Some(l), Some(op)) = (lhs, op_pos) {
-                        let elems = self.waveform_elems(&kids, op + 1);
+                        // `unaffected` elements schedule no transaction.
+                        let elems: Vec<WaveElem> = self
+                            .waveform_elems(&kids, op + 1)
+                            .into_iter()
+                            .filter(|e| !self.is_unaffected_val(&e.val))
+                            .collect();
                         if !elems.is_empty() {
                             let lhs_e = self.lower_expr(l, &self.consts.clone());
                             let mut stmts = Vec::new();
@@ -7737,6 +7793,10 @@ impl<'a> Lower<'a> {
                 }
             }
             SyntaxKind::Aggregate => self.lower_aggregate(e, env, 32),
+            // VHDL-2008 external name in expression position
+            // (`q <= << signal dut.s : std_logic >>;`): the hierarchical
+            // target is not simulated — placeholder, no diagnostic.
+            SyntaxKind::ExtName => Expr::Lit(Value::x(1)),
             _ => {
                 self.err(e.span(), format!("unsupported expression {:?}", e.kind()));
                 Expr::Lit(Value::x(1))

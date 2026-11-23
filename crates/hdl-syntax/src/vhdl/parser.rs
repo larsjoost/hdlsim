@@ -2751,6 +2751,14 @@ impl<'a> Parser<'a> {
         if self.at_kw("force") || self.at_kw("release") {
             self.bump();
         }
+        // VHDL-2008 `unaffected` waveform element: schedules no transaction.
+        // Bump the keyword as a bare child of the assignment; the lowerer
+        // sees no value expression for the element and skips it.
+        if self.at_kw("unaffected") {
+            self.bump();
+            self.in_waveform -= 1;
+            return;
+        }
         self.parse_expression();
         self.in_waveform -= 1;
     }
@@ -3682,17 +3690,21 @@ begin
         end loop;
         force q <= d;
         release q;
+        r <= unaffected;
         case? op is
             when 0 to 3 | 7 => r <= a;
             when others => r <= b;
         end case;
     end process;
+    o <= a when s = '1' else unaffected;
 end;
 "#);
         assert_eq!(sexp.matches("(ExitStmt").count(), 2, "{}", sexp);
-        // force, release, and the two case-alternative assigns.
-        assert_eq!(sexp.matches("(SeqAssign").count(), 4, "{}", sexp);
+        // force, release, `unaffected`, and the two case-alternative assigns.
+        assert_eq!(sexp.matches("(SeqAssign").count(), 5, "{}", sexp);
         assert!(sexp.contains("(Case "), "{}", sexp);
+        // Concurrent conditional waveform with a trailing `else unaffected`.
+        assert!(sexp.contains("(ConcAssign"), "{}", sexp);
     }
 
     #[test]
