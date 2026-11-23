@@ -1311,6 +1311,10 @@ struct Lower<'a> {
     /// different signatures) coexist as candidates; `register_func` keeps
     /// the map invariant and const-eval picks by argument fit.
     funcs: HashMap<String, Vec<FuncIr>>,
+    /// Packages already bulk-merged (`use lib.pkg.all`) into this scope —
+    /// merging is transitive, so without this the same package closure is
+    /// re-cloned (types/consts/functions) once per use clause per file.
+    merged_all: std::collections::HashSet<String>,
     /// Const-eval fallback: function bodies from every known package
     /// (`self.pkgs`), merged regardless of use clauses. A use clause may
     /// merge only one function of a package, yet its body may legally call a
@@ -1474,6 +1478,7 @@ impl<'a> Lower<'a> {
             consts: Rc::new(HashMap::new()),
             const_types: HashMap::new(),
             funcs: HashMap::new(),
+            merged_all: std::collections::HashSet::new(),
             funcs_ce: HashMap::new(),
             types: HashMap::new(),
             type_widths: HashMap::new(),
@@ -2942,8 +2947,9 @@ impl<'a> Lower<'a> {
     }
 
     fn merge_package(&mut self, p: &PackageIr, item: Option<&str>, force: bool) {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = std::mem::take(&mut self.merged_all);
         self.merge_package_rec(p, item, force, &mut visited);
+        self.merged_all = visited;
     }
 
     fn merge_package_rec(
@@ -2953,6 +2959,12 @@ impl<'a> Lower<'a> {
         force: bool,
         visited: &mut std::collections::HashSet<String>,
     ) {
+        // Bulk-merge (`use lib.pkg.all`) of a package already merged into this
+        // scope is idempotent — skip it (the transitive closure was merged
+        // with it). Item-specific and forced merges always run.
+        if item.is_none() && !force && visited.contains(&p.name.to_ascii_lowercase()) {
+            return;
+        }
         for (tname, tinfo) in &p.types {
             if item.is_none_or(|i| i == tname) {
                 if force {
