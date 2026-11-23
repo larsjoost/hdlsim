@@ -302,10 +302,10 @@ pub struct Simulator {
     /// Wall-clock budget for the whole run (`--max-wall`), checked in pump.
     wall_budget: Option<std::time::Duration>,
     /// First pump entry — anchors wall-budget and heartbeat measurements.
-    wall_start: Option<std::time::Instant>,
+    wall_start: std::cell::Cell<Option<std::time::Instant>>,
     /// Last pump-visible time advance / heartbeat print (heartbeat only).
     last_advance: Option<std::time::Instant>,
-    last_heartbeat: Option<std::time::Instant>,
+    last_heartbeat: std::cell::Cell<Option<std::time::Instant>>,
     /// Set when the run ended via signal or wall budget: (reason, exit code).
     interrupt_info: Option<(String, i32)>,
     /// Most recently dispatched process — the between-events fallback for
@@ -333,6 +333,10 @@ pub struct Simulator {
     /// `delta_count`), shown in watch lines so the settling sequence of a
     /// single timestamp is readable.
     delta_no: u64,
+    /// Interpreter statements executed by the current function activation —
+    /// drives the FnRunner heartbeat/stop checks (loops inside function
+    /// bodies run entirely inside FnRunner and touch no other budget).
+    fn_steps: std::cell::Cell<u64>,
 }
 
 impl Simulator {
@@ -497,9 +501,9 @@ impl Simulator {
             interrupt_flag: None,
             interrupt_rc: 130,
             wall_budget: None,
-            wall_start: None,
+            wall_start: std::cell::Cell::new(None),
             last_advance: None,
-            last_heartbeat: None,
+            last_heartbeat: std::cell::Cell::new(None),
             interrupt_info: None,
             last_proc: None,
             fix_sweep: 0,
@@ -510,6 +514,7 @@ impl Simulator {
             watch_max_lines: 0,
             watch_lines: 0,
             delta_no: 0,
+            fn_steps: std::cell::Cell::new(0),
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -650,7 +655,11 @@ impl Simulator {
             }
         }
         if let Some(budget) = self.wall_budget {
-            if self.wall_start.map_or(false, |s| s.elapsed() >= budget) {
+            if self
+                .wall_start
+                .get()
+                .map_or(false, |s| s.elapsed() >= budget)
+            {
                 return true;
             }
         }
@@ -1103,17 +1112,31 @@ impl Simulator {
     /// time advance (`HDLSIM_PROGRESS_SEC=<seconds>`, 0/absent = off). Shows
     /// the same location as the interrupt dump, so a hung or slow run
     /// announces where it is instead of silently burning CPU.
-    fn maybe_heartbeat(&mut self) {
+    /// Wall-clock origin: the first caller initializes it (sim start). Reads
+    /// go through this helper because `Cell::get()` returns a *copy* —
+    /// `get_or_insert` on the copy is silently discarded, which once broke
+    /// `--max-wall` (the budget re-seeded a fresh `Instant` every check and
+    /// never elapsed) and silenced the heartbeat.
+    fn wall_origin(&self) -> std::time::Instant {
+        if self.wall_start.get().is_none() {
+            self.wall_start.set(Some(std::time::Instant::now()));
+        }
+        self.wall_start
+            .get()
+            .unwrap_or_else(std::time::Instant::now)
+    }
+
+    fn maybe_heartbeat(&self) {
         let interval = progress_interval();
         if interval.is_zero() {
             return;
         }
         let now = std::time::Instant::now();
-        let start = *self.wall_start.get_or_insert(now);
+        let start = self.wall_origin();
         if now.duration_since(start) < interval {
             return;
         }
-        let report = self.last_heartbeat.unwrap_or(start);
+        let report = self.last_heartbeat.get().unwrap_or(start);
         let advance = self.last_advance.unwrap_or(start);
         if now.duration_since(report) >= interval && now.duration_since(advance) >= interval {
             eprintln!(
@@ -1121,7 +1144,7 @@ impl Simulator {
                 now.duration_since(advance).as_secs_f64(),
                 self.where_am_i()
             );
-            self.last_heartbeat = Some(now);
+            self.last_heartbeat.set(Some(now));
         }
     }
 
@@ -1165,7 +1188,7 @@ impl Simulator {
                 break;
             }
             if let Some(budget) = self.wall_budget {
-                let start = *self.wall_start.get_or_insert_with(std::time::Instant::now);
+                let start = self.wall_origin();
                 if start.elapsed() >= budget {
                     // 124: the exit code GNU timeout uses when it kills.
                     self.stop_for_interrupt(
@@ -1223,12 +1246,18 @@ impl Simulator {
                     self.set_sig(sig, v);
                 }
                 let exprs = std::mem::take(&mut self.nba_exprs);
-                for (lhs, v, drv) in exprs {
+                for (n, (lhs, v, drv)) in exprs.into_iter().enumerate() {
                     if self.stop_requested() {
                         break;
                     }
                     self.cur_proc = drv;
                     self.assign_to(&lhs, v, None);
+                    // A large scheduled batch can run for minutes; report
+                    // progress from inside it (the pump-top checks only run
+                    // between batches).
+                    if n % 4096 == 4095 {
+                        self.maybe_heartbeat();
+                    }
                 }
                 self.cur_proc = None;
                 continue;
@@ -1385,6 +1414,7 @@ impl Simulator {
     fn run_proc(&mut self, pid: u32) {
         self.proc_steps = 0; // per-activation budget (see exec_frames)
         self.fn_calls.set(0); // per-activation function-call budget
+        self.fn_steps.set(0); // per-activation statement budget (see FnRunner::exec)
         self.last_proc = Some(pid);
         self.emit(SimEvent::ProcActive {
             proc: pid,
@@ -3082,6 +3112,10 @@ impl Simulator {
                             }
                             let old = self.mems[sig][a as usize].clone();
                             let mut cur = old.clone();
+                            // Same clamp as the signal arm: dynamic slice
+                            // bounds must not wrap the bit loop.
+                            let msb = msb.min(cur.bits.len().saturating_sub(1));
+                            let lsb = lsb.min(msb);
                             let v = v.resize(msb - lsb + 1);
                             for j in 0..=(msb - lsb) {
                                 cur.set_bit(lsb + j, v.bit(j));
@@ -3097,6 +3131,14 @@ impl Simulator {
                     Expr::Sig(s) => *s as FlatSigId,
                     _ => return false,
                 };
+                // Mirror the read path (`Value::slice`): clamp a reversed or
+                // oversized dynamic slice instead of letting `msb - lsb`
+                // wrap. A reversed dynamic bound (`sig(0 downto j)` with j>0)
+                // underflowed to usize::MAX here and the bit loop spun
+                // forever inside one call — unreachable by any pump-level
+                // interrupt check.
+                let msb = msb.min(self.vals[sig as usize].bits.len().saturating_sub(1));
+                let lsb = lsb.min(msb);
                 let mut cur = self.vals[sig as usize].clone();
                 let v = v.resize(msb - lsb + 1);
                 for j in 0..=(msb - lsb) {
@@ -4304,6 +4346,23 @@ struct FnRunner<'a> {
 
 impl<'a> FnRunner<'a> {
     fn exec(&mut self, stmt: &Stmt) {
+        // Per-activation statement budget/heartbeat: a loop inside a
+        // function body runs entirely inside FnRunner — without this
+        // counter nothing bounds it or reports progress (the For-loop
+        // guards only check the stop flag, and a loop whose body makes
+        // no calls never touches the call budgets either).
+        let steps = self.sim.fn_steps.get() + 1;
+        self.sim.fn_steps.set(steps);
+        if steps % 4096 == 0 {
+            self.sim.maybe_heartbeat();
+            if self.sim.stop_requested() {
+                // Abort the function: the enclosing run_proc/run_func
+                // unwinds, and the pump-level check reports the interrupt
+                // with the live function chain.
+                self.returned = true;
+                return;
+            }
+        }
         match stmt {
             Stmt::Spanned { inner, .. } => self.exec(inner),
             Stmt::Return(e) => {
@@ -4431,8 +4490,11 @@ impl<'a> FnRunner<'a> {
                     }
                     self.exec(step);
                     guard += 1;
-                    if guard % 1024 == 0 && self.sim.stop_requested() {
-                        break;
+                    if guard % 1024 == 0 {
+                        self.sim.maybe_heartbeat();
+                        if self.sim.stop_requested() {
+                            break;
+                        }
                     }
                     if guard > 1_000_000 {
                         break;
@@ -4584,8 +4646,11 @@ impl<'a> ProcRunner<'a> {
                     }
                     self.exec(step);
                     guard += 1;
-                    if guard % 1024 == 0 && self.sim.stop_requested() {
-                        break;
+                    if guard % 1024 == 0 {
+                        self.sim.maybe_heartbeat();
+                        if self.sim.stop_requested() {
+                            break;
+                        }
                     }
                     if guard > 1_000_000 {
                         break;

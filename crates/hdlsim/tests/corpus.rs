@@ -168,6 +168,10 @@ fn osvvm_repo_lib(repo: &str) -> Option<&'static str> {
         "ethernet" => "osvvm_ethernet",
         "dpram" => "osvvm_dpram",
         "spacewiremonitor" => "osvvm_spacewire",
+        // The SpaceWire Light RTL core (freecores/spacewire_light, LGPL-2.1
+        // for the GRLIB-free parts) — the DUT library of the SpaceWireMonitor
+        // testbench.
+        "spacewire-light" => "spacewire_light",
         _ => return None,
     })
 }
@@ -244,9 +248,6 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
                 }
                 if let Some(lib) = osvvm_repo_lib(repo) {
                     mgr.add_library_dir(lib, sd);
-                }
-                if repo == "spacewiremonitor" {
-                    mgr.add_library_dir("spacewire_light", sd);
                 }
             }
             mgr.add_library_dir("osvvm", &corpus_dir().join("vhdl"));
