@@ -2923,6 +2923,10 @@ impl Simulator {
                             }
                             let old = self.mems[sig][a as usize].clone();
                             let mut cur = old.clone();
+                            // Same clamp as the signal arm: dynamic slice
+                            // bounds must not wrap the bit loop.
+                            let msb = msb.min(cur.bits.len().saturating_sub(1));
+                            let lsb = lsb.min(msb);
                             let v = v.resize(msb - lsb + 1);
                             for j in 0..=(msb - lsb) {
                                 cur.set_bit(lsb + j, v.bit(j));
@@ -2938,6 +2942,14 @@ impl Simulator {
                     Expr::Sig(s) => *s as FlatSigId,
                     _ => return false,
                 };
+                // Mirror the read path (`Value::slice`): clamp a reversed or
+                // oversized dynamic slice instead of letting `msb - lsb`
+                // wrap. A reversed dynamic bound (`sig(0 downto j)` with j>0)
+                // underflowed to usize::MAX here and the bit loop spun
+                // forever inside one call — unreachable by any pump-level
+                // interrupt check.
+                let msb = msb.min(self.vals[sig as usize].bits.len().saturating_sub(1));
+                let lsb = lsb.min(msb);
                 let mut cur = self.vals[sig as usize].clone();
                 let v = v.resize(msb - lsb + 1);
                 for j in 0..=(msb - lsb) {
