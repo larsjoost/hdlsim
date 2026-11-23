@@ -697,12 +697,29 @@ impl LibraryManager {
                 .db
                 .add_file(path.display().to_string(), text.to_string())
                 .map_err(|e| e.to_string())?;
-            let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
+            // Parse through the persistent cache when enabled, so the
+            // compile pass below hits it instead of re-parsing the file.
+            let (root, _parse_diags, _) =
+                match cached_parse(self.cache.as_ref(), path, id, text, &mut self.cache_hits) {
+                    Some(t) => t,
+                    None => {
+                        let parsed = hdl_syntax::vhdl::parser::parse_file(id, self.db.file(id));
+                        store_parse(
+                            self.cache.as_ref(),
+                            path,
+                            text,
+                            &parsed.root,
+                            &parsed.diags,
+                            None,
+                        );
+                        (parsed.root, parsed.diags, None)
+                    }
+                };
             // `use lib.all;` (library-wide) pulls in every unit of that library.
             // `work` is skipped: it usually indexes the whole tree recursively,
             // and bulk-pulling every unit destabilizes compile order when unit
             // names collide across files (units still resolve by name on demand).
-            let ctx_libs = hdl_ir::vhdl_lower::context_libraries(&self.db, &parsed.root);
+            let ctx_libs = hdl_ir::vhdl_lower::context_libraries(&self.db, &root);
             for lib in &ctx_libs {
                 if lib == "work" {
                     continue;
@@ -728,8 +745,8 @@ impl LibraryManager {
             // Units the file declares itself are skipped (pass 0 lowers them,
             // and resolving them externally could pull in a same-named unit
             // from another file).
-            let inst_units = hdl_ir::vhdl_lower::package_inst_target_units(&self.db, &parsed.root);
-            let local_units = hdl_ir::vhdl_lower::declared_unit_names(&self.db, &parsed.root);
+            let inst_units = hdl_ir::vhdl_lower::package_inst_target_units(&self.db, &root);
+            let local_units = hdl_ir::vhdl_lower::declared_unit_names(&self.db, &root);
             for unit in &inst_units {
                 if local_units.contains(unit) {
                     continue;
@@ -740,7 +757,7 @@ impl LibraryManager {
                     }
                 }
             }
-            for (unit, lib) in hdl_ir::vhdl_lower::context_unit_libs(&self.db, &parsed.root) {
+            for (unit, lib) in hdl_ir::vhdl_lower::context_unit_libs(&self.db, &root) {
                 if inst_units.contains(&unit) {
                     continue;
                 }
@@ -1836,7 +1853,10 @@ mod tests {
         m1.compile_file(&mut d1, &dir.join("counter.v")).unwrap();
         m1.compile_file(&mut d1, &dir.join("tb.vhd")).unwrap();
         assert!(d1.modules.iter().any(|m| m.name == "counter"));
-        assert_eq!(m1.cache_hits(), 0);
+        // Cold cache: the VHDL file is parsed once by the context-clause
+        // pre-pass (which stores it) and its compile pass then hits the
+        // cache; the Verilog file has no pre-pass and parses fresh.
+        assert_eq!(m1.cache_hits(), 1);
         assert!(!m1.diags().has_errors());
 
         // Second manager (warm cache): same sources, parse skipped.
@@ -1845,7 +1865,9 @@ mod tests {
         let mut d2 = Design::default();
         m2.compile_file(&mut d2, &dir.join("counter.v")).unwrap();
         m2.compile_file(&mut d2, &dir.join("tb.vhd")).unwrap();
-        assert_eq!(m2.cache_hits(), 2, "both files should hit the cache");
+        // Warm cache: counter.v's compile pass hits once; tb.vhd's
+        // context-clause pre-pass and its compile pass both hit.
+        assert_eq!(m2.cache_hits(), 3, "both files should hit the cache");
         assert!(d2.modules.iter().any(|m| m.name == "counter"));
         assert!(!m2.diags().has_errors());
 

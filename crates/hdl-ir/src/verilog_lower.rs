@@ -3503,7 +3503,8 @@ impl<'a> Lower<'a> {
 
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
-    ce_impl(e, env, &HashMap::new(), None)
+    let no_funcs: HashMap<String, Vec<FuncIr>> = HashMap::new();
+    ce_impl(e, env, &no_funcs, &no_funcs, None)
 }
 
 /// Like [`const_eval`], but user function bodies (`funcs`, e.g. VHDL package
@@ -3514,7 +3515,23 @@ pub fn const_eval_f(
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
 ) -> Option<Value> {
-    ce_impl(e, env, funcs, None)
+    let no_fallback: HashMap<String, Vec<FuncIr>> = HashMap::new();
+    ce_impl(e, env, funcs, &no_fallback, None)
+}
+
+/// Like [`const_eval_f`], but a call no visible function (`funcs`) provides
+/// falls back to `pkg_funcs` — the function bodies of all known packages.
+/// VHDL visibility limits the directly merged table (`use p.f;` merges only
+/// `f`), yet `f`'s body may legally call a package-internal sibling (visible
+/// at the body's declaration site), so nested const-eval needs the wider
+/// table to avoid poisoning the whole constant chain with X.
+pub fn const_eval_f_with_pkgs(
+    e: &Expr,
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
+    pkg_funcs: &HashMap<String, Vec<FuncIr>>,
+) -> Option<Value> {
+    ce_impl(e, env, funcs, pkg_funcs, None)
 }
 
 thread_local! {
@@ -3555,13 +3572,14 @@ fn ce_impl(
     e: &Expr,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<FuncIr>>,
     mut slots: Option<&mut Vec<Value>>,
 ) -> Option<Value> {
     match e {
         Expr::Rising(_) | Expr::Falling(_) | Expr::Prev(_) => None,
         // `to_integer(x)` in a constant initializer.
         Expr::ToInt(e) => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             // Realness is a value property for slot reads: a formal/variable
             // slot holding a real (f64 bits, `real: true`) must round as a
             // number, not truncate its bit pattern to an integer (a w64 real
@@ -3575,7 +3593,7 @@ fn ce_impl(
         }
         // `T'image(x)` in a constant initializer (e.g. integer'image(42)).
         Expr::ToString(e) => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             let s = if ce_real(e) || v.real {
                 ce_f64(&v).map(|f| format!("{}", f))?
             } else {
@@ -3595,8 +3613,8 @@ fn ce_impl(
             None => None,
         },
         Expr::Bin { op, l, r } => {
-            let lv = ce_impl(l, env, funcs, slots.as_deref_mut())?;
-            let rv = ce_impl(r, env, funcs, slots.as_deref_mut())?;
+            let lv = ce_impl(l, env, funcs, extras, slots.as_deref_mut())?;
+            let rv = ce_impl(r, env, funcs, extras, slots.as_deref_mut())?;
             // Realness is a value property for slot reads (see ToInt): a
             // `x * y` of two slot-held reals must multiply numbers, not the
             // f64 bit patterns.
@@ -3631,7 +3649,7 @@ fn ce_impl(
             }
         }
         Expr::Un { op, e } => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             if ce_real(e) || v.real {
                 return match (op, ce_f64(&v)) {
                     (UnOp::Neg, Some(x)) => Some(Value::from_f64(-x)),
@@ -3643,37 +3661,37 @@ fn ce_impl(
             Some(v.unop(*op))
         }
         Expr::Cond { c, t, e } => {
-            if ce_impl(c, env, funcs, slots.as_deref_mut())?.to_u64()? != 0 {
-                ce_impl(t, env, funcs, slots.as_deref_mut())
+            if ce_impl(c, env, funcs, extras, slots.as_deref_mut())?.to_u64()? != 0 {
+                ce_impl(t, env, funcs, extras, slots.as_deref_mut())
             } else {
-                ce_impl(e, env, funcs, slots.as_deref_mut())
+                ce_impl(e, env, funcs, extras, slots.as_deref_mut())
             }
         }
         Expr::Concat(parts) => {
             let mut vals = Vec::with_capacity(parts.len());
             for p in parts {
-                vals.push(ce_impl(p, env, funcs, slots.as_deref_mut())?);
+                vals.push(ce_impl(p, env, funcs, extras, slots.as_deref_mut())?);
             }
             Some(Value::concat(&vals))
         }
         Expr::Replicate { count, e } => {
-            let n = ce_impl(count, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let n = ce_impl(count, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             Some(Value::concat(&vec![v; n]))
         }
         Expr::Sel { e, msb, lsb } => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
-            let msb = ce_impl(msb, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
-            let lsb = ce_impl(lsb, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
+            let msb = ce_impl(msb, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
+            let lsb = ce_impl(lsb, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
             Some(v.slice(msb, lsb))
         }
         Expr::Idx { e, i } => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
-            let i = ce_impl(i, env, funcs, slots.as_deref_mut())?.to_u64()? as usize;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
+            let i = ce_impl(i, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
             Some(Value::from_bit(v.bit(i)))
         }
         Expr::Resize { e, width, signed } => {
-            let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             if *signed && v.width() < *width {
                 let mut bits = vec![if v.bit(v.width() - 1) == V1 { V1 } else { V0 }; *width];
                 for i in 0..v.width() {
@@ -3684,20 +3702,20 @@ fn ce_impl(
                 Some(v.resize(*width))
             }
         }
-        Expr::Signed(e) => ce_impl(e, env, funcs, slots.as_deref_mut()),
+        Expr::Signed(e) => ce_impl(e, env, funcs, extras, slots.as_deref_mut()),
         Expr::SigAttr { .. } => None, // width only known after port connection
         Expr::Call { name, args } => {
             // System functions usable in constant expressions.
             // lower_expr strips the `$` from system tasks, so both spellings.
             if (name == "$clog2" || name == "clog2") && args.len() == 1 {
-                let v = ce_impl(&args[0], env, funcs, slots.as_deref_mut())?;
+                let v = ce_impl(&args[0], env, funcs, extras, slots.as_deref_mut())?;
                 let n = v.to_u64()?;
                 return Some(Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64));
             }
             // VHDL `type'val(x)` / `type'pos(x)` — numeric identity (the 'val
             // result width is applied by a Resize at the lower site).
             if (name == "$val" || name == "$pos") && args.len() == 1 {
-                return ce_impl(&args[0], env, funcs, slots.as_deref_mut());
+                return ce_impl(&args[0], env, funcs, extras, slots.as_deref_mut());
             }
             // Overload resolution: same-name candidates may exist (VHDL
             // overloaded subprograms, e.g. `elog2(integer)` vs
@@ -3707,7 +3725,13 @@ fn ce_impl(
             // unconstrained/unknown formal width of 0 or 1). Without a
             // fitting candidate, the first same-arity one runs — matching
             // the simulator's runtime pick.
-            let cands = funcs.get(&name.to_ascii_lowercase())?;
+            // Directly visible candidates first; `extras` (all package
+            // functions) only fills a total miss — see
+            // `const_eval_f_with_pkgs`.
+            let cands = match funcs.get(&name.to_ascii_lowercase()) {
+                Some(c) => c,
+                None => extras.get(&name.to_ascii_lowercase())?,
+            };
             // Interface-only stubs must never win a width tie against a real
             // body (a stub const-evals to X, which loops on forever — see
             // the matching ordering in the simulator's dispatch).
@@ -3721,7 +3745,7 @@ fn ce_impl(
             let cands = &ordered;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
-                argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
+                argv.push(ce_impl(a, env, funcs, extras, slots.as_deref_mut())?);
             }
             // A call may omit trailing actuals whose formals carry interface
             // defaults (`w : natural := 8`); the real body qualifies, the
@@ -3775,7 +3799,7 @@ fn ce_impl(
                 return None; // recursive const-eval: not constant
             }
             CE_DEPTH.with(|d| d.set(depth + 1));
-            let r = const_eval_func(f, &argv, env, funcs);
+            let r = const_eval_func(f, &argv, env, funcs, extras);
             CE_DEPTH.with(|d| d.set(depth));
             if super::debug::TRACE_CE.load(std::sync::atomic::Ordering::Relaxed)
                 && (name.starts_with("get_")
@@ -3802,6 +3826,12 @@ enum CeFlow {
     Continue,
     Return,
     Abort,
+    /// `break` / VHDL `exit`: ends the innermost enclosing loop; consumed by
+    /// the loop, which resumes normal flow after itself.
+    LoopBreak,
+    /// `continue` / VHDL `next`: skips to the loop's step; consumed by the
+    /// loop, which then runs the step and the next iteration.
+    LoopNext,
 }
 
 /// Const-evaluate a user function body: slot 0 is the return value, then
@@ -3812,6 +3842,7 @@ fn const_eval_func(
     argv: &[Value],
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<FuncIr>>,
 ) -> Option<Value> {
     let mut slots: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
     slots.extend(argv.iter().cloned());
@@ -3821,8 +3852,12 @@ fn const_eval_func(
             .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
     );
     let mut flow = CeFlow::Continue;
-    ce_stmt(&f.body, &mut slots, env, funcs, &mut flow);
-    if flow == CeFlow::Abort {
+    ce_stmt(&f.body, &mut slots, env, funcs, extras, &mut flow);
+    if flow == CeFlow::Abort
+        // A `break`/`continue` that outlives every loop has no value.
+        || flow == CeFlow::LoopBreak
+        || flow == CeFlow::LoopNext
+    {
         return None;
     }
     Some(slots.into_iter().next().unwrap_or(Value::x(1)))
@@ -3833,18 +3868,19 @@ fn ce_stmt(
     slots: &mut Vec<Value>,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<FuncIr>>,
     flow: &mut CeFlow,
 ) {
     if *flow != CeFlow::Continue {
         return;
     }
-    let ev = |e: &Expr, slots: &mut Vec<Value>| ce_impl(e, env, funcs, Some(slots));
+    let ev = |e: &Expr, slots: &mut Vec<Value>| ce_impl(e, env, funcs, extras, Some(slots));
     match s {
         Stmt::Null => {}
-        Stmt::Spanned { inner, .. } => ce_stmt(inner, slots, env, funcs, flow),
+        Stmt::Spanned { inner, .. } => ce_stmt(inner, slots, env, funcs, extras, flow),
         Stmt::Block(ss) => {
             for x in ss {
-                ce_stmt(x, slots, env, funcs, flow);
+                ce_stmt(x, slots, env, funcs, extras, flow);
                 if *flow != CeFlow::Continue {
                     return;
                 }
@@ -3853,10 +3889,10 @@ fn ce_stmt(
         Stmt::If { cond, then, els } => match ev(cond, slots).and_then(|v| v.to_u64()) {
             Some(0) => {
                 if let Some(els) = els {
-                    ce_stmt(els, slots, env, funcs, flow);
+                    ce_stmt(els, slots, env, funcs, extras, flow);
                 }
             }
-            Some(_) => ce_stmt(then, slots, env, funcs, flow),
+            Some(_) => ce_stmt(then, slots, env, funcs, extras, flow),
             None => *flow = CeFlow::Abort,
         },
         Stmt::Assign { lhs, rhs, .. } => {
@@ -3929,13 +3965,15 @@ fn ce_stmt(
             }
             None => *flow = CeFlow::Abort,
         },
+        Stmt::Break => *flow = CeFlow::LoopBreak,
+        Stmt::Continue => *flow = CeFlow::LoopNext,
         Stmt::For {
             init,
             cond,
             step,
             body,
         } => {
-            ce_stmt(init, slots, env, funcs, flow);
+            ce_stmt(init, slots, env, funcs, extras, flow);
             let mut guard = 0u32;
             loop {
                 if *flow != CeFlow::Continue {
@@ -3943,11 +3981,20 @@ fn ce_stmt(
                 }
                 match ev(cond, slots).and_then(|v| v.to_u64()) {
                     Some(n) if n != 0 => {
-                        ce_stmt(body, slots, env, funcs, flow);
-                        if *flow != CeFlow::Continue {
-                            return;
+                        ce_stmt(body, slots, env, funcs, extras, flow);
+                        match *flow {
+                            // The innermost loop consumes break/continue so an
+                            // enclosing loop (or the function epilogue) sees
+                            // normal flow; Return/Abort still propagate.
+                            CeFlow::LoopBreak => {
+                                *flow = CeFlow::Continue;
+                                return;
+                            }
+                            CeFlow::LoopNext => *flow = CeFlow::Continue,
+                            CeFlow::Continue => {}
+                            CeFlow::Return | CeFlow::Abort => return,
                         }
-                        ce_stmt(step, slots, env, funcs, flow);
+                        ce_stmt(step, slots, env, funcs, extras, flow);
                         guard += 1;
                         if guard > 100_000 {
                             *flow = CeFlow::Abort;
@@ -3974,13 +4021,13 @@ fn ce_stmt(
             for (choices, body) in items {
                 for ch in choices {
                     if ev(ch, slots) == Some(v.clone()) {
-                        ce_stmt(body, slots, env, funcs, flow);
+                        ce_stmt(body, slots, env, funcs, extras, flow);
                         return;
                     }
                 }
             }
             if let Some(d) = default {
-                ce_stmt(d, slots, env, funcs, flow);
+                ce_stmt(d, slots, env, funcs, extras, flow);
             }
         }
         _ => *flow = CeFlow::Abort,
@@ -4199,5 +4246,72 @@ endmodule
         // (depth guard) rather than recurse until the stack overflows.
         let src = "module m;\nfunction automatic integer f(input integer x);\n  f = f(x) + 1;\nendfunction\nlocalparam integer P = f(1);\nendmodule\n";
         let (_m, _db, _diags) = lower_src(src); // returns at all = pass
+    }
+
+    #[test]
+    fn const_eval_function_loop_consumes_break_and_keeps_prior_value() {
+        // `break` inside a const-evaluated loop ends the loop; the value
+        // accumulated before the break is the function result. Used to
+        // abort the whole function (X-poisoning the localparam).
+        let src = "package ce_pkg;\n\
+                   function automatic integer sum_until(input integer limit);\n\
+                     integer i;\n\
+                     begin\n\
+                       sum_until = 0;\n\
+                       for (i = 0; i < limit; i = i + 1) begin\n\
+                         if (i == 3) break;\n\
+                         sum_until = sum_until + 1;\n\
+                       end\n\
+                     end\n\
+                   endfunction\n\
+                   endpackage\n\
+                   module m;\n\
+                   localparam integer P = ce_pkg::sum_until(10);\n\
+                   endmodule\n";
+        let (modules, _db, diags) = lower_src(src);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let p = modules[0]
+            .params
+            .iter()
+            .find(|p| p.name == "P")
+            .expect("localparam P lowered");
+        assert_eq!(p.default.to_u64(), Some(3), "{:?}", p.default);
+    }
+
+    #[test]
+    fn const_eval_function_loop_consumes_continue_and_runs_step() {
+        // `continue` inside a const-evaluated loop skips to the step, so the
+        // loop still advances. Used to abort the whole function.
+        let src = "package ce_pkg;\n\
+                   function automatic integer count_odd(input integer limit);\n\
+                     integer i;\n\
+                     begin\n\
+                       count_odd = 0;\n\
+                       for (i = 0; i < limit; i = i + 1) begin\n\
+                         if (i % 2 == 0) continue;\n\
+                         count_odd = count_odd + 1;\n\
+                       end\n\
+                     end\n\
+                   endfunction\n\
+                   endpackage\n\
+                   module m;\n\
+                   localparam integer P = ce_pkg::count_odd(10);\n\
+                   endmodule\n";
+        let (modules, _db, diags) = lower_src(src);
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let p = modules[0]
+            .params
+            .iter()
+            .find(|p| p.name == "P")
+            .expect("localparam P lowered");
+        assert_eq!(p.default.to_u64(), Some(5), "{:?}", p.default);
     }
 }
