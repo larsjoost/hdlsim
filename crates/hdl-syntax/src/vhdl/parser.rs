@@ -2745,6 +2745,12 @@ impl<'a> Parser<'a> {
     /// `when`/`else` belongs to the waveform, not to a conditional expression.
     fn parse_waveform_value(&mut self) {
         self.in_waveform += 1;
+        // VHDL-2008 force/release drive control: `s <= force '1';` /
+        // `s <= release '0';` (also per waveform element). For parse/lower
+        // purposes the value itself is the waveform element.
+        if self.at_kw("force") || self.at_kw("release") {
+            self.bump();
+        }
         self.parse_expression();
         self.in_waveform -= 1;
     }
