@@ -105,10 +105,8 @@ impl Command for Help {
         println!();
         println!("  Global flags (before or after the command):");
         println!("    --color auto|always|never   colorize errors/warnings (default: auto =");
-        println!(
-            "                                 color when stderr is a terminal; env HDLSIM_COLOR,"
-        );
-        println!("                                 NO_COLOR also apply)");
+        println!("                                 color when stderr is a terminal; NO_COLOR");
+        println!("                                 also applies)");
         println!("    --no-color                   disable color output");
         println!(
             "    --report \"msg\"             on failure, file a PUBLIC GitHub issue with a reproducer"
@@ -131,30 +129,16 @@ impl Command for Help {
         println!("                                 without a message)");
         println!();
         println!("  Environment variables:");
-        println!(
-            "    HDLSIM_TRACE=1              scheduler trace on stderr (park/wake/timeout lines)"
-        );
-        println!("    HDLSIM_PROGRESS_SEC=<s>     heartbeat for long compiles and simulations:");
-        println!(
-            "                                \"still running (N s without time advance) at …\""
-        );
-        println!(
-            "    HDLSIM_MAX_MEM_MB=<MiB>     stop with a diagnostic instead of the OS OOM-killer"
-        );
-        println!("    HDLSIM_MAX_SIGNAL_MB=<MiB>  per-signal allocation guard (default 4096)");
-        println!("    HDLSIM_MAX_PROC_STEPS=<n>   interpreter steps per process activation (default 100M)");
-        println!("    HDLSIM_MAX_FUNC_DEPTH=<n>   function call nesting limit (default 200)");
-        println!("    HDLSIM_MAX_FN_CALLS=<n>     function calls per activation (default 100M)");
-        println!("    HDLSIM_NO_CACHE=1           disable the persistent parse cache");
-        println!("    HDLSIM_CACHE_DIR=DIR        move the parse cache (default .hdlsim-cache/)");
         println!("    HDLSIM_STDLIB=DIR           override the built-in std/ieee sources");
-        println!("    HDLSIM_COLOR=auto|always|never  colorize diagnostics (NO_COLOR wins)");
         println!("    HDLSIM_XILINX_LIBS=DIR      add DIR/data/vhdl/src to the library search");
         println!("                                (also XILINX_VIVADO, XILINX_HLS)");
         println!("    HDLSIM_ISSUE_REPO=owner/repo  where --report files issues (default larsjoost/hdlsim)");
         println!("    HDLSIM_REPORT_GIST=public   opt in to public gist upload for --report");
-        println!("    HDLSIM_TRACE_CALLS/_DISPATCH/_PICKED/_CE/_OVERLOAD/_GENRANGE, HDLSIM_DBG_*");
-        println!("                                developer tracing (verbose, unstable output)");
+        println!("                                (NO_COLOR is honored for diagnostics)");
+        println!("  Debug and limit options are CLI flags on the commands that use them");
+        println!("  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir): run");
+        println!("  `hdlsim run --help` for the full list. Environment variables have no");
+        println!("  spell check, so per-run debugging knobs are not environment variables.");
         Ok(0)
     }
 }
@@ -223,18 +207,21 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
-    /// Validate (`name=path`) and convert into [`CommonOpts`].
-    pub fn into_opts(self) -> anyhow::Result<CommonOpts> {
+    /// Validate (`name=path`) and convert into [`CommonOpts`]. Takes
+    /// `&self` so callers can keep reading individual flags (e.g. `run`
+    /// applies the trace/limit fields to the Simulator after building the
+    /// manager); the clone is a handful of small allocations, once per run.
+    pub fn into_opts(&self) -> anyhow::Result<CommonOpts> {
         let mut opts = CommonOpts::default();
         for v in &self.lib {
             opts.libs.push(parse_lib_mapping(v)?);
         }
-        opts.config = self.config;
-        opts.incdirs = self.incdir;
-        opts.lib_roots = self.lib_root;
-        opts.search_dirs = self.search_dir;
+        opts.config = self.config.clone();
+        opts.incdirs = self.incdir.clone();
+        opts.lib_roots = self.lib_root.clone();
+        opts.search_dirs = self.search_dir.clone();
         opts.progress = self.progress;
-        opts.bundle = self.bundle;
+        opts.bundle = self.bundle.clone();
         Ok(opts)
     }
 }
@@ -274,7 +261,8 @@ pub fn parse_lib_mapping(v: &str) -> anyhow::Result<(String, PathBuf)> {
 /// file arguments into it), `None` otherwise.
 pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Option<PathBuf>)> {
     let mut mgr = LibraryManager::new();
-    mgr.use_env_cache(); // `.hdlsim-cache/` unless HDLSIM_NO_CACHE / HDLSIM_CACHE_DIR
+    let ro = run_options();
+    mgr.use_cache_options(ro.no_cache, ro.cache_dir.clone());
     mgr.set_progress(opts.progress);
     let mut root: Option<PathBuf> = None;
     if let Some(b) = &opts.bundle {
@@ -351,6 +339,42 @@ pub fn build_manager(opts: &CommonOpts) -> anyhow::Result<(LibraryManager, Optio
         mgr.add_search_root(d.clone());
     }
     Ok((mgr, root))
+}
+
+/// Process-global run options for the debugging/limit/cache knobs,
+/// stripped from argv anywhere (before or after the subcommand, like
+/// `--color`) and armed once in `main` before any command runs. Global
+/// because they are read from free functions deep in the kernels (the
+/// const-eval traces, `meminfo`, the compile watchdog) with no state to
+/// thread them through — and because a debugging flag belongs on every
+/// command without each subcommand re-declaring it. They are flags, not
+/// environment variables: environment variables have no spell check, so
+/// a typo'd knob silently did nothing while a typo'd flag is an error.
+#[derive(Default, Clone)]
+pub struct RunOptions {
+    pub trace_scheduler: bool,
+    pub trace_dispatch: bool,
+    pub trace_picked: bool,
+    pub trace_calls: bool,
+    pub trace_ce: bool,
+    pub trace_ce_all: bool,
+    pub trace_overload: bool,
+    pub trace_genrange: bool,
+    pub max_mem_mb: Option<u64>,
+    pub max_signal_mb: Option<u64>,
+    pub max_proc_steps: Option<u64>,
+    pub max_func_depth: Option<usize>,
+    pub max_fn_calls: Option<u64>,
+    pub progress_sec: Option<f64>,
+    pub no_cache: bool,
+    pub cache_dir: Option<PathBuf>,
+}
+
+static RUN_OPTIONS: std::sync::OnceLock<RunOptions> = std::sync::OnceLock::new();
+
+/// The options armed by [`apply_global_args`] (defaults until then).
+pub fn run_options() -> &'static RunOptions {
+    RUN_OPTIONS.get_or_init(RunOptions::default)
 }
 
 /// Default config lookup: `./hdlsim.ini`, then each parent directory (like git
@@ -773,34 +797,155 @@ pub const COMMANDS: &[&dyn Command] = &[
 ];
 
 /// Dispatch `args` (without the binary name) to a registered command.
-/// Pull global color flags (`--color <auto|always|never>`, `--color=<...>`,
-/// `--no-color`) out of `args` and apply them to the diagnostic renderer.
-/// Returns the remaining args. Env fallback: `HDLSIM_COLOR` overrides the
-/// tty auto-detection, `NO_COLOR` disables color entirely.
-pub fn apply_color_args(
+/// Pull the global flags out of `args` and apply them:
+/// - color (`--color <auto|always|never>`, `--color=<...>`, `--no-color`)
+///   to the diagnostic renderer;
+/// - the run options (`--trace*`, `--max-*`, `--progress-sec`,
+///   `--no-cache`, `--cache-dir`) — armed once, before any command runs
+///   (see [`RunOptions`]).
+/// Returns the remaining args. `NO_COLOR` disables color entirely.
+/// Flags may appear before or after the subcommand and in `--flag value`
+/// or `--flag=value` form; a bad value is an error (exit code 2).
+pub fn apply_global_args(
     args: &[String],
 ) -> (Vec<String>, Option<hdl_syntax::diagnostic::ColorMode>) {
+    let mut ro = RunOptions::default();
+    let mut color = None;
     let mut rest = Vec::new();
-    let mut mode = None;
     let mut i = 0;
+    // Next argv element as a flag value, when it does not look like a flag.
+    let peek_value = |args: &[String], i: usize| -> Option<String> {
+        match args.get(i + 1) {
+            Some(v) if !v.starts_with("--") => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let parse_num = |flag: &str, v: &str| -> u64 {
+        v.parse().unwrap_or_else(|_| {
+            eprintln!("error: invalid value '{v}' for '{flag}'");
+            std::process::exit(2);
+        })
+    };
     while i < args.len() {
         let a = &args[i];
+        // (flag, takes value) pairs, plus the color specials below.
         if a == "--no-color" {
-            mode = Some(hdl_syntax::diagnostic::ColorMode::Never);
+            color = Some(hdl_syntax::diagnostic::ColorMode::Never);
             i += 1;
         } else if let Some(v) = a.strip_prefix("--color=") {
-            mode = Some(parse_color_mode(v));
+            color = Some(parse_color_mode(v));
             i += 1;
         } else if a == "--color" {
-            let v = args.get(i + 1).map(|s| s.as_str()).unwrap_or("auto");
-            mode = Some(parse_color_mode(v));
-            i += if args.get(i + 1).is_some() { 2 } else { 1 };
+            let v = peek_value(args, i).unwrap_or_else(|| "auto".to_string());
+            color = Some(parse_color_mode(&v));
+            i += if args.get(i + 1).is_some() && !args[i + 1].starts_with("--") {
+                2
+            } else {
+                1
+            };
+        } else if a == "--trace" || a == "--trace=scheduler" {
+            ro.trace_scheduler = true;
+            i += 1;
+        } else if a.starts_with("--trace=") {
+            // --trace=<what>: the scheduler trace is the only one with a
+            // short name today; unknown values error like any typo.
+            eprintln!("error: invalid value '{}' for '--trace'", &a[8..]);
+            std::process::exit(2);
+        } else if a == "--trace-dispatch" {
+            ro.trace_dispatch = true;
+            i += 1;
+        } else if a == "--trace-picked" {
+            ro.trace_picked = true;
+            i += 1;
+        } else if a == "--trace-calls" {
+            ro.trace_calls = true;
+            i += 1;
+        } else if a == "--trace-ce" {
+            ro.trace_ce = true;
+            i += 1;
+        } else if a == "--trace-ce-all" {
+            ro.trace_ce_all = true;
+            i += 1;
+        } else if a == "--trace-overload" {
+            ro.trace_overload = true;
+            i += 1;
+        } else if a == "--trace-genrange" {
+            ro.trace_genrange = true;
+            i += 1;
+        } else if a == "--max-mem-mb" || a.starts_with("--max-mem-mb=") {
+            let v = flag_value(args, &mut i, a, "--max-mem-mb");
+            ro.max_mem_mb = Some(parse_num("--max-mem-mb <MIB>", &v));
+        } else if a == "--max-signal-mb" || a.starts_with("--max-signal-mb=") {
+            let v = flag_value(args, &mut i, a, "--max-signal-mb");
+            ro.max_signal_mb = Some(parse_num("--max-signal-mb <MIB>", &v));
+        } else if a == "--max-proc-steps" || a.starts_with("--max-proc-steps=") {
+            let v = flag_value(args, &mut i, a, "--max-proc-steps");
+            ro.max_proc_steps = Some(parse_num("--max-proc-steps <N>", &v));
+        } else if a == "--max-func-depth" || a.starts_with("--max-func-depth=") {
+            let v = flag_value(args, &mut i, a, "--max-func-depth");
+            ro.max_func_depth = Some(parse_num("--max-func-depth <N>", &v) as usize);
+        } else if a == "--max-fn-calls" || a.starts_with("--max-fn-calls=") {
+            let v = flag_value(args, &mut i, a, "--max-fn-calls");
+            ro.max_fn_calls = Some(parse_num("--max-fn-calls <N>", &v));
+        } else if a == "--progress-sec" || a.starts_with("--progress-sec=") {
+            let v = flag_value(args, &mut i, a, "--progress-sec");
+            let s: f64 = v.parse().unwrap_or_else(|_| {
+                eprintln!("error: invalid value '{v}' for '--progress-sec <S>'");
+                std::process::exit(2);
+            });
+            ro.progress_sec = Some(s);
+        } else if a == "--no-cache" {
+            ro.no_cache = true;
+            i += 1;
+        } else if a == "--cache-dir" || a.starts_with("--cache-dir=") {
+            let v = flag_value(args, &mut i, a, "--cache-dir");
+            ro.cache_dir = Some(PathBuf::from(v));
         } else {
             rest.push(a.clone());
             i += 1;
         }
     }
-    (rest, mode)
+    arm_run_options(&ro);
+    (rest, color)
+}
+
+/// Extract the value of a value-taking flag in either `--flag value` or
+/// `--flag=value` form, advancing `i` past the consumed tokens.
+fn flag_value(args: &[String], i: &mut usize, a: &str, name: &str) -> String {
+    if let Some(eq) = a.find('=') {
+        *i += 1;
+        a[eq + 1..].to_string()
+    } else {
+        match args.get(*i + 1) {
+            Some(v) => {
+                *i += 2;
+                v.clone()
+            }
+            None => {
+                eprintln!("error: '{name}' requires a value");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+/// Arm the process-global knobs from the parsed run options: the lowerer
+/// trace flags (`hdl-ir`), the compile-watchdog and simulation heartbeat
+/// (`--progress-sec`), and the memory guards. The options themselves are
+/// kept in [`RUN_OPTIONS`] for the pieces that are per-instance (the
+/// Simulator's trace fields, the per-manager cache).
+fn arm_run_options(ro: &RunOptions) {
+    hdl_ir::debug::set_traces(
+        ro.trace_ce,
+        ro.trace_ce_all,
+        ro.trace_overload,
+        ro.trace_genrange,
+    );
+    let d = std::time::Duration::from_secs_f64(ro.progress_sec.unwrap_or(0.0).max(0.0));
+    hdl_lib::set_progress_interval(d);
+    hdl_sim::set_progress_interval(d);
+    hdl_sim::meminfo::set_limits(ro.max_mem_mb, ro.max_signal_mb.unwrap_or(4096));
+    let _ = RUN_OPTIONS.set(ro.clone());
 }
 
 fn parse_color_mode(v: &str) -> hdl_syntax::diagnostic::ColorMode {

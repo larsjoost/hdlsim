@@ -28,8 +28,8 @@ impl Severity {
 /// Terminal color mode for diagnostic rendering.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorMode {
-    /// Color when stderr is a terminal; disabled by `NO_COLOR`, overridable
-    /// with `HDLSIM_COLOR=always|never`.
+    /// Color when stderr is a terminal; disabled by the standard
+    /// `NO_COLOR` variable.
     Auto,
     Always,
     Never,
@@ -37,8 +37,8 @@ pub enum ColorMode {
 
 static COLOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Set the global color mode (e.g. from a `--color` CLI flag). Explicitly set
-/// modes win over the `HDLSIM_COLOR`/`NO_COLOR` environment.
+/// Set the global color mode (from the `--color`/`--no-color` CLI flags).
+/// An explicitly set mode wins over `NO_COLOR` and tty auto-detection.
 pub fn set_color_mode(mode: ColorMode) {
     let v = match mode {
         ColorMode::Auto => 0,
@@ -65,11 +65,6 @@ pub fn color_enabled() -> bool {
             use std::io::IsTerminal;
             if std::env::var_os("NO_COLOR").is_some() {
                 return false;
-            }
-            match std::env::var("HDLSIM_COLOR") {
-                Ok(v) if v == "always" || v == "1" || v == "true" => return true,
-                Ok(v) if v == "never" || v == "0" || v == "false" => return false,
-                _ => {}
             }
             std::io::stderr().is_terminal()
         }
@@ -254,7 +249,7 @@ fn intern_code(s: &str) -> &'static str {
 /// Explanations for every code in [`KNOWN_CODES`] plus the lint codes emitted
 /// by [`crate::lint`]. Backs `hdlsim explain <code>`.
 const CODE_EXPLAIN: &[(&str, &str)] = &[
-    ("E0000", "placeholder substituted for an unrecognized code (e.g. from a corrupt cache entry); re-run with HDLSIM_NO_CACHE=1 to see the real code"),
+    ("E0000", "placeholder substituted for an unrecognized code (e.g. from a corrupt cache entry); re-run with --no-cache to see the real code"),
     ("E0001", "generic error (reserved)"),
     ("E0002", "generic error (reserved)"),
     ("E0101", "lexer: unexpected character (a non-ASCII byte in Verilog sources; VHDL uses this code for other invalid characters)"),

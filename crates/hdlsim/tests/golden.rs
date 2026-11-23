@@ -5,7 +5,7 @@ use hdlsim::commands::dispatch;
 
 #[test]
 fn counter_vcd_matches_golden() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let dir = std::env::temp_dir().join(format!("hdlsim_golden_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

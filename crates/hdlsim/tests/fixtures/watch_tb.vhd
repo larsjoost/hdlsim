@@ -1,4 +1,4 @@
--- Regression fixture for HDLSIM_WATCH: a small sequence of signal
+-- Regression fixture for --watch: a small sequence of signal
 -- changes with a known transition into metavarues, so the change
 -- lines, x-only filter, snapshots, and the line cap are all checkable.
 library ieee;

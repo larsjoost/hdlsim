@@ -209,6 +209,25 @@ impl Command for Run {
         if crate::phase::over_mem_limit("sim-init") {
             return Ok(1);
         }
+        // Kernel-side traces and guard overrides (`apply_global_args`
+        // armed the process-global knobs; these are Simulator fields, so
+        // they follow the (possibly restored) instance).
+        let ro = crate::commands::run_options();
+        sim.set_trace(
+            ro.trace_scheduler,
+            ro.trace_dispatch,
+            ro.trace_picked,
+            ro.trace_calls,
+        );
+        if let Some(n) = ro.max_proc_steps {
+            sim.set_max_proc_steps(n);
+        }
+        if let Some(n) = ro.max_func_depth {
+            sim.set_max_func_depth(n);
+        }
+        if let Some(n) = ro.max_fn_calls {
+            sim.set_max_fn_calls(n);
+        }
         if let Some(s) = seed {
             sim.set_seed(s);
         }

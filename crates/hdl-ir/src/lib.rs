@@ -22,6 +22,7 @@
 //! - After elaboration, every `Expr::Sig` refers to the flat signal space.
 
 pub mod analyze;
+pub mod debug;
 pub mod doc;
 pub mod elab;
 pub mod gen;

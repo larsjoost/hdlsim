@@ -13,7 +13,7 @@ simulate and debug HDL designs from the command line.
 development. Features are judged by how well they serve an agent's
 edit → simulate → diagnose loop: LRM-conformant semantics pinned by regression
 fixtures, unambiguous pass/fail (exit code + zero errors/warnings), bounded
-runs (`--max-time`), and machine-readable diagnosis (`HDLSIM_TRACE=1`
+runs (`--max-time`), and machine-readable diagnosis (`--trace`
 scheduler trace, rustc-style diagnostics, JUnit XML).
 
 ## Architecture overview

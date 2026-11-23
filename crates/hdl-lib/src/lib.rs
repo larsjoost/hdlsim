@@ -38,19 +38,25 @@ use providers::{DirProvider, UnitProvider};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// HDLSIM_PROGRESS_SEC=<seconds> — when set > 0, `compile_files` spawns a
-/// watchdog that reports a compile stage (parsing, dependency resolution,
-/// lowering) that outlives the interval. Same knob as the simulator's
-/// heartbeat (hdl-sim): one env var means "report long-running operations".
+/// Heartbeat interval for the compile watchdog (`--progress-sec <s>`):
+/// when > 0, `compile_files` spawns a watchdog that reports a compile
+/// stage (parsing, dependency resolution, lowering) that outlives the
+/// interval. Same knob as the simulator's heartbeat (`hdl-sim`):
+/// one setting means "report long-running operations". Armed explicitly
+/// by the CLI — environment variables have no spell check.
+static PROGRESS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arm the compile watchdog heartbeat. Library users call this instead of
+/// setting an environment variable; the CLI maps `--progress-sec` here.
+pub fn set_progress_interval(d: std::time::Duration) {
+    PROGRESS_MS.store(
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn progress_interval() -> std::time::Duration {
-    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    let secs = *SECS.get_or_init(|| {
-        std::env::var("HDLSIM_PROGRESS_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0)
-    });
-    std::time::Duration::from_secs_f64(secs.max(0.0))
+    std::time::Duration::from_millis(PROGRESS_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Shared "what is the pipeline doing right now" cell plus a printer thread.
@@ -138,7 +144,7 @@ pub struct LibraryManager {
     dir_scanned: bool,
     /// Print indexing/resolution progress to stderr (`--progress`).
     progress: bool,
-    /// Watchdog for long compile stages (`HDLSIM_PROGRESS_SEC`): a thread
+    /// Watchdog for long compile stages (`--progress-sec`): a thread
     /// printing "still <stage> for Ns" when one stage outlives the interval.
     watch: Option<CompileWatch>,
     /// Canonical paths already compiled this session.
@@ -276,11 +282,11 @@ impl LibraryManager {
         self.cache = Some(c);
     }
 
-    /// Enable the cache from the environment (default `.hdlsim-cache/`,
-    /// `HDLSIM_CACHE_DIR` to override, `HDLSIM_NO_CACHE` to disable). Used by
-    /// the CLI; library users opt in via [`LibraryManager::enable_cache`].
-    pub fn use_env_cache(&mut self) {
-        self.cache = cache::Cache::from_env();
+    /// Enable the cache from explicit options (`--no-cache`,
+    /// `--cache-dir`); library users opt in via
+    /// [`LibraryManager::enable_cache`] with a hand-built [`cache::Cache`].
+    pub fn use_cache_options(&mut self, no_cache: bool, dir: Option<PathBuf>) {
+        self.cache = cache::Cache::from_options(no_cache, dir);
     }
 
     /// Parse-cache hits this session.

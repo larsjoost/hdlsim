@@ -203,17 +203,22 @@ pub struct Simulator {
     failures: u64,
     /// Wake-token counter for `wait until` parks (see `Frame::WaitUntilCheck`).
     wait_gen: u64,
-    /// `HDLSIM_TRACE=1` — stderr execution trace of wait/wake scheduling.
+    /// `--trace` — stderr execution trace of wait/wake scheduling.
     trace_on: bool,
+    /// Finer trace flags (`--trace-dispatch`, `--trace-picked`,
+    /// `--trace-calls`), each read on its rare diagnostic path only.
+    trace_dispatch: bool,
+    trace_picked: bool,
+    trace_calls: bool,
     monitor: Vec<Vec<Expr>>,
     monitor_last: Vec<Option<Vec<Value>>>,
     delta_guard: u32,
     /// Interpreter steps in the current process activation — runaway-loop
-    /// budget (see `exec_frames`). Override: `HDLSIM_MAX_PROC_STEPS`.
+    /// budget (see `exec_frames`). Override: `--max-proc-steps`.
     proc_steps: u64,
     max_proc_steps: u64,
     /// Nesting depth of user function/procedure calls — runaway-recursion
-    /// guard (see `run_func`). Override: `HDLSIM_MAX_FUNC_DEPTH`.
+    /// guard (see `run_func`). Override: `--max-func-depth`.
     fn_depth: std::cell::Cell<usize>,
     max_func_depth: usize,
     /// Latched when `fn_depth` passes the budget: the name of the function
@@ -222,7 +227,7 @@ pub struct Simulator {
     /// Function/procedure calls in the current process activation — runaway
     /// guard for loops whose body only calls functions (the per-activation
     /// interpreter-step budget in `exec_frames` cannot see inside one
-    /// statement). Override: `HDLSIM_MAX_FN_CALLS`.
+    /// statement). Override: `--max-fn-calls`.
     fn_calls: std::cell::Cell<u64>,
     max_fn_calls: u64,
     /// Latched when `fn_calls` passes the budget: (process origin, function
@@ -240,7 +245,7 @@ pub struct Simulator {
     fn_stack: std::cell::RefCell<Vec<usize>>,
     /// Names of the call chain captured at latch time (`fn_stack` clone).
     fn_chain: std::cell::RefCell<Vec<String>>,
-    /// Graceful memory guard (`HDLSIM_MAX_MEM_MB` in MiB): exceeding it
+    /// Graceful memory guard (`--max-mem-mb` in MiB): exceeding it
     /// stops the run with an actionable diagnostic instead of an OOM kill.
     max_mem_kb: Option<u64>,
     /// Throttle counter for the guard's `/proc` reads.
@@ -343,28 +348,21 @@ impl Simulator {
     /// Pre-allocation guard for [`Simulator::new`]: estimate each signal's
     /// footprint (a `Value` costs ~1 byte per bit; a memory repeats that per
     /// word) and refuse before touching the allocator when a single signal
-    /// — or the total, when `HDLSIM_MAX_MEM_MB` is set — would exceed its
+    /// — or the total, when `--max-mem-mb` is set — would exceed its
     /// cap. The error names the largest allocators so the design can be
     /// fixed: a width or depth in the GiB range is almost always a generic
     /// or range that did not elaborate (an unpropagated generic-map actual,
     /// a null range underflowing), and allocating it would otherwise abort
     /// or be OOM-killed (exit 137) before any RSS-based guard could run.
     ///
-    /// Caps: `HDLSIM_MAX_SIGNAL_MB` per signal (default 4096 MiB — far above
+    /// Caps: `--max-signal-mb` per signal (default 4096 MiB — far above
     /// any legitimate unit-test or DUT sim, far below the runaway 2³²-width
-    /// class); `HDLSIM_MAX_MEM_MB` (shared with the peak-RSS guard) for the
+    /// class); `--max-mem-mb` (shared with the peak-RSS guard) for the
     /// total, only when set.
     pub fn alloc_report(flat: &Flat) -> Result<(), String> {
-        const DEFAULT_MAX_SIGNAL_MB: u64 = 4096;
-        let per_signal_limit = std::env::var("HDLSIM_MAX_SIGNAL_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_MAX_SIGNAL_MB)
-            * 1024
-            * 1024;
-        // Shared with the peak-RSS guard's env contract: `HDLSIM_MAX_MEM_MB`
-        // in MiB, unset or zero disables the total check.
+        let per_signal_limit = crate::meminfo::signal_limit_bytes();
+        // Shared with the peak-RSS guard: `--max-mem-mb`, unset or zero
+        // disables the total check.
         let total_limit = crate::meminfo::mem_limit_kb().map(|kb| kb * 1024);
         Self::alloc_report_with_caps(flat, per_signal_limit, total_limit)
     }
@@ -400,13 +398,13 @@ impl Simulator {
         if over_signal {
             report.push_str(&format!(
                 "error: sim-init would allocate more than {} MB for a single signal \
-                 (HDLSIM_MAX_SIGNAL_MB={}); largest allocators:\n",
+                 (--max-signal-mb {}); largest allocators:\n",
                 per_signal_limit / 1024 / 1024,
                 per_signal_limit / 1024 / 1024
             ));
         } else {
             report.push_str(&format!(
-                "error: sim-init would allocate ~{} MB (HDLSIM_MAX_MEM_MB={}); \
+                "error: sim-init would allocate ~{} MB (--max-mem-mb {}); \
                  largest allocators:\n",
                 total / 1024 / 1024,
                 total_limit.unwrap() / 1024 / 1024
@@ -426,7 +424,7 @@ impl Simulator {
             "a width or depth this large usually means a generic or range that did not \
              elaborate — check the generic map actuals of the instances above \
              (`hdlsim debug --dump` shows the elaborated widths); raise \
-             HDLSIM_MAX_SIGNAL_MB / HDLSIM_MAX_MEM_MB only if the design is \
+             --max-signal-mb / --max-mem-mb only if the design is \
              genuinely this big\n",
         );
         Err(report)
@@ -489,7 +487,10 @@ impl Simulator {
             finish_status: None,
             failures: 0,
             wait_gen: 0,
-            trace_on: std::env::var("HDLSIM_TRACE").is_ok_and(|v| v == "1"),
+            trace_on: false,
+            trace_dispatch: false,
+            trace_picked: false,
+            trace_calls: false,
             rng: std::cell::Cell::new(0x243F6A8885A308D3),
             objmem,
             objs: std::cell::RefCell::new(HashMap::new()),
@@ -519,23 +520,14 @@ impl Simulator {
             monitor_last: Vec::new(),
             delta_guard: 0,
             proc_steps: 0,
-            max_proc_steps: std::env::var("HDLSIM_MAX_PROC_STEPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000_000),
+            max_proc_steps: 100_000_000,
             max_mem_kb: crate::meminfo::mem_limit_kb(),
             mem_checks: std::cell::Cell::new(0),
             fn_depth: std::cell::Cell::new(0),
-            max_func_depth: std::env::var("HDLSIM_MAX_FUNC_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(200),
+            max_func_depth: 200,
             fn_recursion: std::cell::RefCell::new(None),
             fn_calls: std::cell::Cell::new(0),
-            max_fn_calls: std::env::var("HDLSIM_MAX_FN_CALLS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000_000),
+            max_fn_calls: 100_000_000,
             fn_runaway: std::cell::RefCell::new(None),
             fn_runaway_hit: std::cell::Cell::new(false),
             cur_root_fn: std::cell::Cell::new(None),
@@ -634,6 +626,36 @@ impl Simulator {
     /// stops like an interrupt, with exit code 124 (timeout convention).
     pub fn set_wall_budget(&mut self, budget: std::time::Duration) {
         self.wall_budget = Some(budget);
+    }
+
+    /// Arm the execution traces (`--trace`, `--trace-dispatch`,
+    /// `--trace-picked`, `--trace-calls`): scheduler wait/wake lines on
+    /// stderr, overloaded-procedure dispatch picks, picked overload body
+    /// dumps, and call-tree roots. Armed before the run; environment
+    /// variables have no spell check, so these are explicit options.
+    pub fn set_trace(&mut self, scheduler: bool, dispatch: bool, picked: bool, calls: bool) {
+        self.trace_on = scheduler;
+        self.trace_dispatch = dispatch;
+        self.trace_picked = picked;
+        self.trace_calls = calls;
+    }
+
+    /// Interpreter steps per process activation (`--max-proc-steps`,
+    /// default 100M): the runaway-loop budget.
+    pub fn set_max_proc_steps(&mut self, n: u64) {
+        self.max_proc_steps = n;
+    }
+
+    /// User function/procedure nesting depth (`--max-func-depth`,
+    /// default 200): the runaway-recursion guard.
+    pub fn set_max_func_depth(&mut self, n: usize) {
+        self.max_func_depth = n;
+    }
+
+    /// Function calls per process activation (`--max-fn-calls`,
+    /// default 100M): catches loops whose body only calls functions.
+    pub fn set_max_fn_calls(&mut self, n: u64) {
+        self.max_fn_calls = n;
     }
 
     /// (reason, exit code) when the run ended via signal or wall budget.
@@ -846,7 +868,7 @@ impl Simulator {
         }
     }
 
-    /// Execution trace line (`HDLSIM_TRACE=1` on stderr): wait/wake events,
+    /// Execution trace line (`--trace` on stderr): wait/wake events,
     /// signal wakes, and timeouts — for debugging scheduler semantics without
     /// a wave viewer.
     fn trace(&self, msg: impl std::fmt::Display) {
@@ -942,7 +964,7 @@ impl Simulator {
         false
     }
 
-    /// Graceful memory guard (`HDLSIM_MAX_MEM_MB`): over the limit, stop
+    /// Graceful memory guard (`--max-mem-mb`): over the limit, stop
     /// with an actionable diagnostic instead of being OOM-killed (exit 137,
     /// no output). Throttled to every 128th call — the `/proc` read is not
     /// free in the hot loop. Returns false when the run must stop.
@@ -1109,7 +1131,7 @@ impl Simulator {
     }
 
     /// Periodic "still running" note on stderr for runs that grind without
-    /// time advance (`HDLSIM_PROGRESS_SEC=<seconds>`, 0/absent = off). Shows
+    /// time advance (`--progress <s>`, 0/absent = off). Shows
     /// the same location as the interrupt dump, so a hung or slow run
     /// announces where it is instead of silently burning CPU.
     /// Wall-clock origin: the first caller initializes it (sim start). Reads
@@ -1214,7 +1236,7 @@ impl Simulator {
                 if drain_guard > 1_000_000 {
                     self.emit(SimEvent::Message {
                         text: format!(
-                            "error: zero-delay process loop detected at t={} — the design keeps re-running a process with no time passing; rerun with HDLSIM_TRACE=1 to see the activation cycle; simulation stopped\n",
+                            "error: zero-delay process loop detected at t={} — the design keeps re-running a process with no time passing; rerun with --trace to see the activation cycle; simulation stopped\n",
                             fmt_time(self.time)
                         ),
                         time_fs: self.time,
@@ -1492,7 +1514,7 @@ impl Simulator {
             // body never waits would otherwise spin inside this loop forever —
             // no scheduler guard (delta limit, --max-time) can fire because
             // control never returns to `pump`. Modelsim reports the same
-            // condition as "iteration limit". HDLSIM_MAX_PROC_STEPS lowers
+            // condition as "iteration limit". --max-proc-steps lowers
             // the budget (tests, CI); read once at construction.
             self.proc_steps += 1;
             if self.proc_steps > self.max_proc_steps {
@@ -2716,19 +2738,8 @@ impl Simulator {
             let n_assigns = self.flat.assigns.len();
             for ai in 0..n_assigns {
                 let a = self.flat.assigns[ai].clone();
-                let t0 = std::time::Instant::now();
                 let rhs = self.eval_expr(&a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
-                let dt = t0.elapsed();
-                if std::env::var_os("HDLSIM_DBG_SLOWASSIGN").is_some() && dt.as_millis() > 500 {
-                    eprintln!(
-                        "DBG slow assign#{ai} took {:.1}s calls={} lhs {:.140?} rhs {:.140?}",
-                        dt.as_secs_f64(),
-                        self.fn_calls.get(),
-                        a.lhs,
-                        a.rhs
-                    );
-                }
                 if self.assign_to(&a.lhs, rhs, None) {
                     changed = true;
                     n_changed += 1;
@@ -2887,7 +2898,7 @@ impl Simulator {
         );
     }
 
-    /// `HDLSIM_WATCH_DELTAS`: settled values of all watched signals at each
+    /// `--watch-deltas`: settled values of all watched signals at each
     /// timestamp — pump calls this at the settle point, once per timestamp,
     /// after the drain/NBA/fixpoint work has quiesced. Unchanged signals
     /// print too, so "did this ever become valid" is one grep.
@@ -3002,21 +3013,14 @@ impl Simulator {
 
     // ---- assignment targets -------------------------------------------------------------
 
-    /// Cap for growing a memory on an indexed write (`HDLSIM_MAX_SIGNAL_MB`,
+    /// Cap for growing a memory on an indexed write (`--max-signal-mb`,
     /// shared with `alloc_report`'s per-signal estimate): a write at an index
     /// in the 2³² range is an underflowed/negative address from an
     /// unelaborated generic, and `resize` would abort the process (96 GiB
     /// class) before any RSS guard could run. Over the cap: report the
     /// signal, the index, and the declared depth, and stop the run.
     fn mem_grow_ok(&mut self, sig: usize, a: usize) -> bool {
-        const DEFAULT_MAX_SIGNAL_MB: u64 = 4096;
-        let cap_bytes = std::env::var("HDLSIM_MAX_SIGNAL_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_MAX_SIGNAL_MB)
-            * 1024
-            * 1024;
+        let cap_bytes = crate::meminfo::signal_limit_bytes();
         // Same estimate as `alloc_report`: a stored word costs its Value
         // header (~24 bytes) plus 1 byte per bit — a 1-bit memory at 2³²
         // words is ~96 GiB of headers alone, so the cap must be on bytes,
@@ -3032,9 +3036,9 @@ impl Simulator {
             self.emit(SimEvent::Message {
                 text: format!(
                     "error: memory write to '{}' at index {} would grow it past \
-                     HDLSIM_MAX_SIGNAL_MB (declared depth {} words) — the index is \
+                     --max-signal-mb (declared depth {} words) — the index is \
                      probably an underflowed or negative address (an unelaborated \
-                     generic or range); raise HDLSIM_MAX_SIGNAL_MB only if the \
+                     generic or range); raise --max-signal-mb only if the \
                      design is genuinely this big",
                     self.flat.signals[sig].name,
                     a,
@@ -4022,7 +4026,7 @@ impl Simulator {
         } else {
             picked
         };
-        if std::env::var_os("HDLSIM_TRACE_DISPATCH").is_some() {
+        if self.trace_dispatch {
             fn find_span(s: &Stmt) -> Option<(u32, u32)> {
                 match s {
                     Stmt::Spanned { span, .. } => Some((span.file.0, span.start)),
@@ -4059,10 +4063,10 @@ impl Simulator {
                 args.iter().map(|a| arg_w(a)).collect::<Vec<_>>(),
                 sp,
             );
-            // HDLSIM_TRACE_PICKED=1: dump the picked body (Debug) for the
+            // --trace-picked: dump the picked body (Debug) for the
             // first few picks per name — identifies which overload a hot
             // call site binds to without flooding multi-million-line logs.
-            if std::env::var_os("HDLSIM_TRACE_PICKED").is_some() {
+            if self.trace_picked {
                 use std::cell::RefCell;
                 use std::collections::HashMap;
                 thread_local! {
@@ -4136,10 +4140,10 @@ impl Simulator {
         if d == 1 {
             self.cur_root_fn.set(Some(fi));
         }
-        // HDLSIM_TRACE_CALLS=1: log the roots of call trees (depth 0→1) —
+        // --trace-calls: log the roots of call trees (depth 0→1) —
         // identifies which process/assign drives a hot function without
         // flooding multi-million-call logs. Capped at 300 lines.
-        if std::env::var_os("HDLSIM_TRACE_CALLS").is_some() && d == 1 {
+        if self.trace_calls && d == 1 {
             thread_local! {
                 static ROOTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
@@ -4812,17 +4816,25 @@ fn sign_extend(v: &Value, width: usize) -> Value {
     Value { bits, real: false }
 }
 
-/// HDLSIM_PROGRESS_SEC=<seconds> — set once per process; when > 0, the pump
-/// prints a periodic "still running" heartbeat (see `maybe_heartbeat`).
+/// Heartbeat interval (`--progress-sec <s>`), armed via
+/// [`set_progress_interval`]; 0 (the default) disables the pump's
+/// "still running" heartbeat. A free function so the CLI can arm it
+/// before `Simulator::new` (it also drives the compile watchdog).
+static PROGRESS_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arm the simulation heartbeat: when the pump sees no time advance for
+/// this long it prints a "still running" line with the location.
+pub fn set_progress_interval(d: std::time::Duration) {
+    PROGRESS_INTERVAL_MS.store(
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn progress_interval() -> std::time::Duration {
-    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    let secs = *SECS.get_or_init(|| {
-        std::env::var("HDLSIM_PROGRESS_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0)
-    });
-    std::time::Duration::from_secs_f64(secs.max(0.0))
+    std::time::Duration::from_millis(
+        PROGRESS_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 fn truthy(v: &Value) -> bool {
