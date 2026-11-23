@@ -11,6 +11,7 @@ use hdl_syntax::source::SourceDb;
 use hdl_syntax::verilog::{parser, preproc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A source of design units (one logical library).
 pub trait UnitProvider {
@@ -262,6 +263,17 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
     out
 }
 
+/// Process-wide memo of per-file design-unit names, keyed by (canonical
+/// path, content hash). Library scans re-read and re-parse every file on
+/// each call, and the same trees are scanned repeatedly within one run
+/// (scoped per-library scans, the global full scan, project search) — the
+/// memo keeps that to one parse per file per process.
+fn unit_names_memo() -> &'static Mutex<HashMap<(PathBuf, u64), Arc<Vec<(String, bool)>>>> {
+    static MEMO: OnceLock<Mutex<HashMap<(PathBuf, u64), Arc<Vec<(String, bool)>>>>> =
+        OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Like `units_in_file`, but each unit is tagged with whether its file holds
 /// only the unit's *body* (`package body p;`) and not its declaration.
 pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
@@ -272,11 +284,28 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    let key = (
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        crate::cache::hash64(&text),
+    );
+    if let Some(v) = unit_names_memo().lock().unwrap().get(&key) {
+        return v.as_ref().clone();
+    }
+    let units = compute_units_in_file_tagged(path, &text, lang);
+    unit_names_memo()
+        .lock()
+        .unwrap()
+        .insert(key, Arc::new(units.clone()));
+    units
+}
+
+/// The uncached scan of one file (see [`units_in_file_tagged`]).
+fn compute_units_in_file_tagged(path: &Path, text: &str, lang: Language) -> Vec<(String, bool)> {
     if lang == Language::Vhdl {
-        return vhdl_units_in_file(path, &text);
+        return vhdl_units_in_file(path, text);
     }
     let mut db = SourceDb::new();
-    let Ok(id) = db.add_file(path.display().to_string(), text) else {
+    let Ok(id) = db.add_file(path.display().to_string(), text.to_string()) else {
         return Vec::new();
     };
     let mut macros = HashMap::new();
