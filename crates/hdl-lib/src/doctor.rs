@@ -48,23 +48,20 @@ pub enum CacheSetting {
     Dir(PathBuf),
 }
 
-/// Map the environment (`HDLSIM_NO_CACHE`, `HDLSIM_CACHE_DIR`) to a
-/// [`CacheSetting`]; default is `.hdlsim-cache/` in the working directory.
-pub fn cache_from_env() -> CacheSetting {
-    if std::env::var_os("HDLSIM_NO_CACHE").is_some() {
+/// Build the cache setting from explicit options (`--no-cache`,
+/// `--cache-dir`); default is `.hdlsim-cache/` in the working directory.
+pub fn cache_setting(no_cache: bool, dir: Option<PathBuf>) -> CacheSetting {
+    if no_cache {
         return CacheSetting::Disabled;
     }
-    match std::env::var("HDLSIM_CACHE_DIR") {
-        Ok(d) => CacheSetting::Dir(PathBuf::from(d)),
-        Err(_) => CacheSetting::Dir(PathBuf::from(".hdlsim-cache")),
-    }
+    CacheSetting::Dir(dir.unwrap_or_else(|| PathBuf::from(".hdlsim-cache")))
 }
 
 /// Run all environment checks.
 /// - `config`: project config path (e.g. `./hdlsim.ini`), if any
 /// - `libs`: `-L name=dir` library mappings
 /// - `incdirs`: `-I` include directories
-/// - `cache`: where the parse cache lives (see [`cache_from_env`])
+/// - `cache`: where the parse cache lives (see [`cache_setting`])
 pub fn checks(
     config: Option<&Path>,
     libs: &[(String, PathBuf)],
@@ -182,10 +179,9 @@ pub fn checks(
     }
 
     match cache {
-        CacheSetting::Disabled => out.push(Check::ok(
-            "cache",
-            "disabled via HDLSIM_NO_CACHE".to_string(),
-        )),
+        CacheSetting::Disabled => {
+            out.push(Check::ok("cache", "disabled via --no-cache".to_string()))
+        }
         CacheSetting::Dir(dir) => {
             let probe = dir.join(format!(".doctor-probe-{}", std::process::id()));
             let res = std::fs::create_dir_all(&dir).and_then(|_| {

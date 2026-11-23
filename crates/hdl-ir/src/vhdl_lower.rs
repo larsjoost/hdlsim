@@ -2876,7 +2876,7 @@ impl<'a> Lower<'a> {
         if is_stub(&f) && cands.iter().any(|c| sig(c) && !is_stub(c)) {
             return;
         }
-        if std::env::var_os("HDLSIM_TRACE_OVERLOAD").is_some()
+        if super::debug::TRACE_OVERLOAD.load(std::sync::atomic::Ordering::Relaxed)
             && !is_stub(&f)
             && cands.iter().any(|c| sig(c) && !is_stub(c))
         {
@@ -3779,7 +3779,7 @@ impl<'a> Lower<'a> {
             );
             return;
         };
-        if std::env::var_os("HDLSIM_TRACE_GENRANGE").is_some() && n > 64 {
+        if super::debug::TRACE_GENRANGE.load(std::sync::atomic::Ordering::Relaxed) && n > 64 {
             let sf = self.db.file(s.span().file);
             let (line, _col) = sf.line_col(s.span().start);
             eprintln!(

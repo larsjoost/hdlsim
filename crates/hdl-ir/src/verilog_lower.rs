@@ -3777,8 +3777,9 @@ fn ce_impl(
             CE_DEPTH.with(|d| d.set(depth + 1));
             let r = const_eval_func(f, &argv, env, funcs);
             CE_DEPTH.with(|d| d.set(depth));
-            if std::env::var_os("HDLSIM_TRACE_CE").is_some()
-                && (name.starts_with("get_") || std::env::var_os("HDLSIM_TRACE_CE_ALL").is_some())
+            if super::debug::TRACE_CE.load(std::sync::atomic::Ordering::Relaxed)
+                && (name.starts_with("get_")
+                    || super::debug::TRACE_CE_ALL.load(std::sync::atomic::Ordering::Relaxed))
             {
                 eprintln!(
                     "ce {name} arity={} argvw {:?} argv {:?} -> {:?} pickedw {:?} body {:.80?}",

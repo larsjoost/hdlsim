@@ -16,8 +16,8 @@
 //! text, so any edit is automatically a miss. No dependency edges are needed
 //! at this level because only parse results (not lowered IR) are cached.
 //!
-//! Control: enabled by the CLI via [`Cache::from_env`] — `HDLSIM_NO_CACHE`
-//! disables, `HDLSIM_CACHE_DIR` overrides the directory (default
+//! Control: enabled by the CLI via [`Cache::from_options`] — `--no-cache`
+//! disables, `--cache-dir` overrides the directory (default
 //! `.hdlsim-cache/` in the working directory).
 
 use std::path::{Path, PathBuf};
@@ -58,17 +58,16 @@ impl Cache {
         Some(Cache { dir })
     }
 
-    /// The CLI default: `.hdlsim-cache/` unless `HDLSIM_NO_CACHE` is set;
-    /// `HDLSIM_CACHE_DIR` overrides the location.
-    pub fn from_env() -> Option<Cache> {
-        if std::env::var_os("HDLSIM_NO_CACHE").is_some() {
+    /// Open the cache from explicit options: `no_cache` disables, `dir`
+    /// overrides the location (default `.hdlsim-cache/`). The CLI parses
+    /// `--no-cache` / `--cache-dir` and passes them here; environment
+    /// variables have no spell check, so the cache is not configured
+    /// through one.
+    pub fn from_options(no_cache: bool, dir: Option<PathBuf>) -> Option<Cache> {
+        if no_cache {
             return None;
         }
-        let dir = std::env::var("HDLSIM_CACHE_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".hdlsim-cache"));
-        Cache::open(dir)
+        Cache::open(dir.unwrap_or_else(|| PathBuf::from(".hdlsim-cache")))
     }
 
     fn entry(&self, file: &Path) -> PathBuf {
