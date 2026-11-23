@@ -16,6 +16,15 @@ package math_real is
     constant math_log10_e  : real := 0.434294481903252;
     constant math_ln2      : real := 0.693147180559945;
     constant math_ln10     : real := 2.302585092994046;
+    -- VHDL-2019 additions (1076-2019 math_real):
+    constant math_1_over_e    : real := 0.367879441171442;
+    constant math_pi_over_2   : real := 1.570796326794897;
+    constant math_pi_over_3   : real := 1.047197551196598;
+    constant math_pi_over_4   : real := 0.785398163397448;
+    constant math_3_pi_over_2 : real := 4.712388980384690;
+    constant math_sqrt_pi     : real := 1.772453850905516;
+    constant math_deg_to_rad  : real := 0.017453292519943;
+    constant math_rad_to_deg  : real := 57.295779513082323;
 
     function sqrt  (x : real) return real;
     function log   (x : real) return real;
