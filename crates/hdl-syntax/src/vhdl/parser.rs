@@ -2766,13 +2766,17 @@ impl<'a> Parser<'a> {
             return;
         }
         // VHDL-2008 conditional expression: `v when c else e [when c2 else e2]`.
+        // VHDL-2019 allows omitting the final `else` (`v when c`) — the lowerer
+        // treats the missing else branch as X.
         // Not in waveform position (there `when` starts a conditional waveform).
         if self.in_waveform == 0 && self.at_kw("when") {
             self.builder.start_node_at(mark, SyntaxKind::CondExpr);
             self.bump(); // when
             self.parse_expr_prec(1); // condition
-            self.expect_kw("else", "in the conditional expression");
-            self.parse_expr_prec(1); // else branch (chains further when/else)
+            if self.at_kw("else") {
+                self.bump();
+                self.parse_expr_prec(1); // else branch (chains further when/else)
+            }
             self.builder.finish_node();
         }
     }

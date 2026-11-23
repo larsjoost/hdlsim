@@ -1218,6 +1218,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Index
             | SyntaxKind::Attr
             | SyntaxKind::Qualified
+            | SyntaxKind::CondExpr
             | SyntaxKind::Others
     )
 }
@@ -1341,6 +1342,11 @@ struct Lower<'a> {
     /// (record type, field) → field type mark, for nested record selects
     /// (`rv.param.distribution`).
     rec_field_ty: HashMap<(String, String), String>,
+    /// User-declared physical type unit name -> value in the type's base
+    /// unit (`units angstrom; nm = 10 angstrom; ...` -- `nm` -> 10). Lets
+    /// physical literals (`1.5 cm`) and bare unit names (`mm`) lower to a
+    /// base-unit integer instead of erroring.
+    phys_units: HashMap<String, u64>,
     /// Hidden signals allocated while lowering statements (for-loop vars),
     /// appended to the module after the process body is lowered.
     extra_signals: Vec<SignalIr>,
@@ -1473,6 +1479,7 @@ impl<'a> Lower<'a> {
             sig_dims: HashMap::new(),
             access_inner: HashMap::new(),
             rec_field_ty: HashMap::new(),
+            phys_units: HashMap::new(),
             names_stack: Vec::new(),
             extra_signals: Vec::new(),
             extra_base: 0,
@@ -4832,7 +4839,112 @@ impl<'a> Lower<'a> {
             } else {
                 self.types.insert(name, TypeInfo::Integer { signed: false });
             }
+            // Physical type: `type d is range 0 to 1e16 units ... end units;`
+            // -- record the unit values so literals (`1.5 cm`) and bare unit
+            // names (`mm`) lower to base-unit integers.
+            if kids
+                .iter()
+                .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "units")
+            {
+                self.lower_phys_units(&kids);
+            }
         }
+    }
+
+    /// Physical type body: `units base; name = value unit; ... end units;`
+    /// The parser keeps the entries as flat children of the TypeDecl.
+    /// Records each unit's value in the base unit in `phys_units`.
+    fn lower_phys_units(&mut self, kids: &[SyntaxNode]) {
+        let Some(upos) = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "units")
+        else {
+            return;
+        };
+        let mut i = upos + 1;
+        while i < kids.len() {
+            let k = &kids[i];
+            if k.kind() == SyntaxKind::Ident && self.kw(k) == "end" {
+                break;
+            }
+            if k.kind() != SyntaxKind::Name {
+                i += 1;
+                continue;
+            }
+            let uname = self.text(k).to_ascii_lowercase();
+            let is_derived = kids.get(i + 1).map_or(false, |p| {
+                p.kind() == SyntaxKind::Punct && self.text(p) == "="
+            });
+            if !is_derived {
+                // Base (primary) unit: value 1.
+                self.phys_units.insert(uname, 1);
+                i += 1;
+                continue;
+            }
+            // Derived unit: `name = <value> [unit] ;` -- the value may be a
+            // merged physical literal (`10 mm`), a number plus a separate
+            // unit name (`10 angstrom` for unit names outside the parser's
+            // built-in list), or a general expression.
+            let mut j = i + 2;
+            let mut val: Option<u64> = None;
+            if let Some(e) = kids.get(j) {
+                match e.kind() {
+                    SyntaxKind::Literal => {
+                        let t = self.text(e);
+                        val = match t.split_once(char::is_whitespace) {
+                            Some((num, unit)) => self.phys_lit_value(num, unit),
+                            None => self
+                                .parse_int_literal(t.trim())
+                                .and_then(|v| v.to_u64())
+                                .or_else(|| t.trim().parse::<f64>().ok().map(|f| f as u64)),
+                        };
+                        j += 1;
+                    }
+                    _ if is_expr_node(e.kind()) => {
+                        if let Expr::Lit(v) = self.lower_expr(e, &self.consts.clone()) {
+                            val = v.to_u64();
+                        }
+                        j += 1;
+                    }
+                    _ => {}
+                }
+            }
+            // Separate unit name after a plain number: `nm = 10 angstrom;`
+            if let Some(u) = kids.get(j).filter(|u| u.kind() == SyntaxKind::Name) {
+                let un = self.text(u).to_ascii_lowercase();
+                let base = self
+                    .phys_units
+                    .get(&un)
+                    .copied()
+                    .unwrap_or_else(|| time_unit_fs(&un));
+                val = val.map(|v| v.saturating_mul(base));
+            }
+            self.phys_units.insert(uname, val.unwrap_or(1));
+            // Skip to the terminating `;` of this unit entry.
+            while i < kids.len()
+                && !(kids[i].kind() == SyntaxKind::Punct && self.text(&kids[i]) == ";")
+            {
+                i += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// Value of a physical literal `num unit` in base units (the unit is
+    /// either a user-declared physical unit or a built-in time/length/freq
+    /// unit).
+    fn phys_lit_value(&mut self, num: &str, unit: &str) -> Option<u64> {
+        let ul = unit.trim().to_ascii_lowercase();
+        let base = self
+            .phys_units
+            .get(&ul)
+            .copied()
+            .unwrap_or_else(|| time_unit_fs(&ul));
+        let n = self
+            .parse_int_literal(num.trim())
+            .and_then(|v| v.to_u64())
+            .or_else(|| num.trim().parse::<f64>().ok().map(|f| f.max(0.0) as u64));
+        n.map(|n| n.saturating_mul(base))
     }
 
     fn lower_subtype_decl(&mut self, d: &SyntaxNode) {
@@ -7279,7 +7391,12 @@ impl<'a> Lower<'a> {
                     // Physical unit constants (`ns`, `ms`, ...) are values of
                     // type `time` — 64-bit, else `30 ms` truncates to µs.
                     return Expr::Lit(Value::from_u64(64, time_unit_fs(&key)));
+                } // Bare user-declared physical unit name (`mm`, `cm`,
+                  // `angstrom`, ...): a literal of one unit, in base units.
+                if let Some(v) = self.phys_units.get(key.as_str()).copied() {
+                    return Expr::Lit(Value::from_u64(64, v));
                 }
+
                 // Bare state-variable reference inside a protected-type body:
                 // read the field of `$this` (`$getf::t::field@lsb,w`).
                 if let Some(t) = self.prot_body_ctx.clone() {
@@ -8310,6 +8427,16 @@ impl<'a> Lower<'a> {
                 };
                 // Time is femtoseconds — 64-bit, else `30 ms` overflows 32 bits.
                 return Expr::Lit(Value::from_u64(64, fs));
+            }
+            // User-declared physical unit (`1.5 cm` of a `units ... end units`
+            // type): value in the type's base unit, 64-bit.
+            if let Some(v) = self.phys_lit_value(num, unit.trim()) {
+                if self
+                    .phys_units
+                    .contains_key(&unit.trim().to_ascii_lowercase())
+                {
+                    return Expr::Lit(Value::from_u64(64, v));
+                }
             }
         }
         // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` / signed
