@@ -152,3 +152,102 @@ fn watch_line_cap_suppresses_after_the_budget() {
     let watch_lines = stderr.lines().filter(|l| l.starts_with("watch ")).count();
     assert_eq!(watch_lines, 2, "cap must hold, got:\n{stderr}");
 }
+
+// ---- signal name discovery ----------------------------------------------------
+//
+// Finding the exact name to watch in a design with tens of thousands of
+// signals: --list-signals prints (optionally filtered) names after
+// elaboration and exits, and an unmatched --watch name gets rustc-style
+// suggestions instead of a bare error.
+
+/// `--list-signals`: all hierarchical names, sorted, one per line on
+/// stdout, count on stderr, exit 0 — and no simulation (the fixture's
+/// drive process never runs, so no watch/PASS lines appear).
+#[test]
+fn list_signals_prints_all_hierarchical_names_and_exits() {
+    let out = hdlsim()
+        .args(["run", "--top", "watch_hier_tb", "--list-signals"])
+        .arg(fixture("watch_hier_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed:\n{stderr}");
+    let names: Vec<&str> = stdout.lines().collect();
+    assert_eq!(names, vec!["clk", "dut.cnt", "dut.tick", "en"], "{stdout}");
+    assert!(stderr.contains("hdlsim: 4 signal(s)"), "{stderr}");
+    // A query, not a run: nothing simulated.
+    assert!(!stdout.contains("PASS") && !stderr.contains("simulation stopped"));
+}
+
+/// `--list-signals=PATTERN`: case-insensitive substring filter.
+#[test]
+fn list_signals_filters_by_substring() {
+    let out = hdlsim()
+        .args(["run", "--top", "watch_hier_tb", "--list-signals=CNT"])
+        .arg(fixture("watch_hier_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed:\n{stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["dut.cnt"],
+        "{stdout}"
+    );
+    assert!(stderr.contains("1 signal(s) matching 'CNT'"), "{stderr}");
+}
+
+/// A typo'd --watch name suggests the real signal (edit distance).
+#[test]
+fn watch_typo_suggests_similar_name() {
+    let out = hdlsim()
+        .args(["run", "--top", "watch_hier_tb", "--watch", "cmt"])
+        .arg(fixture("watch_hier_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "typo'd name must fail:\n{stderr}");
+    assert!(
+        stderr.contains("--watch: no signal matched cmt"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did you mean 'dut.cnt'"), "{stderr}");
+}
+
+/// An unmatched hierarchical name with an existing trailing component
+/// points at the count of signals sharing it, with the exact
+/// --list-signals call to enumerate them.
+#[test]
+fn watch_wrong_instance_suggests_component_count() {
+    let out = hdlsim()
+        .args(["run", "--top", "watch_hier_tb", "--watch", "inst.cnt"])
+        .arg(fixture("watch_hier_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "bad path must fail:\n{stderr}");
+    assert!(stderr.contains("did you mean 'dut.cnt'"), "{stderr}");
+    assert!(
+        stderr.contains("1 signal(s) end in '.cnt' — run with --list-signals=cnt to list them"),
+        "{stderr}"
+    );
+}
+
+/// A name matching nothing at all gets the generic pointer to
+/// --list-signals instead of silence.
+#[test]
+fn watch_unmatchable_suggests_listing() {
+    let out = hdlsim()
+        .args(["run", "--top", "watch_hier_tb", "--watch", "zzzz"])
+        .arg(fixture("watch_hier_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "bad name must fail:\n{stderr}");
+    assert!(
+        stderr.contains("note: run with --list-signals to print all signal names"),
+        "{stderr}"
+    );
+}
