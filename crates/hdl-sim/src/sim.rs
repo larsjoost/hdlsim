@@ -2818,10 +2818,15 @@ impl Simulator {
         }
         if !unmatched.is_empty() {
             self.watch.clear();
-            return Err(format!(
-                "--watch: no signal matched {} (hierarchical names, e.g. tb.dut.q)",
-                unmatched.join(", ")
-            ));
+            let mut msg = format!("--watch: no signal matched {}", unmatched.join(", "));
+            for cand in &unmatched {
+                let s = self.watch_suggestions(cand);
+                if !s.is_empty() {
+                    msg.push('\n');
+                    msg.push_str(&s);
+                }
+            }
+            return Err(msg);
         }
         self.watch_x_only = x_only;
         self.watch_snapshots = snapshots;
@@ -2839,6 +2844,83 @@ impl Simulator {
             self.watch_max_lines
         );
         Ok(())
+    }
+
+    /// All signal names (hierarchical, exactly as `set_watch` matches
+    /// them), sorted with duplicates removed (duplicate instance names
+    /// produce duplicate signal names). Backs `run --list-signals`.
+    pub fn signal_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.flat.signals.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// rustc-style help for an unmatched `--watch` name: up to three
+    /// similarly named signals, ranked by tier then distance —
+    /// 0: same trailing name component (the signal exists, the instance
+    ///    path is off — with real instance names any two hierarchy paths
+    ///    are farther apart than an edit-distance budget),
+    /// 1: trailing component within the edit budget (a typo'd component,
+    ///    `cmt` → `dut.cnt` — the full names are too far apart for tier 2),
+    /// 2: full name within the edit budget.
+    /// When many signals share the trailing component exactly, the count
+    /// is added with a `--list-signals` pointer. Empty-input note handled
+    /// by the caller; this never returns an empty string.
+    fn watch_suggestions(&self, cand: &str) -> String {
+        let key = cand.to_ascii_lowercase();
+        let last = key.rsplit('.').next().unwrap_or(&key).to_string();
+        let max_d = (key.len() / 3).max(3);
+        let mut cands: Vec<(u8, usize, &str)> = Vec::new();
+        let mut suffix_count = 0usize;
+        for s in &self.flat.signals {
+            let n = s.name.to_ascii_lowercase();
+            let nlast = n.rsplit('.').next().unwrap_or(&n);
+            if nlast == last {
+                suffix_count += 1;
+                cands.push((0, 0, &s.name));
+            } else {
+                let dc = hdl_ir::levenshtein_bounded(&last, nlast, max_d);
+                if dc <= max_d {
+                    cands.push((1, dc, &s.name));
+                } else {
+                    let df = hdl_ir::levenshtein_bounded(&key, &n, max_d);
+                    if df <= max_d {
+                        cands.push((2, df, &s.name));
+                    }
+                }
+            }
+        }
+        cands.sort();
+        let shown: Vec<&str> = cands.iter().take(3).map(|(_, _, n)| *n).collect();
+        let mut out = String::new();
+        match shown.len() {
+            0 => {}
+            1 => out.push_str(&format!("did you mean '{}'?", shown[0])),
+            _ => {
+                let (last_one, rest) = shown.split_last().unwrap();
+                out.push_str(&format!(
+                    "did you mean {} or '{}'?",
+                    rest.iter()
+                        .map(|s| format!("'{s}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    last_one
+                ));
+            }
+        }
+        if suffix_count > 0 {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "note: {suffix_count} signal(s) end in '.{last}' — run with --list-signals={last} to list them"
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("note: run with --list-signals to print all signal names");
+        }
+        out
     }
 
     /// Line-budget gate shared by change lines and snapshots: false once
