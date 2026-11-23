@@ -12,7 +12,7 @@
 use crate::ir::*;
 use crate::levenshtein_bounded;
 use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VX, VZ};
-use crate::verilog_lower::const_eval_f;
+use crate::verilog_lower::const_eval_f_with_pkgs;
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
@@ -1311,6 +1311,13 @@ struct Lower<'a> {
     /// different signatures) coexist as candidates; `register_func` keeps
     /// the map invariant and const-eval picks by argument fit.
     funcs: HashMap<String, Vec<FuncIr>>,
+    /// Const-eval fallback: function bodies from every known package
+    /// (`self.pkgs`), merged regardless of use clauses. A use clause may
+    /// merge only one function of a package, yet its body may legally call a
+    /// package-internal sibling (visible at the body's declaration site), so
+    /// nested const-eval resolves against this wider table when the direct
+    /// map misses.
+    funcs_ce: HashMap<String, Vec<FuncIr>>,
     /// Type marks in scope (built-ins + user type/subtype decls).
     types: HashMap<String, TypeInfo>,
     /// Subtype name -> constrained width, so `signal x : my_subtype` (no
@@ -1467,6 +1474,7 @@ impl<'a> Lower<'a> {
             consts: Rc::new(HashMap::new()),
             const_types: HashMap::new(),
             funcs: HashMap::new(),
+            funcs_ce: HashMap::new(),
             types: HashMap::new(),
             type_widths: HashMap::new(),
             names: HashMap::new(),
@@ -1584,6 +1592,18 @@ impl<'a> Lower<'a> {
                 self.merge_use_clause(&child);
             }
         }
+        // Snapshot every known package's function bodies as the const-eval
+        // fallback (`funcs_ce`). Rebuilt per call: packages registered later
+        // in this file also register their functions into `self.funcs`
+        // directly, so the snapshot only needs the cross-file state.
+        self.funcs_ce = self
+            .pkgs
+            .values()
+            .flat_map(|p| p.functions.iter().cloned())
+            .fold(HashMap::new(), |mut m, f| {
+                m.entry(f.name.to_ascii_lowercase()).or_default().push(f);
+                m
+            });
     }
 
     /// Merge one `use lib.pkg.item;` / `context lib.pkg;` clause into scope.
@@ -2472,13 +2492,13 @@ impl<'a> Lower<'a> {
     /// Const-eval in the lowerer's constant scope, with visible package
     /// function bodies (for calls in constant initializers).
     fn ce(&self, e: &Expr) -> Option<Value> {
-        const_eval_f(e, &self.consts, &self.funcs)
+        const_eval_f_with_pkgs(e, &self.consts, &self.funcs, &self.funcs_ce)
     }
 
     /// Const-eval against an explicit env (loop vars, generics) plus package
     /// function bodies.
     fn ce_env(&self, e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
-        const_eval_f(e, env, &self.funcs)
+        const_eval_f_with_pkgs(e, env, &self.funcs, &self.funcs_ce)
     }
 
     // ---- entities / architectures ---------------------------------------------
@@ -6441,8 +6461,17 @@ impl<'a> Lower<'a> {
                 }
             }
             SyntaxKind::ExitStmt => {
-                // `exit;` / `exit when cond;` → break (optionally conditional).
+                // The parser folds `exit` and `next` into one ExitStmt node:
+                // the first ident child is the keyword. `exit` ends the loop
+                // (break), `next` skips to the loop step (continue) — LRM
+                // 1076 §10.11/§10.12. Both take an optional `when cond;`.
                 let kids = real_children(s);
+                let is_next = kids
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| self.kw(k).eq_ignore_ascii_case("next"))
+                    .unwrap_or(false);
+                let jump = if is_next { Stmt::Continue } else { Stmt::Break };
                 let cond = kids
                     .iter()
                     .find(|k| is_expr_node(k.kind()))
@@ -6450,10 +6479,10 @@ impl<'a> Lower<'a> {
                 match cond {
                     Some(c) => Stmt::If {
                         cond: c,
-                        then: Box::new(Stmt::Break),
+                        then: Box::new(jump),
                         els: None,
                     },
-                    None => Stmt::Break,
+                    None => jump,
                 }
             }
             SyntaxKind::ReturnStmt => {
