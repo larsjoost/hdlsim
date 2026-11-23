@@ -38,6 +38,31 @@ pub use value::{BinOp, UnOp, Value};
 /// `59918000000000` → `"59.918ms"`, `1000000` → `"1ns"`. Used by
 /// diagnostics, heartbeats, and phase summaries so `t=` values are
 /// comparable with `--max-time` arguments instead of raw fs counts.
+/// Levenshtein edit distance, counted in chars, but gives up (returns
+/// `max + 1`) as soon as the distance provably exceeds `max` — keeps
+/// "is it close?" cheap on long candidate lists (did-you-mean suggestions
+/// in the lowerers and in the simulator's `--watch` error).
+pub fn levenshtein_bounded(a: &str, b: &str, max: usize) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = Vec::with_capacity(b.len() + 1);
+        cur.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            cur.push(
+                (prev[j] + usize::from(ca != *cb))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1),
+            );
+        }
+        if cur.iter().min().copied().unwrap_or(usize::MAX) > max {
+            return max + 1;
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 pub fn fmt_time(fs: u64) -> String {
     const UNITS: [(u64, &str); 5] = [
         (1_000_000_000_000_000, "s"),

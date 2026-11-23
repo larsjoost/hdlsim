@@ -155,6 +155,7 @@ hdlsim bundle --out repro.tar --top tb [files]  # pack the project into one .tar
 hdlsim run --bundle repro.tar --top tb       # reproduce straight from the bundle
 hdlsim debug --top tb --dump                 # dump the elaborated design (signals, processes)
 hdlsim debug --top tb --watch sig --all      # watch signal changes live during the sim
+hdlsim run --top tb --list-signals=rdy ...   # print (filtered) signal names, no sim — find --watch names
 hdlsim debug --top tb --mem imem.mem --watch '#12'   # dump memories / watch by id
 hdlsim debug --top tb --driver q                     # which process/assign last drove a signal
 hdlsim regress --junit results.xml --list tests.txt  # run many testbenches, JUnit XML report

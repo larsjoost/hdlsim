@@ -44,7 +44,8 @@ struct RunArgs {
     max_wall: Option<String>,
     /// Print every change of the named signals: comma-separated
     /// hierarchical names (case-insensitive; a suffix like `dut.q` matches
-    /// all instances). Lines look like:
+    /// all instances; `--list-signals` prints the exact names). Lines look
+    /// like:
     /// `watch t=15ns d3 tb.dut.q 0b0001->"xxxx" driver=foo.vhd:57`.
     #[arg(long, value_name = "NAMES")]
     watch: Option<String>,
@@ -60,6 +61,18 @@ struct RunArgs {
     /// With --watch: cap on watch lines before suppression.
     #[arg(long, default_value_t = 2000)]
     watch_max: u64,
+    /// List signal names (hierarchical) after elaboration and exit, no
+    /// simulation — use it to find the exact name for --watch. Optional
+    /// `=PATTERN` (case-insensitive substring) filters, e.g.
+    /// `--list-signals=rdy`; bare `--list-signals` lists all.
+    #[arg(
+        long,
+        value_name = "PATTERN",
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    list_signals: Option<String>,
     /// Save the simulator state here when the run stops (resume with --restore).
     #[arg(long)]
     checkpoint: Option<PathBuf>,
@@ -208,6 +221,27 @@ impl Command for Run {
         init_phase.done("state initialized");
         if crate::phase::over_mem_limit("sim-init") {
             return Ok(1);
+        }
+        // `--list-signals`: a query, not a run — print the (optionally
+        // filtered) signal names and exit before any simulation. The names
+        // come from the same flat list `--watch` matches against, so a
+        // copied name always watches. Matches go to stdout (grep-able),
+        // the count to stderr.
+        if let Some(pattern) = &a.list_signals {
+            let mut names = sim.signal_names();
+            if !pattern.is_empty() {
+                let p = pattern.to_ascii_lowercase();
+                names.retain(|n| n.to_ascii_lowercase().contains(&p));
+            }
+            for n in &names {
+                println!("{n}");
+            }
+            if pattern.is_empty() {
+                eprintln!("hdlsim: {} signal(s)", names.len());
+            } else {
+                eprintln!("hdlsim: {} signal(s) matching '{}'", names.len(), pattern);
+            }
+            return Ok(0);
         }
         // Kernel-side traces and guard overrides (`apply_global_args`
         // armed the process-global knobs; these are Simulator fields, so

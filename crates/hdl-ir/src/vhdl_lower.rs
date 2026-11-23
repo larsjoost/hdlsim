@@ -10,6 +10,7 @@
 //! built in: recognized by name here and lowered to dedicated `Expr` nodes.
 
 use crate::ir::*;
+use crate::levenshtein_bounded;
 use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VX, VZ};
 use crate::verilog_lower::const_eval_f;
 use hdl_syntax::cst::SyntaxNode;
@@ -8670,31 +8671,7 @@ fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) ->
 /// Levenshtein edit distance, counted in chars.
 #[cfg(test)]
 fn levenshtein(a: &str, b: &str) -> usize {
-    levenshtein_bounded(a, b, usize::MAX)
-}
-
-/// Levenshtein distance, but gives up (returns `max + 1`) as soon as the
-/// distance provably exceeds `max` — keeps "is it close?" cheap on long
-/// candidate lists.
-fn levenshtein_bounded(a: &str, b: &str, max: usize) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur = Vec::with_capacity(b.len() + 1);
-        cur.push(i + 1);
-        for (j, cb) in b.iter().enumerate() {
-            cur.push(
-                (prev[j] + usize::from(ca != *cb))
-                    .min(prev[j + 1] + 1)
-                    .min(cur[j] + 1),
-            );
-        }
-        if cur.iter().min().copied().unwrap_or(usize::MAX) > max {
-            return max + 1;
-        }
-        prev = cur;
-    }
-    prev[b.len()]
+    crate::levenshtein_bounded(a, b, usize::MAX)
 }
 
 /// VHDL time unit → femtoseconds.
