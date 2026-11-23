@@ -298,10 +298,16 @@ mod tests {
             ("counter_pkg".to_string(), true),
         ];
         cache.put_units(f, hash64("package counter_pkg"), &units);
-        assert_eq!(cache.get_units(f, hash64("package counter_pkg")), Some(units));
+        assert_eq!(
+            cache.get_units(f, hash64("package counter_pkg")),
+            Some(units)
+        );
         // Edited source → different hash → miss; parse payloads for the same
         // path must not collide with unit-index entries.
-        assert_eq!(cache.get_units(f, hash64("package counter_pkg -- edited")), None);
+        assert_eq!(
+            cache.get_units(f, hash64("package counter_pkg -- edited")),
+            None
+        );
         assert_eq!(cache.get(f, hash64("package counter_pkg")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

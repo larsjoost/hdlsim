@@ -522,10 +522,7 @@ impl LibraryManager {
             .filter(|(i, _)| !self.lib_scanned.contains(i))
             .flat_map(|(i, p)| {
                 if self.progress {
-                    eprintln!(
-                        "  scanning library '{}' for unit names…",
-                        p.name()
-                    );
+                    eprintln!("  scanning library '{}' for unit names…", p.name());
                 }
                 self.scan_provider_tagged(p.as_ref())
                     .into_iter()
@@ -570,10 +567,7 @@ impl LibraryManager {
                 Vec::new() // in-memory providers are indexed eagerly already
             } else {
                 if self.progress {
-                    eprintln!(
-                        "  scanning library '{}' for unit names…",
-                        p.name()
-                    );
+                    eprintln!("  scanning library '{}' for unit names…", p.name());
                 }
                 self.scan_provider_tagged(p.as_ref())
             }
