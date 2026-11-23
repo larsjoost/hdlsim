@@ -134,6 +134,21 @@ impl Command for Help {
         println!(
             "    HDLSIM_TRACE=1              scheduler trace on stderr (park/wake/timeout lines)"
         );
+        println!("    HDLSIM_WATCH=<names>        print every change of the named signals:");
+        println!(
+            "                                `watch t=15ns d3 tb.dut.q 0b0001->\"xxxx\" driver=…`"
+        );
+        println!("                                names are hierarchical (case-insensitive; a");
+        println!("                                suffix like `dut.q` matches all instances)");
+        println!("    HDLSIM_WATCH_X=1            watch only transitions into x/z/metavalues —");
+        println!(
+            "                                finds where the first X came from and who wrote it"
+        );
+        println!("    HDLSIM_WATCH_DELTAS=1       also print a settled snapshot of the watched");
+        println!("                                signals at every timestamp (watch-snap lines)");
+        println!(
+            "    HDLSIM_WATCH_MAX=<n>        cap on watch lines before suppression (default 2000)"
+        );
         println!("    HDLSIM_PROGRESS_SEC=<s>     heartbeat for long compiles and simulations:");
         println!(
             "                                \"still running (N s without time advance) at …\""

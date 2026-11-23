@@ -318,6 +318,21 @@ pub struct Simulator {
     /// settling; a constant nonzero count = oscillating combinational loop.
     fix_sweep: u64,
     fix_changed: u64,
+    /// Watched signals (`HDLSIM_WATCH`): (sig id, display name), resolved
+    /// once at construction. Empty by default — the check in `set_sig` is
+    /// one branch when nothing is watched.
+    watch: Vec<(u32, String)>,
+    /// Watch modes: only metavarue transitions (`HDLSIM_WATCH_X`), a value
+    /// snapshot per timestamp (`HDLSIM_WATCH_DELTAS`), and the total line
+    /// cap (`HDLSIM_WATCH_MAX`) with the running count.
+    watch_x_only: bool,
+    watch_snapshots: bool,
+    watch_max_lines: u64,
+    watch_lines: u64,
+    /// Delta cycle number within the current timestamp (pump's
+    /// `delta_count`), shown in watch lines so the settling sequence of a
+    /// single timestamp is readable.
+    delta_no: u64,
 }
 
 impl Simulator {
@@ -489,6 +504,12 @@ impl Simulator {
             last_proc: None,
             fix_sweep: 0,
             fix_changed: 0,
+            watch: Vec::new(),
+            watch_x_only: false,
+            watch_snapshots: false,
+            watch_max_lines: 0,
+            watch_lines: 0,
+            delta_no: 0,
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -523,6 +544,7 @@ impl Simulator {
             in_active: vec![false; np],
         };
         sim.prev = sim.vals.clone();
+        sim.resolve_watch();
         for (i, f) in sim.flat.functions.iter().enumerate() {
             let cands = sim.funcs.entry(f.name.to_ascii_lowercase()).or_default();
             // Stub shape: an interface-only spec declaration lowered without
@@ -1122,6 +1144,7 @@ impl Simulator {
                 break;
             }
             delta_count += 1;
+            self.delta_no = delta_count;
             if delta_count > 10_000 {
                 self.emit(SimEvent::Message {
                     text: format!(
@@ -1218,6 +1241,9 @@ impl Simulator {
             if !self.active.is_empty() {
                 continue;
             }
+            // The timestamp has settled: drain done, scheduled assigns and
+            // the fixpoint applied, no runnable processes left.
+            self.watch_snapshot();
             // Advance time to the next event.
             let next = self.time_events.keys().next().copied();
             match next {
@@ -2722,6 +2748,137 @@ impl Simulator {
 
     // ---- signal update + scheduling ---------------------------------------------------
 
+    /// Resolve `HDLSIM_WATCH` once at construction: a comma-separated list
+    /// of hierarchical signal names (case-insensitive; a name also matches
+    /// as a dot-suffix, `dut.q` matches `tb.dut.q`). Names matching nothing
+    /// are reported so a typo cannot silently watch nothing.
+    fn resolve_watch(&mut self) {
+        let spec = match std::env::var("HDLSIM_WATCH") {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => return,
+        };
+        self.watch_x_only = std::env::var_os("HDLSIM_WATCH_X").is_some();
+        self.watch_snapshots = std::env::var_os("HDLSIM_WATCH_DELTAS").is_some();
+        self.watch_max_lines = std::env::var("HDLSIM_WATCH_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let mut unmatched: Vec<String> = Vec::new();
+        for cand in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let key = cand.to_ascii_lowercase();
+            let suffix = format!(".{}", key);
+            let mut matched = 0;
+            for (i, s) in self.flat.signals.iter().enumerate() {
+                let n = s.name.to_ascii_lowercase();
+                if n == key || n.ends_with(&suffix) {
+                    self.watch.push((i as u32, s.name.clone()));
+                    matched += 1;
+                }
+            }
+            if matched == 0 {
+                unmatched.push(cand.to_string());
+            }
+        }
+        if !unmatched.is_empty() {
+            eprintln!(
+                "watch: no signal matched {} (HDLSIM_WATCH)",
+                unmatched.join(", ")
+            );
+        }
+        if !self.watch.is_empty() {
+            eprintln!(
+                "watch: {} signal(s) [{}] — x-only={} snapshots={} cap={}",
+                self.watch.len(),
+                self.watch
+                    .iter()
+                    .map(|(_, n)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.watch_x_only,
+                self.watch_snapshots,
+                self.watch_max_lines
+            );
+        }
+    }
+
+    /// Line-budget gate shared by change lines and snapshots: false once
+    /// the cap is hit (after printing the one-time notice on the line that
+    /// exhausts the budget). Keeps a runaway design from flooding the log.
+    fn watch_take_line(&mut self) -> bool {
+        if self.watch_lines >= self.watch_max_lines {
+            return false;
+        }
+        self.watch_lines += 1;
+        if self.watch_lines == self.watch_max_lines {
+            eprintln!(
+                "watch: line cap ({}) reached — further lines suppressed (HDLSIM_WATCH_MAX)",
+                self.watch_max_lines
+            );
+        }
+        true
+    }
+
+    /// One `watch:` line for a changed watched signal. Called from
+    /// `set_sig` only when the watch list is non-empty, before the
+    /// observer emit, so the line keeps the causal order with other
+    /// stderr diagnostics. In x-only mode only transitions into
+    /// metavarues print — the fastest path to "where did the first X
+    /// come from, and who wrote it".
+    fn watch_change(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
+        if !self.watch.iter().any(|(id, _)| *id == sig) {
+            return;
+        }
+        if self.watch_x_only && !new.has_meta() {
+            return;
+        }
+        if !self.watch_take_line() {
+            return;
+        }
+        let name = self
+            .watch
+            .iter()
+            .find(|(id, _)| *id == sig)
+            .map(|(_, n)| n.as_str())
+            .unwrap_or_default();
+        let driver = match self.cur_proc {
+            Some(p) if (p as usize) < self.flat.procs.len() => {
+                format!(" driver={}", self.flat.procs[p as usize].origin)
+            }
+            Some(_) => " driver=assign".to_string(),
+            None => String::new(),
+        };
+        eprintln!(
+            "watch t={} d{} {} {}->{}{}",
+            fmt_time(self.time),
+            self.delta_no,
+            name,
+            old.fmt_value(),
+            new.fmt_value(),
+            driver
+        );
+    }
+
+    /// `HDLSIM_WATCH_DELTAS`: settled values of all watched signals at each
+    /// timestamp — pump calls this at the settle point, once per timestamp,
+    /// after the drain/NBA/fixpoint work has quiesced. Unchanged signals
+    /// print too, so "did this ever become valid" is one grep.
+    fn watch_snapshot(&mut self) {
+        if !self.watch_snapshots || self.watch.is_empty() || !self.watch_take_line() {
+            return;
+        }
+        let vals: Vec<String> = self
+            .watch
+            .iter()
+            .map(|(id, name)| format!("{}={}", name, self.vals[*id as usize].fmt_value()))
+            .collect();
+        eprintln!(
+            "watch-snap t={} d{} {}",
+            fmt_time(self.time),
+            self.delta_no,
+            vals.join(" ")
+        );
+    }
+
     /// Returns true if the signal actually changed.
     fn set_sig(&mut self, sig: FlatSigId, v: Value) -> bool {
         let old = self.vals[sig as usize].clone();
@@ -2731,6 +2888,9 @@ impl Simulator {
         }
         self.prev[sig as usize] = old.clone();
         self.vals[sig as usize] = new.clone();
+        if !self.watch.is_empty() {
+            self.watch_change(sig, &old, &new);
+        }
         self.emit(SimEvent::SignalChange {
             sig,
             old,
