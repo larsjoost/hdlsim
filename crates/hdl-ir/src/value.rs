@@ -213,6 +213,60 @@ impl Value {
         self.bits.iter().all(|&b| is_known(b))
     }
 
+    /// Whether any bit is a metavalue (x/z/w/…). X-only debug filters use
+    /// this to catch transitions into unknown states.
+    pub fn has_meta(&self) -> bool {
+        self.bits.iter().any(|&b| !is_known(b))
+    }
+
+    /// Compact single-token rendering for logs and watch lines. Real-typed
+    /// values decode the f64; all-0/1 values print as `0b…` (≤8 bits) or
+    /// `0x…`; anything with metavarues prints one state letter per bit,
+    /// MSB first (same alphabet as the JSON serialization, quoted so a
+    /// leading `-` or letter cannot be read as a number).
+    pub fn fmt_value(&self) -> String {
+        if self.real {
+            if let Some(u) = self.to_u64() {
+                return format!("r={}", f64::from_bits(u));
+            }
+        }
+        if !self.has_meta() {
+            let w = self.bits.len();
+            if w <= 8 {
+                let mut s = String::with_capacity(2 + w);
+                s.push_str("0b");
+                for &b in self.bits.iter().rev() {
+                    s.push(if b == V1 { '1' } else { '0' });
+                }
+                return s;
+            }
+            let mut hex = String::with_capacity(2 + w.div_ceil(4));
+            hex.push_str("0x");
+            let (mut nib, mut n, mut used) = (0u8, 0u32, 0usize);
+            for &b in self.bits.iter().rev() {
+                nib = (nib << 1) | u8::from(b == V1);
+                n += 1;
+                used += 1;
+                if n == 4 || used == w {
+                    // Suppress leading zero nibbles on the first digit.
+                    if !(hex.len() == 2 && nib == 0 && used < w) {
+                        hex.push(char::from_digit(nib as u32, 16).unwrap_or('0'));
+                    }
+                    (nib, n) = (0, 0);
+                }
+            }
+            return hex;
+        }
+        const L: &[u8; 9] = b"01xzwlh-u";
+        let mut s = String::with_capacity(1 + self.bits.len());
+        s.push('"');
+        for &b in self.bits.iter().rev() {
+            s.push(L[b as usize] as char);
+        }
+        s.push('"');
+        s
+    }
+
     /// Resize to `width` bits (zero-extend; Verilog unsigned default).
     pub fn resize(&self, width: usize) -> Value {
         let mut bits = vec![V0; width.max(1)];
@@ -790,6 +844,43 @@ mod tests {
             .unwrap(),
             r#"{"w":1,"bits":"z"}"#
         );
+    }
+
+    #[test]
+    fn fmt_value_binary_hex_real_and_meta() {
+        // Narrow clean values read as binary (bit positions visible).
+        assert_eq!(Value::from_u64(4, 0b0001).fmt_value(), "0b0001");
+        assert_eq!(Value::from_u64(8, 0).fmt_value(), "0b00000000");
+        // Wider clean values read as hex; leading zero nibbles collapse.
+        assert_eq!(Value::from_u64(16, 0x00ff).fmt_value(), "0xff");
+        assert_eq!(Value::from_u64(16, 0x1000).fmt_value(), "0x1000");
+        assert_eq!(Value::from_u64(12, 0xf).fmt_value(), "0xf");
+        assert_eq!(Value::from_u64(10, 0b11_1111).fmt_value(), "0xf3");
+        assert_eq!(Value::from_u64(12, 0).fmt_value(), "0x0");
+        // Real-typed values decode the f64.
+        let mut r = Value::from_u64(64, 0);
+        r.real = true;
+        assert_eq!(r.fmt_value(), "r=0");
+        let mut one = Value::from_u64(64, 1.5f64.to_bits());
+        one.real = true;
+        assert_eq!(one.fmt_value(), "r=1.5");
+        // Metavalues print one state letter per bit, MSB first, quoted.
+        let m = Value {
+            bits: vec![V1, V0, VX, VZ],
+            real: false,
+        };
+        assert_eq!(m.fmt_value(), r#""zx01""#);
+    }
+
+    #[test]
+    fn has_meta_distinguishes_clean_from_unknown() {
+        assert!(!Value::from_u64(4, 0b1010).has_meta());
+        assert!(Value {
+            bits: vec![V0, VW, V1],
+            real: false,
+        }
+        .has_meta());
+        assert!(!Value::from_u64(1, 0).has_meta());
     }
 
     #[test]
