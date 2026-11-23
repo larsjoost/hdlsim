@@ -291,7 +291,7 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
     if let Some(v) = unit_names_memo().lock().unwrap().get(&key) {
         return v.as_ref().clone();
     }
-    let units = compute_units_in_file_tagged(path, &text, lang);
+    let units = units_in_text_tagged(lang, path, &text);
     unit_names_memo()
         .lock()
         .unwrap()
@@ -299,8 +299,10 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
     units
 }
 
-/// The uncached scan of one file (see [`units_in_file_tagged`]).
-fn compute_units_in_file_tagged(path: &Path, text: &str, lang: Language) -> Vec<(String, bool)> {
+/// Like [`units_in_file_tagged`], for already-read text — callers that hash
+/// the text for a cache entry (the persistent unit-index cache) or read it
+/// another way avoid reading the file twice.
+pub fn units_in_text_tagged(lang: Language, path: &Path, text: &str) -> Vec<(String, bool)> {
     if lang == Language::Vhdl {
         return vhdl_units_in_file(path, text);
     }

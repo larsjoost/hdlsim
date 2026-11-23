@@ -23,6 +23,9 @@
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"HDLCST1\0";
+/// Unit-index entries (design-unit names per file) live in their own
+/// namespace so they cannot collide with parse payloads for the same path.
+const UNITS_MAGIC: &[u8; 8] = b"HDLUID1\0";
 const FORMAT_VERSION: u32 = 2;
 
 /// Fingerprint of everything a cached payload depends on: the SyntaxKind table
@@ -71,12 +74,23 @@ impl Cache {
     }
 
     fn entry(&self, file: &Path) -> PathBuf {
+        self.entry_named(file, "")
+    }
+
+    /// Entry path for `file` in a payload namespace (`""` = parse payloads,
+    /// `"units"` = unit indexes), so different payload kinds never collide.
+    fn entry_named(&self, file: &Path, namespace: &str) -> PathBuf {
         let key = hash64(
             &std::fs::canonicalize(file)
                 .unwrap_or_else(|_| file.to_path_buf())
                 .to_string_lossy(),
         );
-        self.dir.join(format!("{:016x}.bin", key))
+        let suffix = if namespace.is_empty() {
+            String::new()
+        } else {
+            format!("-{namespace}")
+        };
+        self.dir.join(format!("{:016x}{suffix}.bin", key))
     }
 
     /// Fetch the payload if the entry exists and matches `source_hash`.
@@ -107,10 +121,60 @@ impl Cache {
         out.extend_from_slice(&payload_fingerprint().to_le_bytes());
         out.extend_from_slice(&source_hash.to_le_bytes());
         out.extend_from_slice(payload);
-        let entry = self.entry(file);
+        self.put_raw(&self.entry(file), &out);
+    }
+
+    /// Fetch the design-unit index for `file` (see [`Cache::put_units`]).
+    /// The payload is a plain `(name, is_body_only)` list — no SyntaxKind
+    /// indices — but the same fingerprint gates it so an upgrade that changes
+    /// the extraction logic also invalidates these entries.
+    pub fn get_units(&self, file: &Path, source_hash: u64) -> Option<Vec<(String, bool)>> {
+        let bytes = std::fs::read(self.entry_named(file, "units")).ok()?;
+        let mut r = Cursor::new(&bytes);
+        if r.take(UNITS_MAGIC.len())? != UNITS_MAGIC {
+            return None;
+        }
+        if r.u32()? != FORMAT_VERSION {
+            return None;
+        }
+        if r.u64()? != payload_fingerprint() {
+            return None;
+        }
+        if r.u64()? != source_hash {
+            return None;
+        }
+        let n = r.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let name = String::from_utf8(r.bytes()?.to_vec()).ok()?;
+            let body = r.u8()?;
+            out.push((name, body == 1));
+        }
+        Some(out)
+    }
+
+    /// Store the design-unit index of `file` (unit name, body-only flag) —
+    /// the result of the parse-scan used to index library directories.
+    /// Content-addressed and atomic like [`Cache::put`].
+    pub fn put_units(&self, file: &Path, source_hash: u64, units: &[(String, bool)]) {
+        let mut out = Vec::new();
+        out.extend_from_slice(UNITS_MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&payload_fingerprint().to_le_bytes());
+        out.extend_from_slice(&source_hash.to_le_bytes());
+        out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for (name, body) in units {
+            w_bytes(&mut out, name.as_bytes());
+            w_u8(&mut out, u8::from(*body));
+        }
+        self.put_raw(&self.entry_named(file, "units"), &out);
+    }
+
+    /// Write one entry file (atomic via tmp+rename; failures silently ignored).
+    fn put_raw(&self, entry: &Path, out: &[u8]) {
         let tmp = entry.with_extension("tmp");
-        if std::fs::write(&tmp, &out).is_ok() {
-            let _ = std::fs::rename(&tmp, &entry);
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, entry);
         }
     }
 }
@@ -221,6 +285,48 @@ mod tests {
         bytes[12] ^= 0xff;
         std::fs::write(&entry, &bytes).unwrap();
         assert_eq!(cache.get(f, hash64("x")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unit_index_roundtrip_and_invalidation() {
+        let dir = temp_dir("units");
+        let cache = Cache::open(dir.clone()).unwrap();
+        let f = Path::new("src/pkg.vhd");
+        let units = vec![
+            ("counter_pkg".to_string(), false),
+            ("counter_pkg".to_string(), true),
+        ];
+        cache.put_units(f, hash64("package counter_pkg"), &units);
+        assert_eq!(
+            cache.get_units(f, hash64("package counter_pkg")),
+            Some(units)
+        );
+        // Edited source → different hash → miss; parse payloads for the same
+        // path must not collide with unit-index entries.
+        assert_eq!(
+            cache.get_units(f, hash64("package counter_pkg -- edited")),
+            None
+        );
+        assert_eq!(cache.get(f, hash64("package counter_pkg")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_unit_index_is_rejected() {
+        let dir = temp_dir("ucorrupt");
+        let cache = Cache::open(dir.clone()).unwrap();
+        let f = Path::new("a.vhd");
+        cache.put_units(f, hash64("x"), &[("p".to_string(), false)]);
+        let entry = cache.entry_named(f, "units");
+        let mut bytes = std::fs::read(&entry).unwrap();
+        bytes[3] ^= 0xff; // break magic
+        std::fs::write(&entry, &bytes).unwrap();
+        assert_eq!(cache.get_units(f, hash64("x")), None);
+        // Truncated file → None, no panic.
+        let bytes = std::fs::read(&entry).unwrap();
+        std::fs::write(&entry, &bytes[..10]).unwrap();
+        assert_eq!(cache.get_units(f, hash64("x")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

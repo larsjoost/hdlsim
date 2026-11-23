@@ -462,8 +462,54 @@ impl LibraryManager {
         self.stem_indexed = true;
     }
 
+    /// Unit names of a filesystem provider's files, going through the
+    /// persistent unit-index cache when enabled (see [`Self::units_in_file_cached`]).
+    /// In-memory providers (no files) scan directly as before.
+    fn scan_provider_tagged(&self, p: &dyn UnitProvider) -> Vec<(String, PathBuf, bool)> {
+        let files = p.source_files();
+        if files.is_empty() {
+            return p.scan_tagged();
+        }
+        let mut out = Vec::new();
+        for f in files {
+            for (u, b) in self.units_in_file_cached(&f) {
+                out.push((u, f.clone(), b));
+            }
+        }
+        out
+    }
+
+    /// Design units of one file via the unit-index cache when enabled: the
+    /// scan result is content-addressed, so the full-parse scan of a library
+    /// directory is paid once per file ever — shared across managers and
+    /// processes (the corpus compiles ~100 groups against the same core
+    /// libraries; without the cache each group re-parses them for indexing).
+    fn units_in_file_cached(&self, path: &Path) -> Vec<(String, bool)> {
+        let Some(c) = self.cache.as_ref() else {
+            return providers::units_in_file_tagged(path);
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let h = cache::hash64(&text);
+        if let Some(units) = c.get_units(path, h) {
+            return units;
+        }
+        let lang = match Language::from_path(path) {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        let units = providers::units_in_text_tagged(lang, path, &text);
+        c.put_units(path, h, &units);
+        units
+    }
+
     /// Fully scan (parse) the filesystem providers once, on a lookup miss —
     /// needed when a unit's name differs from its file name (multi-unit files).
+    /// Providers already content-scanned via `resolve_in_library`
+    /// (`lib_scanned`) are skipped and their results are shared, so the same
+    /// library is never parsed twice in one session.
     fn full_scan_dir_providers(&mut self) {
         if self.dir_scanned {
             return;
@@ -473,14 +519,12 @@ impl LibraryManager {
             .all_providers()
             .enumerate()
             .filter(|(_, p)| !p.source_files().is_empty()) // filesystem providers
+            .filter(|(i, _)| !self.lib_scanned.contains(i))
             .flat_map(|(i, p)| {
                 if self.progress {
-                    eprintln!(
-                        "  scanning library '{}' for unit names (parsing)…",
-                        p.name()
-                    );
+                    eprintln!("  scanning library '{}' for unit names…", p.name());
                 }
-                p.scan_tagged()
+                self.scan_provider_tagged(p.as_ref())
                     .into_iter()
                     .map(move |(u, f, b)| (i, u, f, b))
             })
@@ -503,6 +547,12 @@ impl LibraryManager {
             // (embedded stdlib) candidates under this unit name.
             self.index.entry(unit).or_default().extend(decls);
         }
+        // Everything content-scanned here also counts as scanned for the
+        // per-library path.
+        let n = self.all_providers().count();
+        for i in 0..n {
+            self.lib_scanned.insert(i);
+        }
     }
 
     /// Parse-scan one filesystem provider's files for unit names and add the
@@ -517,12 +567,9 @@ impl LibraryManager {
                 Vec::new() // in-memory providers are indexed eagerly already
             } else {
                 if self.progress {
-                    eprintln!(
-                        "  scanning library '{}' for unit names (parsing)…",
-                        p.name()
-                    );
+                    eprintln!("  scanning library '{}' for unit names…", p.name());
                 }
-                p.scan_tagged()
+                self.scan_provider_tagged(p.as_ref())
             }
         };
         // Declarations first per unit: candidates are compiled in order, and
