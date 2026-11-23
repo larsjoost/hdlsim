@@ -1,0 +1,2505 @@
+--
+--  File Name:         PcieInterfacePkg.vhd
+--  Design Unit Name:  PcieInterfacePkg
+--  Revision:          OSVVM MODELS STANDARD VERSION
+--
+--  Maintainer:        Simon Southwell      email:  simon.southwell@gmail.com
+--  Contributor(s):
+--     Simon Southwell simon.southwell@gmail.com
+--
+--
+--  Description:
+--      Defines types, constants, and subprograms to support the PCie interface to DUT
+--      These are currently only intended for testbench models.
+--
+--  Revision History:
+--    Date      Version    Description
+--    06/2026   2026.08    Added support for DLLP and PHY traffic processing
+--    09/2025   2026.01    Initial revision
+--
+--
+--  This file is part of OSVVM.
+--
+--  Copyright (c) 2026 by [OSVVM Authors](../../../AUTHORS.md).
+--
+--  Licensed under the Apache License, Version 2.0 (the "License") ;
+--  you may not use this file except in compliance with the License.
+--  You may obtain a copy of the License at
+--
+--      https://www.apache.org/licenses/LICENSE-2.0
+--
+--  Unless required by applicable law or agreed to in writing, software
+--  distributed under the License is distributed on an "AS IS" BASIS,
+--  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+--  See the License for the specific language governing permissions and
+--  limitations under the License.
+--
+
+library ieee ;
+  use ieee.std_logic_1164.all ;
+  use ieee.numeric_std.all ;
+  use ieee.numeric_std_unsigned.all ;
+  use ieee.std_logic_textio.all ;
+
+library osvvm ;
+  context osvvm.OsvvmContext ;
+  use osvvm.ScoreboardPkg_slv.all ;
+
+library osvvm_cosim ;
+  context osvvm_cosim.CoSimContext ;
+
+library osvvm_common ;
+  context osvvm_common.OsvvmCommonContext ;
+
+package PcieInterfacePkg is
+
+  ------------------------------------------------------------
+  -- Memory map offsets of PcieModel registers
+  ------------------------------------------------------------
+
+ -- **** if the ../include/pcie_vhost_map.h values are updated, update the values below to match ****
+  constant PVH_STOP                          : integer := -3 ;
+  constant PVH_FINISH                        : integer := -2 ;
+  constant PVH_FATAL                         : integer := -1 ;
+
+  constant LINKADDR0                         : integer :=  0 ;
+  constant LINKADDR1                         : integer :=  1 ;
+  constant LINKADDR2                         : integer :=  2 ;
+  constant LINKADDR3                         : integer :=  3 ;
+  constant LINKADDR4                         : integer :=  4 ;
+  constant LINKADDR5                         : integer :=  5 ;
+  constant LINKADDR6                         : integer :=  6 ;
+  constant LINKADDR7                         : integer :=  7 ;
+  constant LINKADDR8                         : integer :=  8 ;
+  constant LINKADDR9                         : integer :=  9 ;
+  constant LINKADDR10                        : integer := 10 ;
+  constant LINKADDR11                        : integer := 11 ;
+  constant LINKADDR12                        : integer := 12 ;
+  constant LINKADDR13                        : integer := 13 ;
+  constant LINKADDR14                        : integer := 14 ;
+  constant LINKADDR15                        : integer := 15 ;
+
+  constant NODENUMADDR                       : integer := 200 ;
+  constant LANESADDR                         : integer := 201 ;
+  constant PVH_INVERT                        : integer := 202 ;
+  constant EP_ADDR                           : integer := 203 ;
+  constant CLK_COUNT                         : integer := 204 ;
+  constant LINK_STATE                        : integer := 205 ;
+  constant RESET_STATE                       : integer := 206 ;
+  constant DISABLE_SCRAMBLE_ADDR             : integer := 207 ;
+  constant DISABLE_8B10B_ADDR                : integer := 208 ;
+  constant GEN2_CLK_ADDR                     : integer := 209 ;
+
+  --   ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^
+  -- **** if the ../include/pcie_vhost_map.h values are updated, update the values above to match ****
+
+  -- **** If the below values change, also update ../../code/pcieVcInterface.h ****
+  --   v    v    v    v    v    v    v    v    v    v    v    v    v    v    v    v
+
+  constant REQID_ADDR                        : integer := 300 ;
+  constant PIPE_ADDR                         : integer := 301 ;
+  constant EN_ECRC_ADDR                      : integer := 302 ;
+  constant INITPHY_ADDR                      : integer := 303 ;
+  constant ENABLE_AUTO_ADDR                  : integer := 304 ;
+
+  constant GETNEXTTRANS                      : integer := 400 ;
+  constant GETINTTOMODEL                     : integer := 401 ;
+  constant GETBOOLTOMODEL                    : integer := 402 ;
+  constant GETTIMETOMODEL                    : integer := 403 ;
+  constant GETADDRESS                        : integer := 404 ;
+  constant GETADDRESSWIDTH                   : integer := 405 ;
+  constant GETDATATOMODEL                    : integer := 406 ;
+  constant GETDATAWIDTH                      : integer := 407 ;
+  constant GETPARAMS                         : integer := 408 ;
+  constant GETOPTIONS                        : integer := 409 ;
+  constant ACKTRANS                          : integer := 410 ;
+  constant SETDATAFROMMODEL                  : integer := 411 ;
+  constant SETBOOLFROMMODEL                  : integer := 412 ;
+  constant SETINTFROMMODEL                   : integer := 413 ;
+  constant SETPARAMS                         : integer := 414 ;
+  constant POPWDATA                          : integer := 415 ;
+  constant PUSHWDATA                         : integer := 416 ;
+  constant POPRDATA                          : integer := 417 ;
+  constant PUSHRDATA                         : integer := 418 ;
+  constant PUSHRDATA32                       : integer := 419 ;
+  constant POPRDATA32                        : integer := 420 ;
+
+  ------------------------------------------------------------
+  -- SetModelOptions for PCIe VC
+  ------------------------------------------------------------
+  constant NULLOPTVALUE                      : integer := -1 ;
+  constant VCOPTIONSTART                     : integer :=  1000 ;
+
+  constant SETCFGSPC                         : integer :=  1001 ;
+  constant SETCFGSPCMASK                     : integer :=  1002 ;
+  constant SETCFGSPCOFFSET                   : integer :=  1003 ;
+  constant SETMEMADDRLO                      : integer :=  1004 ;
+  constant SETMEMADDRHI                      : integer :=  1005 ;
+  constant SETMEMDATA                        : integer :=  1006 ;
+  constant SETMEMENDIANNESS                  : integer :=  1007 ;
+
+  ------------------------------------------------------------
+  -- GetModelOptions for internal memory back door access
+  ------------------------------------------------------------
+  constant GETMEMDATA                        : integer :=  2000 ;
+
+  ------------------------------------------------------------
+  -- EXTEND_OP Options
+  ------------------------------------------------------------
+  constant WAIT_FOR_TRANS                    : integer := 0;
+  constant TRY                               : integer := 1;
+
+  ------------------------------------------------------------
+  -- EXTEND_DIRECTIVE_OP options
+  ------------------------------------------------------------
+  constant INITDLL                           : integer :=  0 ;
+  constant INITPHY                           : integer :=  1 ;
+  constant GEN_OS                            : integer :=  2 ;
+  constant GEN_TS                            : integer :=  3 ;
+  constant GET_EVENT                         : integer :=  4 ;
+  constant RST_EVENT                         : integer :=  5 ;
+  constant GET_LANE_TS                       : integer :=  6 ;
+  constant SEND_DLL_ACK                      : integer :=  7 ;
+  constant SEND_DLL_NAK                      : integer :=  8 ;
+  constant SEND_DLL_FC                       : integer :=  9 ;
+  constant SEND_DLL_PM                       : integer := 10 ;
+  constant SEND_DLL_VEND_NODATA              : integer := 11 ;
+  constant SEND_DLL_VEND_DATA                : integer := 12 ;
+  constant WAIT_FOR_DLL                      : integer := 13 ;
+  constant TRY_DLL                           : integer := 14 ;
+
+  ------------------------------------------------------------
+  -- Memory endian settings
+  ------------------------------------------------------------
+  constant LITTLE_END                        : integer := 1 ;
+  constant BIG_END                           : integer := 0 ;
+
+  --   ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^    ^
+  -- **** If the above values change, also update ../../code/pcieVcInterface.h ****
+
+  ------------------------------------------------------------
+  -- 10 bit COMMA codes
+  ------------------------------------------------------------
+  constant PCOMMA                            : std_logic_vector (9 downto 0) := 10b"1010000011";   -- 0x283
+  constant NCOMMA                            : std_logic_vector (9 downto 0) := 10b"0101111100";   -- 0x17c
+
+  ------------------------------------------------------------
+  -- SetModelOptions for pcievhost model
+  ------------------------------------------------------------
+  constant CONFIG_FC_HDR_RATE                : integer :=  0 ;
+  constant CONFIG_FC_DATA_RATE               : integer :=  1 ;
+
+  constant CONFIG_ENABLE_FC                  : integer :=  2 ;
+  constant CONFIG_DISABLE_FC                 : integer :=  3 ;
+
+  constant CONFIG_ENABLE_ACK                 : integer :=  4 ;
+  constant CONFIG_DISABLE_ACK                : integer :=  5 ;
+
+  constant CONFIG_ENABLE_MEM                 : integer :=  6 ;
+  constant CONFIG_DISABLE_MEM                : integer :=  7 ;
+
+  constant CONFIG_ENABLE_SKIPS               : integer :=  8 ;
+  constant CONFIG_DISABLE_SKIPS              : integer :=  9 ;
+
+  constant CONFIG_ENABLE_UR_CPL              : integer := 10 ;
+  constant CONFIG_DISABLE_UR_CPL             : integer := 11 ;
+
+  constant CONFIG_POST_HDR_CR                : integer := 12 ;
+  constant CONFIG_POST_DATA_CR               : integer := 13 ;
+
+  constant CONFIG_NONPOST_HDR_CR             : integer := 14 ;
+  constant CONFIG_NONPOST_DATA_CR            : integer := 15 ;
+
+  constant CONFIG_CPL_HDR_CR                 : integer := 16 ;
+  constant CONFIG_CPL_DATA_CR                : integer := 17 ;
+
+  constant CONFIG_CPL_DELAY_RATE             : integer := 18 ;
+  constant CONFIG_CPL_DELAY_SPREAD           : integer := 19 ;
+
+  constant CONFIG_LTSSM_LINKNUM              : integer := 20 ;
+  constant CONFIG_LTSSM_N_FTS                : integer := 21 ;
+  constant CONFIG_LTSSM_TS_CTL               : integer := 22 ;
+  constant CONFIG_LTSSM_DETECT_QUIET_TO      : integer := 23 ;
+  constant CONFIG_LTSSM_ENABLE_TESTS         : integer := 24 ;
+  constant CONFIG_LTSSM_FORCE_TESTS          : integer := 25 ;
+  constant CONFIG_LTSSM_POLL_ACTIVE_TX_COUNT : integer := 26 ;
+  constant CONFIG_LTSSM_DISABLE_DISP_STATE   : integer := 27 ;
+
+  constant CONFIG_DISABLE_SCRAMBLING         : integer := 28 ;
+  constant CONFIG_ENABLE_SCRAMBLING          : integer := 29 ;
+
+  constant CONFIG_DISABLE_8B10B              : integer := 30 ;
+  constant CONFIG_ENABLE_8B10B               : integer := 31 ;
+
+  constant CONFIG_DISABLE_ECRC_CMPL          : integer := 32 ;
+  constant CONFIG_ENABLE_ECRC_CMPL           : integer := 33 ;
+
+  constant CONFIG_DISABLE_CRC_CHK            : integer := 34 ;
+  constant CONFIG_ENABLE_CRC_CHK             : integer := 35 ;
+
+  constant CONFIG_DISABLE_DISPLINK_COLOUR    : integer := 36 ;
+  constant CONFIG_ENABLE_DISPLINK_COLOUR     : integer := 37 ;
+
+  constant CONFIG_DISP_BCK_NODE_NUM          : integer := 38 ;
+
+  constant CONFIG_DONT_CARE                  : integer :=  -1 ;
+
+  ------------------------------------------------------------
+  -- Simulation control
+  ------------------------------------------------------------
+  constant FREERUNSIM                        : integer :=  0 ;
+  constant STOPSIM                           : integer :=  1 ;
+  constant FINISHSIM                         : integer :=  2 ;
+
+  ------------------------------------------------------------
+  -- TLP packet type
+  ------------------------------------------------------------
+  constant MEM_TRANS                         : integer :=  0 ;
+  constant IO_TRANS                          : integer :=  1 ;
+  constant CFG_SPC_TRANS                     : integer :=  2 ;
+  constant MSG_TRANS                         : integer :=  3 ;
+  constant CPL_TRANS                         : integer :=  4 ;
+  constant PART_CPL_TRANS                    : integer :=  5 ;
+
+  constant ACK_NAK_DLL                       : integer :=  6 ;
+  constant PM_DLL                            : integer :=  7 ;
+  constant VENDOR_DLL                        : integer :=  8 ;
+  constant INITFC_DLL                        : integer :=  9 ;
+  constant UPDATEFC_DLL                      : integer := 10 ;
+
+  ------------------------------------------------------------
+  -- TLP request tag auto-generation value
+  ------------------------------------------------------------
+  constant TLP_TAG_AUTO                      : integer :=  16#100# ;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when generating transactions and
+  -- returned status
+  ------------------------------------------------------------
+  constant PARAM_TRANS_MODE                  : integer := 0 ;
+  constant PARAM_RDLCK                       : integer := 1 ;
+  constant PARAM_CMPLRID                     : integer := 2 ;
+  constant PARAM_CMPLCID                     : integer := 3 ;
+  constant PARAM_CMPLRLEN                    : integer := 4 ;
+  constant PARAM_CMPLRTAG                    : integer := 5 ;
+  constant PARAM_CMPLSTATUS                  : integer := 6 ;
+  constant PARAM_REQTAG                      : integer := 7 ;
+  constant PARAM_PKT_STATUS                  : integer := 8 ;
+  constant PARAM_CMPL_STATUS                 : integer := 9;
+  constant PARAM_CMPL_RX_TAG                 : integer := 10 ;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when receiving transactions
+  ------------------------------------------------------------
+  constant PARAM_REQ_TYPE                    : integer := 0 ;
+  constant PARAM_REQ_TAG                     : integer := 1 ;
+  constant PARAM_REQ_RID                     : integer := 2 ;
+  constant PARAM_REQ_BE_MSGCODE              : integer := 3 ;
+  constant PARAM_REQ_DIGEST                  : integer := 4 ;
+  constant PARAM_REQ_POISONED                : integer := 5 ;
+  constant PARAM_REQ_ATTR                    : integer := 6 ;
+  constant PARAM_REQ_AT                      : integer := 7 ;
+  constant PARAM_REQ_FBE                     : integer := 8 ;
+  constant PARAM_REQ_LBE                     : integer := 9 ;
+  constant PARAM_REQ_MSG_CODE                : integer := 10 ;
+  constant PARAM_REQ_CFG_FUNC                : integer := 11 ;
+  constant PARAM_REQ_CFG_DEV                 : integer := 12 ;
+  constant PARAM_REQ_CFG_BUS                 : integer := 13 ;
+  constant PARAM_REQ_CFG_REG                 : integer := 14 ;
+  constant PARAM_REQ_LENGTH                  : integer := 15 ;
+  constant PARAM_REQ_BYTE_LEN                : integer := 16 ;
+  constant PARAM_REQ_PKT_STATUS              : integer := 17 ;
+  constant PARAM_REQ_ADDR                    : integer := 18 ;
+
+  constant NUM_PCIE_PARAMS                   : integer := PARAM_REQ_ADDR + 1 ;
+
+  -- PARAM_REQ_ADDRHI not included in parameter count but still required for decoding
+  constant PARAM_REQ_ADDRHI                  : integer := PARAM_REQ_ADDR + 1;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when generating ordered sets
+  ------------------------------------------------------------
+  constant PARAM_OS_TYPE                     : integer := 0 ;
+  constant PARAM_OS_COUNT                    : integer := 1 ;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when generating training sequences
+  ------------------------------------------------------------
+  constant PARAM_TS_TYPE                     : integer := 0 ;
+  constant PARAM_LINK                        : integer := 1 ;
+  constant PARAM_LANE                        : integer := 2 ;
+  constant PARAM_NFTS                        : integer := 3 ;
+  constant PARAM_GEN                         : integer := 4 ;
+  constant PARAM_CTL                         : integer := 5 ;
+  constant PARAM_TS_COUNT                    : integer := 6 ;
+
+  ------------------------------------------------------------
+  -- Parameters offsets when sending DLLP flow control packets
+  ------------------------------------------------------------
+  constant PARAM_FC_TYPE                     : integer := 0 ;
+  constant PARAM_FC_VC                       : integer := 1 ;
+  constant PARAM_FC_HDR_CREDITS              : integer := 2 ;
+  constant PARAM_FC_DATA_CREDITS             : integer := 3 ;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when accessing TS/OS RX events
+  ------------------------------------------------------------
+  constant PARAM_EVENT_TYPE                  : integer := 0 ;
+
+  ------------------------------------------------------------
+  -- Parameter offsets when receiving a DLLP
+  ------------------------------------------------------------
+  constant PARAM_DLLP_TYPE                   : integer := 0 ;
+  constant PARAM_DLLP_STATUS                 : integer := 1 ;
+  constant PARAM_DLLP_VC                     : integer := 2 ;
+  constant PARAM_DLLP_HDR_CREDITS            : integer := 3 ;
+  constant PARAM_DLLP_DATA_CREDITS           : integer := 4 ;
+  constant PARAM_DLLP_SEQ_NUM                : integer := 5 ;
+  constant PARAM_DLLP_VEND_DATA              : integer := 6 ;
+
+  ------------------------------------------------------------
+  -- TLP types
+  ------------------------------------------------------------
+  constant TL_MRD32                          : integer := 16#00# ;
+  constant TL_MRD64                          : integer := 16#20# ;
+  constant TL_MRDLCK32                       : integer := 16#01# ;
+  constant TL_MRDLCK64                       : integer := 16#21# ;
+  constant TL_MWR32                          : integer := 16#40# ;
+  constant TL_MWR64                          : integer := 16#60# ;
+  constant TL_IORD                           : integer := 16#02# ;
+  constant TL_IOWR                           : integer := 16#42# ;
+  constant TL_CFGRD0                         : integer := 16#04# ;
+  constant TL_CFGWR0                         : integer := 16#44# ;
+  constant TL_CFGRD1                         : integer := 16#05# ;
+  constant TL_CFGWR1                         : integer := 16#45# ;
+  constant TL_MSG                            : integer := 16#30# ;
+  constant TL_MSGD                           : integer := 16#70# ;
+  constant TL_CPL                            : integer := 16#0a# ;
+  constant TL_CPLD                           : integer := 16#4a# ;
+  constant TL_CPLLK                          : integer := 16#0b# ;
+  constant TL_CPLDLK                         : integer := 16#4b# ;
+
+  ------------------------------------------------------------
+  -- DLL types
+  ------------------------------------------------------------
+  constant DL_ACK                            : integer := 16#00#;
+  constant DL_NAK                            : integer := 16#10#;
+  constant DL_INITFC1_P                      : integer := 16#40#;
+  constant DL_INITFC1_NP                     : integer := 16#50#;
+  constant DL_INITFC1_CPL                    : integer := 16#60#;
+  constant DL_INITFC2_P                      : integer := 16#c0#;
+  constant DL_INITFC2_NP                     : integer := 16#d0#;
+  constant DL_INITFC2_CPL                    : integer := 16#e0#;
+  constant DL_UPDATEFC_P                     : integer := 16#80#;
+  constant DL_UPDATEFC_NP                    : integer := 16#90#;
+  constant DL_UPDATEFC_CPL                   : integer := 16#a0#;
+  constant DL_PM_ENTER_L1                    : integer := 16#20#;
+  constant DL_PM_ENTER_L23                   : integer := 16#21#;
+  constant DL_PM_REQ_L0S                     : integer := 16#22#;
+  constant DL_PM_REQ_L1                      : integer := 16#23#;
+  constant DL_PM_REQ_ACK                     : integer := 16#24#;
+  constant DL_VENDOR                         : integer := 16#30#;
+
+  ------------------------------------------------------------
+  -- Training sequence types
+  ------------------------------------------------------------
+  constant TS1_ID                            : integer := 16#4a# ;
+  constant TS2_ID                            : integer := 16#45# ;
+
+  constant TS_PAD                            : integer := 16#1f7# ;
+  constant TS_SEQ                            : integer := 0;
+
+  ------------------------------------------------------------
+  -- Ordered set codes
+  ------------------------------------------------------------
+
+  constant OS_SKP                            : integer := 16#11c# ;
+  constant OS_FTS                            : integer := 16#13c# ;
+  constant OS_IDL                            : integer := 16#17c# ;
+  constant OS_EIE                            : integer := 16#1fc# ;
+
+  constant ELEC_IDLE                         : integer := 0 ;
+
+  ------------------------------------------------------------
+  -- PCIe Message codes
+  ------------------------------------------------------------
+  constant MSG_UNLOCK                        : std_logic_vector(31 downto 0) := X"00000000" ;
+
+  constant MSG_ASSERT_INTA                   : std_logic_vector(31 downto 0) := X"00000020" ;
+  constant MSG_ASSERT_INTB                   : std_logic_vector(31 downto 0) := X"00000021" ;
+  constant MSG_ASSERT_INTC                   : std_logic_vector(31 downto 0) := X"00000022" ;
+  constant MSG_ASSERT_INTD                   : std_logic_vector(31 downto 0) := X"00000023" ;
+  constant MSG_DEASSERT_INTA                 : std_logic_vector(31 downto 0) := X"00000024" ;
+  constant MSG_DEASSERT_INTB                 : std_logic_vector(31 downto 0) := X"00000025" ;
+  constant MSG_DEASSERT_INTC                 : std_logic_vector(31 downto 0) := X"00000026" ;
+  constant MSG_DEASSERT_INTD                 : std_logic_vector(31 downto 0) := X"00000027" ;
+
+  constant MSG_PM_ACTIVE_STATE_NAK           : std_logic_vector(31 downto 0) := X"00000014" ;
+  constant MSG_PME                           : std_logic_vector(31 downto 0) := X"00000018" ;
+  constant MSG_PME_TURN_OFF                  : std_logic_vector(31 downto 0) := X"00000019" ;
+  constant MSG_PME_TO_ACK                    : std_logic_vector(31 downto 0) := X"0000001B" ;
+
+  constant MSG_ERR_CORR                      : std_logic_vector(31 downto 0) := X"00000030" ;
+  constant MSG_ERR_NON_FATAL                 : std_logic_vector(31 downto 0) := X"00000031" ;
+  constant MSG_ERR_FATAL                     : std_logic_vector(31 downto 0) := X"00000033" ;
+
+  constant MSG_SET_PWR_LIMIT                 : std_logic_vector(31 downto 0) := X"00000050" ;
+  constant MSG_VENDOR_0                      : std_logic_vector(31 downto 0) := X"0000007e" ;
+  constant MSG_VENDOR_1                      : std_logic_vector(31 downto 0) := X"0000007f" ;
+
+  constant MSG_DATA_NULL                     : std_logic_vector(31 downto 0) := X"00000000" ;
+
+  ------------------------------------------------------------
+  -- Completion packet error status values
+  ------------------------------------------------------------
+  constant PKT_STATUS_GOOD                   : integer                       :=  0 ;
+  constant PKT_STATUS_BAD_LCRC               : integer                       :=  1 ;
+  constant PKT_STATUS_BAD_DLLP_CRC           : integer                       :=  1 ;
+  constant PKT_STATUS_BAD_ECRC               : integer                       :=  2 ;
+  constant PKT_STATUS_UNSUPPORTED            : integer                       :=  4 ;
+  constant PKT_STATUS_NULLIFIED              : integer                       :=  8 ;
+
+  ------------------------------------------------------------
+  -- Completion status values
+  ------------------------------------------------------------
+  constant CPL_SUCCESS                       : integer                       :=  0 ;
+  constant CPL_UNSUPPORTED                   : integer                       :=  1 ;
+  constant CPL_CRS                           : integer                       :=  2 ;
+  constant CPL_ABORT                         : integer                       :=  4 ;
+
+  ------------------------------------------------------------
+  -- TS GEN byte bit field definitions
+  ------------------------------------------------------------
+  constant PCIE_GEN1                         : integer                       := 16#02# ;
+  constant PCIE_GEN2                         : integer                       := 16#04# ;
+  constant PCIE_AUTO_CHANGE                  : integer                       := 16#40# ;
+  constant PCIE_SPEED_CHANGE                 : integer                       := 16#80# ;
+
+  ------------------------------------------------------------
+  -- TS CTL byte bit field definitions
+  ------------------------------------------------------------
+  constant PCIE_HOT_RESET                    : integer                       := 16#01# ;
+  constant PCIE_DISABLE_LINK                 : integer                       := 16#02# ;
+  constant PCIE_LOOPBACK                     : integer                       := 16#04# ;
+  constant PCIE_DISABLE_SCRAMBLING           : integer                       := 16#08# ;
+  constant PCIE_COMPLIANCE_RX                : integer                       := 16#10# ;
+
+  ------------------------------------------------------------
+  -- Link dimension limits
+  ------------------------------------------------------------
+  constant MAXLINKWIDTH                      : integer                       := 16 ;
+  constant ENCODEDWIDTH                      : integer                       := 10 ;
+
+  ------------------------------------------------------------
+  subtype TagType is integer range 0 to 256;
+  -- Sub-type for setting tag of request TLP, or specifying
+  -- model to auto-generate
+  ------------------------------------------------------------
+
+  ------------------------------------------------------------
+  type LinkType is array (natural range <>) of std_logic_vector ;
+  -- Basic uni-directional PCIe link type
+  ------------------------------------------------------------
+
+  ------------------------------------------------------------
+  type PcieRecType is record
+  -- PCIe link type
+  ------------------------------------------------------------
+    LinkOut       : LinkType ;
+    LinkIn        : LinkType ;
+  end record PcieRecType;
+
+
+  ------------------------------------------------------------
+  type PcieStatusRecType is record
+  -- Non-posted TLP completion status type
+  ------------------------------------------------------------
+    Packet     : integer ;
+    Completion : integer ;
+    Tag        : TagType ;
+  end record PcieStatusRecType ;
+
+  ------------------------------------------------------------
+  type PcieTsRecType is record
+  -- Training Sequence symbol fields
+  ------------------------------------------------------------
+    Id         : integer ;
+    Linknum    : integer ;
+    Lanenum    : integer ;
+    Nfts       : integer range 0 to 255;
+    Datarate   : integer range 0 to 255;
+    Control    : integer range 0 to 255;
+
+  end record PcieTsRecType ;
+
+  ------------------------------------------------------------
+  type PcieEventCountsType  is array (natural range 0 to MAXLINKWIDTH-1) of integer ;
+  -- Received OS/TS event counts type
+  ------------------------------------------------------------
+
+  ------------------------------------------------------------
+  function has_all_z  (
+  -- Function to flag that *all* link inputs are Z
+  ------------------------------------------------------------
+    vec                     : std_logic_vector
+  ) return boolean ;
+
+  ------------------------------------------------------------
+  procedure PcieTryWaitForTransaction (
+  --
+  ------------------------------------------------------------
+    signal   Clk                : In  std_logic ;
+    signal   Rdy                : In  RdyType ;
+    signal   Ack                : In  AckType ;
+             TransUnavail       : Out boolean ;
+    constant ClkActive          : In  std_logic := CLK_ACTIVE
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieInitLink (
+  -- do PCIe Memory Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieInitDll (
+  -- do PCIe Memory Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemWrite (
+  -- do PCIe Memory Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iData          : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemWrite (
+  -- do PCIe Burst Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemRead (
+  -- do PCIe Memory Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemRead (
+  -- do PCIe Burst Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iByteCount      : In    integer ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLock (
+  -- do PCIe Locked Memory Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLock (
+  -- do PCIe Locked Burst Memory Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iByteCount      : In    integer ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadAddress (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iLock          : In    boolean := false ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadAddress (
+  -- do PCIe Burst Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLockAddress (
+  -- do PCIe Locked Burst Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadData (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+    variable oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceWrite (
+  -- do PCIe Configuration Space Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iCid            : In    std_logic_vector ;
+             iData           : In    std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceRead (
+  -- do PCIe Configuration Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceRead (
+  -- do PCIe Configuration Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iCid            : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieIoWrite (
+  -- do PCIe I/O Space Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iData           : In    std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieIoRead (
+  -- do PCIe I/O Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMessageWrite (
+  -- do PCIe message (no data) Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iMsgType       : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieMessageWrite (
+  -- do PCIe message (with data) Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iMsgType       : In    std_logic_vector ;
+             iMsgData       : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iData          : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with no data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletionLock (
+  -- do PCIe locked completion (with data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iData          : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletionLock (
+  -- do PCIe locked completion (with no data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePartCompletion (
+  -- do PCIe completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iRemainingLen  : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePartCompletionLock (
+  -- do PCIe locked completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iRemainingLen  : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieGetTransCommon (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iOption         : In    integer ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+             oAvailable      : Out   boolean ;
+    constant StatusMsgOn     : In    boolean := false
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieGetTrans (
+  -- Blocking fetch of received transaction
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+    constant StatusMsgOn     : In    boolean := false
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieTryGetTrans (
+  -- Non-blocking test for a received transaction
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+             oAvailable      : Out   boolean ;
+    constant StatusMsgOn     : In    boolean := false
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemWrite (
+  -- Extract memory write data word
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oData              : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemWrite (
+  -- Extract memory write with burst data
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemRead (
+  -- Extract memory read
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oLocked            : Out   boolean
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractIoWrite (
+  -- Extract memoryI/O write data word
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oData              : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractIoRead (
+  -- Extract I/O read
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractCfgWrite (
+  -- Extract configuration space write data word
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oBus               : Out   integer ;
+             oDev               : Out   integer ;
+             oFunc              : Out   integer ;
+             oReg               : Out   integer ;
+             oData              : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractCfgRead (
+  -- Extract Configuration space read
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oBus               : Out   integer ;
+             oDev               : Out   integer ;
+             oFunc              : Out   integer ;
+             oReg               : Out   integer ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMsg (
+  -- Extract message
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oMsgCode           : Out   integer ;
+             oLength            : Out   integer ;
+             oRouteType         : out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  );
+
+
+  ------------------------------------------------------------
+  procedure PcieDecodePciRegisters (
+  -- Decode and log PCI configuration space register values
+  ------------------------------------------------------------
+             RegData            : In    std_logic_vector ;
+             RegNumber          : In    integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendAck (
+  -- Send DLL ACK with specified Sequence
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iSeqNum            : In    integer range 0 to 4095
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendNak (
+  -- Send DLL NAK with specified Sequence
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iSeqNum            : In    integer range 0 to 4095
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendFc (
+  -- Send DLL flow control
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iFcType            : In    integer ;
+             iHdrCredits        : In    integer range 0 to 127 ;
+             iDataCredits       : In    integer range 0 to 2047 ;
+             iVc                : In    integer range 0 to 7     := 0
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendPm (
+  -- Send DLL power management DLL
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iPmType            : In    integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllVendor (
+  -- Send Vendor DLL (no data)
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieDllVendor (
+  -- Send Vendor DLL (with data)
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iData              : In    integer range 0 to 16#1000000#
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieGetDllp (
+  -- Blocking fetch of received DLLP
+  ------------------------------------------------------------
+    signal   TransactionRec   : InOut AddressBusRecType ;
+             oDllpType        : Out   integer ;
+             oDllpErrorStatus : Out   integer ;
+    constant StatusMsgOn      : In    boolean := false
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieTryGetDllp (
+  -- Non-blocking test for a received DLLP
+  ------------------------------------------------------------
+    signal   TransactionRec   : InOut AddressBusRecType ;
+             oDllpType        : Out   integer ;
+             oDllpErrorStatus : Out   integer ;
+             oAvailable       : Out   boolean ;
+    constant StatusMsgOn      : In    boolean := false
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpSeqNum (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpSeqNum     : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpFc (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpVc         : Out   integer ;
+           oDllpHdrFc      : Out   integer ;
+           oDllpDataFc     : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpVendData (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpVendData   : Out   integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePhyOs (
+  -- Generate ordered set
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iOsType            : In    integer ;
+             iCount             : In    integer range 1 to 2**20 := 1
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePhyTs (
+  -- Generate Training Sequence
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsParams          : In    PcieTsRecType ;
+             iCount             : In    integer range 1 to 2**20 := 1
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePhyGetOsTsEventCounts (
+  -- Read ordered set/training sequence event counts.
+  -- counts returned in FIFO
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsOsType          : In    integer ;
+             oNumLanes          : Out   integer ;
+             oEventCounts       : Out   PcieEventCountsType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePhyResetOsTsEventCounts (
+  -- Reset ordered set/training sequence event counts.
+  -- counts returned in FIFO
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsOsType          : In    integer
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PciePhyGetTs (
+  -- Returns a training sequence type (TS_t) which is the
+  -- last TS value received
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iLane              : In    integer range 0 to MAXLINKWIDTH-1;
+             oLastTs            : Out   PcieTsRecType
+  ) ;
+
+  ------------------------------------------------------------
+  procedure PcieGetAccessFromModel (
+  ------------------------------------------------------------
+             node               : In    integer ;
+             VPData             : InOut integer ;
+             VPDataHi           : InOut integer ;
+             VPAddr             : InOut integer ;
+             VPOp               : Out   integer ;
+             VPDone             : Out   integer ;
+             VPError            : Out   integer
+
+  ) ;
+
+end package PcieInterfacePkg ;
+
+-- ***********************************************************
+-- ************************ B O D Y **************************
+-- ***********************************************************
+
+package body PcieInterfacePkg is
+
+  ------------------------------------------------------------
+  function has_all_z (vec : std_logic_vector) return boolean is
+  ------------------------------------------------------------
+  variable zcount : integer := 0 ;
+  begin
+
+    for idx in vec'range loop
+      case vec(idx) is
+        when 'Z'                         => zcount := zcount + 1 ;
+        when others                      => zcount := 0 ;
+      end case;
+    end loop;
+
+    return zcount = vec'length ;
+
+  end function has_all_z ;
+
+  ------------------------------------------------------------
+  procedure PcieTryWaitForTransaction (
+  -- Non-blocking wait for a new Transaction request, returning
+  -- with TransUnavail TRUE if no request, else return with
+  -- TransUnavail FALSE when new request ready.
+  ------------------------------------------------------------
+    signal   Clk                : In    std_logic ;
+    signal   Rdy                : In    RdyType ;
+    signal   Ack                : In    AckType ;
+             TransUnavail       : Out   boolean ;
+    constant ClkActive          : In    std_logic := CLK_ACTIVE
+  ) is
+  begin
+
+    -- Allow any new request ready to propagate for this iteration.
+    wait for 0 ns ;
+
+    TransUnavail := TRUE when Ack = Rdy else FALSE ;
+
+    if not TransUnavail then
+
+      -- Align to clock if needed (not back-to-back transactions)
+      if not EdgeActive(Clk, ClkActive) then
+        wait until Clk ?= ClkActive ;
+      end if ;
+
+    end if ;
+
+  end procedure PcieTryWaitForTransaction ;
+
+  ------------------------------------------------------------
+  procedure PcieGetAccessFromModel (
+  ------------------------------------------------------------
+             node               : In    integer ;
+             VPData             : InOut integer ;
+             VPDataHi           : InOut integer ;
+             VPAddr             : InOut integer ;
+             VPOp               : Out   integer ;
+             VPDone             : Out   integer ;
+             VPError            : Out   integer
+
+  ) is
+    variable UnusedVPDataWidth : integer := 0 ;
+    variable UnusedVPAddrHi    : integer := 0 ;
+    variable UnusedVPAddrWidth : integer := 0 ;
+    variable UnusedVPBurstSize : integer := 0 ;
+    variable UnusedVPTicks     : integer := 0 ;
+    variable UnusedVPParam     : integer := 0 ;
+    variable UnusedVPStatus    : integer := 0 ;
+    variable UnusedVPCount     : integer := 0 ;
+    variable UnusedCount       : integer := 0 ;
+    variable UnusedIntReq      : integer := 0 ;
+  begin
+    -- Fetch the next access from the model via the CoSim foreign procedure
+    VTrans (node,   UnusedIntReq,      UnusedVPStatus,  UnusedVPCount, UnusedCount,
+            VPData, VPDataHi,          UnusedVPDataWidth,
+            VPAddr, UnusedVPAddrHi,    UnusedVPAddrWidth,
+            VPOp,   UnusedVPBurstSize, UnusedVPTicks,
+            VPDone, VPError,           UnusedVPParam) ;
+
+  end procedure PcieGetAccessFromModel ;
+
+  ------------------------------------------------------------
+  procedure PcieInitLink (
+  -- do PCIe PHY link initialisation
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType
+  ) is
+  begin
+    -- Put values in record
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= INITPHY ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieInitLink ;
+
+  ------------------------------------------------------------
+  procedure PcieInitDll (
+  -- do PCIe DLL flow control initialisation
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType
+  ) is
+  begin
+    -- Put values in record
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= INITDLL ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieInitDll ;
+
+  ------------------------------------------------------------
+  procedure PcieMemWrite (
+  -- do PCIe Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iData          : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Write(TransactionRec, iAddr, iData) ;
+
+  end procedure PcieMemWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieMemWrite (
+  -- do PCIe Burst Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    WriteBurst(TransactionRec, iAddr, iByteCount) ;
+
+  end procedure PcieMemWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieMemRead (
+  -- do PCIe Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+
+    Read(TransactionRec, iAddr, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieMemRead ;
+
+  ------------------------------------------------------------
+  procedure PcieMemRead (
+  -- do PCIe Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iByteCount      : In    integer ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+
+    ReadBurst(TransactionRec, iAddr, iByteCount) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieMemRead ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLock (
+  -- do PCIe Memory Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      1) ;
+
+    Read(TransactionRec, iAddr, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieMemReadLock ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLock (
+  -- do PCIe Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iByteCount      : In    integer ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      1) ;
+
+    ReadBurst(TransactionRec, iAddr, iByteCount) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieMemReadLock ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadAddress (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iLock          : In    boolean := false ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      iLock) ;
+
+    -- Put values in record
+    TransactionRec.Operation     <= READ_ADDRESS ;
+    TransactionRec.Address       <= SafeResize(iAddr, TransactionRec.Address'length) ;
+    TransactionRec.AddrWidth     <= iAddr'length ;
+    TransactionRec.DataToModel   <= (TransactionRec.DataToModel'range => 'X') ;
+    TransactionRec.DataWidth     <= iByteCount * 8;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    -- Start Transaction
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieMemReadAddress ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadAddress (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    PcieMemReadAddress(TransactionRec, iAddr, iByteCount, false, iTag) ;
+
+  end procedure PcieMemReadAddress ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadLockAddress (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iAddr          : In    std_logic_vector ;
+             iByteCount     : In    integer ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    PcieMemReadAddress(TransactionRec, iAddr, iByteCount, true, iTag) ;
+
+  end procedure PcieMemReadLockAddress ;
+
+  ------------------------------------------------------------
+  procedure PcieMemReadData (
+  -- do PCIe Read Address Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+    variable oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MEM_TRANS) ;
+
+    ReadData(TransactionRec, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieMemReadData ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceWrite (
+  -- do PCIe Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iCid            : In    std_logic_vector ;
+             iData           : In    std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CFG_SPC_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Write(TransactionRec, iCid & iAddr, iData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieCfgSpaceWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceRead (
+  -- do PCIe Configuration Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CFG_SPC_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Read(TransactionRec, iAddr, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieCfgSpaceRead ;
+
+  ------------------------------------------------------------
+  procedure PcieCfgSpaceRead (
+  -- do PCIe Configuration Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iCid            : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CFG_SPC_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Read(TransactionRec, iCid & iAddr, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieCfgSpaceRead ;
+
+  ------------------------------------------------------------
+  procedure PcieIoWrite (
+  -- do PCIe Write Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             iData           : In    std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, IO_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Write(TransactionRec, iAddr, iData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieIoWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieIoRead (
+  -- do PCIe Configuration Space Read Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iAddr           : In    std_logic_vector ;
+             oData           : Out   std_logic_vector ;
+             oStatus         : Out   PcieStatusRecType ;
+             iTag            : In    TagType := TLP_TAG_AUTO
+  ) is
+  variable Status            : integer ;
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, IO_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    Read(TransactionRec, iAddr, oData) ;
+
+    oStatus.Packet     := Get(TransactionRec.Params, PARAM_PKT_STATUS) ;
+    oStatus.Completion := Get(TransactionRec.Params, PARAM_CMPL_STATUS) ;
+    oStatus.Tag        := Get(TransactionRec.Params, PARAM_CMPL_RX_TAG) ;
+
+  end procedure PcieIoRead ;
+
+  ------------------------------------------------------------
+  procedure PcieMessageWrite (
+  -- do PCIe message (no data) Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iMsgType       : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MSG_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    -- Do some memory reads and writes
+    WriteAddressAsync(TransactionRec, iMsgType) ;
+
+  end procedure PcieMessageWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieMessageWrite (
+  -- do PCIe message (with data) Cycle
+  ------------------------------------------------------------
+    signal   TransactionRec : InOut AddressBusRecType ;
+             iMsgType       : In    std_logic_vector ;
+             iMsgData       : In    std_logic_vector ;
+             iTag           : In    TagType := TLP_TAG_AUTO
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, MSG_TRANS) ;
+    Set(TransactionRec.Params, PARAM_REQTAG,     iTag) ;
+
+    -- Do some memory reads and writes
+    Write(TransactionRec, iMsgType, iMsgData) ;
+
+  end procedure PcieMessageWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iData          : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+
+    Write(TransactionRec, iLowAddr, iData) ;
+
+  end procedure PcieCompletion ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with no data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+
+    WriteAddressAsync(TransactionRec, iLowAddr) ;
+
+  end procedure PcieCompletion ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletion (
+  -- do PCIe completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+
+    WriteBurst(TransactionRec, iLowAddr, iByteCount) ;
+
+  end procedure PcieCompletion ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletionLock (
+  -- do PCIe locked completion (with data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iData          : In    std_logic_vector ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      1) ;
+
+    Write(TransactionRec, iLowAddr, iData) ;
+
+  end procedure PcieCompletionLock ;
+
+  ------------------------------------------------------------
+  procedure PcieCompletionLock (
+  -- do PCIe locked completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      1) ;
+
+    WriteBurst(TransactionRec, iLowAddr, iByteCount) ;
+
+  end procedure PcieCompletionLock ;
+
+  ------------------------------------------------------------
+  procedure PciePartCompletion (
+  -- do PCIe completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iRemainingLen  : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, PART_CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRLEN,   iRemainingLen) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      0) ;
+
+    WriteBurst(TransactionRec, iLowAddr, iByteCount) ;
+
+  end procedure PciePartCompletion ;
+
+  ------------------------------------------------------------
+  procedure PciePartCompletionLock (
+  -- do PCIe locked completion (with burst data) Cycle
+  ------------------------------------------------------------
+  signal   TransactionRec : InOut AddressBusRecType ;
+           iLowAddr       : In    std_logic_vector ;
+           iByteCount     : In    integer ;
+           iRid           : In    std_logic_vector ;
+           iCid           : In    std_logic_vector ;
+           iRemainingLen  : In    std_logic_vector ;
+           iTag           : In    TagType ;
+           iCplStatus     : In    integer := CPL_SUCCESS
+  ) is
+  begin
+
+    Set(TransactionRec.Params, PARAM_TRANS_MODE, PART_CPL_TRANS) ;
+    Set(TransactionRec.Params, PARAM_CMPLRTAG,   iTag) ;
+    Set(TransactionRec.Params, PARAM_CMPLCID,    iCid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRID,    iRid) ;
+    Set(TransactionRec.Params, PARAM_CMPLRLEN,   iRemainingLen) ;
+    Set(TransactionRec.Params, PARAM_CMPLSTATUS, iCplStatus) ;
+    Set(TransactionRec.Params, PARAM_RDLCK,      1) ;
+
+    WriteBurst(TransactionRec, iLowAddr, iByteCount) ;
+
+  end procedure PciePartCompletionLock ;
+
+  ------------------------------------------------------------
+  procedure PcieGetTransCommon (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             iOption         : In    integer ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+             oAvailable      : Out   boolean ;
+    constant StatusMsgOn     : In    boolean := false
+  )  is
+  begin
+    -- Put values in record
+    TransactionRec.Operation     <= EXTEND_OP ;
+    TransactionRec.Options       <= iOption ;
+    TransactionRec.StatusMsgOn   <= StatusMsgOn ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+    oTransType       := Get(TransactionRec.Params, PARAM_REQ_TYPE) ;
+    oAvailable       := TransactionRec.BoolFromModel ;
+
+    if oAvailable then
+      oPktErrorStatus := Get(TransactionRec.Params, PARAM_REQ_PKT_STATUS) ;
+    else
+      oPktErrorStatus := PKT_STATUS_GOOD ;
+    end if;
+
+  end procedure PcieGetTransCommon ;
+
+  ------------------------------------------------------------
+  procedure PcieGetTrans (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+    constant StatusMsgOn     : In    boolean := false
+  ) is
+  variable   Available       :       boolean ;
+  variable   opt             :       integer := WAIT_FOR_TRANS ;
+  begin
+
+    PcieGetTransCommon(TransactionRec, opt, oTransType, oPktErrorStatus, Available, StatusMsgOn) ;
+
+  end procedure PcieGetTrans ;
+
+  ------------------------------------------------------------
+  procedure PcieTryGetTrans (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec  : InOut AddressBusRecType ;
+             oTransType      : Out   integer ;
+             oPktErrorStatus : Out   integer ;
+             oAvailable      : Out   boolean ;
+    constant StatusMsgOn     : In    boolean := false
+  ) is
+  variable   opt             :       integer := TRY ;
+  begin
+    PcieGetTransCommon(TransactionRec, opt, oTransType, oPktErrorStatus, oAvailable, StatusMsgOn) ;
+  end procedure PcieTryGetTrans ;
+
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemWrite (
+  -- Extract a memory write word request
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oData              : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  ) is
+  begin
+
+    oAddress           := SafeResize(Get(TransactionRec.Params, PARAM_REQ_ADDR), oAddress'length) ;
+    oLength            := Get(TransactionRec.Params, PARAM_REQ_LENGTH) ;
+    oPayloadByteLength := Get(TransactionRec.Params, PARAM_REQ_BYTE_LEN) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oLBE               := Get(TransactionRec.Params, PARAM_REQ_LBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    oData := std_logic_vector(to_unsigned(0, oData'length)) ;
+    for i in 0 to oPayloadByteLength-1 loop
+      case (i) is
+      when 0 => Pop(TransactionRec.ReadBurstFifo, oData( 7 downto  0)) ;
+      when 1 => Pop(TransactionRec.ReadBurstFifo, oData(15 downto  8)) ;
+      when 2 => Pop(TransactionRec.ReadBurstFifo, oData(23 downto 16)) ;
+      when 3 => Pop(TransactionRec.ReadBurstFifo, oData(31 downto 24)) ;
+      when others => null ;
+      end case ;
+    end loop ;
+
+  end procedure PcieExtractMemWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemWrite (
+  -- Extract a memory write burst request
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  ) is
+  begin
+
+    oAddress           := SafeResize(Get(TransactionRec.Params, PARAM_REQ_ADDR), oAddress'length) ;
+    oLength            := Get(TransactionRec.Params, PARAM_REQ_LENGTH) ;
+    oPayloadByteLength := Get(TransactionRec.Params, PARAM_REQ_BYTE_LEN) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oLBE               := Get(TransactionRec.Params, PARAM_REQ_LBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+  end procedure PcieExtractMemWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMemRead (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oLength            : Out   integer ;
+             oFBE               : Out   integer ;
+             oLBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oLocked            : Out   boolean
+  ) is
+  variable tlptype              :       unsigned (7 downto 0);
+  begin
+
+    oAddress           := SafeResize(Get(TransactionRec.Params, PARAM_REQ_ADDR), oAddress'length) ;
+    oLength            := Get(TransactionRec.Params, PARAM_REQ_LENGTH) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oLBE               := Get(TransactionRec.Params, PARAM_REQ_LBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    tlptype            := to_unsigned(Get(TransactionRec.Params, PARAM_REQ_TYPE), 8) ;
+
+    if tlptype(5) = '1' then
+      oLocked          := true ;
+    else
+      oLocked          := false ;
+    end if ;
+
+  end procedure PcieExtractMemRead ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractIoWrite (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oData              : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) is
+  begin
+
+    oAddress           := SafeResize(Get(TransactionRec.Params, PARAM_REQ_ADDR), oAddress'length) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    oData := std_logic_vector(to_unsigned(0, oData'length)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData( 7 downto  0)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(15 downto  8)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(23 downto 16)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(31 downto 24)) ;
+
+  end procedure PcieExtractIoWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractIoRead (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oAddress           : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) is
+  begin
+
+    oAddress           := SafeResize(Get(TransactionRec.Params, PARAM_REQ_ADDR), oAddress'length) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+  end procedure PcieExtractIoRead ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractCfgWrite (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oBus               : Out   integer ;
+             oDev               : Out   integer ;
+             oFunc              : Out   integer ;
+             oReg               : Out   integer ;
+             oData              : Out   std_logic_vector ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) is
+  variable tlptype              :       unsigned (7 downto 0);
+  begin
+
+    oBus               := Get(TransactionRec.Params, PARAM_REQ_CFG_BUS) ;
+    oDev               := Get(TransactionRec.Params, PARAM_REQ_CFG_DEV) ;
+    oFunc              := Get(TransactionRec.Params, PARAM_REQ_CFG_FUNC) ;
+    oReg               := Get(TransactionRec.Params, PARAM_REQ_CFG_REG) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    tlptype            := to_unsigned(Get(TransactionRec.Params, PARAM_REQ_TYPE), 8) ;
+
+    oData := std_logic_vector(to_unsigned(0, oData'length)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData( 7 downto  0)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(15 downto  8)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(23 downto 16)) ;
+    Pop(TransactionRec.ReadBurstFifo, oData(31 downto 24)) ;
+
+
+  end procedure PcieExtractCfgWrite ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractCfgRead (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oBus               : Out   integer ;
+             oDev               : Out   integer ;
+             oFunc              : Out   integer ;
+             oReg               : Out   integer ;
+             oFBE               : Out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer
+  ) is
+  variable tlptype              :       unsigned (7 downto 0);
+  begin
+
+    oBus               := Get(TransactionRec.Params, PARAM_REQ_CFG_BUS) ;
+    oDev               := Get(TransactionRec.Params, PARAM_REQ_CFG_DEV) ;
+    oFunc              := Get(TransactionRec.Params, PARAM_REQ_CFG_FUNC) ;
+    oReg               := Get(TransactionRec.Params, PARAM_REQ_CFG_REG) ;
+    oFBE               := Get(TransactionRec.Params, PARAM_REQ_FBE) ;
+    oRID               := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag               := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    tlptype            := to_unsigned(Get(TransactionRec.Params, PARAM_REQ_TYPE), 8) ;
+
+  end procedure PcieExtractCfgRead ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractMsg (
+  --
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             oMsgCode           : Out   integer ;
+             oLength            : Out   integer ;
+             oRouteType         : out   integer ;
+             oRID               : Out   integer ;
+             oTag               : Out   integer ;
+             oPayloadByteLength : Out   integer
+  ) is
+  variable tlptype              :       unsigned (7 downto 0);
+  begin
+
+    tlptype              := to_unsigned(Get(TransactionRec.Params, PARAM_REQ_TYPE), 8) ;
+
+    oMsgCode             := Get(TransactionRec.Params, PARAM_REQ_MSG_CODE) ;
+    oRouteType           := to_integer(tlptype(2 downto 0)) ;
+    oRID                 := Get(TransactionRec.Params, PARAM_REQ_RID) ;
+    oTag                 := Get(TransactionRec.Params, PARAM_REQ_TAG) ;
+
+    if tlptype(6) = '1' then
+      oLength            := Get(TransactionRec.Params, PARAM_REQ_LENGTH) ;
+      oPayloadByteLength := Get(TransactionRec.Params, PARAM_REQ_BYTE_LEN) ;
+    else
+      oPayloadByteLength := 0 ;
+      oLength            := 0 ;
+    end if ;
+
+  end procedure PcieExtractMsg ;
+
+  ------------------------------------------------------------
+  procedure PcieDecodePciRegisters (
+  -- Decode and log PCI configuration space register values
+  ------------------------------------------------------------
+             RegData            : In    std_logic_vector ;
+             RegNumber          : In    integer
+  ) is
+  begin
+
+    case RegNumber is
+      when 0      => Log("    PCI REG0  : Device ID               " & to_hstring(RegData(31 downto 16)), INFO, TRUE) ;
+                     Log("              : Vendor ID               " & to_hstring(RegData(15 downto  0)), INFO, TRUE) ;
+
+      when 1      => Log("    PCI REG1  : Status                  " & to_hstring(RegData(31 downto 16)), INFO, TRUE) ;
+                     Log("              : Command                 " & to_hstring(RegData(15 downto  0)), INFO, TRUE) ;
+
+      when 2      => Log("    PCI REG2  : Class Code              " & to_hstring(RegData(31 downto 24)), INFO, TRUE) ;
+                     Log("              : Subclass                " & to_hstring(RegData(23 downto 16)), INFO, TRUE) ;
+                     Log("              : Prog IF                 " & to_hstring(RegData(15 downto  8)), INFO, TRUE) ;
+                     Log("              : Revision ID             " & to_hstring(RegData( 7 downto  0)), INFO, TRUE) ;
+
+      when 3      => Log("    PCI REG3  : BIST                    " & to_hstring(RegData(31 downto 24)), INFO, TRUE) ;
+                     Log("              : Header Type             " & to_hstring(RegData(23 downto 16)), INFO, TRUE) ;
+                     Log("              : Latency Timer           " & to_hstring(RegData(15 downto  8)), INFO, TRUE) ;
+                     Log("              : Cache Line Size         " & to_hstring(RegData( 7 downto  0)), INFO, TRUE) ;
+
+      when 4 | 5 | 6 | 7 | 8 | 9 =>
+                     Log("    PCI REG" & integer'image(RegNumber) & "  : BAR "& integer'image(RegNumber-4) & "                   " & to_hstring(RegData), INFO, TRUE) ;
+
+      when 10 =>     Log("    PCI REG10 : Cardbus CIS Ptr         " & to_hstring(RegData), INFO, TRUE) ;
+
+      when 11 =>     Log("    PCI REG11 : Subsystem ID            " & to_hstring(RegData(31 downto 16)), INFO, TRUE) ;
+                     Log("              : Subsystem Vendor ID     " & to_hstring(RegData(31 downto 16)), INFO, TRUE) ;
+
+      when 12 =>     Log("    PCI REG12 : Expansion ROM Base Addr " & to_hstring(RegData), INFO, TRUE) ;
+
+      when 13 =>     Log("    PCI REG13 : Capabilities Ptr        " & to_hstring(RegData(7 downto 0)), INFO, TRUE) ;
+
+      when 15 =>     Log("    PCI REG15 : Max Latency             " & to_hstring(RegData(31 downto 24)), INFO, TRUE) ;
+                     Log("              : Min Grant               " & to_hstring(RegData(23 downto 16)), INFO, TRUE) ;
+                     Log("              : Interrupt Pin           " & to_hstring(RegData(15 downto  8)), INFO, TRUE) ;
+                     Log("              : Interrupt Line          " & to_hstring(RegData( 7 downto  0)), INFO, TRUE) ;
+
+      when others => Log("    PCI REG" & integer'image(RegNumber) & "                           " & to_hstring(RegData), INFO, TRUE) ;
+
+     end case ;
+
+  end procedure PcieDecodePciRegisters ;
+
+
+  ------------------------------------------------------------
+  procedure PcieDllSendAck (
+  -- Send DLL ACK with specified Sequence
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iSeqNum            : In    integer range 0 to 4095
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_ACK ;
+    TransactionRec.IntToModel    <= iSeqNum;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllSendAck ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendNak (
+  -- Send DLL NAK with specified Sequence
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iSeqNum            : In    integer range 0 to 4095
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_NAK ;
+    TransactionRec.IntToModel    <= iSeqNum;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllSendNak ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendFc (
+  -- Send DLL flow control
+  -- Valid iFcType values:
+  --    DL_INITFC1_P,  DL_INITFC1_NP,  DL_INITFC1_CPL,
+  --    DL_INITFC2_P,  DL_INITFC2_NP,  DL_INITFC2_CPL,
+  --    DL_UPDATEFC_P, DL_UPDATEFC_NP, DL_UPDATEFC_CPL
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iFcType            : In    integer ;
+             iHdrCredits        : In    integer range 0 to 127 ;
+             iDataCredits       : In    integer range 0 to 2047 ;
+             iVc                : In    integer range 0 to 7     := 0
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_FC ;
+
+    Set(TransactionRec.Params, PARAM_FC_TYPE,         iFcType) ;
+    Set(TransactionRec.Params, PARAM_FC_HDR_CREDITS,  iHdrCredits) ;
+    Set(TransactionRec.Params, PARAM_FC_DATA_CREDITS, iDataCredits) ;
+    Set(TransactionRec.Params, PARAM_FC_VC,           iVc) ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllSendFc ;
+
+  ------------------------------------------------------------
+  procedure PcieDllSendPm (
+  -- Send DLL power management DLL
+  -- Valid iPmType values:
+  --    DL_PM_ENTER_L1, DL_PM_ENTER_L23, DL_PM_REQ_ACK,
+  --    DL_PM_REQ_L0S, DL_PM_REQ_L1
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iPmType            : In    integer
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_PM ;
+    TransactionRec.IntToModel    <= iPmType;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllSendPm ;
+
+  ------------------------------------------------------------
+  procedure PcieDllVendor (
+  -- Send Vendor DLL (no data)
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_VEND_NODATA ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllVendor ;
+
+  ------------------------------------------------------------
+  procedure PcieDllVendor (
+  -- Send Vendor DLL (with data)
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iData              : In    integer range 0 to 16#1000000#
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= SEND_DLL_VEND_DATA ;
+    TransactionRec.IntToModel    <= iData ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PcieDllVendor ;
+
+  ------------------------------------------------------------
+  procedure PcieGetDllp (
+  -- Blocking fetch of received DLLP
+  ------------------------------------------------------------
+    signal   TransactionRec   : InOut AddressBusRecType ;
+             oDllpType        : Out   integer ;
+             oDllpErrorStatus : Out   integer ;
+    constant StatusMsgOn      : In    boolean := false
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= WAIT_FOR_DLL ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+    oDllpType                    := Get(TransactionRec.Params, PARAM_DLLP_TYPE) ;
+    oDllpErrorStatus             := Get(TransactionRec.Params, PARAM_DLLP_STATUS) ;
+
+  end procedure PcieGetDllp;
+
+  ------------------------------------------------------------
+  procedure PcieTryGetDllp (
+  -- Non-blocking test for a received DLLP
+  ------------------------------------------------------------
+    signal   TransactionRec   : InOut AddressBusRecType ;
+             oDllpType        : Out   integer ;
+             oDllpErrorStatus : Out   integer ;
+             oAvailable       : Out   boolean ;
+    constant StatusMsgOn      : In    boolean := false
+  ) is
+  begin
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= TRY_DLL ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+    oDllpType                    := Get(TransactionRec.Params, PARAM_DLLP_TYPE) ;
+    oDllpErrorStatus             := Get(TransactionRec.Params, PARAM_DLLP_STATUS) ;
+    oAvailable                   := TransactionRec.BoolFromModel ;
+
+  end procedure PcieTryGetDllp;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpSeqNum (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpSeqNum     : Out   integer
+  ) is
+  begin
+
+    oDllpSeqNum                  := Get(TransactionRec.Params, PARAM_DLLP_SEQ_NUM) ;
+
+  end procedure PcieExtractDllpSeqNum ;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpFc (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpVc         : Out   integer ;
+           oDllpHdrFc      : Out   integer ;
+           oDllpDataFc     : Out   integer
+  ) is
+  begin
+
+    oDllpVc                      := Get(TransactionRec.Params, PARAM_DLLP_VC) ;
+    oDllpHdrFc                   := Get(TransactionRec.Params, PARAM_DLLP_HDR_CREDITS) ;
+    oDllpDataFc                  := Get(TransactionRec.Params, PARAM_DLLP_DATA_CREDITS) ;
+
+  end procedure PcieExtractDllpFc;
+
+  ------------------------------------------------------------
+  procedure PcieExtractDllpVendData (
+  -- Extract the sequence number for ACK/NAk DLLPs
+  ------------------------------------------------------------
+  signal   TransactionRec  : InOut AddressBusRecType ;
+           oDllpVendData   : Out   integer
+  ) is
+  begin
+
+    oDllpVendData                :=  Get(TransactionRec.Params, PARAM_DLLP_VEND_DATA) ;
+
+  end procedure PcieExtractDllpVendData;
+
+  ------------------------------------------------------------
+  procedure PciePhyOs (
+  -- Generate ordered set
+  --
+  -- Valid iOsType values :
+  --    OS_IDL, OS_EIE, OS_FTS, OS_SKP
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iOsType            : In    integer ;
+             iCount             : In    integer range 1 to 2**20 := 1
+  ) is
+  begin
+
+    -- Put values in record
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= GEN_OS ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    Set(TransactionRec.Params, PARAM_OS_TYPE,  iOsType) ;
+    Set(TransactionRec.Params, PARAM_OS_COUNT, iCount) ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PciePhyOs ;
+
+  ------------------------------------------------------------
+  procedure PciePhyTs (
+  -- Generate Training Sequence
+  --
+  -- Valid iTsParams.Id values      : TS1_ID, TS2_ID
+  -- Valid iTsParams.Linknum values : TS_PAD, 0 to 255
+  -- Valid iTsParams.Lanenum values : TS_PAD, TS_SEQ
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsParams          : In    PcieTsRecType ;
+             iCount             : In    integer range 1 to 2**20 := 1
+  ) is
+  begin
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= GEN_TS ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    Set(TransactionRec.Params, PARAM_TS_TYPE,  iTsParams.Id) ;
+    Set(TransactionRec.Params, PARAM_LINK,     iTsParams.Linknum) ;
+    Set(TransactionRec.Params, PARAM_LANE,     iTsParams.Lanenum) ;
+    Set(TransactionRec.Params, PARAM_NFTS,     iTsParams.Nfts) ;
+    Set(TransactionRec.Params, PARAM_GEN,      iTsParams.Datarate) ;
+    Set(TransactionRec.Params, PARAM_CTL,      iTsParams.Control) ;
+    Set(TransactionRec.Params, PARAM_TS_COUNT, iCount) ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PciePhyTs ;
+
+  ------------------------------------------------------------
+  procedure PciePhyGetOsTsEventCounts (
+  -- Read ordered set/training sequence event counts.
+  -- Counts returned in oEventCounts array with oNumLanes
+  -- entries
+  --
+  -- Valid iTsOsType values :
+  --    TS1_ID, TS2_ID, OS_IDL, OS_EIE, OS_FTS,
+  --    OS_SKP, ELEC_IDLE
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsOsType          : In    integer ;
+             oNumLanes          : Out   integer ;
+             oEventCounts       : Out   PcieEventCountsType
+  ) is
+    variable evcount            :       std_logic_vector(31 downto 0) ;
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= GET_EVENT ;
+    TransactionRec.IntToModel    <= iTsOsType ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+    oNumLanes                    := TransactionRec.IntFromModel ;
+
+    for i in 0 to oNumLanes-1 loop
+      evcount         := Pop(TransactionRec.ReadBurstFifo) ;
+      oEventCounts(i) := to_integer(unsigned(evcount)) ;
+    end loop ;
+
+  end procedure PciePhyGetOsTsEventCounts ;
+
+  ------------------------------------------------------------
+  procedure PciePhyResetOsTsEventCounts (
+  -- Reset ordered set/training sequence event counts.
+  -- counts returned in FIFO
+  --
+  -- Valid iTsOsType values :
+  --    TS1_ID, TS2_ID, OS_IDL, OS_EIE, OS_FTS,
+  --    OS_SKP, ELEC_IDLE
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iTsOsType          : In    integer
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= RST_EVENT ;
+    TransactionRec.IntToModel    <= iTsOsType ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+  end procedure PciePhyResetOsTsEventCounts ;
+
+  ------------------------------------------------------------
+  procedure PciePhyGetTs (
+  -- Returns a training sequence type (PcieTsRecType) which is the
+  -- last TS value received on specified lane
+  --
+  -- Valid iLane values: 1, 2, 4, 8, 12 and 16
+  ------------------------------------------------------------
+    signal   TransactionRec     : InOut AddressBusRecType ;
+             iLane              : In    integer range 0 to MAXLINKWIDTH-1 ;
+             oLastTs            : Out   PcieTsRecType
+  ) is
+  begin
+
+    TransactionRec.Operation     <= EXTEND_DIRECTIVE_OP ;
+    TransactionRec.Options       <= GET_LANE_TS ;
+    TransactionRec.IntToModel    <= iLane ;
+    TransactionRec.StatusMsgOn   <= false ;
+
+    RequestTransaction(Rdy => TransactionRec.Rdy, Ack => TransactionRec.Ack) ;
+
+    oLastTs.Id                   := Get(TransactionRec.Params, PARAM_TS_TYPE);
+    oLastTs.Linknum              := Get(TransactionRec.Params, PARAM_LINK);
+    oLastTs.Lanenum              := Get(TransactionRec.Params, PARAM_LANE);
+    oLastTs.Nfts                 := Get(TransactionRec.Params, PARAM_NFTS);
+    oLastTs.Datarate             := Get(TransactionRec.Params, PARAM_GEN);
+    oLastTs.Control              := Get(TransactionRec.Params, PARAM_CTL);
+
+  end procedure PciePhyGetTs ;
+
+end package body PcieInterfacePkg ;
+

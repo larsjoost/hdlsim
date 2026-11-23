@@ -170,6 +170,8 @@ fn osvvm_repo_lib(repo: &str) -> Option<&'static str> {
         "spacewiremonitor" => "osvvm_spacewire",
         "spi" => "osvvm_spi",
         "videobus" => "osvvm_videobus",
+        "cosim" => "osvvm_cosim",
+        "cospcile" => "osvvm_cospcie",
         // The SpaceWire Light RTL core (freecores/spacewire_light, LGPL-2.1
         // for the GRLIB-free parts) — the DUT library of the SpaceWireMonitor
         // testbench.
