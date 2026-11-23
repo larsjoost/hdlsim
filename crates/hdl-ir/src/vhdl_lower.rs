@@ -6384,8 +6384,17 @@ impl<'a> Lower<'a> {
                 }
             }
             SyntaxKind::ExitStmt => {
-                // `exit;` / `exit when cond;` → break (optionally conditional).
+                // The parser folds `exit` and `next` into one ExitStmt node:
+                // the first ident child is the keyword. `exit` ends the loop
+                // (break), `next` skips to the loop step (continue) — LRM
+                // 1076 §10.11/§10.12. Both take an optional `when cond;`.
                 let kids = real_children(s);
+                let is_next = kids
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| self.kw(k).eq_ignore_ascii_case("next"))
+                    .unwrap_or(false);
+                let jump = if is_next { Stmt::Continue } else { Stmt::Break };
                 let cond = kids
                     .iter()
                     .find(|k| is_expr_node(k.kind()))
@@ -6393,10 +6402,10 @@ impl<'a> Lower<'a> {
                 match cond {
                     Some(c) => Stmt::If {
                         cond: c,
-                        then: Box::new(Stmt::Break),
+                        then: Box::new(jump),
                         els: None,
                     },
-                    None => Stmt::Break,
+                    None => jump,
                 }
             }
             SyntaxKind::ReturnStmt => {
