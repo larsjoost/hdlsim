@@ -272,8 +272,14 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    units_in_text_tagged(lang, path, &text)
+}
+
+/// Like [`units_in_file_tagged`], for already-read text — callers that hash
+/// the text for a cache entry avoid reading the file twice.
+pub fn units_in_text_tagged(lang: Language, path: &Path, text: &str) -> Vec<(String, bool)> {
     if lang == Language::Vhdl {
-        return vhdl_units_in_file(path, &text);
+        return vhdl_units_in_file(path, text);
     }
     let mut db = SourceDb::new();
     let Ok(id) = db.add_file(path.display().to_string(), text) else {
