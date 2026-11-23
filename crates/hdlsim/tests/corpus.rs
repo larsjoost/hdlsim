@@ -184,7 +184,22 @@ fn shared_cache_dir() -> &'static PathBuf {
 
 /// Compile one group as a single library, registering the directory under the
 /// logical library names its files declare in `library` clauses.
+// ---- progress ----------------------------------------------------------------
+//
+// The built-in test harness prints one buffered dot per test, so a corpus
+// run is opaque for its whole (multi-minute) duration. These notes go to
+// stderr via `eprintln!` — stderr is unbuffered, so they appear live through
+// pipes/tee with `RUST_TEST_NOCAPTURE=1 cargo test`.
+
+/// Run-to-run stable name for a corpus file in progress notes.
+fn progress_note(stage: &str, done: usize, total: usize, f: &Path) {
+    if done % 25 == 0 || done == total {
+        eprintln!("corpus: [{stage}] {done}/{total} — {}", rel_path(f));
+    }
+}
+
 fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
+    eprintln!("corpus: group {sub}: compiling {} files…", files.len());
     let dir = corpus_dir().join(sub);
     let mut mgr = LibraryManager::new();
     if let Some(c) = hdl_lib::cache::Cache::open(shared_cache_dir().clone()) {
@@ -330,8 +345,11 @@ fn run_with_big_stack(f: impl FnOnce() + Send + 'static) {
 #[test]
 fn corpus_files_lex_and_parse_without_errors() {
     let mut failures = Vec::new();
-    for f in corpus_sources() {
-        let diags = parse_one(&f);
+    let all = corpus_sources();
+    let total = all.len();
+    for (n, f) in all.iter().enumerate() {
+        progress_note("parse", n + 1, total, f);
+        let diags = parse_one(f);
         let errors: Vec<_> = diags
             .iter()
             .filter(|d| d.severity == hdl_syntax::diagnostic::Severity::Error)

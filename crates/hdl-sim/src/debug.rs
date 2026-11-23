@@ -22,6 +22,7 @@ pub fn fmt_value(v: &Value) -> String {
             // Wide clean value (e.g. a memory init): show the low 64 bits.
             let low = Value {
                 bits: v.bits[..64].to_vec(),
+                real: false,
             };
             return format!("{}…({} bits)", fmt_value(&low), v.bits.len());
         }

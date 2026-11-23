@@ -190,8 +190,17 @@ pub enum EdgeKind {
 pub struct FuncIr {
     pub name: String,
     pub ret_width: usize,
-    /// (name, width) of arguments, in order.
-    pub args: Vec<(String, usize)>,
+    /// (name, width, declared type name lowercased) of arguments, in order.
+    /// The type is empty when unknown (Verilog, synthesized stubs) — it
+    /// disambiguates same-width overloads at dispatch: the three
+    /// unconstrained vector formals of `conv_float_phase` (`signed`,
+    /// `unsigned`, `std_ulogic_vector`, all w1) are told apart only by this,
+    /// and picking wrong one makes the delegating bodies recurse forever.
+    pub args: Vec<(String, usize, String)>,
+    /// Const-evaluated default value per formal (same order as `args`),
+    /// `None` where the formal has no default. A call may omit trailing
+    /// actuals whose formals carry `Some`. Empty when no formal has one.
+    pub defaults: Vec<Option<Value>>,
     pub locals: Vec<SignalIr>,
     pub body: Stmt,
 }

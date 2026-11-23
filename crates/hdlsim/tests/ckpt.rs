@@ -41,7 +41,7 @@ fn checkpoint_then_restore_matches_uninterrupted_run() {
     assert!(baseline.status.success());
     let base_out = String::from_utf8_lossy(&baseline.stdout);
     assert!(base_out.contains("PASS"), "{}", base_out);
-    assert!(base_out.contains("t=116000000 fs"), "{}", base_out);
+    assert!(base_out.contains("t=116ns"), "{}", base_out);
 
     let ck = tmp("ck.bin");
     let _ = std::fs::remove_file(&ck);
@@ -52,7 +52,7 @@ fn checkpoint_then_restore_matches_uninterrupted_run() {
         String::from_utf8_lossy(&part.stderr)
     );
     let part_out = String::from_utf8_lossy(&part.stdout);
-    assert!(part_out.contains("t=50000000 fs"), "{}", part_out);
+    assert!(part_out.contains("t=50ns"), "{}", part_out);
     assert!(part_out.contains("checkpoint written"), "{}", part_out);
     assert!(ck.is_file());
 
@@ -64,7 +64,7 @@ fn checkpoint_then_restore_matches_uninterrupted_run() {
     );
     let res_out = String::from_utf8_lossy(&resumed.stdout);
     assert!(res_out.contains("PASS"), "{}", res_out);
-    assert!(res_out.contains("t=116000000 fs"), "{}", res_out);
+    assert!(res_out.contains("t=116ns"), "{}", res_out);
     let _ = std::fs::remove_file(&ck);
 }
 

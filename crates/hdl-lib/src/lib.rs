@@ -38,6 +38,80 @@ use providers::{DirProvider, UnitProvider};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// HDLSIM_PROGRESS_SEC=<seconds> — when set > 0, `compile_files` spawns a
+/// watchdog that reports a compile stage (parsing, dependency resolution,
+/// lowering) that outlives the interval. Same knob as the simulator's
+/// heartbeat (hdl-sim): one env var means "report long-running operations".
+fn progress_interval() -> std::time::Duration {
+    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let secs = *SECS.get_or_init(|| {
+        std::env::var("HDLSIM_PROGRESS_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    });
+    std::time::Duration::from_secs_f64(secs.max(0.0))
+}
+
+/// Shared "what is the pipeline doing right now" cell plus a printer thread.
+/// A single compile stage can legitimately run for minutes (one package body
+/// lowering thousands of constants) with no code point to check a clock —
+/// the thread observes the shared cell from the outside instead.
+struct CompileWatch {
+    shared: std::sync::Arc<std::sync::Mutex<(String, std::time::Instant)>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CompileWatch {
+    fn start() -> Option<Self> {
+        let interval = progress_interval();
+        if interval.is_zero() {
+            return None;
+        }
+        let shared = std::sync::Arc::new(std::sync::Mutex::new((
+            String::new(),
+            std::time::Instant::now(),
+        )));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sh = shared.clone();
+        let st = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if st.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let g = sh.lock().unwrap();
+                if g.0.is_empty() {
+                    continue;
+                }
+                let secs = g.1.elapsed().as_secs_f64();
+                if secs >= interval.as_secs_f64() {
+                    eprintln!("hdlsim: still {} for {secs:.0} s", g.0);
+                }
+            }
+        });
+        Some(Self {
+            shared,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn mark(&self, what: String) {
+        let mut s = self.shared.lock().unwrap();
+        *s = (what, std::time::Instant::now());
+    }
+
+    fn end(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// The library manager: providers (search path) + compile pipeline + cache.
 pub struct LibraryManager {
     providers: Vec<Box<dyn UnitProvider>>,
@@ -64,6 +138,9 @@ pub struct LibraryManager {
     dir_scanned: bool,
     /// Print indexing/resolution progress to stderr (`--progress`).
     progress: bool,
+    /// Watchdog for long compile stages (`HDLSIM_PROGRESS_SEC`): a thread
+    /// printing "still <stage> for Ns" when one stage outlives the interval.
+    watch: Option<CompileWatch>,
     /// Canonical paths already compiled this session.
     compiled: HashSet<PathBuf>,
     /// Persistent parse cache (`.hdlsim-cache/`); None unless enabled.
@@ -134,6 +211,7 @@ impl LibraryManager {
             lib_scanned: HashSet::new(),
             dir_scanned: false,
             progress: false,
+            watch: None,
             compiled: HashSet::new(),
             cache: None,
             cache_hits: 0,
@@ -559,6 +637,9 @@ impl LibraryManager {
         // VHDL: resolve the units named in context clauses (`use lib.pkg.all;`)
         // first, so their packages are on the design and visible while lowering.
         if Language::from_path(path) == Some(Language::Vhdl) {
+            if let Some(w) = &self.watch {
+                w.mark(format!("resolving context clauses of {}", path.display()));
+            }
             let id = self
                 .db
                 .add_file(path.display().to_string(), text.to_string())
@@ -633,6 +714,9 @@ impl LibraryManager {
             }
         }
         let cache = self.cache.as_ref();
+        if let Some(w) = &self.watch {
+            w.mark(format!("lowering {}", path.display()));
+        }
         compile_one(
             path,
             text,
@@ -676,6 +760,7 @@ impl LibraryManager {
         // pending architectures against incomplete provenance (later files
         // may declare another same-named entity).
         self.batch = true;
+        let watch = CompileWatch::start();
         let mut pkgs: Vec<&PathBuf> = Vec::new();
         let mut rest: Vec<&PathBuf> = Vec::new();
         for p in paths {
@@ -705,6 +790,9 @@ impl LibraryManager {
                     self.add_search_root(parent.to_path_buf());
                 }
             }
+            if let Some(w) = &watch {
+                w.mark(format!("compiling {}", p.display()));
+            }
             if let Err(e) = self.compile_file(design, p) {
                 self.diags.push(Diagnostic::error("E0501", None, e));
             }
@@ -712,6 +800,9 @@ impl LibraryManager {
         self.batch = false;
         self.retry_pending_architectures(design, true);
         self.warn_unresolved_context_units(design);
+        if let Some(mut w) = watch {
+            w.end();
+        }
     }
 
     /// Warn about `use`d library units that could not be resolved anywhere.

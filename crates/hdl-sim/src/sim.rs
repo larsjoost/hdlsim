@@ -32,7 +32,7 @@ fn pack_str_value(s: &str) -> Value {
             bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
         }
     }
-    Value { bits }
+    Value { bits, real: false }
 }
 
 /// Inverse of [`pack_str_value`]: bytes of a packed string Value → String.
@@ -93,6 +93,7 @@ fn vhdl_radix_string(v: &Value, radix: u32) -> String {
     }
     out
 }
+use hdl_ir::fmt_time;
 use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -218,6 +219,27 @@ pub struct Simulator {
     /// Latched when `fn_depth` passes the budget: the name of the function
     /// at detection. The pump reports it and stops the simulation.
     fn_recursion: std::cell::RefCell<Option<String>>,
+    /// Function/procedure calls in the current process activation — runaway
+    /// guard for loops whose body only calls functions (the per-activation
+    /// interpreter-step budget in `exec_frames` cannot see inside one
+    /// statement). Override: `HDLSIM_MAX_FN_CALLS`.
+    fn_calls: std::cell::Cell<u64>,
+    max_fn_calls: u64,
+    /// Latched when `fn_calls` passes the budget: (process origin, function
+    /// name). The pump reports it and stops the simulation.
+    fn_runaway: std::cell::RefCell<Option<(String, String)>>,
+    /// Fast-path flag mirroring `fn_runaway.is_some()`: once latched, every
+    /// function call unwinds with X immediately instead of continuing the
+    /// runaway computation.
+    fn_runaway_hit: std::cell::Cell<bool>,
+    /// Function index at call-tree depth 1 (the root of the current call
+    /// tree) — reported with the runaway latch to identify the entry point.
+    cur_root_fn: std::cell::Cell<Option<usize>>,
+    /// Active function call chain (indices, innermost last) — captured when
+    /// the runaway latch fires so the report can show the recursion cycle.
+    fn_stack: std::cell::RefCell<Vec<usize>>,
+    /// Names of the call chain captured at latch time (`fn_stack` clone).
+    fn_chain: std::cell::RefCell<Vec<String>>,
     /// Graceful memory guard (`HDLSIM_MAX_MEM_MB` in MiB): exceeding it
     /// stops the run with an actionable diagnostic instead of an OOM kill.
     max_mem_kb: Option<u64>,
@@ -264,9 +286,38 @@ pub struct Simulator {
     open_files: HashMap<String, String>,
     /// Current object handle while executing a class method (`$this`).
     cur_obj: std::cell::Cell<u64>,
+    /// Index of the function whose frame is currently executing (`None`
+    /// outside functions) — lets dispatch detect a self-call.
+    cur_fn: std::cell::Cell<Option<usize>>,
     /// External stop request (e.g. the live wave window's Stop button):
     /// checked once per event-loop iteration in `run`.
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// External-interrupt flag (SIGINT/SIGTERM via the CLI): when set, the
+    /// pump dumps the current location and ends the run with `interrupt_rc`.
+    /// Separate from `stop_flag`, whose set just finishes quietly (live
+    /// viewer Stop button).
+    interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Exit code for an interrupt stop (130 = shell convention for SIGINT).
+    interrupt_rc: i32,
+    /// Wall-clock budget for the whole run (`--max-wall`), checked in pump.
+    wall_budget: Option<std::time::Duration>,
+    /// First pump entry — anchors wall-budget and heartbeat measurements.
+    wall_start: Option<std::time::Instant>,
+    /// Last pump-visible time advance / heartbeat print (heartbeat only).
+    last_advance: Option<std::time::Instant>,
+    last_heartbeat: Option<std::time::Instant>,
+    /// Set when the run ended via signal or wall budget: (reason, exit code).
+    interrupt_info: Option<(String, i32)>,
+    /// Most recently dispatched process — the between-events fallback for
+    /// `where_am_i` (nothing is executing at the check point itself).
+    last_proc: Option<u32>,
+    /// Live fixpoint progress, shown by the heartbeat/`where_am_i` while the
+    /// concurrent-assign sweep runs (cur_proc holds the u32::MAX sentinel):
+    /// sweep number within the current fixpoint, and how many assigns
+    /// changed in the previous sweep. A shrinking count = converging
+    /// settling; a constant nonzero count = oscillating combinational loop.
+    fix_sweep: u64,
+    fix_changed: u64,
 }
 
 impl Simulator {
@@ -426,7 +477,18 @@ impl Simulator {
             textio_pos: std::cell::RefCell::new(HashMap::new()),
             open_files: HashMap::new(),
             cur_obj: std::cell::Cell::new(u64::MAX),
+            cur_fn: std::cell::Cell::new(None),
             stop_flag: None,
+            interrupt_flag: None,
+            interrupt_rc: 130,
+            wall_budget: None,
+            wall_start: None,
+            last_advance: None,
+            last_heartbeat: None,
+            interrupt_info: None,
+            last_proc: None,
+            fix_sweep: 0,
+            fix_changed: 0,
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -443,6 +505,16 @@ impl Simulator {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200),
             fn_recursion: std::cell::RefCell::new(None),
+            fn_calls: std::cell::Cell::new(0),
+            max_fn_calls: std::env::var("HDLSIM_MAX_FN_CALLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000_000),
+            fn_runaway: std::cell::RefCell::new(None),
+            fn_runaway_hit: std::cell::Cell::new(false),
+            cur_root_fn: std::cell::Cell::new(None),
+            fn_stack: std::cell::RefCell::new(Vec::new()),
+            fn_chain: std::cell::RefCell::new(Vec::new()),
             error_stopped: false,
             nba_exprs: Vec::new(),
             parked: vec![false; np],
@@ -452,16 +524,30 @@ impl Simulator {
         };
         sim.prev = sim.vals.clone();
         for (i, f) in sim.flat.functions.iter().enumerate() {
-            let cands = sim.funcs.entry(f.name.clone()).or_default();
-            // A package-spec declaration lowers as an empty stub before the
-            // package-body definition of the same function lands. The body
-            // must win: matching the pre-overload single-value `insert`
-            // semantics, a later definition with the same formal count
-            // replaces the earlier candidate, and only differing counts
-            // coexist as genuine overloads.
+            let cands = sim.funcs.entry(f.name.to_ascii_lowercase()).or_default();
+            // Stub shape: an interface-only spec declaration lowered without
+            // a body (`Stmt::Null` or an empty block). Elaboration already
+            // merges a spec stub with its same-signature body; what can
+            // still coexist here are GENUINE overloads sharing a formal
+            // count (`conv_float(integer)` vs `conv_float(unsigned)`), which
+            // width dispatch separates at the call site. A body replaces a
+            // stub of the same formal count; a stub never displaces a body.
+            let is_stub = |j: usize| match &*sim.flat.functions[j].body {
+                Stmt::Null => true,
+                Stmt::Block(ss) => ss.is_empty(),
+                _ => false,
+            };
+            let new_is_stub = is_stub(i);
+            if new_is_stub
+                && cands
+                    .iter()
+                    .any(|&j| sim.flat.functions[j].arity == f.arity && !is_stub(j))
+            {
+                continue;
+            }
             match cands
                 .iter()
-                .position(|&j| sim.flat.functions[j].arity == f.arity)
+                .position(|&j| sim.flat.functions[j].arity == f.arity && is_stub(j))
             {
                 Some(pos) => cands[pos] = i,
                 None => cands.push(i),
@@ -503,6 +589,51 @@ impl Simulator {
     /// button): when set, `run` finishes at the next loop iteration.
     pub fn set_stop_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.stop_flag = Some(flag);
+    }
+
+    /// Install an external interrupt flag (SIGINT/SIGTERM): when set, the run
+    /// stops with a location dump (see [`Self::where_am_i`]) and exits with
+    /// `rc` — an agent (or human) staring at a hung run gets file:line of
+    /// the active process and the function chain instead of a bare kill.
+    pub fn set_interrupt_flag(
+        &mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        rc: i32,
+    ) {
+        self.interrupt_flag = Some(flag);
+        self.interrupt_rc = rc;
+    }
+
+    /// Wall-clock budget for the whole run (`--max-wall`): on expiry the run
+    /// stops like an interrupt, with exit code 124 (timeout convention).
+    pub fn set_wall_budget(&mut self, budget: std::time::Duration) {
+        self.wall_budget = Some(budget);
+    }
+
+    /// (reason, exit code) when the run ended via signal or wall budget.
+    pub fn interrupt_info(&self) -> Option<(String, i32)> {
+        self.interrupt_info.clone()
+    }
+
+    /// Cheap gate for hot loops (process bodies, fixpoint sweeps, event
+    /// batches): break and let the pump report the location.
+    pub fn stop_requested(&self) -> bool {
+        if let Some(f) = &self.interrupt_flag {
+            if f.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+        }
+        if let Some(f) = &self.stop_flag {
+            if f.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+        }
+        if let Some(budget) = self.wall_budget {
+            if self.wall_start.map_or(false, |s| s.elapsed() >= budget) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn add_observer(&mut self, o: Box<dyn Observer>) {
@@ -709,10 +840,68 @@ impl Simulator {
     /// and the loop can otherwise end without reporting it.
     fn report_fn_recursion(&mut self) -> bool {
         if let Some(name) = self.fn_recursion.take() {
+            let root = self
+                .cur_root_fn
+                .get()
+                .map(|i| self.flat.functions[i].name.clone())
+                .unwrap_or_else(|| "?".to_string());
+            // Tail of the chain captured at latch time; a repeating suffix
+            // is the overload-dispatch cycle.
+            let tail: Vec<String> = self
+                .fn_chain
+                .borrow()
+                .iter()
+                .rev()
+                .take(14)
+                .rev()
+                .cloned()
+                .collect();
             self.emit(SimEvent::Message {
                 text: format!(
-                    "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (self-call or cyclic overloads); simulation stopped",
-                    self.max_func_depth, self.time
+                    "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (call tree rooted at '{root}', chain tail: {}); simulation stopped\n",
+                    self.max_func_depth,
+                    fmt_time(self.time),
+                    tail.join(" > ")
+                ),
+                time_fs: self.time,
+            });
+            self.stopped = true;
+            self.error_stopped = true;
+            return true;
+        }
+        false
+    }
+
+    /// Snapshot the active call chain (names, innermost last) for the
+    /// latch reports — this reveals the recursion cycle or the misfit
+    /// dispatch. Called when either latch fires.
+    fn capture_fn_chain(&self) {
+        let stack = self.fn_stack.borrow().clone();
+        *self.fn_chain.borrow_mut() = stack
+            .into_iter()
+            .map(|i| self.flat.functions[i].name.clone())
+            .collect();
+    }
+
+    /// Report the function-call runaway latch (see `fn_calls`). Same shape
+    /// as [`Self::report_fn_recursion`], but for bounded-depth loops whose
+    /// body only calls functions.
+    fn report_fn_runaway(&mut self) -> bool {
+        if let Some((origin, name)) = self.fn_runaway.take() {
+            let root = self
+                .cur_root_fn
+                .get()
+                .map(|i| self.flat.functions[i].name.clone())
+                .unwrap_or_else(|| "?".to_string());
+            let chain = self.fn_chain.borrow().clone();
+            // Show the tail of the chain; a repeating suffix is the cycle.
+            let tail: Vec<String> = chain.iter().rev().take(14).rev().cloned().collect();
+            self.emit(SimEvent::Message {
+                text: format!(
+                    "error: function call limit exceeded ({} calls in one process activation) at t={} — process '{origin}' loops while calling function '{name}' (call tree rooted at '{root}', chain tail: {}); simulation stopped\n",
+                    self.max_fn_calls,
+                    fmt_time(self.time),
+                    tail.join(" > ")
                 ),
                 time_fs: self.time,
             });
@@ -830,6 +1019,91 @@ impl Simulator {
         self.eval_assigns_fixpoint();
     }
 
+    /// Human-readable "where is the simulator right now": current time, the
+    /// active process origin (file:line), and the live function call chain.
+    /// Shared by the interrupt dump and the progress heartbeat.
+    fn where_am_i(&self) -> String {
+        let proc_desc = match self.cur_proc {
+            Some(p) if (p as usize) < self.flat.procs.len() => {
+                format!("in {}", self.flat.procs[p as usize].origin)
+            }
+            // eval_assigns_fixpoint runs assigns under a sentinel proc id.
+            Some(_) if self.fix_sweep > 0 => format!(
+                "in concurrent assign sweep #{}, {} of {} assigns changed in the last pass",
+                self.fix_sweep,
+                self.fix_changed,
+                self.flat.assigns.len()
+            ),
+            Some(_) => "in concurrent assign sweep".to_string(),
+            // Between events: nothing is executing right now — name the most
+            // recently dispatched process instead.
+            None => match self.last_proc {
+                Some(p) if (p as usize) < self.flat.procs.len() => {
+                    format!("after {}", self.flat.procs[p as usize].origin)
+                }
+                _ => "before the first process ran".to_string(),
+            },
+        };
+        let stack = self.fn_stack.borrow();
+        let chain = if stack.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", in function {}",
+                stack
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .map(|i| self.flat.functions[*i].name.clone())
+                    .collect::<Vec<_>>()
+                    .join(" > ")
+            )
+        };
+        format!("t={}, {}{}", fmt_time(self.time), proc_desc, chain)
+    }
+
+    /// End the run from the interrupt flag or the wall budget: emit the
+    /// location dump as a transcript message and record the exit code.
+    fn stop_for_interrupt(&mut self, reason: &str, rc: i32) {
+        self.emit(SimEvent::Message {
+            text: format!(
+                "error: simulation {} at {} — simulation stopped\n",
+                reason,
+                self.where_am_i()
+            ),
+            time_fs: self.time,
+        });
+        self.interrupt_info = Some((reason.to_string(), rc));
+        self.stopped = true;
+    }
+
+    /// Periodic "still running" note on stderr for runs that grind without
+    /// time advance (`HDLSIM_PROGRESS_SEC=<seconds>`, 0/absent = off). Shows
+    /// the same location as the interrupt dump, so a hung or slow run
+    /// announces where it is instead of silently burning CPU.
+    fn maybe_heartbeat(&mut self) {
+        let interval = progress_interval();
+        if interval.is_zero() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let start = *self.wall_start.get_or_insert(now);
+        if now.duration_since(start) < interval {
+            return;
+        }
+        let report = self.last_heartbeat.unwrap_or(start);
+        let advance = self.last_advance.unwrap_or(start);
+        if now.duration_since(report) >= interval && now.duration_since(advance) >= interval {
+            eprintln!(
+                "hdlsim: still running ({:.0} s without time advance) at {}",
+                now.duration_since(advance).as_secs_f64(),
+                self.where_am_i()
+            );
+            self.last_heartbeat = Some(now);
+        }
+    }
+
     fn pump(&mut self, max_time_fs: u64, soft: bool) {
         // Delta cycles since the last time advance: a design whose processes
         // or assigns keep re-triggering without time moving would otherwise
@@ -844,12 +1118,15 @@ impl Simulator {
             if self.report_fn_recursion() {
                 break;
             }
+            if self.report_fn_runaway() {
+                break;
+            }
             delta_count += 1;
             if delta_count > 10_000 {
                 self.emit(SimEvent::Message {
                     text: format!(
-                        "error: delta-cycle limit exceeded ({} iterations without time advance) at t={} — the design keeps producing zero-delay events (e.g. `wait for 0 ns` in a loop, or processes re-triggering each other with no delay); simulation stopped",
-                        delta_count, self.time
+                        "error: delta-cycle limit exceeded ({} iterations without time advance) at t={} — the design keeps producing zero-delay events (e.g. `wait for 0 ns` in a loop, or processes re-triggering each other with no delay); simulation stopped\n",
+                        delta_count, fmt_time(self.time)
                     ),
                     time_fs: self.time,
                 });
@@ -857,24 +1134,54 @@ impl Simulator {
                 self.error_stopped = true;
                 break;
             }
-            if let Some(f) = &self.stop_flag {
-                if f.load(std::sync::atomic::Ordering::Relaxed) {
-                    self.finished = true;
+            let flag_set = self
+                .interrupt_flag
+                .as_ref()
+                .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+            if flag_set {
+                self.stop_for_interrupt("interrupt received", self.interrupt_rc);
+                break;
+            }
+            if let Some(budget) = self.wall_budget {
+                let start = *self.wall_start.get_or_insert_with(std::time::Instant::now);
+                if start.elapsed() >= budget {
+                    // 124: the exit code GNU timeout uses when it kills.
+                    self.stop_for_interrupt(
+                        &format!("wall-time budget of {}s exceeded", budget.as_secs_f64()),
+                        124,
+                    );
                     break;
                 }
             }
+            let quiet_set = self
+                .stop_flag
+                .as_ref()
+                .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+            if quiet_set {
+                self.finished = true;
+                break;
+            }
+            self.maybe_heartbeat();
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
                 self.in_active[pid as usize] = false;
                 drain_guard += 1;
                 if drain_guard > 1_000_000 {
                     self.emit(SimEvent::Message {
-                        text: format!("error: zero-delay process loop detected at t={}", self.time),
+                        text: format!(
+                            "error: zero-delay process loop detected at t={} — the design keeps re-running a process with no time passing; rerun with HDLSIM_TRACE=1 to see the activation cycle; simulation stopped\n",
+                            fmt_time(self.time)
+                        ),
                         time_fs: self.time,
                     });
                     self.stopped = true;
                     self.error_stopped = true;
                     break;
+                }
+                // A single pass over a large activation batch can run for
+                // minutes — report progress from inside it too.
+                if drain_guard % 4096 == 0 {
+                    self.maybe_heartbeat();
                 }
                 self.run_proc(pid);
                 if self.finished || self.stopped {
@@ -887,11 +1194,17 @@ impl Simulator {
             if !self.nba.is_empty() || !self.nba_exprs.is_empty() {
                 let nba = std::mem::take(&mut self.nba);
                 for (sig, v, drv) in nba {
+                    if self.stop_requested() {
+                        break;
+                    }
                     self.cur_proc = drv;
                     self.set_sig(sig, v);
                 }
                 let exprs = std::mem::take(&mut self.nba_exprs);
                 for (lhs, v, drv) in exprs {
+                    if self.stop_requested() {
+                        break;
+                    }
                     self.cur_proc = drv;
                     self.assign_to(&lhs, v, None);
                 }
@@ -915,6 +1228,7 @@ impl Simulator {
                     // at one timestamp would spin forever.
                     if t > self.time {
                         delta_count = 0;
+                        self.last_advance = Some(std::time::Instant::now());
                     }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
@@ -935,7 +1249,7 @@ impl Simulator {
                     // A recursion-guard latch set while the last processes
                     // ran must be reported here: the loop-top check would
                     // never run again once the event queue is empty.
-                    let latched = self.report_fn_recursion();
+                    let latched = self.report_fn_recursion() || self.report_fn_runaway();
                     if !latched {
                         if soft {
                             break; // pause at the target; simulation stays resumable
@@ -1045,6 +1359,8 @@ impl Simulator {
 
     fn run_proc(&mut self, pid: u32) {
         self.proc_steps = 0; // per-activation budget (see exec_frames)
+        self.fn_calls.set(0); // per-activation function-call budget
+        self.last_proc = Some(pid);
         self.emit(SimEvent::ProcActive {
             proc: pid,
             active: true,
@@ -1133,9 +1449,9 @@ impl Simulator {
                 };
                 self.emit(SimEvent::Message {
                     text: format!(
-                        "error: process step limit exceeded ({} interpreter steps in one activation) at t={} — process '{origin}' loops without waiting (e.g. `loop`/`while` with no `wait`); simulation stopped",
+                        "error: process step limit exceeded ({} interpreter steps in one activation) at t={} — process '{origin}' loops without waiting (e.g. `loop`/`while` with no `wait`); simulation stopped\n",
                         budget,
-                        self.time
+                        fmt_time(self.time)
                     ),
                     time_fs: self.time,
                 });
@@ -1681,7 +1997,7 @@ impl Simulator {
                     self.vals[sig as usize] = Value::from_u64(64, handle).resize(sw);
                 }
                 let fname = format!("{}::new", cn);
-                if let Some(fi) = self.func_match(&fname, args.len().saturating_sub(1)) {
+                if let Some(fi) = self.func_match(&fname, args.get(1..).unwrap_or(&[]), None) {
                     let saved = self.cur_obj.replace(handle);
                     self.run_func(fi, &args[1..], None);
                     self.cur_obj.set(saved);
@@ -1690,7 +2006,9 @@ impl Simulator {
             // Void method call as a statement: `c.do(args);`
             m if m.starts_with("$callmethod::") => {
                 let rest = &m["$callmethod::".len()..]; // `C::m`
-                if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
+                if let Some(fi) =
+                    self.func_match(rest, args.get(1..).unwrap_or(&[]), locals.as_deref())
+                {
                     let obj = args
                         .first()
                         .map(|a| {
@@ -1944,7 +2262,14 @@ impl Simulator {
                             nb[(add - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                         }
                     }
-                    self.store_value(target, Value { bits: nb }, locals.as_deref_mut());
+                    self.store_value(
+                        target,
+                        Value {
+                            bits: nb,
+                            real: false,
+                        },
+                        locals.as_deref_mut(),
+                    );
                 }
             }
             // `writeline(f, l)` — print the line (stdout) or append to the file.
@@ -2095,7 +2420,7 @@ impl Simulator {
                 // User procedure / SV task called as a statement, if
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
-                if let Some(fi) = self.func_match(name, args.len()) {
+                if let Some(fi) = self.func_match(name, &args, locals.as_deref()) {
                     self.run_procedure(fi, &args, locals.as_deref());
                 } else {
                     self.emit(SimEvent::Message {
@@ -2326,17 +2651,53 @@ impl Simulator {
     fn eval_assigns_fixpoint(&mut self) -> bool {
         let mut any = false;
         self.cur_proc = Some(u32::MAX);
-        for _ in 0..10_000 {
+        self.fn_calls.set(0); // per-fixpoint call budget (see run_func)
+        for sweep in 0..10_000 {
             self.delta_guard += 1;
+            self.fix_sweep = sweep as u64 + 1;
+            self.maybe_heartbeat();
             let mut changed = false;
-            for ai in 0..self.flat.assigns.len() {
+            let mut n_changed = 0u64;
+            let n_assigns = self.flat.assigns.len();
+            for ai in 0..n_assigns {
                 let a = self.flat.assigns[ai].clone();
+                let t0 = std::time::Instant::now();
                 let rhs = self.eval_expr(&a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
+                let dt = t0.elapsed();
+                if std::env::var_os("HDLSIM_DBG_SLOWASSIGN").is_some() && dt.as_millis() > 500 {
+                    eprintln!(
+                        "DBG slow assign#{ai} took {:.1}s calls={} lhs {:.140?} rhs {:.140?}",
+                        dt.as_secs_f64(),
+                        self.fn_calls.get(),
+                        a.lhs,
+                        a.rhs
+                    );
+                }
                 if self.assign_to(&a.lhs, rhs, None) {
                     changed = true;
+                    n_changed += 1;
+                }
+                // A non-converging fixpoint whose assigns call heavy
+                // functions would grind through all 10_000 sweeps before
+                // the pump can report the latched runaway-call budget —
+                // surface it mid-sweep (a check per assign is cheap).
+                if ai % 64 == 0 {
+                    self.fix_changed = n_changed;
+                    if self.report_fn_runaway() {
+                        self.cur_proc = None;
+                        return any;
+                    }
+                    // Same for an external interrupt: report it at the pump
+                    // level (with the location) instead of grinding on. Keep
+                    // the sentinel cur_proc so the dump names the sweep.
+                    if self.stop_requested() {
+                        return any;
+                    }
+                    self.maybe_heartbeat();
                 }
             }
+            self.fix_changed = n_changed;
             any |= changed;
             if !changed {
                 self.cur_proc = None;
@@ -2345,7 +2706,10 @@ impl Simulator {
         }
         self.cur_proc = None;
         self.emit(SimEvent::Message {
-            text: format!("error: combinational loop detected at t={}", self.time),
+            text: format!(
+                "error: combinational loop detected at t={} — continuous assignments never settle (a signal's value feeds back into its own RHS with no clock in between); simulation stopped\\n",
+                fmt_time(self.time)
+            ),
             time_fs: self.time,
         });
         // Unconverged continuous assigns will oscillate every delta — an
@@ -2387,7 +2751,39 @@ impl Simulator {
         true
     }
 
+    /// Wake processes sensitive to a memory (array) signal after an element
+    /// write. Memory words live in `mems`, not `vals`, so element writes
+    /// bypass `set_sig` — but a VHDL event on any element is still an event
+    /// on the signal (LRM 1076.4 sensitivity sets use the longest static
+    /// prefix), so a process parked on the array must wake. Only a value
+    /// change wakes, matching the scalar path.
+    fn wake_mem_watchers(&mut self, sig: usize, a: usize, old_elem: Value) {
+        let new_elem = self.mems[sig][a].clone();
+        if old_elem != new_elem {
+            self.schedule_sensitive(sig as FlatSigId, &old_elem, &new_elem);
+        }
+    }
+
     fn schedule_sensitive(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
+        // Lowering-internal signals (`__for_i` loop variables, `__pN_var_*`
+        // variable mirrors) are not VHDL signals: writing them must never
+        // wake a process. A (ALL) process's collect_sigs sensitivity
+        // includes them — the loop reads its own variable, the body reads
+        // its variables — so an unfiltered wake lets a process wake on its
+        // own loop/variable writes: an infinite zero-delay loop (observed
+        // as a (ALL) tb stimulus process re-running on every `__for_i`
+        // iteration write). Flat names are instance-qualified
+        // (`inst.__p0_var_x`), so test the last path segment. VHDL
+        // identifiers cannot begin with `__`, so the prefix is
+        // unambiguous.
+        if self.flat.signals[sig as usize]
+            .name
+            .rsplit('.')
+            .next()
+            .map_or(false, |n| n.starts_with("__"))
+        {
+            return;
+        }
         let edge_of = |ek: &EdgeKind| match ek {
             EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
             EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
@@ -2406,8 +2802,8 @@ impl Simulator {
         for pid in to_wake {
             if self.parked[pid as usize] {
                 self.trace(format!(
-                    "{}: woken by edge on signal {sig}",
-                    self.flat.procs[pid as usize].origin
+                    "{}: woken by edge on signal {sig} ({})",
+                    self.flat.procs[pid as usize].origin, self.flat.signals[sig as usize].name
                 ));
             }
             self.unpark(pid);
@@ -2482,10 +2878,14 @@ impl Simulator {
                         let sig = *s as usize;
                         let w = self.flat.signals[sig].width.max(1);
                         if (a as usize) < self.mems[sig].len() {
+                            let old = self.mems[sig][a as usize].clone();
                             self.mems[sig][a as usize] = v.resize(w);
+                            self.wake_mem_watchers(sig, a as usize, old);
                         } else if self.mem_grow_ok(sig, a as usize) {
+                            let old = Value::x(w);
                             self.mems[sig].resize(a as usize + 1, Value::x(w));
                             self.mems[sig][a as usize] = v.resize(w);
+                            self.wake_mem_watchers(sig, a as usize, old);
                         }
                         false // memory element: no scalar event phase 1
                     }
@@ -2521,12 +2921,14 @@ impl Simulator {
                             if (a as usize) >= self.mems[sig].len() {
                                 self.mems[sig].resize(a as usize + 1, Value::x(w));
                             }
-                            let mut cur = self.mems[sig][a as usize].clone();
+                            let old = self.mems[sig][a as usize].clone();
+                            let mut cur = old.clone();
                             let v = v.resize(msb - lsb + 1);
                             for j in 0..=(msb - lsb) {
                                 cur.set_bit(lsb + j, v.bit(j));
                             }
                             self.mems[sig][a as usize] = cur;
+                            self.wake_mem_watchers(sig, a as usize, old);
                             return false; // memory element: no scalar event phase 1
                         }
                     }
@@ -2617,7 +3019,7 @@ impl Simulator {
             }
             Expr::Idx { .. } => 1,
             Expr::Call { name, args } => self
-                .func_match(name, args.len())
+                .func_match(name, args, locals)
                 .map(|i| self.flat.functions[i].ret_width)
                 .unwrap_or(1),
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
@@ -2700,7 +3102,7 @@ impl Simulator {
     /// One operand of a real-typed binop as f64: real operands decode their
     /// bit pattern, integer operands convert their integer value.
     fn operand_f64(&self, e: &Expr, v: &Value, locals: Option<&Vec<Value>>) -> Option<f64> {
-        if self.expr_real(e, locals) {
+        if self.expr_real(e, locals) || v.real {
             v.to_f64()
         } else {
             v.to_u64().map(|n| n as f64)
@@ -2787,6 +3189,21 @@ impl Simulator {
             Expr::Real(x) => Value::from_f64(*x),
             Expr::SigAttr { sig, attr } => {
                 let sig = *sig as usize;
+                // Function-local slots share the id space with flat signals
+                // (Expr::Sig resolves locals first); a formal's `sig'length`
+                // must come from the bound value, not an unrelated flat
+                // signal.
+                if let Some(l) = locals {
+                    if sig < l.len() {
+                        let w = l[sig].width().max(1);
+                        let v = match *attr {
+                            "length" => w as u64,
+                            "high" | "left" => (w as u64).saturating_sub(1),
+                            _ => 0, // low | right
+                        };
+                        return Value::from_u64(32, v);
+                    }
+                }
                 let w = self.flat.signals[sig].width.max(1);
                 let n = self
                     .mems
@@ -2817,7 +3234,10 @@ impl Simulator {
                 let lv = self.eval_expr(l, locals);
                 let rv = self.eval_expr(r, locals);
                 // Real-typed expression: IEEE-754 arithmetic on f64 operands.
-                if self.expr_real(l, locals) || self.expr_real(r, locals) {
+                // A value-level marker covers function frames, whose slots
+                // have no type metadata (`expr_real` cannot see a real
+                // formal/variable behind a slot id).
+                if self.expr_real(l, locals) || self.expr_real(r, locals) || lv.real || rv.real {
                     return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
                 }
                 // VHDL signed operands: sign-extend both to the wider width
@@ -2915,8 +3335,9 @@ impl Simulator {
             Expr::ToInt(e) => {
                 let v = self.eval_expr(e, locals);
                 // Real operand (`integer(r)`, `to_integer(r)`): round to the
-                // nearest integer, ties away from zero (VHDL LRM).
-                if self.expr_real(e, locals) {
+                // nearest integer, ties away from zero (VHDL LRM). The value
+                // marker covers real formals/locals in function frames.
+                if self.expr_real(e, locals) || v.real {
                     return match v.to_f64() {
                         Some(f) => Value::from_u64(32, (f.round() as i64) as u64),
                         None => Value::x(32),
@@ -2958,7 +3379,7 @@ impl Simulator {
             }
             Expr::Un { op, e } => {
                 let v = self.eval_expr(e, locals);
-                if self.expr_real(e, locals) {
+                if self.expr_real(e, locals) || v.real {
                     return match (op, v.to_f64()) {
                         (UnOp::Neg, Some(x)) => Value::from_f64(-x),
                         (UnOp::Pos, Some(x)) => Value::from_f64(x),
@@ -3222,7 +3643,7 @@ impl Simulator {
         }
         if let Some(rest) = name.strip_prefix("$method::") {
             // `c.m(args)` in expression position; funcs are keyed `C::m`.
-            if let Some(fi) = self.func_match(rest, args.len().saturating_sub(1)) {
+            if let Some(fi) = self.func_match(rest, args.get(1..).unwrap_or(&[]), locals) {
                 let obj = args
                     .first()
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
@@ -3234,7 +3655,7 @@ impl Simulator {
             }
             return Value::x(32);
         }
-        if let Some(fi) = self.func_match(name, args.len()) {
+        if let Some(fi) = self.func_match(name, args, locals) {
             return self.run_func(fi, args, locals);
         }
         Value::x(32)
@@ -3243,23 +3664,226 @@ impl Simulator {
     /// Execute function `fi` with the given argument expressions; returns
     /// slot 0 (the function-name slot, i.e. the return value). Shared by
     /// plain calls and class method calls.
-    /// Resolve a name to one function. Overloads share a bare name; an
-    /// exact formal-count match wins (VHDL likewise prefers the overload
-    /// that binds without default values). Still-ambiguous overloads fall
-    /// back to the first-registered one — a width-mismatched argument reads
-    /// X rather than failing.
-    fn func_match(&self, name: &str, nargs: usize) -> Option<usize> {
-        let cands = self.funcs.get(name)?;
+    /// Resolve a name to one function. Overloads share a bare name. Among
+    /// the candidates a call fits (exact formal count, or every omitted
+    /// trailing formal carries an interface default), prefer the one whose
+    /// provided-formal widths match the actual widths — width is the only
+    /// type signal, and it is what separates `conv_float(integer)` from
+    /// `conv_float(real)` (`real(x)` lowers to a w64 expression). Then an
+    /// exact formal-count match (VHDL likewise prefers the overload that
+    /// binds without default values), then any fitting candidate, then the
+    /// first-registered one — a width-mismatched argument reads X rather
+    /// than failing.
+    fn func_match(&self, name: &str, args: &[Expr], locals: Option<&Vec<Value>>) -> Option<usize> {
+        let nargs = args.len();
+        // VHDL identifiers are case-insensitive (LRM 1076 §15.2); the table
+        // is keyed lowercase so a `ROUND(signed)` body answers a `round(...)`
+        // call site. The lowerer's table is keyed the same way.
+        let cands = self.funcs.get(&name.to_ascii_lowercase())?;
         if cands.len() == 1 {
             return Some(cands[0]);
         }
-        Some(
-            cands
-                .iter()
+        // Interface-only stubs (spec declarations whose body never landed —
+        // e.g. the built-in ieee.math_real spec) must never win a width tie
+        // against a real body: they execute as empty bodies returning X,
+        // which callers loop on forever. Try real bodies first; stubs are a
+        // last resort.
+        let is_stub_fn = |i: usize| match &*self.flat.functions[i].body {
+            Stmt::Null => true,
+            Stmt::Block(ss) => ss.is_empty(),
+            _ => false,
+        };
+        let mut ordered: Vec<usize> = cands.iter().copied().filter(|&i| !is_stub_fn(i)).collect();
+        ordered.extend(cands.iter().copied().filter(|&i| is_stub_fn(i)));
+        let cands = &ordered;
+        let fits = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            f.arity == nargs
+                || (f.arity > nargs
+                    && f.defaults
+                        .get(nargs..f.arity)
+                        .is_some_and(|t| t.iter().all(|d| d.is_some())))
+        };
+        // Width agreement on the provided actuals; formal width <= 1 is
+        // unconstrained/unknown and fits anything. A Sig id resolves in the
+        // caller's locals first (function slots), then global signals; an id
+        // in neither must not panic — it counts as width-unknown.
+        let arg_w = |a: &Expr| match a {
+            Expr::Sig(s)
+                if locals.map_or(true, |l| (*s as usize) >= l.len())
+                    && (*s as usize) >= self.flat.signals.len() =>
+            {
+                0
+            }
+            _ => self.expr_width(a, locals),
+        };
+        // Exact width first: an unconstrained (w <= 1) formal is a wildcard
+        // that must not absorb a call an exact-width overload can take —
+        // `conv_float(real_arg)` must reach the w64 real overload, not the
+        // w1 std_ulogic_vector overload that then recurses through
+        // bit-identical type conversions.
+        let width_exact = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter()
+                .enumerate()
+                .all(|(j, a)| matches!(f.slots.get(j + 1), Some(&fw) if fw == arg_w(a)))
+        };
+        let width_wild = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter()
+                .enumerate()
+                .all(|(j, a)| match f.slots.get(j + 1) {
+                    Some(&fw) => fw == arg_w(a) || fw <= 1,
+                    None => true,
+                })
+        };
+        // A conversion-marked actual carries the declared type of the value
+        // it wraps: `signed(data)` lowers to `Expr::Signed` (bit-identical),
+        // the same signal VHDL overload resolution keys on. Same-width
+        // unconstrained overloads (`signed`/`unsigned`/`std_ulogic_vector`,
+        // all w1) are told apart only by the formal's declared type
+        // (`FlatFunc::formal_types`) — widths tie, and picking a wrong one
+        // lets the delegating overload bodies recurse forever
+        // (`conv_float_phase(signed(data))` re-entering the
+        // std_ulogic_vector overload). Prefer candidates whose formals match
+        // every hint; fall back to the width-only rules when none does
+        // (unknown formal types, or the hinted overload is not registered).
+        let arg_hint = |a: &Expr| match a {
+            Expr::Signed(_) | Expr::Resize { signed: true, .. } => Some("signed"),
+            _ => None,
+        };
+        let type_ok = |&i: &usize| {
+            let f = &self.flat.functions[i];
+            args.iter().enumerate().all(|(j, a)| match arg_hint(a) {
+                None => true,
+                Some(h) => f
+                    .formal_types
+                    .get(j)
+                    .map_or(true, |t| t.is_empty() || t == h),
+            })
+        };
+        let pick_in = |pool: &[usize]| -> Option<usize> {
+            pool.iter()
                 .copied()
-                .find(|&i| self.flat.functions[i].arity == nargs)
-                .unwrap_or(cands[0]),
-        )
+                .find(|i| width_exact(i))
+                .or_else(|| pool.iter().copied().find(|i| width_wild(i)))
+                .or_else(|| {
+                    pool.iter()
+                        .copied()
+                        .find(|&i| self.flat.functions[i].arity == nargs)
+                })
+                .or_else(|| pool.iter().copied().find(fits))
+        };
+        let fitting: Vec<usize> = cands.iter().copied().filter(|i| fits(i)).collect();
+        let typed: Vec<usize> = fitting.iter().copied().filter(|i| type_ok(i)).collect();
+        let picked = pick_in(&typed)
+            .or_else(|| pick_in(&fitting))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .copied()
+                    .find(|&i| self.flat.functions[i].arity == nargs)
+            })
+            .or_else(|| cands.iter().copied().find(fits))
+            .unwrap_or(cands[0]);
+        // A self-call that passes a formal through UNCHANGED — the body
+        // lowered `f(unsigned(x))` to `f(Sig(x))` (bit-identical type
+        // conversion) or `f(signed(x))` to `f(Signed(Sig(x)))` — receives
+        // the same value every time and can never make progress: it
+        // recurses to the depth guard. Overload families with same-width
+        // unconstrained formals (`conv_float(signed)` vs
+        // `conv_float(unsigned)`, both w1) hit exactly this. Dispatch to
+        // the next fitting candidate instead of the executing function.
+        let picked = if Some(picked) == self.cur_fn.get() {
+            // A formal passed through a bare `Sig` or through the
+            // bit-identical `Signed` marker reaches this function with the
+            // same value every time — unwrap both to the slot id.
+            let pass_through = match args {
+                [Expr::Sig(s)] => Some(*s),
+                [Expr::Signed(inner)] => match inner.as_ref() {
+                    Expr::Sig(s) => Some(*s),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match pass_through {
+                Some(s) if locals.map_or(false, |l| (s as usize) < l.len()) => {
+                    let alt = |j: &usize| *j != picked && fits(j);
+                    let alts: Vec<usize> = cands.iter().copied().filter(|j| alt(j)).collect();
+                    let typed_alts: Vec<usize> =
+                        alts.iter().copied().filter(|j| type_ok(j)).collect();
+                    pick_in(&typed_alts)
+                        .or_else(|| pick_in(&alts))
+                        .unwrap_or(picked)
+                }
+                _ => picked,
+            }
+        } else {
+            picked
+        };
+        if std::env::var_os("HDLSIM_TRACE_DISPATCH").is_some() {
+            fn find_span(s: &Stmt) -> Option<(u32, u32)> {
+                match s {
+                    Stmt::Spanned { span, .. } => Some((span.file.0, span.start)),
+                    Stmt::Block(ss) => ss.iter().find_map(find_span),
+                    _ => None,
+                }
+            }
+            let sp = find_span(&self.flat.functions[picked].body);
+            let caller = self
+                .cur_fn
+                .get()
+                .map(|i| self.flat.functions[i].name.clone())
+                .unwrap_or_else(|| "<proc>".to_string());
+            eprintln!(
+                "dispatch {name} nargs={nargs} -> {} (caller {caller}, cands {:?}, sigs [{}], argw {:?}, span {:?})",
+                picked,
+                cands,
+                cands.iter()
+                    .map(|&i| {
+                        let f = &self.flat.functions[i];
+                        format!(
+                            "{} ar{} ret{} {}",
+                            f.name,
+                            f.arity,
+                            f.ret_width,
+                            f.slots.iter()
+                                .map(|w| w.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                args.iter().map(|a| arg_w(a)).collect::<Vec<_>>(),
+                sp,
+            );
+            // HDLSIM_TRACE_PICKED=1: dump the picked body (Debug) for the
+            // first few picks per name — identifies which overload a hot
+            // call site binds to without flooding multi-million-line logs.
+            if std::env::var_os("HDLSIM_TRACE_PICKED").is_some() {
+                use std::cell::RefCell;
+                use std::collections::HashMap;
+                thread_local! {
+                    static PICKED: RefCell<HashMap<(String, usize), u32>> =
+                        RefCell::new(HashMap::new());
+                }
+                let dump = PICKED.with(|m| {
+                    let mut m = m.borrow_mut();
+                    let n = m.entry((name.to_ascii_lowercase(), picked)).or_insert(0);
+                    *n += 1;
+                    *n <= 1
+                });
+                if dump {
+                    let body = format!("{:?}", self.flat.functions[picked].body);
+                    eprintln!(
+                        "picked {name} #{picked} body {}",
+                        &body[..body.len().min(900)]
+                    );
+                }
+            }
+        }
+        Some(picked)
     }
 
     /// Execute function `fi` with the given argument expressions; returns
@@ -3267,6 +3891,35 @@ impl Simulator {
     /// plain calls and class method calls.
     fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
         let f = &self.flat.functions[fi];
+        // Runaway-loop budget: count every call made at runtime (not
+        // const-eval/elaboration, which run with cur_proc = None). A loop
+        // whose body only calls functions never returns to `exec_frames`,
+        // so the interpreter-step budget there cannot see it — see
+        // `report_fn_runaway`. Continuous assigns evaluate under the
+        // fixpoint's u32::MAX sentinel; those calls are attributed to the
+        // fixpoint itself.
+        if let Some(pid) = self.cur_proc {
+            let calls = self.fn_calls.get() + 1;
+            self.fn_calls.set(calls);
+            if calls > self.max_fn_calls && self.fn_runaway.borrow().is_none() {
+                let origin = if pid == u32::MAX {
+                    "<continuous-assign fixpoint>".to_string()
+                } else {
+                    self.flat.procs[pid as usize].origin.clone()
+                };
+                self.fn_runaway
+                    .borrow_mut()
+                    .get_or_insert((origin, f.name.clone()));
+                self.fn_runaway_hit.set(true);
+                self.capture_fn_chain();
+            }
+        }
+        // Latched: unwind with X so the enclosing evaluation (fixpoint
+        // sweep, process statement) reaches a latch check promptly instead
+        // of grinding through the runaway computation.
+        if self.fn_runaway_hit.get() {
+            return Value::x(f.ret_width.max(1));
+        }
         // Recursion guard: a self-recursive function (or a cycle of
         // mutually recursive overloads) would otherwise overflow the
         // stack. Latch the name and unwind with X; the pump reports the
@@ -3274,19 +3927,58 @@ impl Simulator {
         let d = self.fn_depth.get() + 1;
         if d > self.max_func_depth {
             self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
+            self.capture_fn_chain();
             return Value::x(f.ret_width.max(1));
         }
         self.fn_depth.set(d);
+        self.fn_stack.borrow_mut().push(fi);
+        if d == 1 {
+            self.cur_root_fn.set(Some(fi));
+        }
+        // HDLSIM_TRACE_CALLS=1: log the roots of call trees (depth 0→1) —
+        // identifies which process/assign drives a hot function without
+        // flooding multi-million-call logs. Capped at 300 lines.
+        if std::env::var_os("HDLSIM_TRACE_CALLS").is_some() && d == 1 {
+            thread_local! {
+                static ROOTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            let n = ROOTS.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            if n <= 300 {
+                let origin = match self.cur_proc {
+                    None => "<none>".to_string(),
+                    Some(u32::MAX) => "<assign-fixpoint>".to_string(),
+                    Some(p) => self.flat.procs[p as usize].origin.clone(),
+                };
+                eprintln!("fnroot #{n} {} proc={origin} t={}fs", f.name, self.time);
+            }
+        }
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
         for (i, a) in args.iter().enumerate() {
             let w = f.slots.get(i + 1).copied().unwrap_or(1);
             lvals.push(self.eval_expr(a, locals).resize(w));
         }
+        // Omitted trailing actuals take the formals' recorded interface
+        // defaults (`w : natural := 8`); anything after the formals (locals)
+        // starts X as before.
+        while lvals.len() < (f.arity + 1).min(f.slots.len()) {
+            let j = lvals.len() - 1;
+            let w = f.slots.get(j + 1).copied().unwrap_or(1);
+            let v = match f.defaults.get(j).and_then(|d| d.as_ref()) {
+                Some(d) => d.clone().resize(w),
+                None => Value::x(w),
+            };
+            lvals.push(v);
+        }
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
         // Functions with delays are not supported — execute recursively.
+        let saved_fn = self.cur_fn.replace(Some(fi));
         let mut runner = FnRunner {
             sim: self,
             locals: &mut lvals,
@@ -3294,7 +3986,9 @@ impl Simulator {
         };
         runner.exec(&f.body);
         let r = lvals[0].clone();
+        self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
+        self.fn_stack.borrow_mut().pop();
         r
     }
 
@@ -3305,13 +3999,34 @@ impl Simulator {
     fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&Vec<Value>>) {
         let f = self.flat.functions[fi].clone();
         // Same recursion guard as `run_func` (shared `fn_depth`, so function
-        // ↔ procedure call chains count together).
+        // ↔ procedure call chains count together). Procedure calls from a
+        // process count toward the same runaway-call budget.
         let d = self.fn_depth.get() + 1;
         if d > self.max_func_depth {
             self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
             return;
         }
+        if let Some(pid) = self.cur_proc {
+            let calls = self.fn_calls.get() + 1;
+            self.fn_calls.set(calls);
+            if calls > self.max_fn_calls && self.fn_runaway.borrow().is_none() {
+                let origin = if pid == u32::MAX {
+                    "<continuous-assign fixpoint>".to_string()
+                } else {
+                    self.flat.procs[pid as usize].origin.clone()
+                };
+                self.fn_runaway
+                    .borrow_mut()
+                    .get_or_insert((origin, f.name.clone()));
+                self.fn_runaway_hit.set(true);
+                self.capture_fn_chain();
+            }
+        }
+        if self.fn_runaway_hit.get() {
+            return; // unwind (see run_func)
+        }
         self.fn_depth.set(d);
+        self.fn_stack.borrow_mut().push(fi);
         let mut lvals: Vec<Value> = Vec::with_capacity(f.slots.len());
         lvals.push(Value::x(f.ret_width.max(1))); // slot 0 = return slot (unused)
         for (i, a) in args.iter().enumerate() {
@@ -3325,13 +4040,16 @@ impl Simulator {
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
+        let saved_fn = self.cur_fn.replace(Some(fi));
         let mut runner = ProcRunner {
             sim: self,
             locals: &mut lvals,
             returned: false,
         };
         runner.exec(&f.body);
+        self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
+        self.fn_stack.borrow_mut().pop();
     }
 
     /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in
@@ -3348,7 +4066,7 @@ impl Simulator {
                     *b = v;
                 }
             }
-            return Value { bits };
+            return Value { bits, real: false };
         }
         Value::x(w)
     }
@@ -3474,7 +4192,7 @@ impl<'a> FnRunner<'a> {
                                     if self.locals[s].bits.len() < a + w {
                                         let mut bits = self.locals[s].bits.clone();
                                         bits.resize(a + w, VX);
-                                        self.locals[s] = Value { bits };
+                                        self.locals[s] = Value { bits, real: false };
                                     }
                                     for b in 0..w {
                                         self.locals[s].set_bit(a + b, v.bit(b));
@@ -3495,7 +4213,7 @@ impl<'a> FnRunner<'a> {
                                     if self.locals[s].bits.len() < l + w {
                                         let mut bits = self.locals[s].bits.clone();
                                         bits.resize(l + w, VX);
-                                        self.locals[s] = Value { bits };
+                                        self.locals[s] = Value { bits, real: false };
                                     }
                                     for b in 0..w {
                                         self.locals[s].set_bit(l + b, v.bit(b));
@@ -3554,6 +4272,9 @@ impl<'a> FnRunner<'a> {
                     }
                     self.exec(step);
                     guard += 1;
+                    if guard % 1024 == 0 && self.sim.stop_requested() {
+                        break;
+                    }
                     if guard > 1_000_000 {
                         break;
                     }
@@ -3704,6 +4425,9 @@ impl<'a> ProcRunner<'a> {
                     }
                     self.exec(step);
                     guard += 1;
+                    if guard % 1024 == 0 && self.sim.stop_requested() {
+                        break;
+                    }
                     if guard > 1_000_000 {
                         break;
                     }
@@ -3809,7 +4533,7 @@ impl<'a> ProcRunner<'a> {
                             if self.locals[s].bits.len() < a + w {
                                 let mut bits = self.locals[s].bits.clone();
                                 bits.resize(a + w, VX);
-                                self.locals[s] = Value { bits };
+                                self.locals[s] = Value { bits, real: false };
                             }
                             for b in 0..w {
                                 self.locals[s].set_bit(a + b, v.bit(b));
@@ -3830,7 +4554,7 @@ impl<'a> ProcRunner<'a> {
                             if self.locals[s].bits.len() < l + w {
                                 let mut bits = self.locals[s].bits.clone();
                                 bits.resize(l + w, VX);
-                                self.locals[s] = Value { bits };
+                                self.locals[s] = Value { bits, real: false };
                             }
                             for b in 0..w {
                                 self.locals[s].set_bit(l + b, v.bit(b));
@@ -3861,7 +4585,20 @@ fn sign_extend(v: &Value, width: usize) -> Value {
             bits[i] = V1;
         }
     }
-    Value { bits }
+    Value { bits, real: false }
+}
+
+/// HDLSIM_PROGRESS_SEC=<seconds> — set once per process; when > 0, the pump
+/// prints a periodic "still running" heartbeat (see `maybe_heartbeat`).
+fn progress_interval() -> std::time::Duration {
+    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let secs = *SECS.get_or_init(|| {
+        std::env::var("HDLSIM_PROGRESS_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    });
+    std::time::Duration::from_secs_f64(secs.max(0.0))
 }
 
 fn truthy(v: &Value) -> bool {

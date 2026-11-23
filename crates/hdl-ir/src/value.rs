@@ -58,10 +58,23 @@ fn eq_string_loose(a: &Value, b: &Value) -> bool {
     })
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct Value {
     pub bits: Vec<u8>,
+    /// Real-typed marker: the bits are an IEEE-754 f64 (VHDL `real`).
+    /// Widths alone cannot tell a 64-bit vector from a real; function
+    /// frames hold real formals/locals that only this marker identifies.
+    /// Equality ignores it (same bits compare equal).
+    pub real: bool,
 }
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits == other.bits
+    }
+}
+
+impl Eq for Value {}
 
 /// JSON output mirrors the VCD sink's two formats: an all-0/1 value is
 /// `{"w": <bits>, "hex": "<value>"}` (4 bits per digit, MSB first, like every
@@ -108,6 +121,7 @@ impl Value {
     pub fn new(width: usize, fill: u8) -> Value {
         Value {
             bits: vec![fill; width.max(1)],
+            real: false,
         }
     }
 
@@ -116,7 +130,7 @@ impl Value {
         for i in 0..width.min(64) {
             bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
         }
-        Value { bits }
+        Value { bits, real: false }
     }
 
     /// All-X value of the given width.
@@ -126,12 +140,18 @@ impl Value {
 
     /// Single-bit value from a bit state constant (`V0`, `V1`, `VX`, …).
     pub fn from_bit(b: u8) -> Value {
-        Value { bits: vec![b] }
+        Value {
+            bits: vec![b],
+            real: false,
+        }
     }
 
     /// 64-bit value holding the IEEE-754 bit pattern of `x` (a `real` signal).
     pub fn from_f64(x: f64) -> Value {
-        Value::from_u64(64, x.to_bits())
+        Value {
+            bits: Value::from_u64(64, x.to_bits()).bits,
+            real: true,
+        }
     }
 
     /// Interpret a 64-bit value as f64 (real signals). None if not 64 known bits.
@@ -205,7 +225,10 @@ impl Value {
                 bits[i] = VX;
             }
         }
-        Value { bits }
+        Value {
+            bits,
+            real: self.real,
+        }
     }
 
     /// VHDL-2008 matching equality (`?=` / `case?`): choice bits of `VDASH`
@@ -232,7 +255,7 @@ impl Value {
             }
             shift += p.width();
         }
-        Value { bits }
+        Value { bits, real: false }
     }
 
     /// Slice `bits[lsb..=msb]` (inclusive, Verilog `[msb:lsb]`).
@@ -241,6 +264,7 @@ impl Value {
         let lsb = lsb.min(msb);
         Value {
             bits: self.bits[lsb..=msb].to_vec(),
+            real: false,
         }
     }
 
@@ -361,7 +385,7 @@ impl Value {
                     }
                     _ => {}
                 }
-                Value { bits }
+                Value { bits, real: false }
             }
         }
     }
@@ -455,7 +479,7 @@ impl Value {
                 for (j, b) in bits.iter_mut().enumerate() {
                     *b = bnot1(self.bit(j));
                 }
-                Value { bits }
+                Value { bits, real: false }
             }
             // Reductions produce 1 bit; fold with the operator's identity
             // (AND/XNOR seed 1, OR/XOR seed 0), then invert for the negated
@@ -728,7 +752,11 @@ mod tests {
             r#"{"w":6,"hex":"f3"}"#
         );
         assert_eq!(
-            serde_json::to_string(&Value { bits: vec![V1] }).unwrap(),
+            serde_json::to_string(&Value {
+                bits: vec![V1],
+                real: false,
+            })
+            .unwrap(),
             r#"{"w":1,"hex":"1"}"#
         );
     }
@@ -738,6 +766,7 @@ mod tests {
         // LSB-first [1,0,x,z] reads MSB-first as "zx01".
         let v = Value {
             bits: vec![V1, V0, VX, VZ],
+            real: false,
         };
         assert_eq!(
             serde_json::to_string(&v).unwrap(),
@@ -747,13 +776,18 @@ mod tests {
         // strong 0/1 (W must not look low, U must not look like a zero init).
         let v = Value {
             bits: vec![VW, VL, VH, VDASH, VU, V0, V1, VZ],
+            real: false,
         };
         assert_eq!(
             serde_json::to_string(&v).unwrap(),
             r#"{"w":8,"bits":"z10u-hlw"}"#
         );
         assert_eq!(
-            serde_json::to_string(&Value { bits: vec![VZ] }).unwrap(),
+            serde_json::to_string(&Value {
+                bits: vec![VZ],
+                real: false,
+            })
+            .unwrap(),
             r#"{"w":1,"bits":"z"}"#
         );
     }

@@ -550,6 +550,7 @@ impl<'a> Lower<'a> {
                     name: format!("{}::{}", ci.name, m.name),
                     ret_width: m.ret_width,
                     args: m.args.clone(),
+                    defaults: m.defaults.clone(),
                     locals: m.locals.clone(),
                     body: m.body.clone(),
                 })
@@ -2642,7 +2643,7 @@ impl<'a> Lower<'a> {
                         .find_map(|k| type_kw_width(&self.text(k)))
                 })
                 .unwrap_or(1);
-            args.push((aname.clone(), aw));
+            args.push((aname.clone(), aw, String::new()));
             slots.push((aname, aw));
         }
         let mut locals = Vec::new();
@@ -2689,6 +2690,7 @@ impl<'a> Lower<'a> {
             name,
             ret_width,
             args,
+            defaults: Vec::new(),
             locals,
             body,
         }
@@ -3304,7 +3306,7 @@ impl<'a> Lower<'a> {
                     bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                 }
             }
-            return Expr::Lit(Value { bits });
+            return Expr::Lit(Value { bits, real: false });
         }
         if let Some(f) = parse_real_literal(&t) {
             return Expr::Real(f);
@@ -3378,7 +3380,7 @@ fn pack_str(s: &str) -> Value {
             bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
         }
     }
-    Value { bits }
+    Value { bits, real: false }
 }
 
 fn type_kw_width(t: &str) -> Option<usize> {
@@ -3448,7 +3450,7 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
         for i in 0..width.min(128) {
             bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
         }
-        return Some(Value { bits });
+        return Some(Value { bits, real: false });
     }
     let digit_bits = match base {
         2 => 1,
@@ -3488,7 +3490,7 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
             }
         }
     }
-    Some(Value { bits })
+    Some(Value { bits, real: false })
 }
 
 impl<'a> Lower<'a> {
@@ -3560,7 +3562,12 @@ fn ce_impl(
         // `to_integer(x)` in a constant initializer.
         Expr::ToInt(e) => {
             let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
-            if ce_real(e) {
+            // Realness is a value property for slot reads: a formal/variable
+            // slot holding a real (f64 bits, `real: true`) must round as a
+            // number, not truncate its bit pattern to an integer (a w64 real
+            // read via `to_u64` yields e.g. 0x1E1E1E1E for 1/17 — the low
+            // half of the f64 bits).
+            if ce_real(e) || v.real {
                 let f = ce_f64(&v)?;
                 return Some(Value::from_u64(32, f.round() as u64));
             }
@@ -3569,7 +3576,7 @@ fn ce_impl(
         // `T'image(x)` in a constant initializer (e.g. integer'image(42)).
         Expr::ToString(e) => {
             let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
-            let s = if ce_real(e) {
+            let s = if ce_real(e) || v.real {
                 ce_f64(&v).map(|f| format!("{}", f))?
             } else {
                 v.to_u64().map(|n| n.to_string())?
@@ -3590,7 +3597,10 @@ fn ce_impl(
         Expr::Bin { op, l, r } => {
             let lv = ce_impl(l, env, funcs, slots.as_deref_mut())?;
             let rv = ce_impl(r, env, funcs, slots.as_deref_mut())?;
-            if ce_real(l) || ce_real(r) {
+            // Realness is a value property for slot reads (see ToInt): a
+            // `x * y` of two slot-held reals must multiply numbers, not the
+            // f64 bit patterns.
+            if ce_real(l) || ce_real(r) || lv.real || rv.real {
                 let a = ce_f64(&lv);
                 let b = ce_f64(&rv);
                 match (a, b) {
@@ -3622,10 +3632,11 @@ fn ce_impl(
         }
         Expr::Un { op, e } => {
             let v = ce_impl(e, env, funcs, slots.as_deref_mut())?;
-            if ce_real(e) {
+            if ce_real(e) || v.real {
                 return match (op, ce_f64(&v)) {
                     (UnOp::Neg, Some(x)) => Some(Value::from_f64(-x)),
                     (UnOp::Pos, Some(x)) => Some(Value::from_f64(x)),
+                    (UnOp::Abs, Some(x)) => Some(Value::from_f64(x.abs())),
                     _ => None,
                 };
             }
@@ -3668,7 +3679,7 @@ fn ce_impl(
                 for i in 0..v.width() {
                     bits[i] = v.bit(i);
                 }
-                Some(Value { bits })
+                Some(Value { bits, real: false })
             } else {
                 Some(v.resize(*width))
             }
@@ -3697,21 +3708,68 @@ fn ce_impl(
             // fitting candidate, the first same-arity one runs — matching
             // the simulator's runtime pick.
             let cands = funcs.get(&name.to_ascii_lowercase())?;
+            // Interface-only stubs must never win a width tie against a real
+            // body (a stub const-evals to X, which loops on forever — see
+            // the matching ordering in the simulator's dispatch).
+            let is_stub_ir = |f: &FuncIr| match &f.body {
+                Stmt::Null => true,
+                Stmt::Block(ss) => ss.is_empty(),
+                _ => false,
+            };
+            let mut ordered: Vec<&FuncIr> = cands.iter().filter(|f| !is_stub_ir(f)).collect();
+            ordered.extend(cands.iter().filter(|f| is_stub_ir(f)));
+            let cands = &ordered;
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 argv.push(ce_impl(a, env, funcs, slots.as_deref_mut())?);
             }
+            // A call may omit trailing actuals whose formals carry interface
+            // defaults (`w : natural := 8`); the real body qualifies, the
+            // interface-only spec stub does not.
+            let fits_defaults = |f: &FuncIr, n: usize| {
+                f.args.len() > n
+                    && f.defaults
+                        .get(n..f.args.len())
+                        .is_some_and(|t| t.iter().all(|d| d.is_some()))
+                    && !matches!(&f.body, Stmt::Block(ss) if ss.is_empty())
+                    && !matches!(f.body, Stmt::Null)
+            };
+            // Width fit is checked across ALL fitting candidates —
+            // exact-arity and defaults-fit alike — exact widths before
+            // wildcards: an unconstrained (w <= 1) formal must not absorb a
+            // call an exact-width overload can take (a real-typed actual,
+            // w64, must reach the real overload, not a same-name
+            // std_ulogic_vector overload registered first).
+            let width_ok = |f: &FuncIr, wild: bool| {
+                f.args
+                    .iter()
+                    .zip(argv.iter())
+                    .all(|((_, w, _), v)| *w == v.width() || (wild && *w <= 1))
+            };
+            let viable = |f: &FuncIr| f.args.len() == argv.len() || fits_defaults(f, argv.len());
             let f = cands
                 .iter()
-                .filter(|f| f.args.len() == argv.len())
-                .find(|f| {
-                    f.args
+                .filter(|f| viable(f) && width_ok(f, false))
+                .next()
+                .or_else(|| {
+                    cands
                         .iter()
-                        .zip(argv.iter())
-                        .all(|((_, w), v)| *w == v.width() || *w <= 1)
+                        .filter(|f| viable(f) && width_ok(f, true))
+                        .next()
                 })
                 .or_else(|| cands.iter().find(|f| f.args.len() == argv.len()))
+                .or_else(|| cands.iter().find(|f| fits_defaults(f, argv.len())))
                 .or_else(|| cands.first())?;
+            // Fill the omitted actuals from the recorded defaults.
+            for (j, d) in f.defaults.iter().enumerate().skip(argv.len()) {
+                match d {
+                    Some(v) => {
+                        let w = f.args.get(j).map(|a| a.1).unwrap_or(v.width()).max(1);
+                        argv.push(v.clone().resize(w));
+                    }
+                    None => break,
+                }
+            }
             let depth = CE_DEPTH.with(|d| d.get());
             if depth >= CE_MAX_DEPTH {
                 return None; // recursive const-eval: not constant
@@ -3719,6 +3777,19 @@ fn ce_impl(
             CE_DEPTH.with(|d| d.set(depth + 1));
             let r = const_eval_func(f, &argv, env, funcs);
             CE_DEPTH.with(|d| d.set(depth));
+            if std::env::var_os("HDLSIM_TRACE_CE").is_some()
+                && (name.starts_with("get_") || std::env::var_os("HDLSIM_TRACE_CE_ALL").is_some())
+            {
+                eprintln!(
+                    "ce {name} arity={} argvw {:?} argv {:?} -> {:?} pickedw {:?} body {:.80?}",
+                    f.args.len(),
+                    argv.iter().map(|v| v.width()).collect::<Vec<_>>(),
+                    argv.iter().map(|v| v.to_u64()).collect::<Vec<_>>(),
+                    r.as_ref().map(|v| (v.width(), v.to_u64())),
+                    f.args.iter().map(|a| a.1).collect::<Vec<_>>(),
+                    f.body,
+                );
+            }
             r
         }
     }
@@ -3812,7 +3883,7 @@ fn ce_stmt(
                         if slots[s].bits.len() < idx + w {
                             let mut bits = slots[s].bits.clone();
                             bits.resize(idx + w, VX);
-                            slots[s] = Value { bits };
+                            slots[s] = Value { bits, real: false };
                         }
                         for b in 0..w {
                             slots[s].set_bit(idx + b, v.bit(b));
@@ -3836,7 +3907,7 @@ fn ce_stmt(
                         if slots[s].bits.len() < lsb + w {
                             let mut bits = slots[s].bits.clone();
                             bits.resize(lsb + w, VX);
-                            slots[s] = Value { bits };
+                            slots[s] = Value { bits, real: false };
                         }
                         for b in 0..w {
                             slots[s].set_bit(lsb + b, v.bit(b));

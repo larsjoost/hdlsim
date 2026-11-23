@@ -75,7 +75,7 @@ fn wait_until_rechecks_condition_on_edge() {
 
 #[test]
 fn pre_true_wait_until_does_not_wake() {
-    let (out, stdout, stderr) = run(
+    let (_out, stdout, stderr) = run(
         "tb_wu_notrig",
         "tests/fixtures/vhdl_wait_until_notrig_tb.vhd",
         &["--max-time", "80ns"],

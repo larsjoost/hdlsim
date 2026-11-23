@@ -99,6 +99,7 @@ impl<'a> R<'a> {
         }
         Ok(Value {
             bits: self.take(n)?.to_vec(),
+            real: false,
         })
     }
 }
@@ -1317,7 +1318,13 @@ mod tests {
             },
             Stmt::Case {
                 expr: Expr::Sig(2),
-                items: vec![(vec![Expr::Lit(Value { bits: vec![V1] })], a.clone())],
+                items: vec![(
+                    vec![Expr::Lit(Value {
+                        bits: vec![V1],
+                        real: false,
+                    })],
+                    a.clone(),
+                )],
                 default: Some(Box::new(Stmt::Null)),
                 matching: false,
             },

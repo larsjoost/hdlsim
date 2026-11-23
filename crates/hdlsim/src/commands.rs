@@ -129,6 +129,32 @@ impl Command for Help {
             "                                 --report-dry-run to preview without uploading (also works"
         );
         println!("                                 without a message)");
+        println!();
+        println!("  Environment variables:");
+        println!(
+            "    HDLSIM_TRACE=1              scheduler trace on stderr (park/wake/timeout lines)"
+        );
+        println!("    HDLSIM_PROGRESS_SEC=<s>     heartbeat for long compiles and simulations:");
+        println!(
+            "                                \"still running (N s without time advance) at …\""
+        );
+        println!(
+            "    HDLSIM_MAX_MEM_MB=<MiB>     stop with a diagnostic instead of the OS OOM-killer"
+        );
+        println!("    HDLSIM_MAX_SIGNAL_MB=<MiB>  per-signal allocation guard (default 4096)");
+        println!("    HDLSIM_MAX_PROC_STEPS=<n>   interpreter steps per process activation (default 100M)");
+        println!("    HDLSIM_MAX_FUNC_DEPTH=<n>   function call nesting limit (default 200)");
+        println!("    HDLSIM_MAX_FN_CALLS=<n>     function calls per activation (default 100M)");
+        println!("    HDLSIM_NO_CACHE=1           disable the persistent parse cache");
+        println!("    HDLSIM_CACHE_DIR=DIR        move the parse cache (default .hdlsim-cache/)");
+        println!("    HDLSIM_STDLIB=DIR           override the built-in std/ieee sources");
+        println!("    HDLSIM_COLOR=auto|always|never  colorize diagnostics (NO_COLOR wins)");
+        println!("    HDLSIM_XILINX_LIBS=DIR      add DIR/data/vhdl/src to the library search");
+        println!("                                (also XILINX_VIVADO, XILINX_HLS)");
+        println!("    HDLSIM_ISSUE_REPO=owner/repo  where --report files issues (default larsjoost/hdlsim)");
+        println!("    HDLSIM_REPORT_GIST=public   opt in to public gist upload for --report");
+        println!("    HDLSIM_TRACE_CALLS/_DISPATCH/_PICKED/_CE/_OVERLOAD/_GENRANGE, HDLSIM_DBG_*");
+        println!("                                developer tracing (verbose, unstable output)");
         Ok(0)
     }
 }
@@ -402,6 +428,29 @@ pub fn parse_time(s: &str) -> anyhow::Result<u64> {
         _ => return Err(anyhow::anyhow!("unknown time unit '{}'", unit)),
     };
     Ok((v * mult) as u64)
+}
+
+/// Parse a wall-clock duration like `30` (bare = seconds), `30s`, `1.5m`,
+/// `2m` into seconds.
+pub fn parse_wall_secs(s: &str) -> anyhow::Result<f64> {
+    let (num, unit) = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|i| (&s[..i], &s[i..]))
+        .unwrap_or((s, ""));
+    let v: f64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration value '{}'", s))?;
+    let mult: f64 = match unit {
+        "" | "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        _ => return Err(anyhow::anyhow!("unknown duration unit '{}'", unit)),
+    };
+    let secs = v * mult;
+    if !(secs.is_finite() && secs > 0.0) {
+        return Err(anyhow::anyhow!("bad duration value '{}'", s));
+    }
+    Ok(secs)
 }
 
 /// `hdlsim help <command>` — detailed per-command documentation.

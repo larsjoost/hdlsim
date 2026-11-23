@@ -83,6 +83,16 @@ pub struct FlatFunc {
     pub arity: usize,
     /// Width of each slot; slot ids in the body index this vector.
     pub slots: Vec<usize>,
+    /// Lowercase declared type name per formal (`""` = unknown). Same-width
+    /// unconstrained overloads (`signed` vs `unsigned` vs
+    /// `std_ulogic_vector`, all w1) are distinguished by this at dispatch —
+    /// widths alone cannot separate them, and a wrong pick lets the
+    /// delegating overload bodies recurse to the depth guard.
+    pub formal_types: Vec<String>,
+    /// Recorded interface defaults, one per formal (`None` where the formal
+    /// has none). A call may omit trailing actuals whose entries are `Some`;
+    /// empty means no formal carries a default.
+    pub defaults: Vec<Option<Value>>,
     /// Shared handle: the kernel can execute a body while mutably borrowing
     /// the simulator (procedure calls re-enter), and cloning stays cheap.
     #[serde(serialize_with = "serde_arc::stmt")]
@@ -352,6 +362,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
     // its own name. Sorted order keeps the registration deterministic when
     // several packages export the same function name.
     if !register_pkg_funcs {
+        dedup_functions(&mut f);
         return Ok(f);
     }
     let mut pkg_names: Vec<&String> = design.packages.keys().collect();
@@ -363,18 +374,75 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
         }
         for func in &p.functions {
             let mut slots: Vec<usize> = vec![func.ret_width.max(1)];
-            slots.extend(func.args.iter().map(|(_, w)| *w));
+            slots.extend(func.args.iter().map(|(_, w, _)| *w));
             slots.extend(func.locals.iter().map(|l| l.width));
             f.functions.push(FlatFunc {
                 name: func.name.clone(),
                 ret_width: func.ret_width,
                 arity: func.args.len(),
                 slots,
+                formal_types: func.args.iter().map(|(_, _, t)| t.clone()).collect(),
+                defaults: func.defaults.clone(),
                 body: Arc::new(func.body.clone()),
             });
         }
     }
+    dedup_functions(&mut f);
     Ok(f)
+}
+
+/// A lowered-but-empty function body: the interface-only form a package-spec
+/// function lowers to before its package body is seen.
+fn func_body_is_stub(f: &FlatFunc) -> bool {
+    match &*f.body {
+        Stmt::Null => true,
+        Stmt::Block(ss) => ss.is_empty(),
+        _ => false,
+    }
+}
+
+/// Package-spec functions and their package-body definitions lower as
+/// separate design units, so the interface-only stub and the real body both
+/// reach this list. The body wins (matching the simulator's overload table,
+/// where a later same-signature registration replaces the earlier one), and
+/// the interface defaults recorded on the spec (`w : natural := 8`) carry
+/// over when the body's interface omits them. A real body replaces an
+/// interface-only stub; two real bodies with the same formal widths are
+/// genuine overloads and coexist (dispatch separates them by actual width
+/// where it can, and the recursion deviation covers the rest).
+fn dedup_functions(f: &mut Flat) {
+    let same_sig = |a: &FlatFunc, b: &FlatFunc| {
+        a.name.eq_ignore_ascii_case(&b.name)
+            && a.arity == b.arity
+            && a.slots[1..=a.arity] == b.slots[1..=b.arity]
+    };
+    let mut merged: Vec<FlatFunc> = Vec::with_capacity(f.functions.len());
+    let has_defaults = |d: &[Option<Value>]| d.iter().any(|d| d.is_some());
+    for func in std::mem::take(&mut f.functions) {
+        match merged.iter().position(|m| same_sig(m, &func)) {
+            Some(i) => {
+                let mut func = func;
+                // Defaults: whichever side recorded them wins.
+                if !has_defaults(&func.defaults) {
+                    func.defaults = merged[i].defaults.clone();
+                }
+                // A real body replaces an interface-only stub; a stub never
+                // displaces a real body. Two REAL bodies with the same
+                // formal widths are genuine overloads the width model
+                // cannot separate (`conj(complex_t)` vs
+                // `conj(complex_float_array)`, both w194) — they must
+                // coexist, or element-wise recursion inside one of them
+                // resolves back to itself and never terminates.
+                if func_body_is_stub(&merged[i]) {
+                    merged[i] = func;
+                } else if !func_body_is_stub(&func) {
+                    merged.push(func);
+                }
+            }
+            None => merged.push(func),
+        }
+    }
+    f.functions = merged;
 }
 
 impl Flat {
@@ -571,7 +639,7 @@ impl Flat {
         for f in &m.functions {
             // Slot 0 is the function name (return value), then args, then locals.
             let mut slots: Vec<usize> = vec![f.ret_width.max(1)];
-            slots.extend(f.args.iter().map(|(_, w)| *w));
+            slots.extend(f.args.iter().map(|(_, w, _)| *w));
             let arg_ids: Vec<SigId> = (0..f.args.len() as SigId).collect();
             let local_base = f.args.len() as SigId;
             for l in &f.locals {
@@ -586,6 +654,8 @@ impl Flat {
                 ret_width: f.ret_width,
                 arity: f.args.len(),
                 slots,
+                formal_types: f.args.iter().map(|(_, _, t)| t.clone()).collect(),
+                defaults: f.defaults.clone(),
                 body,
             });
         }

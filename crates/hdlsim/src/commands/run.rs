@@ -38,6 +38,10 @@ struct RunArgs {
     /// Stop time (e.g. 10us); default: run until there are no more events.
     #[arg(long)]
     max_time: Option<String>,
+    /// Wall-clock limit for the whole run (e.g. 30s, 1.5m): on expiry the
+    /// run stops with a location dump and exit code 124.
+    #[arg(long)]
+    max_wall: Option<String>,
     /// Save the simulator state here when the run stops (resume with --restore).
     #[arg(long)]
     checkpoint: Option<PathBuf>,
@@ -114,6 +118,10 @@ impl Command for Run {
         let max_time_fs = match &a.max_time {
             Some(v) => parse_time(v)?,
             None => u64::MAX,
+        };
+        let max_wall = match &a.max_wall {
+            Some(v) => Some(crate::commands::parse_wall_secs(v)?),
+            None => None,
         };
         let checkpoint = a.checkpoint;
         let restore = a.restore;
@@ -255,15 +263,36 @@ impl Command for Run {
         } else {
             (None, None)
         };
+        // Ctrl-C / SIGTERM: the handler only sets a flag (safe from the
+        // signal context); the kernel dumps the location at a safe point.
+        let interrupt_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let f = interrupt_flag.clone();
+            if ctrlc::set_handler(move || f.store(true, std::sync::atomic::Ordering::Relaxed))
+                .is_err()
+            {
+                eprintln!("hdlsim: note: Ctrl-C handler unavailable; interrupt dumps disabled");
+            }
+        }
+        sim.set_interrupt_flag(interrupt_flag.clone(), 130);
+        if let Some(secs) = max_wall {
+            sim.set_wall_budget(std::time::Duration::from_secs_f64(secs));
+        }
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
-        sim_phase.done(format!("t={}fs", sim.time()));
+        sim_phase.done(format!("t={}", hdl_ir::fmt_time(sim.time())));
         println!(
-            "hdlsim: simulation stopped at t={} fs ({} signals, {} processes)",
-            sim.time(),
+            "hdlsim: simulation stopped at t={} ({} signals, {} processes)",
+            hdl_ir::fmt_time(sim.time()),
             sim.flat().signals.len(),
             sim.flat().procs.len()
         );
+        // Ended by SIGINT/SIGTERM or --max-wall: the dump is already in the
+        // transcript; map it to the conventional exit code (130 / 124).
+        if let Some((reason, rc)) = sim.interrupt_info() {
+            println!("hdlsim: {reason} — exit code {rc}");
+            return Ok(rc);
+        }
         if let Some(p) = &checkpoint {
             sim.save_checkpoint(p)
                 .map_err(|e| anyhow::anyhow!("cannot write checkpoint {}: {}", p.display(), e))?;
@@ -314,8 +343,14 @@ impl Command for Run {
                     "hdlsim: waves still viewable at http://127.0.0.1:{}/ — press Ctrl-C to exit",
                     port
                 );
+                // The Ctrl-C handler is flag-based, so watch the flag here
+                // (short sleep slices) instead of relying on the default
+                // signal death to end the server.
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if interrupt_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                 }
             }
         }
