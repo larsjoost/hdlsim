@@ -2898,7 +2898,7 @@ impl Simulator {
         );
     }
 
-    /// `HDLSIM_WATCH_DELTAS`: settled values of all watched signals at each
+    /// `--watch-deltas`: settled values of all watched signals at each
     /// timestamp — pump calls this at the settle point, once per timestamp,
     /// after the drain/NBA/fixpoint work has quiesced. Unchanged signals
     /// print too, so "did this ever become valid" is one grep.
