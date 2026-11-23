@@ -42,6 +42,24 @@ struct RunArgs {
     /// run stops with a location dump and exit code 124.
     #[arg(long)]
     max_wall: Option<String>,
+    /// Print every change of the named signals: comma-separated
+    /// hierarchical names (case-insensitive; a suffix like `dut.q` matches
+    /// all instances). Lines look like:
+    /// `watch t=15ns d3 tb.dut.q 0b0001->"xxxx" driver=foo.vhd:57`.
+    #[arg(long, value_name = "NAMES")]
+    watch: Option<String>,
+    /// With --watch: print only transitions into x/z/metavalues, with the
+    /// driving process — the fastest path to "where did the first X come
+    /// from".
+    #[arg(long)]
+    watch_x: bool,
+    /// With --watch: also print a settled snapshot of the watched signals
+    /// at every timestamp (`watch-snap` lines).
+    #[arg(long)]
+    watch_deltas: bool,
+    /// With --watch: cap on watch lines before suppression.
+    #[arg(long, default_value_t = 2000)]
+    watch_max: u64,
     /// Save the simulator state here when the run stops (resume with --restore).
     #[arg(long)]
     checkpoint: Option<PathBuf>,
@@ -277,6 +295,10 @@ impl Command for Run {
         sim.set_interrupt_flag(interrupt_flag.clone(), 130);
         if let Some(secs) = max_wall {
             sim.set_wall_budget(std::time::Duration::from_secs_f64(secs));
+        }
+        if let Some(spec) = &a.watch {
+            sim.set_watch(spec, a.watch_x, a.watch_deltas, a.watch_max)
+                .map_err(anyhow::Error::msg)?;
         }
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);

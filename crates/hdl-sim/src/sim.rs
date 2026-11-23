@@ -318,13 +318,13 @@ pub struct Simulator {
     /// settling; a constant nonzero count = oscillating combinational loop.
     fix_sweep: u64,
     fix_changed: u64,
-    /// Watched signals (`HDLSIM_WATCH`): (sig id, display name), resolved
-    /// once at construction. Empty by default — the check in `set_sig` is
+    /// Watched signals (`--watch`): (sig id, display name), resolved when
+    /// `set_watch` arms it. Empty by default — the check in `set_sig` is
     /// one branch when nothing is watched.
     watch: Vec<(u32, String)>,
-    /// Watch modes: only metavarue transitions (`HDLSIM_WATCH_X`), a value
-    /// snapshot per timestamp (`HDLSIM_WATCH_DELTAS`), and the total line
-    /// cap (`HDLSIM_WATCH_MAX`) with the running count.
+    /// Watch modes: only metavarue transitions (`--watch-x`), a value
+    /// snapshot per timestamp (`--watch-deltas`), and the total line
+    /// cap (`--watch-max`) with the running count.
     watch_x_only: bool,
     watch_snapshots: bool,
     watch_max_lines: u64,
@@ -544,7 +544,6 @@ impl Simulator {
             in_active: vec![false; np],
         };
         sim.prev = sim.vals.clone();
-        sim.resolve_watch();
         for (i, f) in sim.flat.functions.iter().enumerate() {
             let cands = sim.funcs.entry(f.name.to_ascii_lowercase()).or_default();
             // Stub shape: an interface-only spec declaration lowered without
@@ -2748,21 +2747,18 @@ impl Simulator {
 
     // ---- signal update + scheduling ---------------------------------------------------
 
-    /// Resolve `HDLSIM_WATCH` once at construction: a comma-separated list
-    /// of hierarchical signal names (case-insensitive; a name also matches
-    /// as a dot-suffix, `dut.q` matches `tb.dut.q`). Names matching nothing
-    /// are reported so a typo cannot silently watch nothing.
-    fn resolve_watch(&mut self) {
-        let spec = match std::env::var("HDLSIM_WATCH") {
-            Ok(s) if !s.trim().is_empty() => s,
-            _ => return,
-        };
-        self.watch_x_only = std::env::var_os("HDLSIM_WATCH_X").is_some();
-        self.watch_snapshots = std::env::var_os("HDLSIM_WATCH_DELTAS").is_some();
-        self.watch_max_lines = std::env::var("HDLSIM_WATCH_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
+    /// Arm the signal watch: `spec` is a comma-separated list of
+    /// hierarchical signal names (case-insensitive; a name also matches as
+    /// a dot-suffix, `dut.q` matches `tb.dut.q`). Resolved immediately so
+    /// a typo fails before the run instead of silently watching nothing —
+    /// zero matches for a name is an error, multiple matches are intended.
+    pub fn set_watch(
+        &mut self,
+        spec: &str,
+        x_only: bool,
+        snapshots: bool,
+        max_lines: u64,
+    ) -> Result<(), String> {
         let mut unmatched: Vec<String> = Vec::new();
         for cand in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let key = cand.to_ascii_lowercase();
@@ -2780,25 +2776,28 @@ impl Simulator {
             }
         }
         if !unmatched.is_empty() {
-            eprintln!(
-                "watch: no signal matched {} (HDLSIM_WATCH)",
+            self.watch.clear();
+            return Err(format!(
+                "--watch: no signal matched {} (hierarchical names, e.g. tb.dut.q)",
                 unmatched.join(", ")
-            );
+            ));
         }
-        if !self.watch.is_empty() {
-            eprintln!(
-                "watch: {} signal(s) [{}] — x-only={} snapshots={} cap={}",
-                self.watch.len(),
-                self.watch
-                    .iter()
-                    .map(|(_, n)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.watch_x_only,
-                self.watch_snapshots,
-                self.watch_max_lines
-            );
-        }
+        self.watch_x_only = x_only;
+        self.watch_snapshots = snapshots;
+        self.watch_max_lines = max_lines.max(1);
+        eprintln!(
+            "watch: {} signal(s) [{}] — x-only={} snapshots={} cap={}",
+            self.watch.len(),
+            self.watch
+                .iter()
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.watch_x_only,
+            self.watch_snapshots,
+            self.watch_max_lines
+        );
+        Ok(())
     }
 
     /// Line-budget gate shared by change lines and snapshots: false once
@@ -2811,7 +2810,7 @@ impl Simulator {
         self.watch_lines += 1;
         if self.watch_lines == self.watch_max_lines {
             eprintln!(
-                "watch: line cap ({}) reached — further lines suppressed (HDLSIM_WATCH_MAX)",
+                "watch: line cap ({}) reached — further lines suppressed (--watch-max)",
                 self.watch_max_lines
             );
         }
