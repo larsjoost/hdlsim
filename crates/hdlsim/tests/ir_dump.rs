@@ -12,7 +12,7 @@ fn tmp_out(tag: &str) -> PathBuf {
 
 #[test]
 fn ir_dump_writes_pretty_json_of_the_elaborated_top() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let ex = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     let out = tmp_out("verilog");
     let _ = std::fs::remove_file(&out);
@@ -57,7 +57,7 @@ fn ir_dump_writes_pretty_json_of_the_elaborated_top() {
 
 #[test]
 fn ir_dump_auto_picks_top_for_entity_arch_pair() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ir_probe.vhd");
     let out = tmp_out("vhdl");
     let _ = std::fs::remove_file(&out);
@@ -94,7 +94,7 @@ fn ir_dump_auto_picks_top_for_entity_arch_pair() {
 
 #[test]
 fn ir_dump_unknown_top_is_an_error() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ir_probe.vhd");
     assert!(dispatch(&[
         "ir".to_string(),

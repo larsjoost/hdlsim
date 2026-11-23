@@ -1,4 +1,4 @@
-//! `HDLSIM_MAX_MEM_MB` memory guard: a run over the limit must stop with the
+//! `--max-mem-mb` memory guard: a run over the limit must stop with the
 //! actionable diagnostic (exit 1) instead of being OOM-killed (exit 137, no
 //! output), and every run must report per-phase time/peak-RSS on stderr.
 
@@ -7,7 +7,7 @@ use std::process::Command;
 
 fn hdlsim() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hdlsim"));
-    c.env("HDLSIM_NO_CACHE", "1");
+    c.arg("--no-cache");
     c
 }
 
@@ -42,7 +42,7 @@ fn phases_report_time_and_peak_rss() {
 fn mem_limit_stops_the_run_with_a_diagnostic() {
     // 1 MiB: every run exceeds it, so the boundary check fires deterministically.
     let out = hdlsim()
-        .env("HDLSIM_MAX_MEM_MB", "1")
+        .args(["--max-mem-mb", "1"])
         .args(["run", "--top", "tb_named_assoc"])
         .arg(fixture("vhdl_named_assoc_tb.vhd"))
         .output()

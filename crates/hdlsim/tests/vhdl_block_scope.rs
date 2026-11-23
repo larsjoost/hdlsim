@@ -16,7 +16,7 @@ use std::time::Duration;
 
 fn hdlsim() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hdlsim"));
-    c.env("HDLSIM_NO_CACHE", "1");
+    c.arg("--no-cache");
     c
 }
 
@@ -47,7 +47,7 @@ fn block_scope_shadows_and_sees_entity_ports() {
 #[test]
 fn runaway_loop_is_stopped_with_diagnostic() {
     let out = hdlsim()
-        .env("HDLSIM_MAX_PROC_STEPS", "50000")
+        .args(["--max-proc-steps", "50000"])
         .args(["run", "--top", "tb_runaway", "--max-time", "1ms"])
         .arg(fixture("vhdl_runaway_loop_tb.vhd"))
         .output()
@@ -100,7 +100,7 @@ fn guards_stop_quickly_not_hang() {
     // AI-driven session cannot hang on a broken testbench).
     let start = std::time::Instant::now();
     let out = hdlsim()
-        .env("HDLSIM_MAX_PROC_STEPS", "20000")
+        .args(["--max-proc-steps", "20000"])
         .args(["run", "--top", "tb_runaway", "--max-time", "1ms"])
         .arg(fixture("vhdl_runaway_loop_tb.vhd"))
         .output()

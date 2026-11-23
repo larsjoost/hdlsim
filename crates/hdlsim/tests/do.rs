@@ -7,7 +7,7 @@ use hdlsim::commands::dispatch;
 
 #[test]
 fn do_file_runs_incremental_steps_and_writes_vcd() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let dir = std::env::temp_dir().join(format!("hdlsim_do_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

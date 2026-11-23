@@ -6,7 +6,7 @@ use hdlsim::commands::dispatch;
 
 #[test]
 fn deps_lists_transitive_files_verilog_and_vhdl() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let ex = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
 
     // Verilog: only the tb file is given; counter.v must be resolved from -L.

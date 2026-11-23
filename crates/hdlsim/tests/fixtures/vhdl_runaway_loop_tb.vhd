@@ -1,5 +1,5 @@
 -- Runaway loop: a `loop` whose body never waits must be stopped by the
--- interpreter step budget (HDLSIM_MAX_PROC_STEPS) with a diagnostic naming
+-- interpreter step budget (--max-proc-steps) with a diagnostic naming
 -- the process, and the run must exit nonzero — not hang forever.
 entity tb_runaway is
 end entity;

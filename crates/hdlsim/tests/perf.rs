@@ -63,7 +63,7 @@ fn run_cycles(dir: &std::path::Path, cycles: u32) -> (i32, std::time::Duration) 
 
 #[test]
 fn perf_smoke_100k_cycles() {
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let dir = std::env::temp_dir().join(format!("hdlsim_perf_smoke_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -80,7 +80,7 @@ fn perf_gate_10m_cycles() {
         eprintln!("skipping: set HDLSIM_PERF=1 to run the 10M-cycle gate");
         return;
     }
-    std::env::set_var("HDLSIM_NO_CACHE", "1");
+    // Library use never enables the parse cache (that is CLI-only, --no-cache);
     let dir = std::env::temp_dir().join(format!("hdlsim_perf_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

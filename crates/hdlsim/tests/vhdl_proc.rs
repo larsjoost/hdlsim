@@ -14,7 +14,7 @@ use std::process::Command;
 
 fn hdlsim() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hdlsim"));
-    c.env("HDLSIM_NO_CACHE", "1");
+    c.arg("--no-cache");
     c
 }
 

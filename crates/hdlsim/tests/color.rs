@@ -1,6 +1,6 @@
 //! Colorized diagnostics: `--color always|never|auto`, `--no-color`, and the
-//! `HDLSIM_COLOR` / `NO_COLOR` environment variables. Tests run the binary with
-//! piped output, so auto mode (default) must produce no ANSI escapes.
+//! standard `NO_COLOR` variable. Tests run the binary with piped output, so
+//! auto mode (default) must produce no ANSI escapes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,7 +10,7 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn hdlsim() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hdlsim"));
-    c.env("HDLSIM_NO_CACHE", "1");
+    c.arg("--no-cache");
     c
 }
 
@@ -91,11 +91,11 @@ fn color_flag_after_command_also_works() {
 }
 
 #[test]
-fn hdls_sim_color_env_forces_and_disables() {
+fn hdls_sim_color_flag_forces_and_disables() {
     let f = write_tmp("env", BAD_SRC);
-    let (_o, err, _c) = run_color(&[], &f, &[("HDLSIM_COLOR", "always")]);
+    let (_o, err, _c) = run_color(&["--color", "always"], &f, &[]);
     assert!(err.contains("\x1b[1;31merror"), "{}", err);
-    let (_o, err, _c) = run_color(&[], &f, &[("HDLSIM_COLOR", "never")]);
+    let (_o, err, _c) = run_color(&["--color", "never"], &f, &[]);
     assert!(!err.contains("\x1b["), "{}", err);
     let _ = std::fs::remove_file(&f);
 }
