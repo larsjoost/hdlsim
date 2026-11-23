@@ -265,14 +265,10 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
 
 /// Per-file status for a group compile: an error diagnostic counts against
 /// the file its span points into; spanless errors count against every file.
-fn group_statuses(sub: &str, files: &[PathBuf]) -> HashMap<String, &'static str> {
-    let t0 = std::time::Instant::now();
-    let mgr = compile_group(sub, files);
-    eprintln!(
-        "corpus: group {sub}: {} files in {:.1}s",
-        files.len(),
-        t0.elapsed().as_secs_f32()
-    );
+/// Per-file status from an already-compiled group: an error diagnostic
+/// counts against the file its span points into; spanless errors count
+/// against every file.
+fn statuses_from(mgr: &LibraryManager, files: &[PathBuf]) -> HashMap<String, &'static str> {
     let mut name_to_rel: HashMap<String, String> = HashMap::new();
     for f in files {
         name_to_rel.insert(f.display().to_string(), rel_path(f));
@@ -373,9 +369,17 @@ fn corpus_files_lex_and_parse_without_errors() {
     );
 }
 
+/// One compile per group serves both the check-run assertions and the
+/// per-file status snapshot. These were separate `#[test]`s that each
+/// called `compile_group`, so the corpus — thousands of third-party
+/// files — was lowered and analyzed twice per run for no added coverage;
+/// the parse cache only skips lex/parse, not lowering. Merging halves
+/// the corpus runtime.
 #[test]
-fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
+fn corpus_group_compiles_meet_expected_status_with_rustc_diags() {
     run_with_big_stack(|| {
+        let expected_path = corpus_dir().join("expected.json");
+        let mut actual: HashMap<String, String> = HashMap::new();
         let mut checked = 0;
         let mut with_diags = 0;
         for (sub, files) in corpus_groups() {
@@ -388,10 +392,10 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
                 t0.elapsed().as_secs_f32()
             );
             checked += files.len();
+            // rustc-style: every error line carries a stable `error[Exxxx]` code.
             let rendered = mgr.diags().render_all(mgr.db());
             if !mgr.diags().is_empty() {
                 with_diags += 1;
-                // rustc-style: every error line carries a stable `error[Exxxx]` code.
                 for line in rendered.lines().filter(|l| l.starts_with("error")) {
                     assert!(
                         line.starts_with("error[") || line.starts_with("error:"),
@@ -401,6 +405,9 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
                     );
                 }
             }
+            for (rel, status) in statuses_from(&mgr, &files) {
+                actual.insert(rel, status.to_string());
+            }
         }
         // Sanity: the corpus is real code, so at least some files should produce
         // diagnostics for constructs outside the current subset (no panics either way).
@@ -409,38 +416,6 @@ fn corpus_files_check_runs_and_diagnostics_are_rustc_style() {
             checked, with_diags
         );
         assert_eq!(checked, corpus_sources().len());
-    });
-}
-
-// ---- per-file expected status (corpus/expected.json) ------------------------
-//
-// Each corpus file has a recorded status in `corpus/expected.json`:
-//   "clean" = compile+lower with zero *error* diagnostics (warnings ok)
-//   "diags" = parses cleanly but still hits unsupported constructs
-// Statuses are computed from a per-library group compile (see compile_group),
-// attributing each error diagnostic to the file its span points into. The
-// test asserts every file reaches at least its recorded status, so fixes
-// only ever move files up (promote the entry in expected.json in the same PR
-// that fixes the file). Regenerate/snapshot with HDLSIM_UPDATE_CORPUS_EXPECTED=1.
-
-fn rank(status: &str) -> u8 {
-    match status {
-        "clean" => 2,
-        "diags" => 1,
-        _ => 0,
-    }
-}
-
-#[test]
-fn corpus_files_meet_their_recorded_status() {
-    run_with_big_stack(|| {
-        let expected_path = corpus_dir().join("expected.json");
-        let mut actual: HashMap<String, String> = HashMap::new();
-        for (sub, files) in corpus_groups() {
-            for (rel, status) in group_statuses(&sub, &files) {
-                actual.insert(rel, status.to_string());
-            }
-        }
         if std::env::var_os("HDLSIM_UPDATE_CORPUS_EXPECTED").is_some() {
             let mut entries: Vec<(&String, &String)> = actual.iter().collect();
             entries.sort();
@@ -498,4 +473,22 @@ fn corpus_files_meet_their_recorded_status() {
             actual.len()
         );
     });
+}
+
+// ---- per-file expected status (corpus/expected.json) ------------------------
+//
+// Each corpus file has a recorded status in `corpus/expected.json`://   "clean" = compile+lower with zero *error* diagnostics (warnings ok)
+//   "diags" = parses cleanly but still hits unsupported constructs
+// Statuses are computed from a per-library group compile (see compile_group),
+// attributing each error diagnostic to the file its span points into. The
+// test asserts every file reaches at least its recorded status, so fixes
+// only ever move files up (promote the entry in expected.json in the same PR
+// that fixes the file). Regenerate/snapshot with HDLSIM_UPDATE_CORPUS_EXPECTED=1.
+
+fn rank(status: &str) -> u8 {
+    match status {
+        "clean" => 2,
+        "diags" => 1,
+        _ => 0,
+    }
 }
