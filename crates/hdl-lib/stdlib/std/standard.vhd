@@ -77,8 +77,9 @@ package standard is
 
     type real is range -1.0e308 to 1.0e308;
 
-    -- VHDL-2008: file open kinds/status moved to std.standard.
-    type file_open_kind is (read_mode, write_mode, append_mode);
+    -- VHDL-2008: file open kinds/status moved to std.standard. VHDL-2019 adds
+    -- read_write_mode.
+    type file_open_kind is (read_mode, write_mode, append_mode, read_write_mode);
     type file_open_status is (open_ok, status_error, name_error, mode_error);
 
     -- VHDL-2019 unconstrained vector types.

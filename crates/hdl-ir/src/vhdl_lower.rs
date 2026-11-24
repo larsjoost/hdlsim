@@ -1799,11 +1799,19 @@ impl<'a> Lower<'a> {
             ("read_mode", 0u64),
             ("write_mode", 1),
             ("append_mode", 2),
+            ("read_write_mode", 3),
             ("open_ok", 0),
             ("status_error", 1),
             ("name_error", 2),
             ("mode_error", 3),
+            ("state_open", 0),
+            ("state_closed", 1),
         ] {
+            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value::from_u64(32, v));
+        }
+        // VHDL-2019 range-record direction literals (`direction => descending`
+        // in a `T'range'record` aggregate).
+        for (n, v) in [("ascending", 0u64), ("descending", 1)] {
             Rc::make_mut(&mut self.consts).insert(n.to_string(), Value::from_u64(32, v));
         }
         self.types.insert("file_open_kind".into(), TypeInfo::Scalar);
@@ -5124,18 +5132,33 @@ impl<'a> Lower<'a> {
         let kids = real_children(f);
         let mut name = String::new();
         let mut ret_mark: Option<SyntaxNode> = None;
+        let mut of_mark: Option<SyntaxNode> = None;
         let mut decl_nodes: Vec<SyntaxNode> = Vec::new();
         let mut nested_fns: Vec<SyntaxNode> = Vec::new();
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
         let mut seen_return = false;
+        let mut seen_of = false;
         let mut seen_begin = false;
         for k in &kids {
             match k.kind() {
                 SyntaxKind::Ident if self.kw(k) == "return" => seen_return = true,
+                SyntaxKind::Ident if self.kw(k) == "of" && seen_return => seen_of = true,
                 SyntaxKind::Ident if self.kw(k) == "begin" => seen_begin = true,
+                // VHDL-2019 subprogram generic clause (`function f generic
+                // (type T) parameter ...`): register its type formals so the
+                // parameter list (`a : T`, `b : a'subtype`) resolves.
+                SyntaxKind::GenericClause if !seen_begin => {
+                    let _ = self.lower_generic_decls(k, &HashMap::new());
+                }
                 SyntaxKind::Name if !seen_return && name.is_empty() => name = self.text(k),
                 SyntaxKind::Name if seen_return && !seen_begin && ret_mark.is_none() => {
                     ret_mark = Some(k.clone())
+                }
+                // VHDL-2019 `return rv_t of std_logic_vector`: the `of` clause
+                // names the element type; the return type mark is an alias of
+                // an array of it (register before resolving the mark below).
+                SyntaxKind::Name if seen_of && !seen_begin && of_mark.is_none() => {
+                    of_mark = Some(k.clone())
                 }
                 // Declarative items in textual order: each may reference the
                 // ones before it (params, types, constants, locals).
@@ -5162,12 +5185,20 @@ impl<'a> Lower<'a> {
         if name.is_empty() {
             return None;
         }
-        let (mut ret_width, _, _, _) = match &ret_mark {
-            Some(tm) => self.resolve_type(tm, None, f.span()),
-            None => (32, false, None, false),
-        };
+        if let (Some(rm), Some(om)) = (&ret_mark, &of_mark) {
+            let rn = self.kw(rm).to_ascii_lowercase();
+            let on = self.kw(om).to_ascii_lowercase();
+            let ti = self
+                .types
+                .get(&on)
+                .cloned()
+                .unwrap_or(TypeInfo::Vector { signed: false });
+            self.types.insert(rn, ti);
+        }
+        let mut ret_width = 32usize;
         // Params: PortDecl `a, b : integer [range] [:= default]` — names
         // before ':', type after.
+        let mut param_w: HashMap<String, usize> = HashMap::new();
         let mut args: Vec<(String, usize, String)> = Vec::new();
         let mut arg_types: Vec<(String, String)> = Vec::new();
         let mut defaults: Vec<Option<Value>> = Vec::new();
@@ -5195,7 +5226,12 @@ impl<'a> Lower<'a> {
                         .and_then(|i| pk.get(i + 1))
                 })
                 .filter(|k| k.kind() == SyntaxKind::Range);
+            // `b : a'subtype` — the base is an earlier formal of this
+            // subprogram (VHDL-2019 subprogram generics); adopt its width.
             let (w, _, _, _) = match &tmark {
+                Some(tm) if param_w.contains_key(&self.kw(tm)) => {
+                    (param_w[&self.kw(tm)], false, None, false)
+                }
                 Some(tm) => self.resolve_type(tm, constraint, pd.span()),
                 None => (32, false, None, false),
             };
@@ -5232,12 +5268,21 @@ impl<'a> Lower<'a> {
                 .and_then(|ex| self.ce(&ex))
                 .map(|v| v.resize(w.max(1)));
             for n in names {
+                param_w.insert(n.to_ascii_lowercase(), w);
                 if let Some(tm) = &tmark {
                     arg_types.push((n.clone(), self.kw(tm)));
                 }
                 args.push((n, w, ty.clone()));
                 defaults.push(default_v.clone());
             }
+        }
+        // Return type mark resolved after the parameter loop so a
+        // `return a'subtype` mark (base = an earlier formal) finds its width.
+        if let Some(tm) = &ret_mark {
+            ret_width = match param_w.get(&self.kw(tm)) {
+                Some(w) => *w,
+                None => self.resolve_type(tm, None, f.span()).0,
+            };
         }
         // Lower the body in slot space (slot 0 = return value). Install the
         // return + parameter slots first so function-local constants can
@@ -6438,6 +6483,17 @@ impl<'a> Lower<'a> {
             SyntaxKind::For => self.lower_for(s),
             SyntaxKind::LoopStmt => self.lower_loop(s),
             SyntaxKind::Wait => self.lower_wait(s),
+            // Sequential block statement: lower its body statements as a
+            // block (block-local declarations are not simulated).
+            SyntaxKind::Block => {
+                let stmts: Vec<Stmt> = real_children(s)
+                    .iter()
+                    .filter(|k| !is_decl_kind(k.kind()))
+                    .filter(|k| !matches!(k.kind(), SyntaxKind::Ident | SyntaxKind::Punct))
+                    .map(|k| self.lower_seq_stmt(k))
+                    .collect();
+                Stmt::Block(stmts)
+            }
             SyntaxKind::NullStmt => Stmt::Null,
             SyntaxKind::AssertStmt => {
                 // Covers both `assert cond [report msg] [severity lvl]` and
@@ -8542,11 +8598,12 @@ impl<'a> Lower<'a> {
             }
         }
         // Bit string literal: x"FF" / b"01" / o"7", or sized `32X"0"` / signed
-        // `32SB"1"` (VHDL-2008: strip the leading decimal size and optional `S`).
+        // `32SB"1"` / unsigned `32UB"1"` (VHDL-2008/2019: strip the leading
+        // decimal size and optional `S`/`U` prefix).
         let t: &str = {
             let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
             let mut n = digits;
-            if digits > 0 && t.len() > n && matches!(t.as_bytes()[n], b's' | b'S') {
+            if digits > 0 && t.len() > n && matches!(t.as_bytes()[n], b's' | b'S' | b'u' | b'U') {
                 n += 1;
             }
             if n > 0
@@ -8725,6 +8782,7 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::ExitStmt
             | SyntaxKind::CallStmt
             | SyntaxKind::ReturnStmt
+            | SyntaxKind::Block
     )
 }
 
