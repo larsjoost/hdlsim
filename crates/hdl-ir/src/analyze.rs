@@ -309,6 +309,7 @@ mod tests {
             modules: vec![m],
             top: None,
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         };
         let fs = analyze_design(&design);
@@ -375,6 +376,7 @@ mod tests {
             modules: vec![m],
             top: None,
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         };
         assert!(analyze_design(&design).is_empty());
@@ -406,6 +408,7 @@ mod tests {
             modules: vec![m],
             top: None,
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         };
         let fs = analyze_design(&design);

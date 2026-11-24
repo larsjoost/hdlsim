@@ -3504,7 +3504,8 @@ impl<'a> Lower<'a> {
 /// Constant-evaluate an expression with an environment of named constants.
 pub fn const_eval(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
     let no_funcs: HashMap<String, Vec<FuncIr>> = HashMap::new();
-    ce_impl(e, env, &no_funcs, &no_funcs, None)
+    let no_fallback: HashMap<String, Vec<std::rc::Rc<FuncIr>>> = HashMap::new();
+    ce_impl(e, env, &no_funcs, &no_fallback, None)
 }
 
 /// Like [`const_eval`], but user function bodies (`funcs`, e.g. VHDL package
@@ -3515,7 +3516,7 @@ pub fn const_eval_f(
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
 ) -> Option<Value> {
-    let no_fallback: HashMap<String, Vec<FuncIr>> = HashMap::new();
+    let no_fallback: HashMap<String, Vec<std::rc::Rc<FuncIr>>> = HashMap::new();
     ce_impl(e, env, funcs, &no_fallback, None)
 }
 
@@ -3529,7 +3530,7 @@ pub fn const_eval_f_with_pkgs(
     e: &Expr,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
-    pkg_funcs: &HashMap<String, Vec<FuncIr>>,
+    pkg_funcs: &HashMap<String, Vec<std::rc::Rc<FuncIr>>>,
 ) -> Option<Value> {
     ce_impl(e, env, funcs, pkg_funcs, None)
 }
@@ -3572,7 +3573,7 @@ fn ce_impl(
     e: &Expr,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
-    extras: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<std::rc::Rc<FuncIr>>>,
     mut slots: Option<&mut Vec<Value>>,
 ) -> Option<Value> {
     match e {
@@ -3725,24 +3726,35 @@ fn ce_impl(
             // unconstrained/unknown formal width of 0 or 1). Without a
             // fitting candidate, the first same-arity one runs — matching
             // the simulator's runtime pick.
-            // Directly visible candidates first; `extras` (all package
-            // functions) only fills a total miss — see
-            // `const_eval_f_with_pkgs`.
-            let cands = match funcs.get(&name.to_ascii_lowercase()) {
-                Some(c) => c,
-                None => extras.get(&name.to_ascii_lowercase())?,
-            };
             // Interface-only stubs must never win a width tie against a real
             // body (a stub const-evals to X, which loops on forever — see
             // the matching ordering in the simulator's dispatch).
+            // Directly visible candidates first; the design-wide package
+            // fallback only fills a total miss — either/or, never merged.
             let is_stub_ir = |f: &FuncIr| match &f.body {
                 Stmt::Null => true,
                 Stmt::Block(ss) => ss.is_empty(),
                 _ => false,
             };
-            let mut ordered: Vec<&FuncIr> = cands.iter().filter(|f| !is_stub_ir(f)).collect();
-            ordered.extend(cands.iter().filter(|f| is_stub_ir(f)));
-            let cands = &ordered;
+            // Directly visible candidates first; the design-wide package
+            // fallback only fills a total miss — either/or, never merged.
+            let cands: Vec<&FuncIr> = match funcs.get(&name.to_ascii_lowercase()) {
+                Some(c) => {
+                    let mut v: Vec<&FuncIr> = c.iter().filter(|f| !is_stub_ir(f)).collect();
+                    v.extend(c.iter().filter(|f| is_stub_ir(f)));
+                    v
+                }
+                None => {
+                    let c = extras.get(&name.to_ascii_lowercase())?;
+                    let mut v: Vec<&FuncIr> = c
+                        .iter()
+                        .map(std::rc::Rc::as_ref)
+                        .filter(|f| !is_stub_ir(f))
+                        .collect();
+                    v.extend(c.iter().map(std::rc::Rc::as_ref).filter(|f| is_stub_ir(f)));
+                    v
+                }
+            };
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 argv.push(ce_impl(a, env, funcs, extras, slots.as_deref_mut())?);
@@ -3842,7 +3854,7 @@ fn const_eval_func(
     argv: &[Value],
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
-    extras: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<std::rc::Rc<FuncIr>>>,
 ) -> Option<Value> {
     let mut slots: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
     slots.extend(argv.iter().cloned());
@@ -3868,7 +3880,7 @@ fn ce_stmt(
     slots: &mut Vec<Value>,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
-    extras: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<std::rc::Rc<FuncIr>>>,
     flow: &mut CeFlow,
 ) {
     if *flow != CeFlow::Continue {

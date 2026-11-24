@@ -426,6 +426,7 @@ pub fn lower_file(
     diags: &mut Vec<Diagnostic>,
     _time_unit_fs: u64,
     pkgs: &HashMap<String, Rc<PackageIr>>,
+    pkg_funcs: &std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
     cfgs: &HashMap<String, Rc<ConfigIr>>,
 ) -> Lowered {
     let _ = file;
@@ -436,6 +437,7 @@ pub fn lower_file(
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
+    lx.funcs_ce = pkg_funcs.clone();
     lx.cfgs = cfgs
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -883,6 +885,7 @@ pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     pkgs: &HashMap<String, Rc<PackageIr>>,
+    pkg_funcs: &std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
     cfgs: &HashMap<String, Rc<ConfigIr>>,
     modules: &mut Vec<ModuleIr>,
     pending: Vec<PendingArch>,
@@ -929,6 +932,7 @@ pub fn lower_pending_architectures(
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
+        lx.funcs_ce = pkg_funcs.clone();
         lx.cfgs = cfgs
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -1042,6 +1046,7 @@ pub fn lower_entity_variant(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
     pkgs: &HashMap<String, Rc<PackageIr>>,
+    pkg_funcs: &std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
     cfgs: &HashMap<String, Rc<ConfigIr>>,
     root: &SyntaxNode,
     arch_roots: &[SyntaxNode],
@@ -1056,6 +1061,7 @@ pub fn lower_entity_variant(
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
+    lx.funcs_ce = pkg_funcs.clone();
     lx.cfgs = cfgs
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -1116,6 +1122,7 @@ pub fn lower_entity_variant(
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
+        lax.funcs_ce = pkg_funcs.clone();
         lax.cfgs = cfgs
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
@@ -1315,13 +1322,15 @@ struct Lower<'a> {
     /// merging is transitive, so without this the same package closure is
     /// re-cloned (types/consts/functions) once per use clause per file.
     merged_all: std::collections::HashSet<String>,
-    /// Const-eval fallback: function bodies from every known package
-    /// (`self.pkgs`), merged regardless of use clauses. A use clause may
-    /// merge only one function of a package, yet its body may legally call a
+    /// Const-eval fallback: function bodies from every known package,
+    /// shared design-wide (`Design::pkg_funcs`) and only consulted when the
+    /// direct `self.funcs` map misses. A use clause may merge only one
+    /// function of a package, yet its body may legally call a
     /// package-internal sibling (visible at the body's declaration site), so
     /// nested const-eval resolves against this wider table when the direct
-    /// map misses.
-    funcs_ce: HashMap<String, Vec<FuncIr>>,
+    /// map misses. Cross-file packages only: same-file packages register
+    /// their functions into `self.funcs` directly.
+    funcs_ce: std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
     /// Type marks in scope (built-ins + user type/subtype decls).
     types: HashMap<String, TypeInfo>,
     /// Subtype name -> constrained width, so `signal x : my_subtype` (no
@@ -1479,7 +1488,7 @@ impl<'a> Lower<'a> {
             const_types: HashMap::new(),
             funcs: HashMap::new(),
             merged_all: std::collections::HashSet::new(),
-            funcs_ce: HashMap::new(),
+            funcs_ce: std::rc::Rc::new(HashMap::new()),
             types: HashMap::new(),
             type_widths: HashMap::new(),
             names: HashMap::new(),
@@ -1597,18 +1606,10 @@ impl<'a> Lower<'a> {
                 self.merge_use_clause(&child);
             }
         }
-        // Snapshot every known package's function bodies as the const-eval
-        // fallback (`funcs_ce`). Rebuilt per call: packages registered later
-        // in this file also register their functions into `self.funcs`
-        // directly, so the snapshot only needs the cross-file state.
-        self.funcs_ce = self
-            .pkgs
-            .values()
-            .flat_map(|p| p.functions.iter().cloned())
-            .fold(HashMap::new(), |mut m, f| {
-                m.entry(f.name.to_ascii_lowercase()).or_default().push(f);
-                m
-            });
+        // The const-eval fallback (`funcs_ce`) is shared design-wide
+        // (`Design::pkg_funcs`) — see the field docs — so nothing to
+        // snapshot here: rebuilding it per context application re-cloned the
+        // whole package closure (quadratic in design size).
     }
 
     /// Merge one `use lib.pkg.item;` / `context lib.pkg;` clause into scope.
@@ -3337,6 +3338,7 @@ impl<'a> Lower<'a> {
         let mut lx2 = Lower::new(self.db, self.diags);
         lx2.register_builtin_types();
         lx2.pkgs = self.pkgs.clone();
+        lx2.funcs_ce = self.funcs_ce.clone();
         // The enclosing scope (entity generics, constants, types) is visible in
         // the `generic map` associations — but seed it WITHOUT the generic
         // package's own exports: pass-0 merges each instantiation into the
@@ -9075,6 +9077,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         let errs: Vec<_> = diags
@@ -9106,6 +9109,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         for p in lowered.packages {
@@ -9120,6 +9124,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &pkgs,
+            &pkg_funcs_from(&pkgs),
             &HashMap::new(),
         );
         let errs: Vec<_> = diags
@@ -9131,6 +9136,22 @@ mod tests {
             "{:?}",
             errs.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    /// Design-wide const-eval fallback for tests, mirroring how hdl-lib
+    /// maintains `Design::pkg_funcs` as packages arrive.
+    fn pkg_funcs_from(
+        pkgs: &HashMap<String, std::rc::Rc<PackageIr>>,
+    ) -> std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>> {
+        let mut m: HashMap<String, Vec<std::rc::Rc<FuncIr>>> = HashMap::new();
+        for p in pkgs.values() {
+            for f in &p.functions {
+                m.entry(f.name.to_ascii_lowercase())
+                    .or_default()
+                    .push(std::rc::Rc::new(f.clone()));
+            }
+        }
+        std::rc::Rc::new(m)
     }
 
     fn lower_src(src: &str) -> Vec<hdl_syntax::diagnostic::Diagnostic> {
@@ -9145,6 +9166,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         diags
@@ -9217,6 +9239,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         for p in lowered.packages {
@@ -9231,6 +9254,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &pkgs,
+            &pkg_funcs_from(&pkgs),
             &HashMap::new(),
         );
         assert_no_errors(&diags);
@@ -9253,6 +9277,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         for p in lowered.packages {
@@ -9267,6 +9292,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &pkgs,
+            &pkg_funcs_from(&pkgs),
             &HashMap::new(),
         );
         assert_no_errors(&diags);
@@ -9356,6 +9382,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &HashMap::new(),
+            &std::rc::Rc::new(HashMap::new()),
             &HashMap::new(),
         );
         for p in lowered.packages {
@@ -9370,6 +9397,7 @@ mod tests {
             &mut diags,
             1_000_000,
             &pkgs,
+            &pkg_funcs_from(&pkgs),
             &HashMap::new(),
         );
         assert_no_errors(&diags);
@@ -9395,6 +9423,7 @@ mod tests {
                 &mut diags,
                 1_000_000,
                 &HashMap::new(),
+                &std::rc::Rc::new(HashMap::new()),
                 &HashMap::new(),
             );
         }
