@@ -33,4 +33,29 @@ package env is
     function TO_STRING (value : call_path_vector; separator : string) return string;
     function TO_STRING (value : call_path_vector_ptr; separator : string) return string;
 
+    -- VHDL-2019 date/time API (decl-only; not simulated).
+    type time_record is record
+      time_value_sec  : integer;
+      time_value_nsec : integer;
+      time_second     : integer;
+      time_minute     : integer;
+      time_hour       : integer;
+      time_day        : integer;
+      time_month      : integer;
+      time_year       : integer;
+      time_zone       : integer;
+    end record;
+    constant EPOCH : real := 0.0;
+    impure function LOCALTIME return time_record;
+    impure function GMTIME return time_record;
+    impure function LOCALTIME (timer : real) return time_record;
+    impure function GMTIME (timer : real) return time_record;
+    impure function LOCALTIME (trec : time_record) return time_record;
+    impure function GMTIME (trec : time_record) return time_record;
+    impure function EPOCH (trec : time_record) return real;
+    function TIME_TO_SECONDS (trec : time_record) return real;
+    function SECONDS_TO_TIME (secs : real) return time_record;
+    function TO_STRING (value : time_record) return string;
+    function TO_STRING (value : time_record; field : natural) return string;
+
 end package env;

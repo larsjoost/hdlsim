@@ -35,4 +35,16 @@ package textio is
 
     function endfile (file f : text) return boolean;
 
+    -- VHDL-2019 file API: open/close + state queries (decl-only; the kernel
+    -- simulates open/read/write on real files via the file decl itself).
+    procedure file_open (file f : text; external_name : in string;
+                         open_kind : in file_open_kind := read_mode);
+    procedure file_open (status : out file_open_status; file f : text;
+                         external_name : in string;
+                         open_kind : in file_open_kind := read_mode);
+    procedure file_close (file f : text);
+    type file_state is (state_open, state_closed);
+    function file_state (file f : text) return file_state;
+    function file_mode (file f : text) return file_open_kind;
+
 end package textio;

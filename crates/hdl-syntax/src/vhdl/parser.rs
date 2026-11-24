@@ -609,7 +609,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(')', "to close the generic list");
-        self.expect_punct(';', "after the generic clause");
+        // The `;` is optional here: a subprogram generic clause is followed
+        // by `parameter (...)`, not by `;` (`function f generic (...) parameter ...`).
+        self.eat_punct(';');
         self.builder.finish_node();
     }
 
@@ -626,6 +628,26 @@ impl<'a> Parser<'a> {
         self.expect_punct(')', "to close the port list");
         self.expect_punct(';', "after the port clause");
         self.builder.finish_node();
+    }
+
+    /// Skip a subtype indication inside an interface list, stopping at the
+    /// `;` or the `)` closing the list (whichever comes first at bracket
+    /// depth zero) — for `type T is <subtype indication>` formals.
+    fn skip_to_interface_end(&mut self) {
+        let mut depth = 0;
+        while self.peek().kind != TokenKind::Eof {
+            if self.at_punct('(') || self.at_punct('[') {
+                depth += 1;
+            } else if self.at_punct(')') || self.at_punct(']') {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            } else if depth == 0 && self.at_punct(';') {
+                break;
+            }
+            self.bump();
+        }
     }
 
     /// `name [, name...] : [mode] type_mark [constraint] [:= default]`.
@@ -694,9 +716,15 @@ impl<'a> Parser<'a> {
             return;
         }
         self.expect_punct(':', "before the mode/type");
-        // VHDL-2019 view mode: `bus : view ViewName of RecType` (the view
-        // name may be parenthesized: `view (V) of T`).
-        if self.at_kw("view") {
+        // VHDL-2019 anonymous-type formal: `A : type is private;` /
+        // `B : type is <>;` — the `type` keyword (with an optional
+        // `is <subtype indication>`) acts as the type mark itself.
+        if self.at_kw("type") {
+            self.bump();
+            if self.eat_kw("is") {
+                self.skip_to_interface_end();
+            }
+        } else if self.at_kw("view") {
             self.bump();
             if self.eat_punct('(') {
                 self.parse_name(); // view name
@@ -832,6 +860,15 @@ impl<'a> Parser<'a> {
             }
             _ if self.at_kw("use") => self.parse_use_clause(),
             _ if self.at_kw("for") => self.parse_for_spec(),
+            // VHDL-2019 `private` section marker inside a protected-type body.
+            _ if self.at_kw("private") => {
+                self.bump();
+            }
+            // VHDL-2019 generic clause inside a protected-type body:
+            // `type t is protected generic (type e_t;) ... end protected;`
+            _ if self.at_kw("generic") && self.peek2_text() == "(" => {
+                self.parse_generic_clause();
+            }
             _ if self.at_kw("package")
                 && self.peek2().kind == TokenKind::Ident
                 && self.peek3_text().eq_ignore_ascii_case("is") =>
@@ -1193,7 +1230,17 @@ impl<'a> Parser<'a> {
             return;
         }
         self.expect_kw("is", "after the type name");
-        if self.at_punct('(') {
+        if self.at_kw("new") {
+            // VHDL-2019 type instantiation: `type x is new g generic map (...);`
+            // — parsed loosely (name + optional generic map).
+            self.bump();
+            self.parse_name();
+            if self.at_kw("generic") {
+                self.bump();
+                self.expect_kw("map", "after generic");
+                self.parse_assoc_list();
+            }
+        } else if self.at_punct('(') {
             // Enumeration type: (idle, running, ...)
             self.bump();
             loop {
@@ -1415,6 +1462,11 @@ impl<'a> Parser<'a> {
         } else {
             self.error_here("expected a subprogram name");
         }
+        // VHDL-2019 subprogram generic clause:
+        // `function f generic (type T) parameter (...) return ...;`
+        if self.at_kw("generic") && self.peek2_text() == "(" {
+            self.parse_generic_clause();
+        }
         // VHDL-2008: `procedure p parameter (x : t);` — the interface list may
         // be introduced by the `parameter` keyword.
         self.eat_kw("parameter");
@@ -1430,6 +1482,11 @@ impl<'a> Parser<'a> {
         if self.at_kw("return") {
             self.bump();
             self.parse_type_mark();
+            // VHDL-2019: `return rv_t of std_logic_vector` — the return
+            // subtype is refined by an `of` clause (the marked type follows).
+            if self.eat_kw("of") {
+                self.parse_type_mark();
+            }
         }
         if self.eat_kw("is") {
             while !self.at_kw("begin") && self.peek().kind != TokenKind::Eof {
@@ -1888,6 +1945,49 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    /// Sequential block statement:
+    /// `[label:] block [(guard)] [is] <decls> begin <seq stmts> end block [label];`
+    fn parse_block_stmt(&mut self) {
+        self.start(SyntaxKind::Block);
+        self.bump(); // block
+        if self.at_punct('(') {
+            self.bump();
+            self.parse_expression();
+            self.expect_punct(')', "to close the block guard");
+        }
+        if self.eat_kw("guarded") {
+            // VHDL-2008 guarded block — keyword kept in the tree
+        }
+        self.eat_kw("is");
+        while !self.at_kw("begin") && !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            if self.at_kw("generic") && self.peek2_text() == "(" {
+                self.parse_generic_clause();
+            } else if self.at_kw("port") && self.peek2_text() == "(" {
+                self.parse_port_clause();
+            } else if (self.at_kw("generic") || self.at_kw("port"))
+                && self.peek2_text().eq_ignore_ascii_case("map")
+            {
+                self.bump(); // generic | port
+                self.bump(); // map
+                self.parse_assoc_list();
+                self.eat_punct(';');
+            } else {
+                self.parse_decl();
+            }
+        }
+        self.expect_kw("begin", "in block");
+        while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
+            self.parse_seq_stmt();
+        }
+        self.expect_kw("end", "to close the block");
+        self.eat_kw("block");
+        if self.peek().kind == TokenKind::Ident {
+            self.bump(); // optional label
+        }
+        self.expect_punct(';', "to end the block");
+        self.builder.finish_node();
+    }
+
     /// True when the next token starts a declarative item (as opposed to a
     /// concurrent statement) inside a generate body. `for` is excluded: it
     /// would be ambiguous with a nested for-generate.
@@ -2235,6 +2335,9 @@ impl<'a> Parser<'a> {
             self.parse_if();
         } else if self.at_kw("case") {
             self.parse_case();
+        } else if self.at_kw("block") {
+            // Sequential block statement: `lbl : block ... begin ... end block;`
+            self.parse_block_stmt();
         } else if self.at_kw("for") {
             self.parse_for_loop();
         } else if self.at_kw("loop") || self.at_kw("while") {
@@ -2431,6 +2534,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("end", "to close the case");
         self.eat_kw("case");
+        self.eat_punct('?'); // `end case?;`
         if self.peek().kind == TokenKind::Ident {
             self.bump();
         }
@@ -2627,6 +2731,14 @@ impl<'a> Parser<'a> {
 
     fn parse_name_suffixes(&mut self, mark: crate::cst::Mark) {
         loop {
+            // VHDL-2019 generic map on a subprogram call:
+            // `f generic map (T => u) (args);` — skip the map, then the args.
+            if self.at_kw("generic") && self.peek2_text().eq_ignore_ascii_case("map") {
+                self.bump();
+                self.bump();
+                self.parse_assoc_list();
+                continue;
+            }
             if self.at_punct('(') {
                 self.bump();
                 let mut is_slice = false;
@@ -2994,13 +3106,14 @@ impl<'a> Parser<'a> {
                 {
                     self.bump();
                 }
-                // Sized bit-string literal: `32X"0"`, `32SB"1"` — the size
-                // integer is directly followed by an optional `s` (signed),
-                // the base letter, and the string.
+                // Sized bit-string literal: `32X"0"`, `32SB"1"`, `32UB"1"` —
+                // the size integer is directly followed by an optional `s`
+                // (signed) or `u` (unsigned, VHDL-2019), the base letter, and
+                // the string.
                 if self.peek().kind == TokenKind::Ident
                     && (self.peek_text().len() == 1
                         || (self.peek_text().len() == 2
-                            && matches!(self.peek_text().as_bytes()[0], b's' | b'S')))
+                            && matches!(self.peek_text().as_bytes()[0], b's' | b'S' | b'u' | b'U')))
                     && matches!(
                         self.peek_text().as_bytes()[self.peek_text().len() - 1],
                         b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D'
@@ -3705,6 +3818,38 @@ end;
         assert!(sexp.contains("(Case "), "{}", sexp);
         // Concurrent conditional waveform with a trailing `else unaffected`.
         assert!(sexp.contains("(ConcAssign"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_r19_subprog_generic_return_of_seq_block_bitstring() {
+        let sexp = ok(r#"
+package p is
+    function f generic (type pt) parameter (s : natural; a : pt; b : a'subtype) return a'subtype;
+    function g return rv_t of std_logic_vector;
+    type int_vec_t is new work.pkg generic map (N => 4);
+    procedure priv generic (type q) parameter (x : q);
+end package;
+architecture rtl of m is
+    constant c : bit_vector(5 downto 0) := 6Ux"a";
+begin
+    p : process
+    begin
+        inner : block
+        begin
+            q <= '1';
+        end block;
+        case? op is
+            when 0 => q <= a;
+            when others => q <= b;
+        end case?;
+        r <= f generic map (pt => std_logic)(0, a, b);
+    end process;
+end;
+"#);
+        assert_eq!(sexp.matches("(GenericClause").count(), 2, "{}", sexp);
+        assert_eq!(sexp.matches("(Block").count(), 1, "{}", sexp);
+        assert!(sexp.contains("Ux"), "{}", sexp);
+        assert!(sexp.contains("(Call "), "{}", sexp);
     }
 
     #[test]
