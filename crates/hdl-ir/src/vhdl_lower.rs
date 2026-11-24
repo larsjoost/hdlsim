@@ -4651,6 +4651,10 @@ impl<'a> Lower<'a> {
             for k in &kids {
                 match k.kind() {
                     SyntaxKind::TypeDecl => self.lower_type_decl(k),
+                    // Body-local subtype (`subtype t_data_buffer is
+                    // std_logic_vector(N-1 downto 0);`) — must be registered
+                    // before the state variables that use it.
+                    SyntaxKind::SubtypeDecl => self.lower_subtype_decl(k),
                     SyntaxKind::VariableDecl if is_body => {
                         let vk = real_children(k);
                         let colon = vk
