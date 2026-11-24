@@ -48,6 +48,13 @@ pub struct Design {
     /// (`label : configuration work.cfg`) and `--top cfg` resolve (see
     /// [`crate::vhdl_lower::ConfigIr`]).
     pub configurations: HashMap<String, std::rc::Rc<crate::vhdl_lower::ConfigIr>>,
+    /// Const-eval fallback shared by every file lowering in this design: all
+    /// packages' function bodies grouped by lowercase name (the lowerer's
+    /// `funcs_ce`). Kept in sync as packages enter `self.packages` (one
+    /// clone per function per design), because rebuilding it per lowered
+    /// file — which re-clones the whole package closure several times per
+    /// file — is quadratic and dominated large library compiles.
+    pub pkg_funcs: std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]

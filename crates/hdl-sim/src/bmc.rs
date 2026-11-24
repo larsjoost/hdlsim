@@ -2239,6 +2239,7 @@ mod tests {
             modules,
             top: Some(top.to_string()),
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         }
     }

@@ -1025,6 +1025,7 @@ mod tests {
             modules: vec![top, child],
             top: Some("top".into()),
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         }
     }

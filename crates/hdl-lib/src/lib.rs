@@ -906,6 +906,7 @@ impl LibraryManager {
             &self.db,
             &mut lower_diags,
             &design.packages,
+            &design.pkg_funcs,
             &design.configurations,
             &mut design.modules,
             pending,
@@ -1099,6 +1100,7 @@ impl UnitResolver for LibraryManager {
             &self.db,
             &mut lower_diags,
             &design.packages,
+            &design.pkg_funcs,
             &design.configurations,
             &eparsed.root,
             &arch_roots,
@@ -1481,6 +1483,7 @@ pub fn compile_one(
                 &mut lower_diags,
                 1_000_000,
                 &design.packages,
+                &design.pkg_funcs,
                 &design.configurations,
             );
             diags.extend(lower_diags);
@@ -1537,6 +1540,21 @@ pub fn compile_one(
                     .insert(c.name.to_ascii_lowercase(), std::rc::Rc::new(c));
             }
             for p in lowered.packages {
+                // Keep the design-wide const-eval fallback (`pkg_funcs`) in
+                // sync with `design.packages`: the delta to the entry's
+                // functions is `p.functions` in both the insert and the
+                // merge case. Building it here — once per package arrival —
+                // replaces a per-file rebuild of the whole package closure
+                // in the lowerer, which was quadratic in design size.
+                {
+                    let funcs = std::rc::Rc::make_mut(&mut design.pkg_funcs);
+                    for f in &p.functions {
+                        funcs
+                            .entry(f.name.to_ascii_lowercase())
+                            .or_default()
+                            .push(std::rc::Rc::new(f.clone()));
+                    }
+                }
                 // `package p` and `package body p` arrive as two entries with
                 // the same name — merge their items instead of last-wins.
                 match design.packages.entry(p.name.clone()) {

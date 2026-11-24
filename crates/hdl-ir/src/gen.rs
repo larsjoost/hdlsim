@@ -269,6 +269,7 @@ mod tests {
             modules: vec![m],
             top: None,
             packages: Default::default(),
+            pkg_funcs: Default::default(),
             configurations: Default::default(),
         }
     }
