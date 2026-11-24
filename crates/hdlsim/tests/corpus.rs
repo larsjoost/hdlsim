@@ -62,7 +62,7 @@ fn collect_group_dirs(root: &Path, out: &mut Vec<PathBuf>) {
 /// are registered under the repo's logical library name.
 fn corpus_groups() -> Vec<(String, Vec<PathBuf>)> {
     let mut out = Vec::new();
-    for sub in ["verilog", "vhdl", "vhdl-vunit"] {
+    for sub in ["verilog", "vhdl", "vhdl-vunit", "vhdl-uvvm"] {
         out.push((sub.to_string(), dir_sources(&corpus_dir().join(sub))));
     }
     // OSVVM model repos are grouped per subproject (`vhdl-osvvm/<repo>/<sub>`
@@ -228,6 +228,16 @@ fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
             mgr.add_library_dir("vunit_lib", &dir);
             mgr.add_library_dir("work", &dir);
             mgr.add_library_dir("osvvm", &corpus_dir().join("vhdl"));
+        }
+        // UVVM's sources reference each other both as `work.*` and as
+        // `uvvm_util.*` / `uvvm_vvc_framework.*` (its vhdl_ls.toml maps all
+        // three logical names onto the same tree), so register all of them
+        // on the group's own directory.
+        "vhdl-uvvm" => {
+            mgr.add_library_dir("uvvm_util", &dir);
+            mgr.add_library_dir("uvvm_assertions", &dir);
+            mgr.add_library_dir("uvvm_vvc_framework", &dir);
+            mgr.add_library_dir("work", &dir);
         }
         // OSVVM model tree: `work` is the group's own directory (per-testbench
         // `work.TestCtrl` etc. must not collide across testbenches); every
