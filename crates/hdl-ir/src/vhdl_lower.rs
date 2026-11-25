@@ -2196,7 +2196,23 @@ impl<'a> Lower<'a> {
                 let w = bits_for(lits.len());
                 (w, false, None, false)
             }
-            TypeInfo::Array { elem, depth, .. } => (elem, false, Some(depth), false),
+            TypeInfo::Array {
+                elem, depth, dims, ..
+            } => {
+                // A constrained array type mark (`array (field_id) of
+                // field_t`) covers every element of its own dims: the flat
+                // width is elem × ∏ sizes, not the bare element width —
+                // otherwise objects of the type collapse to one element and
+                // named-choice/OTHERS aggregates cannot re-size them.
+                // Unconstrained marks (empty dims) keep the element width;
+                // the object's own constraint sizes those.
+                let w = if dims.is_empty() {
+                    elem
+                } else {
+                    elem.max(1) * dims.iter().map(|(_, n)| (*n).max(1)).product::<usize>()
+                };
+                (w, false, Some(depth), false)
+            }
             TypeInfo::Record { fields } => (
                 fields.iter().map(|f| f.1).sum::<usize>().max(1),
                 false,
@@ -2204,6 +2220,25 @@ impl<'a> Lower<'a> {
                 false,
             ),
             TypeInfo::Handle => (64, false, None, false),
+        }
+    }
+
+    /// Row width for a memory-backed object (`mem` set): `resolve_type`
+    /// returns an array type mark's full flat width, but a memory stores
+    /// `depth` rows of element width, so the slot must stay one row.
+    fn mem_row_width(&self, tm: Option<&SyntaxNode>, width: usize) -> usize {
+        let Some(tm) = tm else {
+            return width;
+        };
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match self.types.get(&tn) {
+            Some(TypeInfo::Array { elem, .. }) => (*elem).max(1),
+            _ => width,
         }
     }
 
@@ -3268,6 +3303,7 @@ impl<'a> Lower<'a> {
                 Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
                 None => (1, false, None, false),
             };
+            let width = self.mem_row_width(type_mark.as_ref(), width);
             let dir = match mode.as_str() {
                 "out" | "buffer" => Dir::Out,
                 "inout" => Dir::Inout,
@@ -4775,6 +4811,7 @@ impl<'a> Lower<'a> {
             Some(tm) => self.resolve_type(tm, constraint, span),
             None => (1, false, None, false),
         };
+        let width = self.mem_row_width(type_mark, width);
         let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(&e, &self.consts.clone());
@@ -5518,33 +5555,20 @@ impl<'a> Lower<'a> {
                             // (constrained subtypes carry their sizes in
                             // dims and need no extra factor).
                             let ftn = self.kw(tm);
-                            let w = match self.types.get(&ftn) {
-                                Some(TypeInfo::Array { dims, .. })
-                                    if dims.is_empty() && constraint.is_some() =>
-                                {
-                                    w.max(1)
-                                        * self
-                                            .constraint_width(
-                                                constraint.expect(
+                            let w =
+                                match self.types.get(&ftn) {
+                                    Some(TypeInfo::Array { dims, .. })
+                                        if dims.is_empty() && constraint.is_some() =>
+                                    {
+                                        w.max(1)
+                                            * self
+                                                .constraint_width(constraint.expect(
                                                     "match guard checked constraint.is_some()",
-                                                ),
-                                            )
-                                            .max(1)
-                                }
-                                // Constrained array type mark
-                                // (`fields : fields_t` where `fields_t is
-                                // array (field_id) of field_t`): resolve_type
-                                // returns the element width, but the field's
-                                // flat slice must cover every element of the
-                                // type's own dims — otherwise the field
-                                // aggregates to one element and chain selects
-                                // past index 0 fold to X.
-                                Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
-                                    w.max(1)
-                                        * dims.iter().map(|(_, n)| (*n).max(1)).product::<usize>()
-                                }
-                                _ => w,
-                            };
+                                                ))
+                                                .max(1)
+                                    }
+                                    _ => w,
+                                };
                             let fty = self.kw(tm);
                             for n in names {
                                 self.rec_field_ty
