@@ -77,6 +77,10 @@ jobs:
     name: standards audit (report only)
     continue-on-error: true
     runs-on: ubuntu-latest
+    env:
+      # Plain cargo output so the audit's count greps match: GitHub's
+      # default CARGO_TERM_COLOR=always wraps `-->` in ANSI escapes.
+      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,10 +100,6 @@ jobs:
       # clippy.toml; the ≤ 30 target stays review-level. Report only until
       # the existing long functions are extracted, then flip to blocking.
       - name: Functions over the 50-line split line
-        env:
-          # Plain cargo output so the count greps match: GitHub's default
-          # CARGO_TERM_COLOR=always wraps `-->` in ANSI escapes.
-          CARGO_TERM_COLOR: never
         run: |
           cargo clippy --all-targets -- -W clippy::too_many_lines > /tmp/tml.txt 2>&1 || true
           echo "functions over 50 lines: $(grep -cE '^\s+--> ' /tmp/tml.txt)"
@@ -108,9 +108,6 @@ jobs:
       # Cognitive complexity (threshold 30 in clippy.toml), library code
       # only — tests are exempt from the shape rules, like the crash rules.
       - name: Functions over the complexity split line
-        env:
-          # Same plain-output requirement as the function-length step.
-          CARGO_TERM_COLOR: never
         run: |
           cargo clippy --workspace --lib -- -W clippy::cognitive_complexity > /tmp/cc.txt 2>&1 || true
           echo "lib functions over complexity 30: $(grep -cE '^\s+--> ' /tmp/cc.txt)"
