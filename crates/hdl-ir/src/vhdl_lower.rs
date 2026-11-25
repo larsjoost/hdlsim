@@ -1573,6 +1573,11 @@ struct Lower<'a> {
     /// `x` characters X-poison the value and kill `'length` downstream. Set
     /// around initializer lowering only (see `string_typed`).
     str_ctx: bool,
+    /// Names currently bound to no value whose X roots in an unbound formal
+    /// generic (a required formal with no default, and constants derived from
+    /// one): expressions referencing them are constant per instance, so their
+    /// bare-context fold failure warns misleadingly and is skipped instead.
+    per_instance_names: std::collections::HashSet<String>,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -1681,6 +1686,7 @@ impl<'a> Lower<'a> {
             cur_entity: String::new(),
             cur_scope: String::new(),
             str_ctx: false,
+            per_instance_names: std::collections::HashSet::new(),
             prot_types: HashMap::new(),
             prot_body_ctx: None,
             sig_prot: HashMap::new(),
@@ -2240,6 +2246,27 @@ impl<'a> Lower<'a> {
             Some(TypeInfo::Array { elem, .. }) => (*elem).max(1),
             _ => width,
         }
+    }
+
+    /// Whether this node references a generic that is currently bound to no
+    /// value (an unbound formal). Expressions hanging on such a generic are
+    /// constant per instance — the generic map rebinds it — so their
+    /// bare-context fold failure warns misleadingly and callers skip the
+    /// warning.
+    fn refs_unset_generic(&self, n: &SyntaxNode) -> bool {
+        n.descendants()
+            .filter(|d| matches!(d.kind(), SyntaxKind::Name | SyntaxKind::Ident))
+            .any(|d| {
+                let t = self.text(&d).to_ascii_lowercase();
+                // Selected names (`pkg.G_SIZE`) match on their last segment;
+                // the currently-unknown gate keeps stale markers from other
+                // contexts harmless.
+                let last = t.rsplit('.').next().unwrap_or(&t);
+                [t.as_str(), last].iter().any(|cand| {
+                    self.per_instance_names.contains(*cand)
+                        && matches!(self.consts.get(*cand), Some(v) if !v.is_known())
+                })
+            })
     }
 
     /// Width from a constraint: `(msb downto lsb)` / `(msb to lsb)` / `(n)`,
@@ -3207,6 +3234,13 @@ impl<'a> Lower<'a> {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
+                if !val.is_known() {
+                    // Insert-only marker: instance contexts re-lower the same
+                    // generic with a known value, and the suppression check
+                    // gates on the const being unknown right now, so stale
+                    // entries from other contexts stay harmless.
+                    self.per_instance_names.insert(key.clone());
+                }
                 let status = if val.is_known() { "ok" } else { "unset" };
                 self.dump_const(n, "generic", d.span(), status, &val);
                 if let Some(tn) = &rec_ty {
@@ -4126,6 +4160,13 @@ impl<'a> Lower<'a> {
             Rc::make_mut(&mut self.consts)
                 .entry(key.clone())
                 .or_insert_with(|| prm.default.clone());
+            // Mirror the per-instance marker (see `lower_generic_decls`):
+            // this path restores the entity's generics into a fresh Lower
+            // for an out-of-file architecture, so without it the suppression
+            // never sees the unbound formals.
+            if self.consts.get(&key).is_some_and(|v| !v.is_known()) {
+                self.per_instance_names.insert(key.clone());
+            }
             if let Some(ty) = &prm.ty {
                 self.const_types.entry(key).or_insert_with(|| ty.clone());
             }
@@ -4400,19 +4441,28 @@ impl<'a> Lower<'a> {
         let downto = kids
             .iter()
             .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "downto");
-        let env = self.consts.clone();
-        let exprs: Vec<Expr> = kids
+        let range_nodes: Vec<&SyntaxNode> = kids
             .iter()
             .enumerate()
             .filter(|(i, k)| *i > in_pos && *i < gen_pos && is_expr_node(k.kind()))
-            .map(|(_, k)| self.lower_expr(k, &env))
+            .map(|(_, k)| k)
+            .collect();
+        let env = self.consts.clone();
+        let exprs: Vec<Expr> = range_nodes
+            .iter()
+            .map(|k| self.lower_expr(k, &env))
             .collect();
         if exprs.len() < 2 {
             return;
         }
         let ev = |e: &Expr| self.ce_env(e, &env).and_then(|v| v.to_u64());
         let (Some(lo), Some(hi)) = (ev(&exprs[0]), ev(&exprs[1])) else {
-            self.warn(s.span(), "generate range is not constant; skipped");
+            // A range hanging on an unbound formal generic is constant per
+            // instance (the generic map rebinds it) — same reasoning as the
+            // constant-initializer suppression.
+            if !range_nodes.iter().any(|k| self.refs_unset_generic(k)) {
+                self.warn(s.span(), "generate range is not constant; skipped");
+            }
             return;
         };
         let (decls, body) = self.gen_body(&kids[gen_pos + 1..]);
@@ -5089,6 +5139,15 @@ impl<'a> Lower<'a> {
                         Some(&init),
                         &v,
                     );
+                    // A constant that folded to X while its initializer hangs
+                    // on an unbound formal generic (X propagates through
+                    // arithmetic, so the fold "succeeds") is per-instance
+                    // just like a failed fold: record it so generate ranges
+                    // and other constants referencing it suppress their
+                    // misleading bare-context warnings.
+                    if !v.is_known() && self.refs_unset_generic(&init) {
+                        self.per_instance_names.insert(n.to_ascii_lowercase());
+                    }
                     let status = if v.is_known() { "ok" } else { "x" };
                     self.dump_const(n, "constant", d.span(), status, &v);
                 }
@@ -5097,10 +5156,26 @@ impl<'a> Lower<'a> {
                 // Keep the name bound to X (e.g. a generic with no default is
                 // not constant at analysis time) so uses resolve instead of
                 // cascading into unknown-identifier errors.
-                self.warn(
-                    d.span(),
-                    "constant initializer is not constant; treated as X",
-                );
+                // An initializer hanging (directly or through an
+                // already-X-derived constant) on an unbound formal generic is
+                // constant per instance (the generic map rebinds it), so the
+                // bare-context fold failure is not a warning — established
+                // simulators evaluate these at elaboration and stay silent.
+                if self.refs_unset_generic(&init) {
+                    // Record these constants too: expressions referencing
+                    // them (a generate range, another constant) inherit the
+                    // per-instance property. The unknown-value gate in
+                    // `refs_unset_generic` keeps this harmless in contexts
+                    // where the generic is bound.
+                    for n in &names {
+                        self.per_instance_names.insert(n.to_ascii_lowercase());
+                    }
+                } else {
+                    self.warn(
+                        d.span(),
+                        "constant initializer is not constant; treated as X",
+                    );
+                }
                 for n in &names {
                     Rc::make_mut(&mut self.consts)
                         .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
