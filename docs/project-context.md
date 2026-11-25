@@ -55,6 +55,15 @@ cargo test        # corpus tests are #[ignore]d; the release CI corpus job runs 
 cargo smoke       # fast regression subset (see .cargo/config.toml)
 ```
 
+## Standards ratchet
+
+Shape debt — functions over the 50-line split line, functions over cognitive
+complexity 30, modules over ~600 lines — is frozen per file in
+`docs/standards-baseline.json`. CI fails when any count grows or a file
+gains debt it does not have an entry for; improvements are committed by
+regenerating the file with `scripts/standards-baseline.sh` alongside the
+change that earned them.
+
 ## Workflow
 
 - **Never commit directly to `main`.** Create a branch, push it, and open a
