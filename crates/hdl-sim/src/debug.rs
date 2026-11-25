@@ -39,7 +39,7 @@ pub fn fmt_value(v: &Value) -> String {
             }
             hex.push(
                 char::from_digit(val as u32, 16)
-                    .unwrap()
+                    .expect("val is a 4-bit nibble, so from_digit(16) succeeds")
                     .to_ascii_uppercase(),
             );
         }

@@ -173,7 +173,10 @@ impl DoSession {
                     self.build_sim()?;
                 }
                 let (t, bytes) = {
-                    let sim = self.sim.as_mut().unwrap();
+                    let sim = self
+                        .sim
+                        .as_mut()
+                        .expect("build_sim() leaves self.sim set on Ok");
                     match args.get(1).map(|s| s.as_str()) {
                         None | Some("-all") => sim.run_until(self.max_time_fs),
                         Some(t) => {
@@ -202,7 +205,11 @@ impl DoSession {
                     ));
                 }
                 self.history.truncate(self.history.len() - n);
-                let (t, bytes) = self.history.last().unwrap().clone();
+                let (t, bytes) = self
+                    .history
+                    .last()
+                    .expect("the guard requires n < history.len(), so history is non-empty")
+                    .clone();
                 let flat = match &self.sim {
                     Some(s) => s.flat().clone(),
                     None => {
@@ -300,7 +307,12 @@ impl DoSession {
                 if self.sim.is_none() {
                     self.build_sim()?;
                 }
-                let flat = self.sim.as_ref().unwrap().flat().clone();
+                let flat = self
+                    .sim
+                    .as_ref()
+                    .expect("build_sim() leaves self.sim set on Ok")
+                    .flat()
+                    .clone();
                 let mut sim = Simulator::restore_checkpoint(flat, std::path::Path::new(path))
                     .map_err(anyhow::Error::msg)?;
                 sim.add_observer(Box::new(Transcript::new(

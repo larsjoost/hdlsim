@@ -17,6 +17,14 @@ pass/fail. This file is the map; follow it instead of rediscovering it.
 - `cargo fmt --check` must pass — run `cargo fmt` before committing.
 - `cargo clippy --all-targets -- -D warnings` must pass (CI gate, zero
   findings) — run `cargo clippy --fix` and fix the rest before opening a PR.
+- `cargo clippy --workspace --lib -- -D clippy::unwrap_used` must pass (CI
+  gate): `.unwrap()` never states an invariant, so library code uses
+  `.expect("why this cannot fail")` or recovers from poisoning with
+  `into_inner()`. Tests and CLI entry points are outside this rule.
+- CI runs a non-blocking standards audit (function length — split at 50,
+  see `clippy.toml`; module size — well under ~600 lines; per-commit change
+  size — ≤ ~400 lines). It flips to blocking as the existing offenders are
+  extracted; function ≤ 30, nesting ≤ 2, and dedup stay review-level.
 
 ## Workflow (required)
 

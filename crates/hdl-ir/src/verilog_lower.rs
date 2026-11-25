@@ -121,7 +121,11 @@ pub fn lower_file_with_time_scoped(
         .iter()
         .filter(|(k, _)| k.contains("::"))
         .flat_map(|(k, v)| {
-            let bare = k.rsplit("::").next().unwrap().to_string();
+            let bare = k
+                .rsplit("::")
+                .next()
+                .expect("rsplit always yields at least one item")
+                .to_string();
             v.iter().map(move |f| (bare.clone(), f.clone()))
         })
         .collect();
@@ -1696,7 +1700,7 @@ impl<'a> Lower<'a> {
                 })
             });
             if is_decl {
-                let np = name_pos.unwrap();
+                let np = name_pos.expect("is_decl is only true when name_pos was found");
                 let n = self.text(&ik[np]);
                 if self.sig_id(&n).is_none() {
                     let id = (self.extra_base + self.extra_signals.len()) as SigId;
@@ -1713,7 +1717,9 @@ impl<'a> Lower<'a> {
                 if ik.get(np + 1).is_some_and(|k| self.text(k) == "=") {
                     if let Some(e) = ik.get(np + 2).filter(|e| is_expr_node(e.kind())) {
                         return Stmt::Assign {
-                            lhs: Expr::Sig(self.sig_id(&self.text(&ik[np])).unwrap()),
+                            lhs: Expr::Sig(self.sig_id(&self.text(&ik[np])).expect(
+                                "the signal was registered just above when it was missing",
+                            )),
                             rhs: self.lower_expr(e, env),
                             nba: false,
                         };
@@ -2065,7 +2071,9 @@ impl<'a> Lower<'a> {
                         if dk.get(i + 1).is_some_and(|k| self.text(k) == "=") {
                             if let Some(e) = dk.get(i + 2).filter(|e| is_expr_node(e.kind())) {
                                 inits.push(Stmt::Assign {
-                                    lhs: Expr::Sig(self.sig_id(&self.text(k)).unwrap()),
+                                    lhs: Expr::Sig(self.sig_id(&self.text(k)).expect(
+                                        "the signal was registered earlier in this declaration",
+                                    )),
                                     rhs: self.lower_expr(e, env),
                                     nba: false,
                                 });
@@ -2076,7 +2084,7 @@ impl<'a> Lower<'a> {
                 if inits.is_empty() {
                     Stmt::Null
                 } else if inits.len() == 1 {
-                    inits.pop().unwrap()
+                    inits.pop().expect("checked inits.len() == 1")
                 } else {
                     Stmt::Block(inits)
                 }
@@ -2455,7 +2463,7 @@ impl<'a> Lower<'a> {
             return;
         };
         let step = &assigns[1];
-        let body_node = body.unwrap().clone();
+        let body_node = body.expect("body.is_none() returned early above").clone();
         let mut iter = 0u32;
         loop {
             if iter > 1_000_000 {

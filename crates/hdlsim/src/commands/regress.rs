@@ -103,7 +103,9 @@ impl Command for Regress {
                     continue;
                 }
                 let mut toks = line.split_whitespace();
-                let first = toks.next().unwrap();
+                let first = toks
+                    .next()
+                    .expect("the line is trimmed and non-empty, so there is at least one token");
                 // `name=top` sets a distinct test name; otherwise name == top.
                 let (name, top) = match first.split_once('=') {
                     Some((n, t)) => (n.to_string(), t.to_string()),

@@ -429,12 +429,17 @@ static CAPTURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Enable or disable diagnostic capture (called by the binary when a
 /// `--report` request is active).
 pub fn set_capture(on: bool) {
-    *CAPTURE.lock().unwrap() = if on { Some(String::new()) } else { None };
+    *CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) =
+        if on { Some(String::new()) } else { None };
 }
 
 /// Take the captured diagnostic output (empty string when capture is off).
 pub fn take_capture() -> String {
-    CAPTURE.lock().unwrap().take().unwrap_or_default()
+    CAPTURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
 }
 
 #[derive(Default, Debug)]
@@ -470,7 +475,7 @@ impl Diagnostics {
     /// Render all diagnostics with explicit color on/off.
     pub fn render_all_with(&self, db: &SourceDb, color: bool) -> String {
         let out = self.render_all_plain(db, color);
-        if let Some(cap) = CAPTURE.lock().unwrap().as_mut() {
+        if let Some(cap) = CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             cap.push_str(&out);
             cap.push('\n');
         }
@@ -548,7 +553,7 @@ impl Diagnostics {
         }
         // Same capture contract as `render_all_with`: the `--report` bundle
         // embeds the exact rendered output, whatever the armed format is.
-        if let Some(cap) = CAPTURE.lock().unwrap().as_mut() {
+        if let Some(cap) = CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             cap.push_str(&out);
         }
         out

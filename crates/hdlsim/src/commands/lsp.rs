@@ -346,7 +346,7 @@ pub fn read_message(r: &mut impl BufRead) -> std::io::Result<Option<String>> {
         }
         // Other headers (Content-Type, ...) are ignored.
     }
-    let mut buf = vec![0u8; len.unwrap()];
+    let mut buf = vec![0u8; len.expect("the header loop only breaks once Content-Length was seen")];
     r.read_exact(&mut buf)?;
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }

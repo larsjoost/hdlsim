@@ -92,7 +92,7 @@ impl CompileWatch {
                 if st.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let g = sh.lock().unwrap();
+                let g = sh.lock().unwrap_or_else(|e| e.into_inner());
                 if g.0.is_empty() {
                     continue;
                 }
@@ -110,7 +110,7 @@ impl CompileWatch {
     }
 
     fn mark(&self, what: String) {
-        let mut s = self.shared.lock().unwrap();
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         *s = (what, std::time::Instant::now());
     }
 
@@ -581,7 +581,10 @@ impl LibraryManager {
     fn scan_provider_into_index(&mut self, pi: usize) {
         // Collect the scan under an immutable borrow, then index mutably.
         let scanned: Vec<(String, PathBuf, bool)> = {
-            let p = self.all_providers().nth(pi).unwrap();
+            let p = self
+                .all_providers()
+                .nth(pi)
+                .expect("pi indexes into the same providers list");
             if p.source_files().is_empty() {
                 Vec::new() // in-memory providers are indexed eagerly already
             } else {

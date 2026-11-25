@@ -197,7 +197,11 @@ fn index_page(design: &Design, units: &[DocUnit]) -> String {
         units.iter().map(|u| (u.name.to_lowercase(), u)).collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, u) in rows {
-        let m = design.modules.iter().find(|m| m.name == u.name).unwrap();
+        let m = design
+            .modules
+            .iter()
+            .find(|m| m.name == u.name)
+            .expect("doc units are projected from design.modules, so the module exists");
         body.push_str(&format!(
             "<tr><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}:{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
             html_escape(&u.page),

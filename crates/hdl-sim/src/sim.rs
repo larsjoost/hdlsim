@@ -87,7 +87,11 @@ fn vhdl_radix_string(v: &Value, radix: u32) -> String {
                 'X'
             });
         } else if known {
-            out.push(char::from_digit(digit, radix).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit(digit, radix)
+                    .expect("digit < radix, so from_digit succeeds")
+                    .to_ascii_uppercase(),
+            );
         } else {
             out.push('X');
         }
@@ -416,7 +420,7 @@ impl Simulator {
                 "error: sim-init would allocate ~{} MB (--max-mem-mb {}); \
                  largest allocators:\n",
                 total / 1024 / 1024,
-                total_limit.unwrap() / 1024 / 1024
+                total_limit.expect("over_total implies total_limit is Some") / 1024 / 1024
             ));
         }
         for (e, i) in ests.iter().take(8) {
@@ -2593,7 +2597,10 @@ impl Simulator {
         };
         let i = *s as usize;
         if i < locals.map_or(0, Vec::len) {
-            Some(locals.unwrap()[i].width())
+            Some(
+                locals.expect("the branch condition implies locals is Some and i in bounds")[i]
+                    .width(),
+            )
         } else {
             Some(self.flat.signals.get(i)?.width)
         }
@@ -2956,7 +2963,9 @@ impl Simulator {
             0 => {}
             1 => out.push_str(&format!("did you mean '{}'?", shown[0])),
             _ => {
-                let (last_one, rest) = shown.split_last().unwrap();
+                let (last_one, rest) = shown
+                    .split_last()
+                    .expect("the 0- and 1-length arms are handled above");
                 out.push_str(&format!(
                     "did you mean {} or '{}'?",
                     rest.iter()

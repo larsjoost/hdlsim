@@ -199,7 +199,9 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
     let times: Vec<u64> = tindex.keys().copied().collect();
     let times = if times.is_empty() { vec![0u64] } else { times };
     let start = times[0];
-    let end = *times.last().unwrap();
+    let end = *times
+        .last()
+        .expect("the empty case is replaced with [0] above");
 
     // Values at the section start time + record chains per handle.
     let mut cur: Vec<Value> = order

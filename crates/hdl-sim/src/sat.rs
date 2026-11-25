@@ -502,7 +502,11 @@ impl Solver {
         if !self.in_heap[v] {
             return;
         }
-        let pos = self.heap.iter().position(|&x| x == v).unwrap();
+        let pos = self
+            .heap
+            .iter()
+            .position(|&x| x == v)
+            .expect("in_heap invariant: v is in the heap");
         self.heap.swap_remove(pos);
         self.in_heap[v] = false;
         if pos < self.heap.len() {

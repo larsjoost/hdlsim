@@ -164,7 +164,9 @@ impl Command for Debug {
             }
             println!("mem {} ({} words):", sim.signal_name(id), sim.mem_len(id));
             for w in 0..sim.mem_len(id) {
-                let v = sim.mem_word(id, w).unwrap();
+                let v = sim
+                    .mem_word(id, w)
+                    .expect("w < mem_len(id), so the word exists");
                 println!("  [{}] = {}", w, fmt_value(&v));
             }
         }
