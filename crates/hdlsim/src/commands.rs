@@ -391,6 +391,7 @@ pub struct RunOptions {
     pub trace_ce_all: bool,
     pub trace_overload: bool,
     pub trace_genrange: bool,
+    pub trace_lower: bool,
     pub max_mem_mb: Option<u64>,
     pub max_signal_mb: Option<u64>,
     pub max_proc_steps: Option<u64>,
@@ -970,6 +971,9 @@ pub fn apply_global_args(
         } else if a == "--trace-overload" {
             ro.trace_overload = true;
             i += 1;
+        } else if a == "--trace-lower" {
+            ro.trace_lower = true;
+            i += 1;
         } else if a == "--trace-genrange" {
             ro.trace_genrange = true;
             i += 1;
@@ -1044,6 +1048,7 @@ fn arm_run_options(ro: &RunOptions) {
         ro.trace_ce_all,
         ro.trace_overload,
         ro.trace_genrange,
+        ro.trace_lower,
     );
     let d = std::time::Duration::from_secs_f64(ro.progress_sec.unwrap_or(0.0).max(0.0));
     hdl_lib::set_progress_interval(d);

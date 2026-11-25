@@ -3377,7 +3377,7 @@ impl<'a> Lower<'a> {
                             if !self.text(c).contains("<>") {
                                 let cd = self.constraint_dims(c);
                                 if !cd.is_empty() {
-                                    self.sig_dims.insert(id, cd);
+                                    self.set_sig_dims_from_constraint(id, cd, &n);
                                 }
                             }
                         }
@@ -4856,7 +4856,7 @@ impl<'a> Lower<'a> {
                         if !self.text(c).contains("<>") {
                             let cd = self.constraint_dims(c);
                             if !cd.is_empty() {
-                                self.sig_dims.insert(id, cd);
+                                self.set_sig_dims_from_constraint(id, cd, &n);
                             }
                         }
                     }
@@ -8876,7 +8876,34 @@ impl<'a> Lower<'a> {
     /// Sources, in order: signal dims (`sig_dims`), constant/generic dims
     /// (`obj_dims`), subtype dims (`type_dims`), array type dims
     /// (`TypeInfo::Array`). `None` — unknown dims or not an array.
+    /// Insert `sig_dims`, tracing the population under `--trace-lower`
+    /// (the population half of the `'length(d)` diagnosis trail — the
+    /// duplicate-warning-class regressions lived exactly at these sites).
+    fn set_sig_dims_from_constraint(&mut self, id: SigId, dims: Vec<(i64, usize)>, name: &str) {
+        if super::debug::TRACE_LOWER.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[lower] sig_dims[{id}] = {dims:?} via inline constraint ({name})");
+        }
+        self.sig_dims.insert(id, dims);
+    }
+
     fn attr_dim_value(&self, base: &str, attr: &str, dim: usize) -> Option<u64> {
+        let hit = self.attr_dim_lookup(base, attr, dim);
+        if super::debug::TRACE_LOWER.load(std::sync::atomic::Ordering::Relaxed) {
+            let outcome = match &hit {
+                Some((src, v)) => format!("{src} -> {v}"),
+                None => "unresolved".to_string(),
+            };
+            eprintln!("[lower] {base}'{attr}({dim}): {outcome}");
+        }
+        hit.map(|(_, v)| v)
+    }
+
+    /// The lookup order for dimension-suffix attributes: the signal's own
+    /// constraint dims, then object dims (constants/generics), then
+    /// package-exported type dims, then the type's own array dims. A signal
+    /// id short-circuits the chain even without an entry — a signal with no
+    /// dims (unconstrained port) does not fall through to the type's dims.
+    fn attr_dim_lookup(&self, base: &str, attr: &str, dim: usize) -> Option<(&'static str, u64)> {
         if dim == 0 {
             return None;
         }
@@ -8894,17 +8921,17 @@ impl<'a> Lower<'a> {
                 .get(&id)
                 .and_then(|d| d.get(dim - 1))
                 .copied()
-                .map(val);
+                .map(|d| ("sig_dims", val(d)));
         }
         if let Some(dims) = self.obj_dims.get(&blc) {
-            return dims.get(dim - 1).copied().map(val);
+            return dims.get(dim - 1).copied().map(|d| ("obj_dims", val(d)));
         }
         let tn = blc.rsplit('.').next().unwrap_or("");
         if let Some(dims) = self.type_dims.get(tn) {
-            return dims.get(dim - 1).copied().map(val);
+            return dims.get(dim - 1).copied().map(|d| ("type_dims", val(d)));
         }
         if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
-            return dims.get(dim - 1).copied().map(val);
+            return dims.get(dim - 1).copied().map(|d| ("type", val(d)));
         }
         None
     }
