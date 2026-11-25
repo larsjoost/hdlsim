@@ -115,9 +115,37 @@ fn coding_standards_configuration_is_wired() {
         "the library crash-safety gate is missing"
     );
     assert!(
-        ci.contains("clippy::too_many_lines") && ci.contains("clippy::cognitive_complexity"),
-        "the report-only shape audits are missing"
+        ci.contains("scripts/standards-baseline.sh --check"),
+        "the ratchet check is not wired into CI"
     );
+    // The lint names live in the ratchet script now, not in the workflow.
+    let ratchet = read(&root, "scripts/standards-baseline.sh");
+    for lint in ["clippy::too_many_lines", "clippy::cognitive_complexity"] {
+        assert!(ratchet.contains(lint), "the ratchet must measure {lint}");
+    }
+}
+
+/// The ratchet baseline must parse and reference files that exist: a
+/// hand-edit typo (bad JSON, renamed file) would otherwise silently
+/// disable the ratchet for those entries — the check compares against
+/// nothing, and nothing fails.
+#[test]
+fn standards_baseline_is_parseable_and_references_real_files() {
+    let root = workspace_root();
+    let text = read(&root, "docs/standards-baseline.json");
+    let baseline: serde_json::Value = serde_json::from_str(&text).expect("baseline is valid JSON");
+    for rule in ["too_many_lines", "cognitive_complexity", "module_lines"] {
+        let entries = baseline[rule]
+            .as_object()
+            .unwrap_or_else(|| panic!("baseline rule table {rule} missing"));
+        assert!(!entries.is_empty(), "baseline rule table {rule} is empty");
+        for path in entries.keys() {
+            assert!(
+                root.join(path).is_file(),
+                "{rule} references missing file {path}"
+            );
+        }
+    }
 }
 
 /// Manifest mirroring `[workspace.lints]` exactly — the mechanism under
