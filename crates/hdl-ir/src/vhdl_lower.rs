@@ -5902,6 +5902,24 @@ impl<'a> Lower<'a> {
 
     /// Whether an index constraint's bounds const-fold at registration time.
     /// Formals have no values yet, so a constraint naming one does not fold.
+    /// Whether the type mark resolves to an array-like type whose flat width
+    /// an index constraint can change (`string`, vectors, arrays). A record's
+    /// flat width is the sum of its fields — a record-element constraint
+    /// (`t_node(name(1 to n))`) selects field ranges only, so the dyn-width
+    /// machinery must not touch it.
+    fn constraint_shapes_width(&self, tm: &SyntaxNode) -> bool {
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(
+            self.types.get(&tn),
+            Some(TypeInfo::Vector { .. }) | Some(TypeInfo::Array { .. })
+        )
+    }
+
     fn constraint_folds(&mut self, c: &SyntaxNode) -> bool {
         if self.text(c).contains("<>") {
             return true; // box: unconstrained by intent, not unfoldable
@@ -6305,10 +6323,17 @@ impl<'a> Lower<'a> {
                     // registration — formals have no values yet — so the
                     // recorded width is a fallback. Record a bit-width
                     // expression for const-eval to fold per call, and size
-                    // an OTHERS initializer from it too.
+                    // an OTHERS initializer from it too. Only array-like
+                    // types qualify: a record's flat width is the sum of
+                    // its fields, and a record-element constraint
+                    // (`t_node(name(1 to n))`) selects field ranges —
+                    // lowering its element name as an identifier would
+                    // misfire E0401.
                     let dyn_w = match (tmark, constraint) {
                         (Some(tm), Some(c))
-                            if !self.text(c).contains("<>") && !self.constraint_folds(c) =>
+                            if self.constraint_shapes_width(tm)
+                                && !self.text(c).contains("<>")
+                                && !self.constraint_folds(c) =>
                         {
                             Some(self.dyn_width_expr(tm, c))
                         }
