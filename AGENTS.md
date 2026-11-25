@@ -25,11 +25,18 @@ pass/fail. This file is the map; follow it instead of rediscovering it.
   code uses `.expect("why this cannot fail")` or recovers from poisoning
   with `into_inner()`, and explicit `panic!` belongs in tests, not the
   kernel. Tests and CLI entry points are outside this rule.
-- CI runs a non-blocking standards audit (function length — split at 50,
-  cognitive complexity — threshold 30, both in `clippy.toml`; module size —
-  well under ~600 lines; per-commit change size — ≤ ~400 lines). It flips
-  to blocking as the existing offenders are extracted; function ≤ 30,
-  nesting ≤ 2, and dedup stay review-level (nesting's lint is nightly-only).
+- CI runs a blocking standards **ratchet** (`scripts/standards-baseline.sh
+  --check`): per-file counts of functions over the 50-line split and over
+  cognitive complexity 30 (thresholds in `clippy.toml`), plus module size
+  (well under ~600 lines), are frozen in `docs/standards-baseline.json` and
+  must never grow; files absent from the baseline must be clean. Improve
+  opportunistically: regenerate with `scripts/standards-baseline.sh` and
+  commit the lowered numbers with the change that earned them; raising a
+  number needs review agreement. The per-commit change-size check
+  (≤ ~400 lines) stays advisory — `numstat` double-counts moved lines, so
+  verify pure moves with `git diff --color-moved=dimmed-zebra`. Function
+  ≤ 30, nesting ≤ 2, and dedup stay review-level (nesting's lint is
+  nightly-only).
 
 ## Workflow (required)
 

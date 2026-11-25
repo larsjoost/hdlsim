@@ -74,12 +74,11 @@ jobs:
         run: cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::panic
 
   standards-audit:
-    name: standards audit (report only)
-    continue-on-error: true
+    name: standards audit (ratchet)
     runs-on: ubuntu-latest
     env:
-      # Plain cargo output so the audit's count greps match: GitHub's
-      # default CARGO_TERM_COLOR=always wraps `-->` in ANSI escapes.
+      # Plain cargo output so the ratchet script's `-->` parsing matches:
+      # GitHub's default CARGO_TERM_COLOR=always wraps them in ANSI escapes.
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
@@ -96,34 +95,20 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Function length ("split candidates at 50"): the threshold lives in
-      # clippy.toml; the ≤ 30 target stays review-level. Report only until
-      # the existing long functions are extracted, then flip to blocking.
-      - name: Functions over the 50-line split line
-        run: |
-          cargo clippy --all-targets -- -W clippy::too_many_lines > /tmp/tml.txt 2>&1 || true
-          echo "functions over 50 lines: $(grep -cE '^\s+--> ' /tmp/tml.txt)"
-          grep -oE '^\s+--> [^:]+\.rs' /tmp/tml.txt | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
-
-      # Cognitive complexity (threshold 30 in clippy.toml), library code
-      # only — tests are exempt from the shape rules, like the crash rules.
-      - name: Functions over the complexity split line
-        run: |
-          cargo clippy --workspace --lib -- -W clippy::cognitive_complexity > /tmp/cc.txt 2>&1 || true
-          echo "lib functions over complexity 30: $(grep -cE '^\s+--> ' /tmp/cc.txt)"
-          grep -oE '^\s+--> [^:]+\.rs' /tmp/cc.txt | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
-
-      # Module size ("well under ~600 lines"): census only, same plan —
-      # extract incrementally, block when the burn-down is done.
-      - name: Modules over ~600 lines
-        run: |
-          find crates -name '*.rs' -path '*/src/*' | xargs wc -l | awk '$1>600 && $2!="total"' | sort -rn
-          echo "modules over 600 lines: $(find crates -name '*.rs' -path '*/src/*' | xargs wc -l | awk '$1>600 && $2!="total"' | wc -l)"
+      # The ratchet (scripts/standards-baseline.sh): shape debt — functions
+      # over the 50-line split line, functions over complexity 30, modules
+      # over ~600 lines — is frozen in docs/standards-baseline.json and
+      # must never grow. Improvements lower the baseline; raising a number
+      # needs review agreement in the PR that edits it.
+      - name: Ratchet check (shape debt must not grow)
+        run: scripts/standards-baseline.sh --check
 
       # Stacked changes ("≤ ~400 changed lines each"): one check per commit
-      # in the PR. Report only until agreed otherwise; binary files do not
-      # count as changed lines.
-      - name: Per-commit change sizes
+      # in the PR. Advisory: numstat double-counts moved lines, so pure
+      # moves (verify with git diff --color-moved=dimmed-zebra) trip it;
+      # binary files do not count as changed lines.
+      - name: Per-commit change sizes (advisory)
+        continue-on-error: true
         run: |
           base="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
           status=0
