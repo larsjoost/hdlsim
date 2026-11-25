@@ -88,6 +88,14 @@ architecture sim of strlen_tb is
   constant C_ROW_LEN   : natural := C_ROW'length;
   constant C_OPT       : opt_t   := set_opt("hi");
   constant C_LOG2      : natural := ceil_log2(12);
+  -- All-alphabet string literals in a string-typed context are ASCII text
+  -- (8 bits/char, all bits known), not 1-bit-per-char bit strings.
+  constant C_MASK    : string  := "0x00000000";
+  constant C_MASKLEN : natural := C_MASK'length;
+  -- The same literal in a std_logic_vector context keeps bit-string semantics
+  -- (a 4-char literal lowers to 4 bits; ASCII would give 32).
+  constant C_SLV    : std_logic_vector(3 downto 0) := "1010";
+  constant C_SLVLEN : natural := C_SLV'length;
 begin
   main : process
   begin
@@ -98,6 +106,8 @@ begin
     report "ROW_LEN=" & integer'image(C_ROW_LEN);
     report "OPT_ACTIVE=" & boolean'image(C_OPT.active);
     report "LOG2=" & integer'image(C_LOG2);
+    report "MASK_LEN=" & integer'image(C_MASKLEN);
+    report "SLV_LEN=" & integer'image(C_SLVLEN);
     wait;
   end process;
 end architecture;

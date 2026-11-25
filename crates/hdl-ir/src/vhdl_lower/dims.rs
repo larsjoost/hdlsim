@@ -147,6 +147,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the type mark names a character-array type (`string` or a
+    /// string subtype): string literals in such an object's initializer are
+    /// ASCII text, not bit strings (`lower_literal` consults this).
+    pub(super) fn string_typed(&self, tm: &SyntaxNode) -> bool {
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        tn == "string" || self.type_elem.get(&tn) == Some(&8)
+    }
+
     /// Dims of an unconstrained one-dimensional array object derived from its
     /// initializer: an empty string literal (`""`) has length 0; otherwise
     /// element count = packed width / element width. An empty string lowers to

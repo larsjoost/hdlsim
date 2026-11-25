@@ -1834,8 +1834,13 @@ impl<'a> Lower<'a> {
         if t.starts_with('"') {
             let inner = t.trim_matches('"').replace("\"\"", "\"");
             // In VHDL a string of bit characters is a std_logic_vector value
-            // (`"0000"`), not ASCII text — otherwise a plain string.
-            if !inner.is_empty()
+            // (`"0000"`), not ASCII text — unless the literal sits in a
+            // string-typed object's initializer (`constant m : string :=
+            // "0x0000"`), where the characters are text: an all-alphabet
+            // literal lowered 1 bit/char X-poisons the value and kills
+            // `'length` downstream.
+            if !self.str_ctx
+                && !inner.is_empty()
                 && inner
                     .bytes()
                     .all(|c| matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'-' | b'?'))

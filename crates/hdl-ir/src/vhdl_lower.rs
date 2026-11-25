@@ -1567,6 +1567,12 @@ struct Lower<'a> {
     /// Scope label for `--dump-consts` records: the package name, or the
     /// `entity` / `entity/arch` module currently being lowered.
     cur_scope: String,
+    /// String-typed object context: string literals in the initializer of a
+    /// `string` (or string-subtype) object are ASCII text, not bit strings —
+    /// an all-alphabet literal like `"0x0000"` must lower 8 bits/char, or its
+    /// `x` characters X-poison the value and kill `'length` downstream. Set
+    /// around initializer lowering only (see `string_typed`).
+    str_ctx: bool,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -1674,6 +1680,7 @@ impl<'a> Lower<'a> {
             variant: None,
             cur_entity: String::new(),
             cur_scope: String::new(),
+            str_ctx: false,
             prot_types: HashMap::new(),
             prot_body_ctx: None,
             sig_prot: HashMap::new(),
@@ -3099,7 +3106,10 @@ impl<'a> Lower<'a> {
             let def = default
                 .as_ref()
                 .and_then(|e| {
+                    let saved = self.str_ctx;
+                    self.str_ctx = type_mark.as_ref().is_some_and(|tm| self.string_typed(tm));
                     let ex = self.lower_expr(e, &HashMap::new());
+                    self.str_ctx = saved;
                     self.ce_env(&ex, &HashMap::new())
                 })
                 .unwrap_or(Value::x(width.max(1)));
@@ -4982,6 +4992,9 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let want_str = type_mark.is_some_and(|tm| self.string_typed(tm));
+        let saved_str = self.str_ctx;
+        self.str_ctx = want_str;
         let ex = match type_mark {
             Some(tm) if init.kind() == SyntaxKind::Aggregate => {
                 let tn = self.text(tm).to_ascii_lowercase();
@@ -5019,6 +5032,7 @@ impl<'a> Lower<'a> {
             }
             _ => self.lower_expr(&init, &env),
         };
+        self.str_ctx = saved_str;
         if let Some(tm) = &type_mark {
             let tn = self.text(tm).to_ascii_lowercase();
             for n in &names {
@@ -5124,6 +5138,8 @@ impl<'a> Lower<'a> {
             }
             return;
         };
+        let saved_str = self.str_ctx;
+        self.str_ctx = type_mark.is_some_and(|tm| self.string_typed(tm));
         let ex = match type_mark {
             Some(tm) if init.kind() == SyntaxKind::Aggregate => {
                 let tn = self.text(tm).to_ascii_lowercase();
@@ -5159,6 +5175,7 @@ impl<'a> Lower<'a> {
             }
             _ => self.lower_expr(&init, &env),
         };
+        self.str_ctx = saved_str;
         match self.ce_env(&ex, &env) {
             Some(v) => {
                 for n in &names {

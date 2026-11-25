@@ -45,6 +45,11 @@ fn strlen_constant_folding() {
     assert!(stdout.contains("OPT_ACTIVE=true"), "{}", stdout);
     // A warning report inside a folded body does not abort the fold.
     assert!(stdout.contains("LOG2=4"), "{}", stdout);
+    // All-alphabet string literals are ASCII text in a string context:
+    // 10 characters fold 'length, not a 1-bit/char X-poisoned bit string.
+    assert!(stdout.contains("MASK_LEN=10"), "{}", stdout);
+    // …and stay bit strings in a std_logic_vector context.
+    assert!(stdout.contains("SLV_LEN=4"), "{}", stdout);
     // No X-fallback warning for the folded initializers.
     assert!(!stderr.contains("W0401"), "{}", stderr);
 }
