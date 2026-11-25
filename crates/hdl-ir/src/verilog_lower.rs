@@ -3736,8 +3736,8 @@ fn ce_impl(
             // eval_call arm.
             if name == "$const_idx" && args.len() == 3 {
                 let v = ce_impl(&args[0], env, funcs, extras, slots.as_deref_mut())?;
-                let a = ce_impl(&args[1], env, funcs, extras, slots.as_deref_mut())?
-                    .to_u64()? as usize;
+                let a =
+                    ce_impl(&args[1], env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
                 let w = ce_impl(&args[2], env, funcs, extras, slots.as_deref_mut())?
                     .to_u64()?
                     .max(1) as usize;

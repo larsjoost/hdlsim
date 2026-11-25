@@ -2480,8 +2480,11 @@ impl<'a> Lower<'a> {
     /// a materialized constant lowers to (`c_arr` → `__const_c_arr`): array
     /// attributes on constants (`c'range`, `c'length`) index that signal.
     fn object_id(&self, name: &str) -> Option<SigId> {
-        self.sig_id(name)
-            .or_else(|| self.names.get(&format!("__const_{}", name.to_ascii_lowercase())).copied())
+        self.sig_id(name).or_else(|| {
+            self.names
+                .get(&format!("__const_{}", name.to_ascii_lowercase()))
+                .copied()
+        })
     }
 
     /// Xilinx implicit globals (`GSR`/`GRESTORE`/`GTS` from the auto-instantiated
@@ -2660,7 +2663,11 @@ impl<'a> Lower<'a> {
     /// flat value; whole signal arrays keep the kernel's memory `Idx`.
     /// Returns `None` when the chain does not resolve this way — the caller
     /// falls back to the legacy per-shape handling.
-    fn lower_selected_chain(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Option<Expr> {
+    fn lower_selected_chain(
+        &mut self,
+        e: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
         let mut segs: Vec<ChainSeg> = Vec::new();
         let root = self.flatten_selected_name(e, &mut segs);
         if root.is_empty() || segs.is_empty() {
@@ -2698,11 +2705,7 @@ impl<'a> Lower<'a> {
             }
         } else if let Some((v, ty)) = const_root {
             (Expr::Lit(v), ty, None)
-        } else if let Some(id) = self
-            .names
-            .get(&format!("__const_{}", root_lc))
-            .copied()
-        {
+        } else if let Some(id) = self.names.get(&format!("__const_{}", root_lc)).copied() {
             let rec = self.sig_rec.get(&id).cloned();
             let elem_rec = self.sig_elem_rec.get(&id).cloned();
             match (rec, elem_rec) {
@@ -2767,13 +2770,11 @@ impl<'a> Lower<'a> {
                     // the slot registration; other bases resolve it from the
                     // current type's Array info.
                     let root_ty = root_elem.take();
-                    let elem_rec_w = root_ty.as_ref().and_then(|en| {
-                        match self.types.get(en) {
-                            Some(TypeInfo::Record { fields }) => Some(
-                                fields.iter().map(|f| f.1).sum::<usize>().max(1),
-                            ),
-                            _ => None,
+                    let elem_rec_w = root_ty.as_ref().and_then(|en| match self.types.get(en) {
+                        Some(TypeInfo::Record { fields }) => {
+                            Some(fields.iter().map(|f| f.1).sum::<usize>().max(1))
                         }
+                        _ => None,
                     });
                     if let Expr::Sig(sid) = cur {
                         // Memory-backed signal arrays index by element;
@@ -2844,7 +2845,10 @@ impl<'a> Lower<'a> {
                     cur_ty = match root_ty {
                         Some(en) => en,
                         None => match self.types.get(&cur_ty).cloned() {
-                            Some(TypeInfo::Array { elem_name: Some(en), .. }) => en,
+                            Some(TypeInfo::Array {
+                                elem_name: Some(en),
+                                ..
+                            }) => en,
                             _ => return None,
                         },
                     };
@@ -3129,7 +3133,12 @@ impl<'a> Lower<'a> {
             // type — overrides carry values, not constraints).
             let mut gen_dims: Option<Vec<(i64, usize)>> = None;
             if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
-                let tn = self.kw(tm).rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                let tn = self
+                    .kw(tm)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. }))
                     && !self.text(c).contains("<>")
                 {
@@ -3464,8 +3473,7 @@ impl<'a> Lower<'a> {
             }
         }
         for (cname, cval) in &p.consts {
-            if item.is_none_or(|i| i == cname)
-                || lit_ok.as_ref().is_some_and(|l| l.contains(cname))
+            if item.is_none_or(|i| i == cname) || lit_ok.as_ref().is_some_and(|l| l.contains(cname))
             {
                 if force {
                     Rc::make_mut(&mut self.consts).insert(cname.clone(), cval.clone());
@@ -3769,8 +3777,7 @@ impl<'a> Lower<'a> {
         let type_widths = types
             .iter()
             .filter(|(n, t)| {
-                matches!(t, TypeInfo::Vector { .. })
-                    && self.type_widths.contains_key(n.as_str())
+                matches!(t, TypeInfo::Vector { .. }) && self.type_widths.contains_key(n.as_str())
             })
             .filter_map(|(n, _)| self.type_widths.get(n.as_str()).map(|w| (n.clone(), *w)))
             .collect();
@@ -3779,7 +3786,12 @@ impl<'a> Lower<'a> {
         let type_dims = types
             .iter()
             .filter(|(_, t)| matches!(t, TypeInfo::Vector { .. }))
-            .filter_map(|(n, _)| self.type_dims.get(n.as_str()).cloned().map(|d| (n.clone(), d)))
+            .filter_map(|(n, _)| {
+                self.type_dims
+                    .get(n.as_str())
+                    .cloned()
+                    .map(|d| (n.clone(), d))
+            })
             .collect();
         PackageIr {
             name,
@@ -4931,14 +4943,18 @@ impl<'a> Lower<'a> {
         // …`): register the object's dims so `'length(d)`-style attributes on
         // the constant fold (the constraint is not part of the type mark).
         if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
-            let tn = self.text(tm).rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            let tn = self
+                .text(tm)
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. })) {
                 if !self.text(c).contains("<>") {
                     let cd = self.constraint_dims(c);
                     if !cd.is_empty() {
                         for n in &names {
-                            self.obj_dims
-                                .insert(n.to_ascii_lowercase(), cd.clone());
+                            self.obj_dims.insert(n.to_ascii_lowercase(), cd.clone());
                         }
                     }
                 }
@@ -4961,9 +4977,7 @@ impl<'a> Lower<'a> {
                         let (n, lo) = match &constraint {
                             Some(c) => {
                                 let n = self.constraint_width(c);
-                                let lo = self
-                                    .range_low(c, &env)
-                                    .unwrap_or(0);
+                                let lo = self.range_low(c, &env).unwrap_or(0);
                                 (Some(n), lo)
                             }
                             None => {
@@ -5446,8 +5460,7 @@ impl<'a> Lower<'a> {
                                 Some(TypeInfo::Array { dims, .. })
                                     if dims.is_empty() && constraint.is_some() =>
                                 {
-                                    w.max(1)
-                                        * self.constraint_width(constraint.unwrap()).max(1)
+                                    w.max(1) * self.constraint_width(constraint.unwrap()).max(1)
                                 }
                                 _ => w,
                             };
@@ -5527,15 +5540,11 @@ impl<'a> Lower<'a> {
             // `constraint_dims` would report a (0, 1) unknown-sentinel dim,
             // which materialized constants would take as a real 1-element
             // constraint.
-            let unconstrained = range
-                .map(|r| self.text(r).contains("<>"))
-                .unwrap_or(true);
+            let unconstrained = range.map(|r| self.text(r).contains("<>")).unwrap_or(true);
             let dims = if unconstrained {
                 Vec::new()
             } else {
-                range
-                    .map(|r| self.constraint_dims(r))
-                    .unwrap_or_default()
+                range.map(|r| self.constraint_dims(r)).unwrap_or_default()
             };
             let depth = if dims.is_empty() {
                 range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1)
@@ -5739,10 +5748,7 @@ impl<'a> Lower<'a> {
                         // Keep the constrained range for vector subtypes:
                         // aggregates onto such signals and their `'range`
                         // loops need the low bound, not only the width.
-                        if matches!(
-                            self.types.get(&base_name),
-                            Some(TypeInfo::Vector { .. })
-                        ) {
+                        if matches!(self.types.get(&base_name), Some(TypeInfo::Vector { .. })) {
                             if let Some(c) = &constraint {
                                 if !self.text(c).contains("<>") {
                                     let cd = self.constraint_dims(c);
@@ -6942,7 +6948,8 @@ impl<'a> Lower<'a> {
                     let mut ex = self.lower_expr(e, &self.consts.clone());
                     if in_generic {
                         ex = self.fold_generic_actual(ex);
-                    }                    match (assoc_name, in_generic) {
+                    }
+                    match (assoc_name, in_generic) {
                         (Some(n), true) => param_overrides.push((Some(n), ex)),
                         (Some(n), false) => conns.push(Conn::Named(n, ex)),
                         // Positional generic actuals bind to the target's
@@ -8477,10 +8484,8 @@ impl<'a> Lower<'a> {
                 // occupies bits [total-1-e·w … total-(e+1)·w]; `sig_width`
                 // holds the element width, `mems` the depth.
                 if let Expr::Sig(sid) = &base_e {
-                    if let (Some(&depth), Some(&ew)) = (
-                        self.mems.get(sid),
-                        self.sig_width.get(sid),
-                    ) {
+                    if let (Some(&depth), Some(&ew)) = (self.mems.get(sid), self.sig_width.get(sid))
+                    {
                         let (e_lo, e_hi) = if dir == "downto" {
                             (lsb, msb)
                         } else {
@@ -8897,11 +8902,7 @@ impl<'a> Lower<'a> {
                     .map(|(_, k)| k);
                 if let Some(a) = arg {
                     let dim_e = self.lower_expr(a, env);
-                    let dim = self
-                        .ce(&dim_e)
-                        .and_then(|v| v.to_u64())
-                        .unwrap_or(1)
-                        .max(1) as usize;
+                    let dim = self.ce(&dim_e).and_then(|v| v.to_u64()).unwrap_or(1).max(1) as usize;
                     let base = ak
                         .iter()
                         .find(|k| k.kind() == SyntaxKind::Name)
@@ -9033,10 +9034,7 @@ impl<'a> Lower<'a> {
                                             32,
                                             (lsb + w - 1) as u64,
                                         ))),
-                                        lsb: Box::new(Expr::Lit(Value::from_u64(
-                                            32,
-                                            lsb as u64,
-                                        ))),
+                                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
                                     };
                                     return Expr::Idx {
                                         e: Box::new(sel),
@@ -9525,7 +9523,10 @@ impl<'a> Lower<'a> {
         lo: i64,
         env: &HashMap<String, Value>,
     ) -> Option<Expr> {
-        let Some(TypeInfo::Array { elem, elem_name, .. }) = self.types.get(tn).cloned() else {
+        let Some(TypeInfo::Array {
+            elem, elem_name, ..
+        }) = self.types.get(tn).cloned()
+        else {
             return None;
         };
         self.lower_array_aggregate_specs(e, n, lo, elem, elem_name, env)
