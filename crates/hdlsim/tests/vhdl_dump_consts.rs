@@ -64,7 +64,7 @@ fn dump_consts_text() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("C_ANSWER") && l.contains("vhdl_dump_consts_tb.vhd:9")),
+            .any(|l| l.contains("C_ANSWER") && l.contains("vhdl_dump_consts_tb.vhd:10")),
         "{lines:?}"
     );
     // Generic override and default, one record per variant re-lowering.
@@ -87,11 +87,19 @@ fn dump_consts_text() {
             .any(|l| l.contains("dmp_unit.G_X") && l.contains("status=unset")),
         "{lines:?}"
     );
-    // Initializer the constant evaluator cannot fold (real `**`): unfolded.
+    // Real `**` folds like every other real operator; the folded value is
+    // the real sqrt(2).
+    assert!(
+        lines.iter().any(|l| l.contains("dmp_unit/rtl.C_ROOT2")
+            && l.contains("status=ok")
+            && l.contains("1.4142135623730951")),
+        "{lines:?}"
+    );
+    // A genuinely unfoldable initializer (procedure call) stays unfolded.
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("dmp_unit/rtl.C_ROOT2") && l.contains("status=unfolded")),
+            .any(|l| l.contains("dmp_unit/rtl.C_UNFOLDABLE") && l.contains("status=unfolded")),
         "{lines:?}"
     );
 }
@@ -122,7 +130,7 @@ fn dump_consts_json() {
             && l.contains("\"kind\":\"constant\"")
             && l.contains("\"status\":\"ok\"")
             && l.contains("\"value\":\"0x2a\"")
-            && l.contains("\"line\":9")),
+            && l.contains("\"line\":10")),
         "{lines:?}"
     );
 }

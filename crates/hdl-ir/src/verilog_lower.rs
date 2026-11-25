@@ -3642,6 +3642,7 @@ fn ce_impl(
                         BinOp::Mul => Value::from_f64(x * y),
                         BinOp::Div => Value::from_f64(x / y),
                         BinOp::Mod => Value::from_f64(x % y),
+                        BinOp::Pow => Value::from_f64(x.powf(y)),
                         BinOp::Lt => Value::from_u64(1, (x < y) as u64),
                         BinOp::Le => Value::from_u64(1, (x <= y) as u64),
                         BinOp::Gt => Value::from_u64(1, (x > y) as u64),

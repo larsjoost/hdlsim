@@ -1,7 +1,8 @@
 -- Fixture for the `--dump-consts` end-to-end tests: one known constant, a
 -- string constant, a generic with a default (overridden in one instance and
--- defaulted in the other), an unset generic, and a constant whose
--- initializer is not const-evalable (real exponentiation).
+-- defaulted in the other), an unset generic, a constant the constant
+-- evaluator folds (real exponentiation), and one it cannot (a procedure
+-- call in the initializer).
 library ieee;
 use ieee.std_logic_1164.all;
 
@@ -25,6 +26,20 @@ end entity;
 
 architecture rtl of dmp_unit is
   constant C_ROOT2 : real := 2.0 ** 0.5;
+
+  procedure setr(variable r : out natural) is
+  begin
+    r := 1;
+  end procedure;
+
+  function undependable return natural is
+    variable r : natural := 0;
+  begin
+    setr(r);
+    return r;
+  end function;
+
+  constant C_UNFOLDABLE : natural := undependable;
 begin
   o <= (others => '0');
 end architecture;
