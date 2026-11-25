@@ -893,6 +893,7 @@ pub const COMMANDS: &[&dyn Command] = &[
 /// - the run options (`--trace*`, `--max-*`, `--progress-sec`,
 ///   `--no-cache`, `--cache-dir`) — armed once, before any command runs
 ///   (see [`RunOptions`]).
+///
 /// Returns the remaining args. `NO_COLOR` disables color entirely.
 /// Flags may appear before or after the subcommand and in `--flag value`
 /// or `--flag=value` form; a bad value is an error (exit code 2).
@@ -948,10 +949,10 @@ pub fn apply_global_args(
         } else if a == "--trace" || a == "--trace=scheduler" {
             ro.trace_scheduler = true;
             i += 1;
-        } else if a.starts_with("--trace=") {
+        } else if let Some(val) = a.strip_prefix("--trace=") {
             // --trace=<what>: the scheduler trace is the only one with a
             // short name today; unknown values error like any typo.
-            eprintln!("error: invalid value '{}' for '--trace'", &a[8..]);
+            eprintln!("error: invalid value '{val}' for '--trace'");
             std::process::exit(2);
         } else if a == "--trace-dispatch" {
             ro.trace_dispatch = true;

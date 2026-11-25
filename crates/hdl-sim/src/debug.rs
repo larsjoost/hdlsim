@@ -129,7 +129,7 @@ impl Watcher {
         }
         self.patterns.iter().any(|p| {
             if let Some(num) = p.strip_prefix('#') {
-                return num.parse::<u32>().map_or(false, |id| id == sig);
+                return num.parse::<u32>() == Ok(sig);
             }
             p == name || name.rsplit('.').next() == Some(p.as_str())
         })

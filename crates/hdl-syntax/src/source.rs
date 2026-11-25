@@ -58,6 +58,10 @@ impl SourceFile {
         self.text.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     /// 1-based (line, column) of a byte offset, for diagnostics.
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let offset = (offset as usize).min(self.text.len());

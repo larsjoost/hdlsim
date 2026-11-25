@@ -688,11 +688,7 @@ impl Simulator {
             }
         }
         if let Some(budget) = self.wall_budget {
-            if self
-                .wall_start
-                .get()
-                .map_or(false, |s| s.elapsed() >= budget)
-            {
+            if self.wall_start.get().is_some_and(|s| s.elapsed() >= budget) {
                 return true;
             }
         }
@@ -1241,7 +1237,7 @@ impl Simulator {
             let flag_set = self
                 .interrupt_flag
                 .as_ref()
-                .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
             if flag_set {
                 self.stop_for_interrupt("interrupt received", self.interrupt_rc);
                 break;
@@ -1260,7 +1256,7 @@ impl Simulator {
             let quiet_set = self
                 .stop_flag
                 .as_ref()
-                .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
             if quiet_set {
                 self.finished = true;
                 break;
@@ -1491,41 +1487,38 @@ impl Simulator {
                         .clone()]));
             }
         }
-        loop {
-            match self.exec_frames(pid) {
-                // Break/Continue are consumed inside exec_frames; if one ever
-                // escapes (no enclosing loop), treat it as process end.
-                Control::Done | Control::Break | Control::Continue => {
-                    if self.flat.procs[pid as usize].kind == ProcKind::Always {
-                        // `always @(sens) stmt` ≡ `forever begin @(sens); stmt end`:
-                        // after the body completes, park until the next event.
-                        // A bare `always` (no event list) re-runs immediately.
-                        match &self.flat.procs[pid as usize].sens {
-                            Sens::List(es) if !es.is_empty() => {
-                                let edges =
-                                    es.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
-                                self.park(pid, edges);
-                            }
-                            Sens::All => {
-                                let sigs = std::mem::take(&mut self.proc_all[pid as usize]);
-                                let edges = sigs.iter().map(|s| (*s, EdgeKind::Any)).collect();
-                                self.proc_all[pid as usize] = sigs;
-                                self.park(pid, edges);
-                            }
-                            _ => self.activate(pid),
+        // Break/Continue are consumed inside exec_frames; if one ever
+        // escapes (no enclosing loop), treat it as process end. Every
+        // control outcome ends this process's activation, so this is a
+        // plain match, not a retry loop.
+        match self.exec_frames(pid) {
+            Control::Done | Control::Break | Control::Continue => {
+                if self.flat.procs[pid as usize].kind == ProcKind::Always {
+                    // `always @(sens) stmt` ≡ `forever begin @(sens); stmt end`:
+                    // after the body completes, park until the next event.
+                    // A bare `always` (no event list) re-runs immediately.
+                    match &self.flat.procs[pid as usize].sens {
+                        Sens::List(es) if !es.is_empty() => {
+                            let edges = es.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                            self.park(pid, edges);
                         }
+                        Sens::All => {
+                            let sigs = std::mem::take(&mut self.proc_all[pid as usize]);
+                            let edges = sigs.iter().map(|s| (*s, EdgeKind::Any)).collect();
+                            self.proc_all[pid as usize] = sigs;
+                            self.park(pid, edges);
+                        }
+                        _ => self.activate(pid),
                     }
-                    break;
                 }
-                Control::Suspend(at) => {
-                    self.time_events
-                        .entry(at)
-                        .or_default()
-                        .push(Ev::Resume(pid));
-                    break;
-                }
-                Control::Wait => break, // parked (see self.parked) until an edge
             }
+            Control::Suspend(at) => {
+                self.time_events
+                    .entry(at)
+                    .or_default()
+                    .push(Ev::Resume(pid));
+            }
+            Control::Wait => {} // parked (see self.parked) until an edge
         }
         self.cur_proc = None;
         self.emit(SimEvent::ProcActive {
@@ -1711,7 +1704,7 @@ impl Simulator {
                         Some(Frame::WaitUntilCheck { cond, edges, .. }) => (
                             match cond {
                                 None => true,
-                                Some(c) => truthy(&self.eval_expr(&c, None)),
+                                Some(c) => truthy(&self.eval_expr(c, None)),
                             },
                             edges.clone(),
                         ),
@@ -1746,7 +1739,7 @@ impl Simulator {
                 // Latch the statement's source span so Message/TestFailed
                 // events emitted while it executes carry a jump-to location.
                 self.cur_span = Some(span);
-                return self.exec_stmt(pid, *inner);
+                self.exec_stmt(pid, *inner)
             }
             Stmt::Null => Control::Done,
             // `return` outside a function body (shouldn't happen) — ignore.
@@ -1977,10 +1970,7 @@ impl Simulator {
             Expr::Lit(v) => Expr::Lit(v.clone()),
             Expr::Real(x) => Expr::Real(*x),
             Expr::Sig(s) => Expr::Sig(*s),
-            Expr::SigAttr { sig, attr } => Expr::SigAttr {
-                sig: *sig,
-                attr: *attr,
-            },
+            Expr::SigAttr { sig, attr } => Expr::SigAttr { sig: *sig, attr },
             Expr::Idx { e, i } => {
                 let a = self.eval_expr(i, None);
                 Expr::Idx {
@@ -2090,10 +2080,8 @@ impl Simulator {
                             "pop_back" => {
                                 self.mems[sig as usize].pop();
                             }
-                            "pop_front" => {
-                                if !self.mems[sig as usize].is_empty() {
-                                    self.mems[sig as usize].remove(0);
-                                }
+                            "pop_front" if !self.mems[sig as usize].is_empty() => {
+                                self.mems[sig as usize].remove(0);
                             }
                             _ => {}
                         }
@@ -2369,13 +2357,13 @@ impl Simulator {
                         < locals.as_deref().map_or(0, Vec::len));
                     let (w, add) = if is_slot {
                         // Dynamic line: always take the full text.
-                        (usize::MAX, text.as_bytes().len())
+                        (usize::MAX, text.len())
                     } else {
                         let w = self
                             .width_of_target(target, locals.as_deref())
                             .unwrap_or(1)
                             .max(1);
-                        (w, text.as_bytes().len().min(w / 8))
+                        (w, text.len().min(w / 8))
                     };
                     if add == 0 {
                         return;
@@ -3194,7 +3182,7 @@ impl Simulator {
             .name
             .rsplit('.')
             .next()
-            .map_or(false, |n| n.starts_with("__"))
+            .is_some_and(|n| n.starts_with("__"))
         {
             return;
         }
@@ -3490,16 +3478,17 @@ impl Simulator {
             }
             // Only arithmetic propagates realness; comparisons/logical ops
             // yield 1-bit results even on real operands.
-            Expr::Bin { op, l, r } => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                    self.expr_real(l, locals) || self.expr_real(r, locals)
-                }
-                _ => false,
-            },
-            Expr::Un { op, e } => match op {
-                UnOp::Neg | UnOp::Pos | UnOp::Abs => self.expr_real(e, locals),
-                _ => false,
-            },
+            Expr::Bin {
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                l,
+                r,
+            } => self.expr_real(l, locals) || self.expr_real(r, locals),
+            Expr::Bin { .. } => false,
+            Expr::Un {
+                op: UnOp::Neg | UnOp::Pos | UnOp::Abs,
+                e,
+            } => self.expr_real(e, locals),
+            Expr::Un { .. } => false,
             Expr::Resize { e, .. } | Expr::Signed(e) => self.expr_real(e, locals),
             Expr::Cond { c, t, e } => {
                 self.expr_real(c, locals) || self.expr_real(t, locals) || self.expr_real(e, locals)
@@ -4144,7 +4133,7 @@ impl Simulator {
         // in neither must not panic — it counts as width-unknown.
         let arg_w = |a: &Expr| match a {
             Expr::Sig(s)
-                if locals.map_or(true, |l| (*s as usize) >= l.len())
+                if locals.is_none_or(|l| (*s as usize) >= l.len())
                     && (*s as usize) >= self.flat.signals.len() =>
             {
                 0
@@ -4190,10 +4179,7 @@ impl Simulator {
             let f = &self.flat.functions[i];
             args.iter().enumerate().all(|(j, a)| match arg_hint(a) {
                 None => true,
-                Some(h) => f
-                    .formal_types
-                    .get(j)
-                    .map_or(true, |t| t.is_empty() || t == h),
+                Some(h) => f.formal_types.get(j).is_none_or(|t| t.is_empty() || t == h),
             })
         };
         let pick_in = |pool: &[usize]| -> Option<usize> {
@@ -4241,7 +4227,7 @@ impl Simulator {
                 _ => None,
             };
             match pass_through {
-                Some(s) if locals.map_or(false, |l| (s as usize) < l.len()) => {
+                Some(s) if locals.is_some_and(|l| (s as usize) < l.len()) => {
                     let alt = |j: &usize| *j != picked && fits(j);
                     let alts: Vec<usize> = cands.iter().copied().filter(|j| alt(j)).collect();
                     let typed_alts: Vec<usize> =
@@ -4289,7 +4275,7 @@ impl Simulator {
                     })
                     .collect::<Vec<_>>()
                     .join(" | "),
-                args.iter().map(|a| arg_w(a)).collect::<Vec<_>>(),
+                args.iter().map(arg_w).collect::<Vec<_>>(),
                 sp,
             );
             // --trace-picked: dump the picked body (Debug) for the
@@ -4738,14 +4724,13 @@ impl<'a> FnRunner<'a> {
                     }
                 }
             }
-            Stmt::SysCall { name, args } => {
+            Stmt::SysCall { name, args }
                 // Class field writes / randomize are &self-capable: run them
                 // as calls. Other syscalls need &mut self — only reachable
                 // here via `ProcRunner`-dispatched nested expression calls.
-                if name.starts_with("$setf::") || name.starts_with("$randomize::") {
+                if (name.starts_with("$setf::") || name.starts_with("$randomize::")) => {
                     self.sim.eval_call(name, args, Some(self.locals));
                 }
-            }
             _ => {}
         }
     }
@@ -4874,10 +4859,8 @@ impl<'a> ProcRunner<'a> {
                     match self.exec(body) {
                         Control::Break => break,
                         Control::Continue => {}
-                        Control::Done => {
-                            if self.returned {
-                                return Control::Done;
-                            }
+                        Control::Done if self.returned => {
+                            return Control::Done;
                         }
                         _ => {}
                     }
@@ -4904,10 +4887,8 @@ impl<'a> ProcRunner<'a> {
                 for _ in 0..n {
                     match self.exec(body) {
                         Control::Break => break,
-                        Control::Done | Control::Continue => {
-                            if self.returned {
-                                return Control::Done;
-                            }
+                        Control::Done | Control::Continue if self.returned => {
+                            return Control::Done;
                         }
                         _ => {}
                     }
@@ -5034,18 +5015,12 @@ impl<'a> ProcRunner<'a> {
 fn sign_extend(v: &Value, width: usize) -> Value {
     let w = width.max(v.width()).max(1);
     let mut bits = vec![V0; w];
-    for i in 0..v.width().min(w) {
-        bits[i] = v.bit(i);
-    }
+    bits[..v.width()].copy_from_slice(&v.bits);
     let sign = v.bit(v.width().saturating_sub(1));
     if sign != V0 && sign != V1 {
-        for i in v.width()..w {
-            bits[i] = sign; // X/Z sign-extends as X/Z
-        }
+        bits[v.width()..w].fill(sign); // X/Z sign-extends as X/Z
     } else if sign == V1 {
-        for i in v.width()..w {
-            bits[i] = V1;
-        }
+        bits[v.width()..w].fill(V1);
     }
     Value { bits, real: false }
 }
@@ -5072,7 +5047,7 @@ fn progress_interval() -> std::time::Duration {
 }
 
 fn truthy(v: &Value) -> bool {
-    v.to_u64().map_or(false, |x| x != 0)
+    v.to_u64().is_some_and(|x| x != 0)
 }
 
 fn eq_strict(a: &Value, b: &Value) -> bool {

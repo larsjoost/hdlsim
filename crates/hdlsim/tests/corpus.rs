@@ -100,7 +100,7 @@ fn corpus_groups() -> Vec<(String, Vec<PathBuf>)> {
             // TestCtrl`, and the `TestCtrl` entity lives in the testbench dir.
             let is_named = |g: &PathBuf, name: &str| {
                 g.file_name()
-                    .map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case(name))
+                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
             };
             let has_tb = groups.iter().any(|g| is_named(g, "testbench"));
             let tc_pos = groups.iter().position(|g| is_named(g, "testcases"));
@@ -190,8 +190,6 @@ fn shared_cache_dir() -> &'static PathBuf {
     })
 }
 
-/// Compile one group as a single library, registering the directory under the
-/// logical library names its files declare in `library` clauses.
 // ---- progress ----------------------------------------------------------------
 //
 // The built-in test harness prints one buffered dot per test, so a corpus
@@ -206,6 +204,8 @@ fn progress_note(stage: &str, done: usize, total: usize, f: &Path) {
     }
 }
 
+/// Compile one group as a single library, registering the directory under the
+/// logical library names its files declare in `library` clauses.
 fn compile_group(sub: &str, files: &[PathBuf]) -> LibraryManager {
     eprintln!("corpus: group {sub}: compiling {} files…", files.len());
     let dir = corpus_dir().join(sub);

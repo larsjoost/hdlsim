@@ -50,7 +50,7 @@ fn ir_dump_writes_pretty_json_of_the_elaborated_top() {
         }
     }
     assert!(
-        j["procs"].as_array().unwrap().len() > 0,
+        !j["procs"].as_array().unwrap().is_empty(),
         "no processes in dump"
     );
     let _ = std::fs::remove_file(&out);

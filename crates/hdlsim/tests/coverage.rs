@@ -43,7 +43,7 @@ fn run_collects_line_branch_toggle_coverage() {
     let f = dir.join("tb.v");
     std::fs::write(&f, TB).unwrap();
 
-    let compiled = compile_paths(&[f.clone()]);
+    let compiled = compile_paths(std::slice::from_ref(&f));
     assert!(!compiled.has_errors(), "{}", compiled.render_diags());
     let flat = elab::elaborate(&compiled.design, "tb").unwrap();
     let mut sim = Simulator::new(flat);

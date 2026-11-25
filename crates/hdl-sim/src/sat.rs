@@ -79,6 +79,12 @@ pub struct Solver {
     pub propagations: u64,
 }
 
+impl Default for Solver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Solver {
     pub fn new() -> Solver {
         Solver {
@@ -318,8 +324,7 @@ impl Solver {
         let mut bt_level = 0u32;
         loop {
             let start = if p == -1 { 0 } else { 1 };
-            for j in start..clause.len() {
-                let q = clause[j];
+            for &q in &clause[start..] {
                 let v = var_of(q);
                 if !seen[v] && self.level[v] > 0 {
                     seen[v] = true;
@@ -417,7 +422,7 @@ impl Solver {
         let cut = learned.len() / 2;
         let mut drop: Vec<bool> = vec![false; self.clauses.len()];
         for &ci in &learned[..cut] {
-            let locked = self.reason.iter().any(|&r| r == ci as u32);
+            let locked = self.reason.contains(&(ci as u32));
             if !locked {
                 drop[ci] = true;
             }
@@ -583,19 +588,19 @@ mod tests {
     fn php(pigeons: usize, holes: usize) -> Option<Vec<bool>> {
         let mut s = Solver::new();
         let mut p = vec![vec![0 as Lit; holes]; pigeons];
-        for i in 0..pigeons {
-            for j in 0..holes {
-                p[i][j] = v(&mut s, i * holes + j);
+        for (i, row) in p.iter_mut().enumerate() {
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = v(&mut s, i * holes + j);
             }
             // Each pigeon sits in at least one hole.
-            let row: Vec<Lit> = p[i].clone();
-            s.add_clause(&row);
+            s.add_clause(row);
         }
         // No hole holds two pigeons.
         for j in 0..holes {
-            for i1 in 0..pigeons {
-                for i2 in i1 + 1..pigeons {
-                    s.add_clause(&[neg(p[i1][j]), neg(p[i2][j])]);
+            let col: Vec<Lit> = p.iter().map(|row| row[j]).collect();
+            for (i1, &l1) in col.iter().enumerate() {
+                for &l2 in &col[i1 + 1..] {
+                    s.add_clause(&[neg(l1), neg(l2)]);
                 }
             }
         }

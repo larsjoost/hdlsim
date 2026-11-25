@@ -64,8 +64,14 @@ pub struct Lowered {
     /// from this file (inline constraints, generic clauses, aggregate
     /// defaults). Retained so `--dump-maps` can show what the lowerer
     /// believed when folding `'length(d)`-style attributes.
-    pub obj_dims: HashMap<String, Vec<(i64, usize)>>,
+    pub obj_dims: ObjDims,
 }
+
+/// Constant/generic name → array dimensions [(low, size), …] as the
+/// lowerer believes them (inline constraints, generic clauses, aggregate
+/// defaults). Nameable because it crosses crate boundaries: `Lowered`
+/// returns it, `hdl-lib` accumulates it per file, `--dump-maps` prints it.
+pub type ObjDims = HashMap<String, Vec<(i64, usize)>>;
 
 /// An architecture deferred until its entity is known design-wide (the entity
 /// may be declared in a file compiled later). Holds the file root so the
@@ -437,6 +443,10 @@ fn use_clause_units(u: &SyntaxNode, db: &SourceDb) -> Vec<String> {
     out
 }
 
+// The lowerer's entry points thread the accumulated design-wide maps
+// (packages, configs, entity roots/maps…) from file to file; a params
+// struct would just relocate the same fields without hiding any.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_file(
     file: FileId,
     root: &SyntaxNode,
@@ -564,31 +574,26 @@ pub fn lower_file(
     // `lower_pending_architectures`.
     let mut last_arch: HashMap<String, String> = HashMap::new();
     for child in real_children(root) {
-        match child.kind() {
-            SyntaxKind::Architecture => {
-                let known = arch_entity(&child, db)
-                    .map(|(_, name)| entities.contains_key(&name))
-                    .unwrap_or(false);
-                if known {
-                    if let Some((ent, arch)) =
-                        lx.lower_architecture(&child, &mut modules, &entities)
-                    {
-                        last_arch.insert(ent, arch);
-                    }
-                } else {
-                    pending.push(PendingArch {
-                        root: root.clone(),
-                        arch: child.clone(),
-                        lib: None,
-                    });
+        if child.kind() == SyntaxKind::Architecture {
+            let known = arch_entity(&child, db)
+                .map(|(_, name)| entities.contains_key(&name))
+                .unwrap_or(false);
+            if known {
+                if let Some((ent, arch)) = lx.lower_architecture(&child, &mut modules, &entities) {
+                    last_arch.insert(ent, arch);
                 }
+            } else {
+                pending.push(PendingArch {
+                    root: root.clone(),
+                    arch: child.clone(),
+                    lib: None,
+                });
             }
-            _ => {}
         }
     }
     apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults, None);
     // Package instantiations from declarative parts (registered on the fly).
-    packages.extend(lx.inst_packages.drain(..));
+    packages.append(&mut lx.inst_packages);
     Lowered {
         modules,
         packages,
@@ -829,7 +834,7 @@ impl<'a> Lower<'a> {
 /// analyzed (IEEE default binding rule). Bodies live in `entity/arch`
 /// variant modules produced by `lower_architecture`.
 fn apply_default_archs(
-    modules: &mut Vec<ModuleIr>,
+    modules: &mut [ModuleIr],
     entities: &HashMap<String, usize>,
     last_arch: &HashMap<String, String>,
     config_defaults: &HashMap<String, String>,
@@ -903,6 +908,7 @@ pub fn stem_key(path: &str) -> String {
     stem
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn lower_pending_architectures(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
@@ -1064,6 +1070,7 @@ pub fn lower_pending_architectures(
 /// actually re-binds the child's generics (generate ranges, port widths,
 /// ...). Returns the lowered modules (empty when `root` does not declare
 /// `entity_name`).
+#[allow(clippy::too_many_arguments)]
 pub fn lower_entity_variant(
     db: &SourceDb,
     diags: &mut Vec<Diagnostic>,
@@ -1435,7 +1442,7 @@ struct Lower<'a> {
     /// `'high(d)` fold on multidimensional constants and generics (the
     /// object constraint is not part of the type mark, so `types` alone
     /// only knows the unconstrained base's dims).
-    obj_dims: HashMap<String, Vec<(i64, usize)>>,
+    obj_dims: ObjDims,
     /// Signal id → (low bound, ascending?) of a vector's own index
     /// constraint — ascending ranges (`0 to N-1`) address flat bits
     /// mirrored (element k = value bit W-1-k), so slices must remap.
@@ -1475,8 +1482,8 @@ struct Lower<'a> {
     /// `LAW.field` selects slice the aliased expression.
     alias_rec: HashMap<String, String>,
     /// >0 while lowering binding-actual expressions in configuration
-    /// specifications: actuals name signals of the enclosing architecture,
-    /// which are not in scope design-wide, so E0401s are suppressed.
+    /// > specifications: actuals name signals of the enclosing architecture,
+    /// > which are not in scope design-wide, so E0401s are suppressed.
     suppress_err: u32,
     /// Depth of function-body lowering. Inside a body, `names` holds exactly
     /// the formals/locals (slot map), so a formal must shadow an outer
@@ -2012,9 +2019,9 @@ impl<'a> Lower<'a> {
     /// Type mark of an interface element, given the children after the `:`:
     /// the first Name, skipping a VHDL-2019 `view [(] ViewName [)] of` prefix.
     fn iface_type_mark<'k>(&self, after: &'k [SyntaxNode]) -> Option<&'k SyntaxNode> {
-        let is_view = after.first().map_or(false, |k| {
-            k.kind() == SyntaxKind::Ident && self.kw(k) == "view"
-        });
+        let is_view = after
+            .first()
+            .is_some_and(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "view");
         if is_view {
             let of = after
                 .iter()
@@ -2047,7 +2054,7 @@ impl<'a> Lower<'a> {
                     .get(&tname)
                     .cloned()
                     .or_else(|| {
-                        let last = tname.split('.').last().unwrap_or(tname.as_str());
+                        let last = tname.split('.').next_back().unwrap_or(tname.as_str());
                         self.types.get(last).cloned()
                     })
                     .unwrap_or(TypeInfo::Scalar)
@@ -2729,12 +2736,7 @@ impl<'a> Lower<'a> {
             match (rec, elem_rec) {
                 (Some(rn), _) => (Expr::Sig(id), rn, None),
                 (None, Some(en)) => (Expr::Sig(id), en.clone(), Some(en)),
-                _ => {
-                    return match const_root {
-                        Some((v, _ty)) => Some(Expr::Lit(v)),
-                        None => None,
-                    }
-                }
+                _ => return const_root.map(|(v, _ty)| Expr::Lit(v)),
             }
         } else if let Some((v, ty)) = const_root {
             (Expr::Lit(v), ty, None)
@@ -2749,11 +2751,10 @@ impl<'a> Lower<'a> {
         } else if let Some(a) = self.aliases.get(&root_lc).cloned() {
             let ty = self.alias_rec.get(&root_lc).cloned()?;
             (a, ty, None)
-        } else if let Some(v) = self.consts.get(&root_lc).cloned() {
+        } else {
+            let v = self.consts.get(&root_lc).cloned()?;
             let ty = self.const_types.get(&root_lc).cloned()?;
             (Expr::Lit(v), ty, None)
-        } else {
-            return None;
         };
         // Effective index dims of the current array context: the type's own
         // dims, overridden by a record field's decl constraint (an
@@ -2838,9 +2839,7 @@ impl<'a> Lower<'a> {
                                 i: Box::new(idx),
                             };
                         } else {
-                            let Some(sd) = self.sig_dims.get(&sid).cloned() else {
-                                return None;
-                            };
+                            let sd = self.sig_dims.get(&sid).cloned()?;
                             if sd.len() != args.len() {
                                 return None;
                             }
@@ -3136,7 +3135,7 @@ impl<'a> Lower<'a> {
                 || after
                     .iter()
                     .find(|k| k.kind() == SyntaxKind::Name)
-                    .map_or(false, |k| self.kw(k) == "type");
+                    .is_some_and(|k| self.kw(k) == "type");
             if is_box {
                 for n in &names {
                     self.types.insert(n.to_ascii_lowercase(), TypeInfo::Scalar);
@@ -3150,11 +3149,10 @@ impl<'a> Lower<'a> {
             };
             let def = default
                 .as_ref()
-                .map(|e| {
+                .and_then(|e| {
                     let ex = self.lower_expr(e, &HashMap::new());
                     self.ce_env(&ex, &HashMap::new())
                 })
-                .flatten()
                 .unwrap_or(Value::x(width.max(1)));
             let _ = (width, signed);
             // Record type of a record-typed generic, resolved (qualified
@@ -3377,7 +3375,7 @@ impl<'a> Lower<'a> {
                             if !self.text(c).contains("<>") {
                                 let cd = self.constraint_dims(c);
                                 if !cd.is_empty() {
-                                    self.set_sig_dims_from_constraint(id, cd, &n);
+                                    self.set_sig_dims_from_constraint(id, cd, n);
                                 }
                             }
                         }
@@ -3523,7 +3521,7 @@ impl<'a> Lower<'a> {
             }
         }
         for f in &p.functions {
-            if item.is_none_or(|i| i == &f.name.to_ascii_lowercase()) {
+            if item.is_none_or(|i| i == f.name.to_ascii_lowercase()) {
                 // The package body (with real bodies) follows the
                 // declaration (signature-only) in the merged package;
                 // register_func replaces the earlier candidate.
@@ -3754,7 +3752,7 @@ impl<'a> Lower<'a> {
             }
         }
         // Protected-type methods + generated ctors lowered inside type bodies.
-        functions.extend(self.pending_funcs.drain(..));
+        functions.append(&mut self.pending_funcs);
         // Collect the items this package added, for cross-file `use` clauses.
         let types: Vec<(String, TypeInfo)> = self
             .types
@@ -3772,7 +3770,7 @@ impl<'a> Lower<'a> {
         let consts: Vec<(String, Value)> = self
             .consts
             .iter()
-            .filter(|(k, v)| consts_before.get(*k).map_or(true, |old| old != *v))
+            .filter(|(k, v)| consts_before.get(*k) != Some(*v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let type_names: std::collections::HashSet<&String> = types.iter().map(|(k, _)| k).collect();
@@ -3787,7 +3785,7 @@ impl<'a> Lower<'a> {
             .iter()
             .filter(|(n, pt)| {
                 type_names.contains(n)
-                    || prot_before.get(*n).map_or(true, |old| {
+                    || prot_before.get(*n).is_none_or(|old| {
                         old.fields != pt.fields
                             || old.methods != pt.methods
                             || old.inits.len() != pt.inits.len()
@@ -4060,9 +4058,7 @@ impl<'a> Lower<'a> {
             .as_ref()
             .map(|(_, s)| s.clone())
             .unwrap_or_default();
-        let Some(&midx) = entities.get(&entity_name) else {
-            return None;
-        };
+        let midx = *entities.get(&entity_name)?;
         // Variant re-lowering: name the arch module after the variant entity.
         let disp = self
             .variant
@@ -4187,7 +4183,7 @@ impl<'a> Lower<'a> {
             self.lower_conc_stmt(module, s, &mut proc_idx);
         }
         // Protected-type methods + ctors lowered from arch-level type bodies.
-        module.functions.extend(self.pending_funcs.drain(..));
+        module.functions.append(&mut self.pending_funcs);
         // Configuration specifications rebind the matching instance label.
         for fs in &config_specs {
             let fk = real_children(fs);
@@ -4856,7 +4852,7 @@ impl<'a> Lower<'a> {
                         if !self.text(c).contains("<>") {
                             let cd = self.constraint_dims(c);
                             if !cd.is_empty() {
-                                self.set_sig_dims_from_constraint(id, cd, &n);
+                                self.set_sig_dims_from_constraint(id, cd, n);
                             }
                         }
                     }
@@ -4989,13 +4985,13 @@ impl<'a> Lower<'a> {
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. })) {
-                if !self.text(c).contains("<>") {
-                    let cd = self.constraint_dims(c);
-                    if !cd.is_empty() {
-                        for n in &names {
-                            self.obj_dims.insert(n.to_ascii_lowercase(), cd.clone());
-                        }
+            if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. }))
+                && !self.text(c).contains("<>")
+            {
+                let cd = self.constraint_dims(c);
+                if !cd.is_empty() {
+                    for n in &names {
+                        self.obj_dims.insert(n.to_ascii_lowercase(), cd.clone());
                     }
                 }
             }
@@ -5477,17 +5473,19 @@ impl<'a> Lower<'a> {
                     while j < kids.len() && kids[j].kind() == SyntaxKind::Name {
                         names.push(self.text(&kids[j]).to_ascii_lowercase());
                         j += 1;
-                        if kids.get(j).map_or(false, |p| {
-                            p.kind() == SyntaxKind::Punct && self.text(p) == ","
-                        }) {
+                        if kids
+                            .get(j)
+                            .is_some_and(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ",")
+                        {
                             j += 1;
                         } else {
                             break;
                         }
                     }
-                    if kids.get(j).map_or(false, |p| {
-                        p.kind() == SyntaxKind::Punct && self.text(p) == ":"
-                    }) {
+                    if kids
+                        .get(j)
+                        .is_some_and(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ":")
+                    {
                         if let Some(tm) = kids.get(j + 1).filter(|k| k.kind() == SyntaxKind::Name) {
                             let constraint =
                                 kids.get(j + 2).filter(|k| k.kind() == SyntaxKind::Range);
@@ -5524,7 +5522,7 @@ impl<'a> Lower<'a> {
                                     constraint,
                                 ) {
                                     let lo = self.range_low(c, &self.consts.clone()).unwrap_or(0);
-                                    let cnt = self.constraint_width(c).max(1) as usize;
+                                    let cnt = self.constraint_width(c).max(1);
                                     self.rec_field_dims
                                         .insert((name.clone(), n.clone()), vec![(lo, cnt)]);
                                 }
@@ -5656,9 +5654,9 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let uname = self.text(k).to_ascii_lowercase();
-            let is_derived = kids.get(i + 1).map_or(false, |p| {
-                p.kind() == SyntaxKind::Punct && self.text(p) == "="
-            });
+            let is_derived = kids
+                .get(i + 1)
+                .is_some_and(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=");
             if !is_derived {
                 // Base (primary) unit: value 1.
                 self.phys_units.insert(uname, 1);
@@ -7129,10 +7127,7 @@ impl<'a> Lower<'a> {
                 let kids = real_children(s);
                 // `(a, b) := f(...);` — parenthesized target list: not
                 // lowered (no error).
-                if kids
-                    .first()
-                    .map_or(false, |k| k.kind() == SyntaxKind::Punct)
-                {
+                if kids.first().is_some_and(|k| k.kind() == SyntaxKind::Punct) {
                     return Stmt::Null;
                 }
                 let lhs = kids.iter().find(|k| {
@@ -7451,7 +7446,7 @@ impl<'a> Lower<'a> {
                             let is_method = self
                                 .prot_types
                                 .get(&t)
-                                .map_or(false, |p| p.methods.contains(&m));
+                                .is_some_and(|p| p.methods.contains(&m));
                             if is_method {
                                 let mut args2 = vec![Expr::Sig(id)];
                                 args2.extend(args.iter().cloned());
@@ -7468,7 +7463,7 @@ impl<'a> Lower<'a> {
                     if self
                         .prot_types
                         .get(&t)
-                        .map_or(false, |p| p.methods.contains(&name))
+                        .is_some_and(|p| p.methods.contains(&name))
                     {
                         let mut args2 = vec![Expr::Call {
                             name: "$this".into(),
@@ -7584,7 +7579,7 @@ impl<'a> Lower<'a> {
     /// time via `SigAttr`. Only applies when the slot is not memory-backed
     /// and has no static dims — real array signals keep their static bounds.
     fn flat_slot_range(&self, id: SigId) -> Option<(Expr, Expr)> {
-        if self.mems.get(&id).copied().is_some() || self.sig_dims.get(&id).is_some() {
+        if self.mems.contains_key(&id) || self.sig_dims.contains_key(&id) {
             return None;
         }
         // Unconstrained-formal widths are only known from the bound value;
@@ -7592,11 +7587,11 @@ impl<'a> Lower<'a> {
         Some((
             Expr::SigAttr {
                 sig: id,
-                attr: "low".into(),
+                attr: "low",
             },
             Expr::SigAttr {
                 sig: id,
-                attr: "high".into(),
+                attr: "high",
             },
         ))
     }
@@ -7648,8 +7643,7 @@ impl<'a> Lower<'a> {
                     let ak = real_children(at);
                     let attr = ak
                         .iter()
-                        .filter(|k| k.kind() == SyntaxKind::Ident)
-                        .last()
+                        .rfind(|k| k.kind() == SyntaxKind::Ident)
                         .map(|k| self.kw(k))
                         .unwrap_or_default();
                     if attr == "range" || attr == "reverse_range" {
@@ -8103,8 +8097,7 @@ impl<'a> Lower<'a> {
                 if let Some(call) = ekids.iter().find(|k| k.kind() == SyntaxKind::Call).cloned() {
                     let field = ekids
                         .iter()
-                        .filter(|k| k.kind() == SyntaxKind::Ident)
-                        .last()
+                        .rfind(|k| k.kind() == SyntaxKind::Ident)
                         .map(|k| self.kw(k))
                         .unwrap_or_default();
                     let base = self.lower_expr(&call, env);
@@ -8645,8 +8638,7 @@ impl<'a> Lower<'a> {
                 let base = kids.iter().find(|k| k.kind() == SyntaxKind::Name);
                 let attr = kids
                     .iter()
-                    .filter(|k| k.kind() == SyntaxKind::Ident)
-                    .last()
+                    .rfind(|k| k.kind() == SyntaxKind::Ident)
                     .map(|k| self.kw(k));
                 let Some(attr) = attr else {
                     return Expr::Lit(Value::x(1));
@@ -8755,17 +8747,15 @@ impl<'a> Lower<'a> {
                             }
                         }
                         // Type marks and subtypes: `integer'high`, `my_arr'length`, ...
-                        return self.type_attr(&bn, &attr);
+                        self.type_attr(&bn, &attr)
                     }
                     // `s'range` in expression position is only meaningful in a
                     // for-spec (handled there); as a value it is X.
-                    "range" | "reverse_range" => return Expr::Lit(Value::x(32)),
+                    "range" | "reverse_range" => Expr::Lit(Value::x(32)),
                     // Report/simulation attributes: placeholder, no warning.
                     "path_name" | "instance_name" | "last_event" | "image" | "reverse_image"
                     | "encoding" | "max_wire_delay" | "subtype" | "simple_name" | "driving"
-                    | "driving_value" => {
-                        return Expr::Lit(Value::x(32));
-                    }
+                    | "driving_value" => Expr::Lit(Value::x(32)),
                     // `sig'quiet` = no event this delta; `sig'active` = event.
                     "quiet" => {
                         if let Some(id) = self.sig_id(&bn) {
@@ -8779,7 +8769,7 @@ impl<'a> Lower<'a> {
                                 }),
                             };
                         }
-                        return Expr::Lit(Value::x(1));
+                        Expr::Lit(Value::x(1))
                     }
                     "active" | "transaction" => {
                         if let Some(id) = self.sig_id(&bn) {
@@ -8790,9 +8780,9 @@ impl<'a> Lower<'a> {
                                 r: Box::new(Expr::Falling(s())),
                             };
                         }
-                        return Expr::Lit(Value::x(1));
+                        Expr::Lit(Value::x(1))
                     }
-                    "ascending" => return Expr::Lit(Value::from_u64(1, 1)),
+                    "ascending" => Expr::Lit(Value::from_u64(1, 1)),
                     // `sig'last_value` — value before the current delta.
                     "last_value" => {
                         if let Some(id) = self.sig_id(&bn) {
@@ -8996,13 +8986,12 @@ impl<'a> Lower<'a> {
         let attr_pos = kids
             .iter()
             .position(|k| k.kind() == SyntaxKind::Attr)
-            .filter(|&i| name_pos0.map_or(true, |np| i < np));
+            .filter(|&i| name_pos0.is_none_or(|np| i < np));
         if let Some(ap) = attr_pos {
             let ak = real_children(&kids[ap]);
             let attr_name = ak
                 .iter()
-                .filter(|k| k.kind() == SyntaxKind::Ident)
-                .last()
+                .rfind(|k| k.kind() == SyntaxKind::Ident)
                 .map(|k| self.kw(k))
                 .unwrap_or_default();
             // Array attributes with an explicit dimension — `A'length(1)`,
@@ -9178,7 +9167,7 @@ impl<'a> Lower<'a> {
         // Fully-qualified call `work.pkg.f(...)` with no `use` clause for pkg:
         // pull the package's subprogram into scope so the call resolves (and
         // can be const-evaluated in a constant initializer).
-        if self.funcs.get(&fname).is_none() && name.contains('.') {
+        if !self.funcs.contains_key(&fname) && name.contains('.') {
             let parts: Vec<&str> = name.split('.').collect();
             if parts.len() >= 3 {
                 let unit = parts[parts.len() - 2].to_ascii_lowercase();
@@ -9200,7 +9189,7 @@ impl<'a> Lower<'a> {
                     let is_method = self
                         .prot_types
                         .get(&t)
-                        .map_or(false, |p| p.methods.contains(&m));
+                        .is_some_and(|p| p.methods.contains(&m));
                     if is_method {
                         let mut args2 = vec![Expr::Sig(id)];
                         args2.extend(args.iter().cloned());
@@ -9221,7 +9210,7 @@ impl<'a> Lower<'a> {
             } else if let Some(t) = self.prot_body_ctx.clone() {
                 // `st.field(args)` rooted at a protected-type state variable:
                 // placeholder (not simulated).
-                if self.prot_types.get(&t).map_or(false, |pt| {
+                if self.prot_types.get(&t).is_some_and(|pt| {
                     pt.fields
                         .iter()
                         .any(|(n, _, _, _)| n.eq_ignore_ascii_case(base))
@@ -9235,7 +9224,7 @@ impl<'a> Lower<'a> {
             if self
                 .prot_types
                 .get(&t)
-                .map_or(false, |p| p.methods.contains(&fname))
+                .is_some_and(|p| p.methods.contains(&fname))
             {
                 let mut args2 = vec![Expr::Call {
                     name: "$this".into(),
@@ -9255,7 +9244,7 @@ impl<'a> Lower<'a> {
             // position: inside the function's own body the name resolves to
             // the result slot (slot 0), which must not turn a recursive call
             // into an index of that slot.
-            _ if base_id.is_some() && !args.is_empty() && self.funcs.get(&fname).is_none() => {
+            _ if base_id.is_some() && !args.is_empty() && !self.funcs.contains_key(&fname) => {
                 let base = base_id.unwrap();
                 if let Some(dims) = self.sig_dims.get(&base).cloned() {
                     if dims.len() == args.len() {
@@ -9735,8 +9724,8 @@ impl<'a> Lower<'a> {
             slots[j] = Some(pi);
         }
         let mut parts: Vec<Expr> = Vec::with_capacity(n);
-        for p in 0..n {
-            let raw = match slots[p].or(others) {
+        for slot in slots.iter().copied() {
+            let raw = match slot.or(others) {
                 Some(vi) => {
                     let vnode = kids[vi].clone();
                     self.lower_typed_field(&vnode, elem_name.as_deref(), elem, env)
@@ -10105,7 +10094,7 @@ impl<'a> Lower<'a> {
             }
             return Expr::Lit(Value { bits, real: false });
         }
-        if let Some(v) = self.parse_int_literal(&t) {
+        if let Some(v) = self.parse_int_literal(t) {
             return Expr::Lit(v);
         }
         // VHDL digit separators (`2.71828_18284_...`) are not valid in Rust's
@@ -10210,10 +10199,8 @@ fn did_you_mean<'c>(name: &str, candidates: impl Iterator<Item = &'c String>) ->
         } else {
             levenshtein_bounded(&n, &cl, max_d)
         };
-        if prefix || d <= max_d {
-            if best.map_or(true, |(bd, _)| d < bd) {
-                best = Some((d, c.as_str()));
-            }
+        if (prefix || d <= max_d) && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, c.as_str()));
         }
     }
     best.map(|(_, c)| c)
@@ -10402,8 +10389,8 @@ pub(crate) fn string_value(s: &str) -> Value {
 /// Build a Value from a u128 with the minimal width that holds it.
 fn value_from_u128(width: usize, v: u128) -> Value {
     let mut bits = vec![V0; width.max(1)];
-    for i in 0..width.min(128) {
-        bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
+    for (i, b) in bits.iter_mut().enumerate().take(width.min(128)) {
+        *b = if (v >> i) & 1 == 1 { V1 } else { V0 };
     }
     Value { bits, real: false }
 }
@@ -10429,7 +10416,7 @@ mod tests {
 
     #[test]
     fn did_you_mean_prefers_close_names() {
-        let cands = vec!["edge_detector_entity".to_string(), "fifo".to_string()];
+        let cands = ["edge_detector_entity".to_string(), "fifo".to_string()];
         // Prefix overlap: `edge_detector` is a prefix of `edge_detector_entity`.
         assert_eq!(
             did_you_mean("edge_detector", cands.iter()),

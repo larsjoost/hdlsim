@@ -127,8 +127,8 @@ impl Value {
 
     pub fn from_u64(width: usize, v: u64) -> Value {
         let mut bits = vec![V0; width.max(1)];
-        for i in 0..width.min(64) {
-            bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
+        for (i, b) in bits.iter_mut().enumerate().take(width.min(64)) {
+            *b = if (v >> i) & 1 == 1 { V1 } else { V0 };
         }
         Value { bits, real: false }
     }
@@ -270,9 +270,8 @@ impl Value {
     /// Resize to `width` bits (zero-extend; Verilog unsigned default).
     pub fn resize(&self, width: usize) -> Value {
         let mut bits = vec![V0; width.max(1)];
-        for i in 0..width.min(self.bits.len()) {
-            bits[i] = self.bits[i];
-        }
+        let n = width.min(self.bits.len());
+        bits[..n].copy_from_slice(&self.bits[..n]);
         // Extension bits of an X/Z value stay X.
         if self.bits.iter().any(|&b| !is_known(b)) && width > self.bits.len() {
             for i in self.bits.len()..width {
@@ -387,12 +386,12 @@ impl Value {
                 };
                 Value::from_u64(1, ord as u64)
             }
-            EqM => return Value::from_u64(1, self.matches_case(rhs) as u64),
-            NeM => return Value::from_u64(1, !self.matches_case(rhs) as u64),
+            EqM => Value::from_u64(1, self.matches_case(rhs) as u64),
+            NeM => Value::from_u64(1, !self.matches_case(rhs) as u64),
             LtM | LeM | GtM | GeM => {
                 // Matching relational: '-' would need wildcard-aware ordering;
                 // conservatively X when either side has a don't-care bit.
-                if self.bits.iter().any(|&b| b == VDASH) || rhs.bits.iter().any(|&b| b == VDASH) {
+                if self.bits.contains(&VDASH) || rhs.bits.contains(&VDASH) {
                     return Value::x(1);
                 }
                 let (a, b) = (self.to_u64(), rhs.to_u64());
@@ -405,7 +404,7 @@ impl Value {
                     },
                     _ => return Value::x(1),
                 };
-                return Value::from_u64(1, ord as u64);
+                Value::from_u64(1, ord as u64)
             }
             LogAnd | LogOr => {
                 // Logical: X if any operand bit unknown, else 0/1.
@@ -427,10 +426,8 @@ impl Value {
             }
             _ => {
                 let mut bits = vec![VX; w];
-                for i in 0..w {
-                    let a = self.bit(i);
-                    let b = rhs.bit(i);
-                    bits[i] = bit_op(op, a, b);
+                for (i, b) in bits.iter_mut().enumerate() {
+                    *b = bit_op(op, self.bit(i), rhs.bit(i));
                 }
                 // Arithmetic needs full-width evaluation, not per-bit.
                 match op {
@@ -539,7 +536,7 @@ impl Value {
             // (AND/XNOR seed 1, OR/XOR seed 0), then invert for the negated
             // forms.
             RedAnd | RedNand => {
-                let acc = self.bits.iter().copied().fold(V1, |acc, b| and1(acc, b));
+                let acc = self.bits.iter().copied().fold(V1, and1);
                 Value::from_bit(if matches!(op, RedNand) {
                     bnot1(acc)
                 } else {
@@ -547,7 +544,7 @@ impl Value {
                 })
             }
             RedOr | RedNor => {
-                let acc = self.bits.iter().copied().fold(V0, |acc, b| or1(acc, b));
+                let acc = self.bits.iter().copied().fold(V0, or1);
                 Value::from_bit(if matches!(op, RedNor) {
                     bnot1(acc)
                 } else {
@@ -555,7 +552,7 @@ impl Value {
                 })
             }
             RedXor | RedXnor => {
-                let acc = self.bits.iter().copied().fold(V0, |acc, b| xor1(acc, b));
+                let acc = self.bits.iter().copied().fold(V0, xor1);
                 Value::from_bit(if matches!(op, RedXnor) {
                     bnot1(acc)
                 } else {
@@ -595,7 +592,7 @@ impl Value {
         match fmt {
             "h" | "x" => {
                 let mut s = String::new();
-                let nibbles = (self.bits.len() + 3) / 4;
+                let nibbles = self.bits.len().div_ceil(4);
                 for n in (0..nibbles).rev() {
                     let mut v = 0u8;
                     let mut unknown = false;
@@ -628,11 +625,11 @@ impl Value {
                 .collect(),
             "d" => match self.to_u64() {
                 Some(v) => v.to_string(),
-                None => "x".repeat((self.bits.len() + 3) / 4),
+                None => "x".repeat(self.bits.len().div_ceil(4)),
             },
             "o" => {
                 let mut s = String::new();
-                let groups = (self.bits.len() + 2) / 3;
+                let groups = self.bits.len().div_ceil(3);
                 for g in (0..groups).rev() {
                     let mut v = 0u8;
                     let mut unknown = false;
@@ -951,7 +948,7 @@ mod tests {
 
     #[test]
     fn f64_roundtrip() {
-        for f in [0.0, 1.5, -2.25, 7.5, 1e300, 1e-300, 3.141592653589793] {
+        for f in [0.0, 1.5, -2.25, 7.5, 1e300, 1e-300, std::f64::consts::PI] {
             let v = Value::from_f64(f);
             assert_eq!(v.width(), 64);
             assert_eq!(v.to_f64(), Some(f));

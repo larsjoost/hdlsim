@@ -202,7 +202,7 @@ impl<'a> Lexer<'a> {
         // `$` followed by identifier characters.
         let start = self.pos;
         self.pos += 1;
-        if self.peek(0).map_or(false, is_ident_start) {
+        if self.peek(0).is_some_and(is_ident_start) {
             while self.pos < self.text.len() && is_ident_continue(self.text[self.pos]) {
                 self.pos += 1;
             }
@@ -230,7 +230,7 @@ impl<'a> Lexer<'a> {
         // `` ` `` followed by identifier characters (macro reference / directive).
         let start = self.pos;
         self.pos += 1;
-        if self.peek(0).map_or(false, is_ident_start) {
+        if self.peek(0).is_some_and(is_ident_start) {
             while self.pos < self.text.len() && is_ident_continue(self.text[self.pos]) {
                 self.pos += 1;
             }
@@ -398,7 +398,7 @@ impl<'a> Lexer<'a> {
         }
         // Real literal: digits '.' digits [exponent] | digits exponent.
         let mut is_real = false;
-        if self.peek(0) == Some(b'.') && self.peek(1).map_or(false, |b| is_digit(b) || b == b'_') {
+        if self.peek(0) == Some(b'.') && self.peek(1).is_some_and(|b| is_digit(b) || b == b'_') {
             is_real = true;
             self.pos += 1;
             while self.pos < self.text.len()
@@ -413,7 +413,7 @@ impl<'a> Lexer<'a> {
             if matches!(self.peek(0), Some(b'+') | Some(b'-')) {
                 self.pos += 1;
             }
-            if self.peek(0).map_or(false, is_digit) {
+            if self.peek(0).is_some_and(is_digit) {
                 is_real = true;
                 while self.pos < self.text.len() && is_digit(self.text[self.pos]) {
                     self.pos += 1;

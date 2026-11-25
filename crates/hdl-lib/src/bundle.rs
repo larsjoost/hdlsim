@@ -75,9 +75,9 @@ pub fn write_tar(entries: &[BundleEntry]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&h);
         out.extend_from_slice(&e.data);
         let pad = (BLOCK - (e.data.len() % BLOCK)) % BLOCK;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
     }
-    out.extend(std::iter::repeat(0u8).take(2 * BLOCK)); // end-of-archive
+    out.extend(std::iter::repeat_n(0u8, 2 * BLOCK)); // end-of-archive
     Ok(out)
 }
 

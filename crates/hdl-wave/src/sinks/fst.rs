@@ -262,7 +262,7 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
                 put_varint(&mut rb, rcv);
             } else if chars.iter().all(|&c| c == b'0' || c == b'1') {
                 put_varint(&mut rb, (*td as u64) << 1);
-                for j in 0..(widths[h] + 7) / 8 {
+                for j in 0..widths[h].div_ceil(8) {
                     let mut acc = 0u8;
                     for k in 0..8 {
                         let ci = 8 * j + k;
@@ -350,6 +350,9 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
     // ---- hierarchy block (gzip) ----
     let mut hier: Vec<u8> = Vec::new();
     let mut hier_scopes = 0usize;
+    // Hierarchy-emit threading: flat + the per-node tables the enclosing
+    // writer built; a params struct would just relocate the same fields.
+    #[allow(clippy::too_many_arguments)]
     fn emit_hier(
         id: usize,
         flat: &Flat,
@@ -358,7 +361,6 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
         order: &[usize],
         handle_of: &[usize],
         widths: &[usize],
-        reals: &[bool],
         hier: &mut Vec<u8>,
         count: &mut usize,
     ) {
@@ -398,7 +400,7 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
         }
         for &ch in &children[id] {
             emit_hier(
-                ch, flat, children, scope_path, order, handle_of, widths, reals, hier, count,
+                ch, flat, children, scope_path, order, handle_of, widths, hier, count,
             );
         }
         hier.push(255); // upscope
@@ -412,7 +414,6 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
             &order,
             &handle_of,
             &widths,
-            &reals,
             &mut hier,
             &mut hier_scopes,
         );
@@ -429,7 +430,8 @@ fn build_fst(flat: &Flat, events: &[SimEvent]) -> Vec<u8> {
     put_u64be(&mut hdr, 329);
     put_u64be(&mut hdr, start);
     put_u64be(&mut hdr, end);
-    hdr.extend_from_slice(&2.7182818284590452354f64.to_le_bytes()); // endian test
+    // The FST spec's endian test word is exactly the bytes of e.
+    hdr.extend_from_slice(&std::f64::consts::E.to_le_bytes());
     put_u64be(&mut hdr, 0); // memory used by writer
     put_u64be(&mut hdr, hier_scopes as u64);
     put_u64be(&mut hdr, n as u64); // hier var entries

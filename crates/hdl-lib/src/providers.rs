@@ -147,7 +147,7 @@ impl UnitProvider for DirProvider {
             .filter(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
-                    .map_or(false, |e| self.extensions.contains(&e))
+                    .is_some_and(|e| self.extensions.contains(&e))
             })
             .collect()
     }
@@ -172,7 +172,7 @@ fn walk_paths(
     for p in entries {
         if p.is_dir() {
             if p.file_name()
-                .map_or(false, |n| is_skip_dir(&n.to_string_lossy()))
+                .is_some_and(|n| is_skip_dir(&n.to_string_lossy()))
             {
                 continue;
             }
@@ -180,7 +180,7 @@ fn walk_paths(
         } else if p
             .extension()
             .and_then(|e| e.to_str())
-            .map_or(false, |e| exts.contains(&e))
+            .is_some_and(|e| exts.contains(&e))
         {
             out.push(p);
         }
@@ -210,7 +210,7 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf)>) {
     for p in files {
         if p.extension()
             .and_then(|e| e.to_str())
-            .map_or(false, |e| exts.contains(&e))
+            .is_some_and(|e| exts.contains(&e))
         {
             for unit in units_in_file(&p) {
                 out.push((unit, p.clone()));
@@ -224,7 +224,7 @@ fn walk_tagged(dir: &Path, exts: &[&str], out: &mut Vec<(String, PathBuf, bool)>
     for p in files {
         if p.extension()
             .and_then(|e| e.to_str())
-            .map_or(false, |e| exts.contains(&e))
+            .is_some_and(|e| exts.contains(&e))
         {
             for (unit, is_body) in units_in_file_tagged(&p) {
                 out.push((unit, p.clone(), is_body));
@@ -268,9 +268,12 @@ pub fn units_in_file(path: &Path) -> Vec<String> {
 /// each call, and the same trees are scanned repeatedly within one run
 /// (scoped per-library scans, the global full scan, project search) — the
 /// memo keeps that to one parse per file per process.
-fn unit_names_memo() -> &'static Mutex<HashMap<(PathBuf, u64), Arc<Vec<(String, bool)>>>> {
-    static MEMO: OnceLock<Mutex<HashMap<(PathBuf, u64), Arc<Vec<(String, bool)>>>>> =
-        OnceLock::new();
+/// Memoized per-file design-unit names, keyed by (canonical path, content
+/// hash): unit name + is-body flag.
+type UnitNames = HashMap<(PathBuf, u64), std::sync::Arc<Vec<(String, bool)>>>;
+
+fn unit_names_memo() -> &'static Mutex<UnitNames> {
+    static MEMO: OnceLock<Mutex<UnitNames>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -393,6 +396,92 @@ pub(crate) fn vhdl_units_in_file(path: &Path, text: &str) -> Vec<(String, bool)>
     out
 }
 
+/// Guess a logical library name from a directory name: lowercase, invalid
+/// identifier chars become `_`, and a non-identifier start gets a `lib_`
+/// prefix (e.g. `scint_scan_integrator` stays as-is, `2nd` -> `lib_2nd`).
+/// Returns `None` for the project root or reserved/built-in names.
+pub fn library_name_from_dir(dir: &Path) -> Option<String> {
+    let raw = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        name = format!("lib_{name}");
+    }
+    // Reserved / built-in names are not user libraries.
+    if matches!(name.as_str(), "work" | "std" | "ieee" | "ieee_proposed") {
+        return None;
+    }
+    Some(name)
+}
+
+/// A "library root" (e.g. `$XILINX_VIVADO/data/vhdl/src`): each immediate
+/// subdirectory containing sources becomes a logical library named after the
+/// subdir. Returns `(name, dir)` pairs in sorted order.
+pub fn lib_root_libraries(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name()
+            .is_some_and(|n| is_skip_dir(&n.to_string_lossy()))
+        {
+            continue;
+        }
+        if walk_source_files(&p).is_empty() {
+            continue;
+        }
+        if let Some(name) = library_name_from_dir(&p) {
+            out.push((name, p));
+        }
+    }
+    out
+}
+
+/// Xilinx vendor library roots from the environment: `HDLSIM_XILINX_LIBS`
+/// (explicit root whose subdirs are libraries), else
+/// `$XILINX_VIVADO/data/vhdl/src` and `$XILINX_HLS/data/vhdl/src` if those
+/// directories exist.
+pub fn xilinx_lib_roots_from_env() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(v) = std::env::var("HDLSIM_XILINX_LIBS") {
+        if !v.is_empty() {
+            roots.push(PathBuf::from(v));
+        }
+    }
+    for var in ["XILINX_VIVADO", "XILINX_HLS"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let p = Path::new(&v).join("data/vhdl/src");
+                if p.is_dir() {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,90 +567,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
-}
-
-/// Guess a logical library name from a directory name: lowercase, invalid
-/// identifier chars become `_`, and a non-identifier start gets a `lib_`
-/// prefix (e.g. `scint_scan_integrator` stays as-is, `2nd` -> `lib_2nd`).
-/// Returns `None` for the project root or reserved/built-in names.
-pub fn library_name_from_dir(dir: &Path) -> Option<String> {
-    let raw = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
-    let mut name: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if name.is_empty() {
-        return None;
-    }
-    if !name
-        .chars()
-        .next()
-        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
-    {
-        name = format!("lib_{name}");
-    }
-    // Reserved / built-in names are not user libraries.
-    if matches!(name.as_str(), "work" | "std" | "ieee" | "ieee_proposed") {
-        return None;
-    }
-    Some(name)
-}
-
-/// A "library root" (e.g. `$XILINX_VIVADO/data/vhdl/src`): each immediate
-/// subdirectory containing sources becomes a logical library named after the
-/// subdir. Returns `(name, dir)` pairs in sorted order.
-pub fn lib_root_libraries(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return out;
-    };
-    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-    entries.sort();
-    for p in entries {
-        if !p.is_dir() {
-            continue;
-        }
-        if p.file_name()
-            .map_or(false, |n| is_skip_dir(&n.to_string_lossy()))
-        {
-            continue;
-        }
-        if walk_source_files(&p).is_empty() {
-            continue;
-        }
-        if let Some(name) = library_name_from_dir(&p) {
-            out.push((name, p));
-        }
-    }
-    out
-}
-
-/// Xilinx vendor library roots from the environment: `HDLSIM_XILINX_LIBS`
-/// (explicit root whose subdirs are libraries), else
-/// `$XILINX_VIVADO/data/vhdl/src` and `$XILINX_HLS/data/vhdl/src` if those
-/// directories exist.
-pub fn xilinx_lib_roots_from_env() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(v) = std::env::var("HDLSIM_XILINX_LIBS") {
-        if !v.is_empty() {
-            roots.push(PathBuf::from(v));
-        }
-    }
-    for var in ["XILINX_VIVADO", "XILINX_HLS"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                let p = Path::new(&v).join("data/vhdl/src");
-                if p.is_dir() {
-                    roots.push(p);
-                }
-            }
-        }
-    }
-    roots
 }

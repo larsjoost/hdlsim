@@ -474,7 +474,7 @@ impl<'a> Lower<'a> {
                         || self
                             .decl_type_name(&dk)
                             .and_then(|t| self.types.get(&t))
-                            .map_or(false, |t| t.real);
+                            .is_some_and(|t| t.real);
                     let tname = self.decl_type_name(&dk);
                     for (i, k) in dk.iter().enumerate() {
                         if k.kind() == SyntaxKind::Name {
@@ -503,7 +503,7 @@ impl<'a> Lower<'a> {
                                     signed: tname
                                         .as_ref()
                                         .and_then(|t| self.types.get(t))
-                                        .map_or(false, |t| t.signed),
+                                        .is_some_and(|t| t.signed),
                                 });
                                 if let Some(t) = &tname {
                                     self.sig_types.insert(id, t.clone());
@@ -584,7 +584,7 @@ impl<'a> Lower<'a> {
                     .or_else(|| self.types.get(&t).map(|td| td.width))
                     .unwrap_or(1);
                 i += 1;
-                if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                if sk.get(i).is_some_and(|k| k.kind() == SyntaxKind::Range) {
                     width = self.range_width(&sk[i], env);
                     i += 1;
                 }
@@ -592,7 +592,7 @@ impl<'a> Lower<'a> {
             while i < sk.len() && sk[i].kind() == SyntaxKind::Name {
                 fields.push((self.text(&sk[i]), width));
                 i += 1;
-                if sk.get(i).map_or(false, |k| k.kind() == SyntaxKind::Range) {
+                if sk.get(i).is_some_and(|k| k.kind() == SyntaxKind::Range) {
                     i += 1; // array field dimension
                 }
             }
@@ -786,10 +786,10 @@ impl<'a> Lower<'a> {
             for param in &p.params {
                 self.gconsts
                     .insert(format!("{}::{}", pkg, param.name), param.default.clone());
-                if star {
-                    self.gconsts
-                        .insert(param.name.clone(), param.default.clone());
-                } else if Some(param.name.as_str()) == item_name.copied() {
+                // `*` imports every parameter unqualified; a named import
+                // (`pkg::item`) aliases its own params unqualified — same
+                // insertion either way.
+                if star || Some(param.name.as_str()) == item_name.copied() {
                     self.gconsts
                         .insert(param.name.clone(), param.default.clone());
                 }
@@ -1048,7 +1048,7 @@ impl<'a> Lower<'a> {
                     if let Some(tn) = self.sig_types.get(&id).cloned() {
                         if let Some(td) = self.types.get(&tn).cloned() {
                             if let TypeKind::Class(cn) = &td.kind {
-                                if self.classes.get(cn).map_or(false, |ci| {
+                                if self.classes.get(cn).is_some_and(|ci| {
                                     ci.fields.iter().any(|(n, _, _, _)| n == field)
                                 }) {
                                     return Some((cn.clone(), field.to_string(), Expr::Sig(id)));
@@ -1141,7 +1141,7 @@ impl<'a> Lower<'a> {
         let packed: Vec<&SyntaxNode> = kids
             .iter()
             .enumerate()
-            .filter(|(i, k)| k.kind() == SyntaxKind::Range && name_pos.map_or(true, |np| *i < np))
+            .filter(|(i, k)| k.kind() == SyntaxKind::Range && name_pos.is_none_or(|np| *i < np))
             .map(|(_, k)| k)
             .collect();
         if !packed.is_empty() {
@@ -1438,7 +1438,7 @@ impl<'a> Lower<'a> {
                 // Optional memory dimension after the name: `reg [7:0] mem [0:255]`.
                 if kids
                     .get(i + 1)
-                    .map_or(false, |k| k.kind() == SyntaxKind::Range)
+                    .is_some_and(|k| k.kind() == SyntaxKind::Range)
                 {
                     let depth = self.range_depth(&kids[i + 1], env);
                     if let Some(id) = self.sig_id(&name) {
@@ -1448,7 +1448,7 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 // Optional `= expr` after the name.
-                if kids.get(i + 1).map_or(false, |k| self.text(k) == "=") {
+                if kids.get(i + 1).is_some_and(|k| self.text(k) == "=") {
                     if let Some(e) = kids.get(i + 2) {
                         if e.kind() == SyntaxKind::Allocator {
                             // `C c = new(args);` — runtime constructor: emit a
@@ -1508,7 +1508,7 @@ impl<'a> Lower<'a> {
         let mut i = 1;
         while i < kids.len() {
             if kids[i].kind() == SyntaxKind::Name
-                && kids.get(i + 1).map_or(false, |k| self.text(k) == "=")
+                && kids.get(i + 1).is_some_and(|k| self.text(k) == "=")
             {
                 if is_type_param {
                     // `parameter type rule_t = struct packed {...}` or
@@ -1536,7 +1536,7 @@ impl<'a> Lower<'a> {
                             let mut width = 1usize;
                             if kids
                                 .get(i + 3)
-                                .map_or(false, |k| k.kind() == SyntaxKind::Range)
+                                .is_some_and(|k| k.kind() == SyntaxKind::Range)
                             {
                                 width = self.range_width(&kids[i + 3], env);
                             }
@@ -1690,7 +1690,7 @@ impl<'a> Lower<'a> {
         if st.kind() == SyntaxKind::StmtAssign {
             let ik = real_children(st);
             let name_pos = ik.iter().position(|k| k.kind() == SyntaxKind::Name);
-            let is_decl = name_pos.map_or(false, |np| {
+            let is_decl = name_pos.is_some_and(|np| {
                 ik[..np].iter().any(|k| {
                     k.kind() == SyntaxKind::Ident && type_kw_width(&self.text(k)).is_some()
                 })
@@ -1710,7 +1710,7 @@ impl<'a> Lower<'a> {
                     });
                     self.names.insert(n, id);
                 }
-                if ik.get(np + 1).map_or(false, |k| self.text(k) == "=") {
+                if ik.get(np + 1).is_some_and(|k| self.text(k) == "=") {
                     if let Some(e) = ik.get(np + 2).filter(|e| is_expr_node(e.kind())) {
                         return Stmt::Assign {
                             lhs: Expr::Sig(self.sig_id(&self.text(&ik[np])).unwrap()),
@@ -2062,7 +2062,7 @@ impl<'a> Lower<'a> {
                             self.names.insert(n, id);
                         }
                         // `= expr` init?
-                        if dk.get(i + 1).map_or(false, |k| self.text(k) == "=") {
+                        if dk.get(i + 1).is_some_and(|k| self.text(k) == "=") {
                             if let Some(e) = dk.get(i + 2).filter(|e| is_expr_node(e.kind())) {
                                 inits.push(Stmt::Assign {
                                     lhs: Expr::Sig(self.sig_id(&self.text(k)).unwrap()),
@@ -2350,7 +2350,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut ordered = fields.clone();
-        ordered.sort_by(|a, b| b.2.cmp(&a.2)); // descending lsb → msb first
+        ordered.sort_by_key(|f| std::cmp::Reverse(f.2)); // descending lsb → msb first
         let mut pos = 0;
         let mut parts: Vec<Expr> = Vec::new();
         for (n, w, _) in &ordered {
@@ -2446,8 +2446,7 @@ impl<'a> Lower<'a> {
             .unwrap_or_default();
         let init_val = ik
             .iter()
-            .filter(|k| is_expr_node(k.kind()))
-            .last()
+            .rfind(|k| is_expr_node(k.kind()))
             .map(|k| self.lower_expr(k, env))
             .and_then(|e| const_eval(&e, env))
             .and_then(|v| v.to_u64());
@@ -2489,13 +2488,13 @@ impl<'a> Lower<'a> {
                         l: Box::new(self.lower_expr(exprs[0], &env2)),
                         r: Box::new(self.lower_expr(exprs[exprs.len() - 1], &env2)),
                     })
-                } else if exprs.len() >= 1 && op_text.contains("++") {
+                } else if !exprs.is_empty() && op_text.contains("++") {
                     Some(Expr::Bin {
                         op: BinOp::Add,
                         l: Box::new(self.lower_expr(exprs[0], &env2)),
                         r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
                     })
-                } else if exprs.len() >= 1 && op_text.contains("--") {
+                } else if !exprs.is_empty() && op_text.contains("--") {
                     Some(Expr::Bin {
                         op: BinOp::Sub,
                         l: Box::new(self.lower_expr(exprs[0], &env2)),
@@ -2509,7 +2508,7 @@ impl<'a> Lower<'a> {
                 .map(|c| self.lower_expr(c, &env2))
                 .and_then(|e| const_eval(&e, &env2))
                 .and_then(|v| v.to_u64())
-                .map_or(false, |v| v != 0);
+                .is_some_and(|v| v != 0);
             if !go {
                 break;
             }
@@ -2561,7 +2560,7 @@ impl<'a> Lower<'a> {
             .map(|c| self.lower_expr(c, env))
             .and_then(|e| const_eval(&e, env))
             .and_then(|v| v.to_u64())
-            .map_or(false, |v| v != 0);
+            .is_some_and(|v| v != 0);
         let bodies: Vec<&SyntaxNode> = kids
             .iter()
             .filter(|k| {
@@ -2709,7 +2708,7 @@ impl<'a> Lower<'a> {
         let mut conns = Vec::new();
         let mut param_overrides = Vec::new();
         let mut i = 0;
-        if kids.first().map_or(false, |k| k.kind() == SyntaxKind::Name) {
+        if kids.first().is_some_and(|k| k.kind() == SyntaxKind::Name) {
             module_name = self.text(&kids[0]);
             i = 1;
         }
@@ -2737,9 +2736,8 @@ impl<'a> Lower<'a> {
             i += 1;
         }
         for c in &kids[i..] {
-            match c.kind() {
-                SyntaxKind::PortConn => conns.push(self.lower_conn(c, env)),
-                _ => {}
+            if c.kind() == SyntaxKind::PortConn {
+                conns.push(self.lower_conn(c, env))
             }
         }
         for c in &kids[1..] {
@@ -2826,9 +2824,9 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let v = self.lower_expr(&rest[i], env);
-            let is_range = rest.get(i + 1).map_or(false, |k| {
-                k.kind() == SyntaxKind::Punct && self.text(k) == ":"
-            });
+            let is_range = rest
+                .get(i + 1)
+                .is_some_and(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
             if is_range {
                 if let Some(hi_node) = rest[i + 2..].iter().find(|k| is_expr_node(k.kind())) {
                     let hi = self.lower_expr(hi_node, env);
@@ -3182,9 +3180,9 @@ impl<'a> Lower<'a> {
                 let mut parts = Vec::new();
                 for (i, k) in kids.iter().enumerate() {
                     if k.kind() == SyntaxKind::Name
-                        && kids.get(i + 1).map_or(false, |n| {
-                            n.kind() == SyntaxKind::Punct && self.text(n) == ":"
-                        })
+                        && kids
+                            .get(i + 1)
+                            .is_some_and(|n| n.kind() == SyntaxKind::Punct && self.text(n) == ":")
                     {
                         continue;
                     }
@@ -3448,8 +3446,8 @@ pub fn parse_int_literal(t: &str) -> Option<Value> {
     {
         let v = u128::from_str_radix(&digits, base).ok()?;
         let mut bits = vec![V0; width.max(1)];
-        for i in 0..width.min(128) {
-            bits[i] = if (v >> i) & 1 == 1 { V1 } else { V0 };
+        for (i, b) in bits.iter_mut().enumerate().take(width.min(128)) {
+            *b = if (v >> i) & 1 == 1 { V1 } else { V0 };
         }
         return Some(Value { bits, real: false });
     }
@@ -3549,13 +3547,17 @@ const CE_MAX_DEPTH: u32 = 64;
 fn ce_real(e: &Expr) -> bool {
     match e {
         Expr::Real(_) => true,
-        Expr::Bin { op, l, r } => match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                ce_real(l) || ce_real(r)
-            }
-            _ => false,
-        },
-        Expr::Un { op, e } => matches!(op, UnOp::Neg | UnOp::Pos) && ce_real(e),
+        Expr::Bin {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            l,
+            r,
+        } => ce_real(l) || ce_real(r),
+        Expr::Bin { .. } => false,
+        Expr::Un {
+            op: UnOp::Neg | UnOp::Pos,
+            e,
+        } => ce_real(e),
+        Expr::Un { .. } => false,
         Expr::Resize { e, .. } | Expr::Signed(e) => ce_real(e),
         Expr::Cond { c, t, e } => ce_real(c) || ce_real(t) || ce_real(e),
         _ => false,
@@ -3696,9 +3698,7 @@ fn ce_impl(
             let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             if *signed && v.width() < *width {
                 let mut bits = vec![if v.bit(v.width() - 1) == V1 { V1 } else { V0 }; *width];
-                for i in 0..v.width() {
-                    bits[i] = v.bit(i);
-                }
+                bits[..v.width()].copy_from_slice(&v.bits);
                 Some(Value { bits, real: false })
             } else {
                 Some(v.resize(*width))
@@ -3822,14 +3822,8 @@ fn ce_impl(
             let viable = |f: &FuncIr| f.args.len() == argv.len() || fits_defaults(f, argv.len());
             let f = cands
                 .iter()
-                .filter(|f| viable(f) && width_ok(f, false))
-                .next()
-                .or_else(|| {
-                    cands
-                        .iter()
-                        .filter(|f| viable(f) && width_ok(f, true))
-                        .next()
-                })
+                .find(|f| viable(f) && width_ok(f, false))
+                .or_else(|| cands.iter().find(|f| viable(f) && width_ok(f, true)))
                 .or_else(|| cands.iter().find(|f| f.args.len() == argv.len()))
                 .or_else(|| cands.iter().find(|f| fits_defaults(f, argv.len())))
                 .or_else(|| cands.first())?;

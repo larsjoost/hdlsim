@@ -52,7 +52,7 @@ impl Command for Project {
             Err(code) => return Ok(code),
         };
         let opts = a.common.into_opts()?;
-        let format = ProjectFormat::from_str(
+        let format = ProjectFormat::parse(
             a.format
                 .as_deref()
                 .ok_or("missing --format (vivado|json)")
@@ -60,12 +60,14 @@ impl Command for Project {
         )
         .map_err(anyhow::Error::msg)?;
         let out = a.out;
-        let mut spec = ProjectSpec::default();
-        spec.name = a.name.unwrap_or_default();
-        spec.top = a.top;
-        spec.sim_top = a.sim_top;
-        spec.part = a.part;
-        spec.files = a.files;
+        let mut spec = ProjectSpec {
+            name: a.name.unwrap_or_default(),
+            top: a.top,
+            sim_top: a.sim_top,
+            part: a.part,
+            files: a.files,
+            ..Default::default()
+        };
         if spec.files.is_empty() {
             return Err(anyhow::anyhow!("no input files"));
         }

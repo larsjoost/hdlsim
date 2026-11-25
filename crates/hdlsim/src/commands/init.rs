@@ -212,7 +212,7 @@ mod dedupe_tests {
         let copy = Path::new(
             "vivado/pcm/rtl/project.srcs/sources_1/imports/hw/hdl/sccore/acmb_azimuth_combiner",
         );
-        assert!(prefer_dir(src, copy) == false);
+        assert!(!prefer_dir(src, copy));
         assert!(prefer_dir(copy, src));
         // Equal depth: keep the current one (first in sorted walk order).
         assert!(!prefer_dir(Path::new("a/x"), Path::new("b/x")));
