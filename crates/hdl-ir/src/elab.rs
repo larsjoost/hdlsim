@@ -1006,6 +1006,7 @@ mod tests {
             time_unit_fs: 1000,
             is_vhdl: false,
             real_ranges: HashMap::new(),
+            sig_dims_debug: None,
         };
         child.assigns.push(AssignIr {
             lhs: Expr::Sig(0),
@@ -1029,6 +1030,7 @@ mod tests {
             time_unit_fs: 1000,
             is_vhdl: false,
             real_ranges: HashMap::new(),
+            sig_dims_debug: None,
         };
         Design {
             modules: vec![top, child],
@@ -1062,6 +1064,7 @@ mod tests {
             time_unit_fs: 1000,
             is_vhdl: false,
             real_ranges: HashMap::new(),
+            sig_dims_debug: None,
         };
         other.assigns.push(AssignIr {
             lhs: Expr::Sig(0),

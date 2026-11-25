@@ -78,6 +78,11 @@ pub struct ModuleIr {
     /// The simulator decodes those slices as IEEE-754; everything else as an
     /// integer bit pattern (VHDL records flatten to one vector per signal).
     pub real_ranges: HashMap<String, Vec<(u32, u32)>>,
+    /// Debug only (`--dump-maps`): signal id (module-relative) → array
+    /// dims [(low, size), …] as believed at the end of lowering this unit.
+    /// Not consumed by the kernel; omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig_dims_debug: Option<HashMap<u32, Vec<(i64, usize)>>>,
 }
 
 impl Default for ModuleIr {
@@ -94,6 +99,7 @@ impl Default for ModuleIr {
             time_unit_fs: 1_000_000,
             is_vhdl: false,
             real_ranges: HashMap::new(),
+            sig_dims_debug: None,
         }
     }
 }

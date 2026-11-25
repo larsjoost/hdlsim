@@ -60,6 +60,11 @@ pub struct Lowered {
     /// (source directory, lowercase entity name) → snapshot; disambiguates
     /// same-named entities from different directories (see `Lower`).
     pub entity_maps_by_dir: HashMap<(String, String), SigMaps>,
+    /// Constant/generic name → array dimensions [(low, size), …] lowered
+    /// from this file (inline constraints, generic clauses, aggregate
+    /// defaults). Retained so `--dump-maps` can show what the lowerer
+    /// believed when folding `'length(d)`-style attributes.
+    pub obj_dims: HashMap<String, Vec<(i64, usize)>>,
 }
 
 /// An architecture deferred until its entity is known design-wide (the entity
@@ -592,6 +597,7 @@ pub fn lower_file(
         entity_roots,
         entity_maps: lx.entity_maps.clone(),
         entity_maps_by_dir: lx.entity_maps_by_dir.clone(),
+        obj_dims: lx.obj_dims.clone(),
     }
 }
 
@@ -1561,6 +1567,24 @@ pub struct SigMaps {
     /// ids need no remapping.
     aliases: HashMap<String, Expr>,
     alias_rec: HashMap<String, String>,
+}
+
+impl SigMaps {
+    /// JSON view of the diagnosis-relevant lower-side maps: widths, array
+    /// dims, memory depths, ascending flags, unconstrained ports, and the
+    /// entity-declarative constants. Types and aliases are omitted (not
+    /// dim-related); this feeds `hdlsim ir --dump-maps`.
+    pub fn debug_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sig_width": self.sig_width,
+            "sig_dims": self.sig_dims,
+            "mems": self.mems,
+            "sig_asc": self.sig_asc,
+            "sig_signed": self.sig_signed,
+            "uncon_ports": self.uncon_ports,
+            "consts": self.consts,
+        })
+    }
 }
 
 impl<'a> Lower<'a> {
@@ -2941,6 +2965,7 @@ impl<'a> Lower<'a> {
             time_unit_fs: 1_000_000,
             is_vhdl: true,
             real_ranges: HashMap::new(),
+            sig_dims_debug: None,
         };
         self.names.clear();
         self.cur_entity = module.name.to_ascii_lowercase();
@@ -3017,6 +3042,10 @@ impl<'a> Lower<'a> {
             .filter(|(k, _)| !alias_rec_before.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        // Snapshot the dims the lowerer believed for this unit BEFORE
+        // snapshot_entity_maps clears the per-signal maps (the arch path
+        // re-installs the entity's maps via install_entity_maps).
+        module.sig_dims_debug = Some(self.sig_dims.clone());
         self.snapshot_entity_maps(&module.name);
         if let Some(v) = &self.variant {
             if v.entity == module.name.to_ascii_lowercase() {
@@ -4182,6 +4211,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        module_owned.sig_dims_debug = Some(self.sig_dims.clone());
         modules.push(module_owned);
         Some((disp, arch_name))
     }
