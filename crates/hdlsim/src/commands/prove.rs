@@ -62,7 +62,7 @@ impl Command for Prove {
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            super::emit_diags(mgr.diags(), mgr.db());
             return Ok(1);
         }
         let top_name = match top {
@@ -74,7 +74,7 @@ impl Command for Prove {
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
         let r = prove(&flat, bmc).map_err(anyhow::Error::msg)?;
         if !mgr.diags().is_empty() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            super::emit_diags(mgr.diags(), mgr.db());
         }
         println!(
             "hdlsim prove: top '{}', BMC depth {}, {} propert{}",

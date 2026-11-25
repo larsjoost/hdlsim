@@ -87,8 +87,10 @@ impl Command for LintCmd {
     }
 }
 
+/// Render a lint finding in the armed [`super::ErrorFormat`] (one JSON object
+/// with `--error-format json`, rustc-style text otherwise).
 fn render(l: &Lint, db: &SourceDb) -> String {
-    Diagnostic {
+    let d = Diagnostic {
         code: l.code,
         severity: l.severity,
         span: Some(l.span),
@@ -97,6 +99,9 @@ fn render(l: &Lint, db: &SourceDb) -> String {
             .fix
             .as_ref()
             .map(|_| "automatic fix available (--fix)".to_string()),
+    };
+    match super::error_format() {
+        super::ErrorFormat::Json => d.render_json(db),
+        super::ErrorFormat::Human => d.render(db),
     }
-    .render(db)
 }

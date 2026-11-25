@@ -78,8 +78,9 @@ impl SourceFile {
     }
 }
 
-/// All source files of a compilation session.
-#[derive(Default, Debug)]
+/// All source files of a compilation session. `Clone` so CLI observers can
+/// hold their own handle to render event spans as `file:line`.
+#[derive(Clone, Default, Debug)]
 pub struct SourceDb {
     files: Vec<SourceFile>,
 }

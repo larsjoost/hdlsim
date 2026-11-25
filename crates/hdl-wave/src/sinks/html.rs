@@ -131,7 +131,7 @@ impl WaveSink for HtmlSink {
                     self.max_time = *time_fs;
                 }
             }
-            SimEvent::Message { text, time_fs } => {
+            SimEvent::Message { text, time_fs, .. } => {
                 self.msgs.push((*time_fs, text.trim_end().to_string()));
             }
             _ => {}
@@ -452,6 +452,7 @@ mod tests {
             &SimEvent::Message {
                 text: "PASS\n".into(),
                 time_fs: 9_000_000,
+                span: None,
             },
             &flat,
         );

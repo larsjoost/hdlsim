@@ -152,7 +152,7 @@ impl Observer for Watcher {
                     ));
                 }
             }
-            SimEvent::Message { text, time_fs } => {
+            SimEvent::Message { text, time_fs, .. } => {
                 self.emit(format!(
                     "t={:<10} | {}",
                     fmt_time(*time_fs),

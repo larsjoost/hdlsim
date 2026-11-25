@@ -1,0 +1,80 @@
+# AGENTS.md — coding agents working in this repo
+
+hdlsim is a self-contained VHDL + Verilog simulator in Rust (workspace under
+`crates/`; no wrapping of GHDL/Icarus/Verilator). It is built to be driven by
+coding agents: deterministic runs, machine-readable diagnosis, unambiguous
+pass/fail. This file is the map; follow it instead of rediscovering it.
+
+## Build, test, lint (run from the repo root)
+
+- `cargo build` — build the workspace (debug profile).
+- `cargo test -- --skip corpus` — the test suite. CI runs exactly this in
+  debug (`.github/workflows/ci.yml`); the `corpus` tests compile thousands of
+  third-party files and run only in the release CI job, so skip them locally.
+- `cargo fmt --check` must pass — run `cargo fmt` before committing.
+
+## Workflow (required)
+
+- **Never commit or push to `main`.** Work on a branch
+  (`git checkout -b vibe/<slug>-<id>`), push it, open a PR with
+  `gh pr create --draft --head <branch> ...`. Merging happens through the PR.
+- One logical change per commit. Follow `REVIEWING.md`: `//!` file headers,
+  `///` on public items, no `unwrap()` on source-derived data, errors as
+  `Result<T, Diagnostic>`, deterministic output, tests colocated in
+  `#[cfg(test)]` plus end-to-end tests in `crates/hdlsim/tests/`.
+- Docs map: `README.md` (features), `docs/project-context.md` (architecture,
+  module table, commands), `docs/extensibility.md` (extension seams),
+  `docs/plan.md` (change history), `REVIEWING.md` (review conventions),
+  `docs/worldclass.md`.
+
+## The debug loop (edit → simulate → diagnose)
+
+When a simulation or compile fails, run these in order — they are the fastest
+path from "something is wrong" to "here is the line":
+
+1. `hdlsim syntax file.vhd` (or `check --syntax-only file.v`) — parse-only
+   check of the edited file in milliseconds.
+2. `hdlsim check [files]` — full compile + elaboration, rustc-style
+   diagnostics with `file:line:col` carets. Add `--error-format json` (global
+   flag, works anywhere on the command line) to get one JSON object per
+   diagnostic on stderr instead — parse `code`/`severity`/`message`/
+   `file`/`line`/`column`/`byte_start`/`byte_end`/`help` programmatically.
+3. `hdlsim run --top tb [files] --max-time 10us --max-wall 30s` — always bound
+   a run (`--max-time`/`--max-wall`) so a hang fails fast with a location dump
+   (exit 124/130) instead of blocking. `--seed N` makes random stimulus
+   reproducible.
+4. On a test failure, the transcript line now carries a `file:line:` prefix
+   (e.g. `tb.vhd:42: assertion failed at t=...`) and the summary prints
+   `hdlsim: FAILED — N test failure(s) (first at tb.vhd:42)` — jump there.
+5. To see why a signal is wrong: `hdlsim run --top tb --list-signals=PATTERN`
+   to get exact hierarchical names, then `--watch sig --watch-x` (first
+   x/z source) or `hdlsim debug --top tb --driver sig --dump`. `--trace`,
+   `--trace-dispatch`, `--trace-picked`, `--trace-calls` print the scheduler
+   trace on stderr.
+6. Waves: `--vcd w.vcd` / `--hwf` / `--fst` / `--wave out.html` on `run`;
+   `--coverage` for a line/branch report; `hdlsim regress --junit out.xml` to
+   run many testbenches for CI.
+
+Exit codes: `0` = clean pass; `1` = compile error or failed test
+(assert/report severity error|failure, `$error`/`$fatal`) or an internal guard
+stop; `2` = usage error (bad flags); `124` = `--max-wall` expired; `130` =
+Ctrl-C/SIGTERM (dumps the active process and call chain first).
+
+## Hard rules
+
+- `project/` holds private HDL designs: **read allowed, edit denied** (see
+  `docs/restricted-paths.jsonc` and `docs/project-context.md`). Nothing in the
+  repo may be traceable to it — no copied or lightly renamed snippets, names,
+  or wave data in tests, fixtures, examples, docs, commits, or PRs. Sim
+  artifacts (waves, `.hdlsim-cache/`, logs) stay under `project/` (gitignored);
+  never write them into tracked paths.
+- External crates are limited to the vetted set in `[workspace.dependencies]`
+  (thiserror, anyhow, clap, serde, serde_json, log, ctrlc); prefer std. A crate
+  opts in with `x.workspace = true`; anything outside the set needs a
+  justification in the PR description.
+- `crates/hdlsim/tests/corpus/` contains third-party sources — keep upstream
+  licensing intact when touching it.
+- New CLI subcommands: one module under `crates/hdlsim/src/commands/` plus one
+  entry in `COMMANDS` (a unit test asserts every command has a help section).
+  New debug knobs are global flags stripped in `apply_global_args`, never
+  environment variables (no spell check on env vars).

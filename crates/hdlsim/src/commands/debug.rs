@@ -4,26 +4,16 @@
 //! Also usable as a library: `hdl_sim::debug::Watcher` is an `Observer` you can
 //! attach to any `Simulator` in your own tooling.
 
-use super::{build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
+use super::run::Transcript;
+use super::{
+    build_manager, emit_diags, parse_time, parse_with, remap_into_bundle, Command, CommonArgs,
+};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::debug::{fmt_time, fmt_value, Watcher};
-use hdl_sim::{Observer, SimEvent, Simulator};
+use hdl_sim::Simulator;
 use std::path::PathBuf;
-
-/// Prints `$display`/`report` messages to stdout, like a simulator transcript.
-struct Transcript;
-
-impl Observer for Transcript {
-    fn on_event(&mut self, ev: &SimEvent) {
-        if let SimEvent::Message { text, .. } = ev {
-            print!("{}", text);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -96,7 +86,7 @@ impl Command for Debug {
         mgr.compile_files(&mut design, &files);
         compile_phase.done(format!("{} modules", design.modules.len()));
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
             return Ok(1);
         }
         let elab_phase = crate::phase::Phase::start("elaborate");
@@ -109,7 +99,7 @@ impl Command for Debug {
             flat.assigns.len()
         ));
         if !mgr.diags().is_empty() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
         }
         // Refuse runaway allocations with the top-allocator report instead
         // of aborting inside the first big `vec![…]`.
@@ -131,13 +121,17 @@ impl Command for Debug {
             watcher = watcher.watch(w);
         }
         sim.add_observer(Box::new(watcher));
-        sim.add_observer(Box::new(Transcript));
+        sim.add_observer(Box::new(Transcript::new(mgr.db().clone())));
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
         sim_phase.done(format!("t={}", fmt_time(sim.time())));
         println!("hdlsim debug: stopped at t={}", fmt_time(sim.time()));
         if sim.failures() > 0 {
-            println!("hdlsim debug: FAILED — {} test failure(s)", sim.failures());
+            let mut msg = format!("hdlsim debug: FAILED — {} test failure(s)", sim.failures());
+            if let Some(span) = sim.first_failure_span() {
+                msg = format!("{} (first at {})", msg, super::span_loc(mgr.db(), span));
+            }
+            println!("{}", msg);
             return Ok(1);
         }
         for d in &drivers {

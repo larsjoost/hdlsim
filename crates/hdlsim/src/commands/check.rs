@@ -1,7 +1,10 @@
 //! `hdlsim check` — compile only (parse + lower + resolve), print diagnostics,
 //! no simulation. Like `vlog -lint` / `ghdl -a`.
 
-use super::{build_manager, parse_with, remap_into_bundle, Command, CommonArgs};
+use super::{
+    build_manager, emit_diags, error_format, parse_with, remap_into_bundle, Command, CommonArgs,
+    ErrorFormat,
+};
 use anyhow::Context as _;
 use clap::Parser;
 use hdl_ir::elab;
@@ -53,8 +56,12 @@ fn syntax_only(label: &str, files: &[PathBuf]) -> anyhow::Result<i32> {
             }
         }
     }
-    for d in &all_diags.items {
-        eprint!("{}", d.render(&db));
+    if error_format() == ErrorFormat::Json {
+        eprint!("{}", all_diags.render_all_json(&db));
+    } else {
+        for d in &all_diags.items {
+            eprint!("{}", d.render(&db));
+        }
     }
     let errors = all_diags
         .items
@@ -127,7 +134,7 @@ impl Command for Check {
         ));
         let diags = mgr.diags();
         if !diags.is_empty() {
-            eprint!("{}", diags.render_all(mgr.db()));
+            emit_diags(diags, mgr.db());
         }
         if diags.has_errors() {
             println!("hdlsim check: {} error(s)", diags.items.len());

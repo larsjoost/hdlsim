@@ -109,6 +109,16 @@ impl Command for Help {
         println!("                                 also applies)");
         println!("    --no-color                   disable color output");
         println!(
+            "    --error-format human|json    diagnostics on stderr as rustc-style text (default)"
+        );
+        println!(
+            "                                 or as JSON Lines: one object per diagnostic with"
+        );
+        println!(
+            "                                 code/severity/message and file/line/column/byte"
+        );
+        println!("                                 offsets (for agents and scripts)");
+        println!(
             "    --report \"msg\"             on failure, file a PUBLIC GitHub issue with a reproducer"
         );
         println!(
@@ -375,6 +385,58 @@ static RUN_OPTIONS: std::sync::OnceLock<RunOptions> = std::sync::OnceLock::new()
 /// The options armed by [`apply_global_args`] (defaults until then).
 pub fn run_options() -> &'static RunOptions {
     RUN_OPTIONS.get_or_init(RunOptions::default)
+}
+
+/// Diagnostic output format for the global `--error-format human|json` flag.
+/// `Json` renders one JSON object per diagnostic (JSON Lines) so agents and
+/// scripts can consume stderr without scraping rustc-style text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorFormat {
+    Human,
+    Json,
+}
+
+static ERROR_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Arm the diagnostic output format (called from [`apply_global_args`]).
+pub fn set_error_format(f: ErrorFormat) {
+    ERROR_FORMAT.store(
+        match f {
+            ErrorFormat::Human => 0,
+            ErrorFormat::Json => 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The armed diagnostic output format (`Human` until `--error-format` says
+/// otherwise).
+pub fn error_format() -> ErrorFormat {
+    match ERROR_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ErrorFormat::Json,
+        _ => ErrorFormat::Human,
+    }
+}
+
+/// Print diagnostics to stderr in the armed [`ErrorFormat`]: rustc-style
+/// human text by default, JSON Lines with `--error-format json`. This is the
+/// single emission point for compile diagnostics in the CLI, so every
+/// command honors the flag.
+pub fn emit_diags(diags: &hdl_syntax::diagnostic::Diagnostics, db: &hdl_syntax::source::SourceDb) {
+    match error_format() {
+        ErrorFormat::Json => eprint!("{}", diags.render_all_json(db)),
+        ErrorFormat::Human => eprint!("{}", diags.render_all(db)),
+    }
+}
+
+/// Render an event span as `file:line` for transcript prefixes and failure
+/// summaries. The line is taken at the span's *end* (last byte): Verilog
+/// statement spans start right after the previous token, so the start can sit
+/// on the line above the statement, while the end is on the statement's own
+/// last line.
+pub fn span_loc(db: &hdl_syntax::source::SourceDb, span: hdl_syntax::source::Span) -> String {
+    let f = db.file(span.file);
+    format!("{}:{}", f.name(), f.line_col(span.end.saturating_sub(1)).0)
 }
 
 /// Default config lookup: `./hdlsim.ini`, then each parent directory (like git
@@ -800,6 +862,8 @@ pub const COMMANDS: &[&dyn Command] = &[
 /// Pull the global flags out of `args` and apply them:
 /// - color (`--color <auto|always|never>`, `--color=<...>`, `--no-color`)
 ///   to the diagnostic renderer;
+/// - the diagnostic format (`--error-format human|json`) via
+///   [`set_error_format`];
 /// - the run options (`--trace*`, `--max-*`, `--progress-sec`,
 ///   `--no-cache`, `--cache-dir`) — armed once, before any command runs
 ///   (see [`RunOptions`]).
@@ -843,6 +907,18 @@ pub fn apply_global_args(
             } else {
                 1
             };
+        } else if a == "--error-format" || a.starts_with("--error-format=") {
+            let v = flag_value(args, &mut i, a, "--error-format");
+            set_error_format(match v.as_str() {
+                "human" => ErrorFormat::Human,
+                "json" => ErrorFormat::Json,
+                _ => {
+                    eprintln!(
+                        "error: invalid value '{v}' for '--error-format' (expected human|json)"
+                    );
+                    std::process::exit(2);
+                }
+            });
         } else if a == "--trace" || a == "--trace=scheduler" {
             ro.trace_scheduler = true;
             i += 1;

@@ -52,7 +52,7 @@ impl Command for Deps {
             failed = true;
         }
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            super::emit_diags(mgr.diags(), mgr.db());
             failed = true;
         }
         if failed {
