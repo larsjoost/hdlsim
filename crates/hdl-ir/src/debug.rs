@@ -24,10 +24,18 @@ pub static TRACE_OVERLOAD: AtomicBool = AtomicBool::new(false);
 /// their bounds and source location.
 pub static TRACE_GENRANGE: AtomicBool = AtomicBool::new(false);
 
+/// `--trace-lower`: log static-attribute dimension resolution
+/// (`'length(d)`-family) — which dims source answered (signal constraint /
+/// object dims / type dims / type info) — and the population of `sig_dims`
+/// from an object's own inline constraint. The lower-side half of the
+/// diagnosis trail; `hdlsim ir --dump-maps` is the static half.
+pub static TRACE_LOWER: AtomicBool = AtomicBool::new(false);
+
 /// Set any subset of the trace flags in one call (`true` = on).
-pub fn set_traces(ce: bool, ce_all: bool, overload: bool, genrange: bool) {
+pub fn set_traces(ce: bool, ce_all: bool, overload: bool, genrange: bool, lower: bool) {
     TRACE_CE.store(ce, Ordering::Relaxed);
     TRACE_CE_ALL.store(ce_all, Ordering::Relaxed);
     TRACE_OVERLOAD.store(overload, Ordering::Relaxed);
     TRACE_GENRANGE.store(genrange, Ordering::Relaxed);
+    TRACE_LOWER.store(lower, Ordering::Relaxed);
 }
