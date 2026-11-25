@@ -99,9 +99,11 @@ impl Command for DoCmd {
         if sim.map(|s| s.failures()).unwrap_or(0) > 0 {
             return Ok(1);
         }
-        Ok(sim
-            .and_then(|s| s.finish_status())
-            .map_or(0, |c| (c & 0xFF) as i32))
+        let finish_exit = sim.and_then(|s| s.finish_status());
+        if finish_exit.is_some() {
+            super::mark_design_finish_exit();
+        }
+        Ok(finish_exit.map_or(0, |c| (c & 0xFF) as i32))
     }
 }
 
