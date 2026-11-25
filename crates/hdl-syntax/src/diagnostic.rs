@@ -224,6 +224,66 @@ impl Diagnostic {
         }
         out
     }
+
+    /// Machine-readable rendering (one JSON object, no trailing newline) for
+    /// agents and scripts that consume diagnostics programmatically
+    /// (`--error-format json`): every field is stable and typed —
+    /// `{"code":"E0301","severity":"error","message":"...","file":"t.v",
+    ///    "line":2,"column":4,"byte_start":12,"byte_end":17,"help":null}`.
+    /// Location fields are `null` for file-level diagnostics. Color is never
+    /// emitted. Rendering never fails: any input string is escaped.
+    pub fn render_json(&self, db: &SourceDb) -> String {
+        let mut out = String::from("{\"code\":");
+        json_str(&mut out, self.code);
+        out.push_str(",\"severity\":");
+        json_str(&mut out, self.severity.name());
+        out.push_str(",\"message\":");
+        json_str(&mut out, &self.message);
+        match self.span {
+            Some(span) => {
+                let file = db.file(span.file);
+                let (line, col) = file.line_col(span.start);
+                out.push_str(",\"file\":");
+                json_str(&mut out, file.name());
+                let _ = write!(
+                    out,
+                    ",\"line\":{line},\"column\":{col},\"byte_start\":{},\"byte_end\":{}",
+                    span.start, span.end
+                );
+            }
+            None => {
+                out.push_str(
+                    ",\"file\":null,\"line\":null,\"column\":null,\"byte_start\":null,\"byte_end\":null"
+                );
+            }
+        }
+        out.push_str(",\"help\":");
+        match &self.help {
+            Some(h) => json_str(&mut out, h),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
+}
+
+/// Append `s` as a quoted, escaped JSON string.
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 fn w_str(out: &mut Vec<u8>, s: &str) {
@@ -470,6 +530,29 @@ impl Diagnostics {
         }
         out
     }
+
+    /// Machine-readable rendering of the whole list: one JSON object per
+    /// diagnostic ([`Diagnostic::render_json`]), newline-separated — JSON
+    /// Lines, so a consumer can parse stderr line by line. No human summary
+    /// footer: a consumer counts severities itself. Empty list renders as an
+    /// empty string, like [`Diagnostics::render_all_with`].
+    pub fn render_all_json(&self, db: &SourceDb) -> String {
+        let mut out = self
+            .items
+            .iter()
+            .map(|d| d.render_json(db))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        // Same capture contract as `render_all_with`: the `--report` bundle
+        // embeds the exact rendered output, whatever the armed format is.
+        if let Some(cap) = CAPTURE.lock().unwrap().as_mut() {
+            cap.push_str(&out);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -590,6 +673,49 @@ mod tests {
         );
         // Empty diagnostics still render as an empty string.
         assert_eq!(Diagnostics::new().render_all_with(&db, false), "");
+    }
+
+    #[test]
+    fn render_json_emits_stable_fields() {
+        let mut db = SourceDb::new();
+        db.add_file("t.v", "module m;\n  wire x\nendmodule\n")
+            .unwrap();
+        let d = Diagnostic::error(
+            "E0001",
+            Some(Span::new(FileId(0), 13, 16)),
+            "missing semicolon",
+        )
+        .with_help("add `;` here");
+        assert_eq!(
+            d.render_json(&db),
+            r#"{"code":"E0001","severity":"error","message":"missing semicolon","file":"t.v","line":2,"column":4,"byte_start":13,"byte_end":16,"help":"add `;` here"}"#
+        );
+    }
+
+    #[test]
+    fn render_json_nulls_without_span_and_escapes() {
+        let db = SourceDb::new();
+        let d = Diagnostic::warning("W0001", None, "trailing \"ws\"\n\tline");
+        assert_eq!(
+            d.render_json(&db),
+            r#"{"code":"W0001","severity":"warning","message":"trailing \"ws\"\n\tline","file":null,"line":null,"column":null,"byte_start":null,"byte_end":null,"help":null}"#
+        );
+    }
+
+    #[test]
+    fn render_all_json_is_json_lines() {
+        let mut db = SourceDb::new();
+        db.add_file("t.v", "module m;\nendmodule\n").unwrap();
+        let mut ds = Diagnostics::new();
+        ds.push(Diagnostic::error("E0001", None, "e1"));
+        ds.push(Diagnostic::warning("W0001", None, "w1"));
+        let out = ds.render_all_json(&db);
+        let lines: Vec<&str> = out.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with(r#"{"code":"E0001","severity":"error""#));
+        assert!(lines[1].starts_with(r#"{"code":"W0001","severity":"warning""#));
+        assert!(out.ends_with('\n'));
+        assert_eq!(Diagnostics::new().render_all_json(&db), "");
     }
 
     #[test]

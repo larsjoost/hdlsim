@@ -1,6 +1,6 @@
 //! `hdlsim run` — compile (with libraries) and simulate one design.
 
-use super::{build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
+use super::{build_manager, emit_diags, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -176,7 +176,7 @@ impl Command for Run {
         mgr.compile_files(&mut design, &files);
         compile_phase.done(format!("{} modules", design.modules.len()));
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
             return Ok(1);
         }
         if crate::phase::over_mem_limit("compile") {
@@ -200,7 +200,7 @@ impl Command for Run {
             return Ok(1);
         }
         if !mgr.diags().is_empty() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
         }
         if mgr.diags().has_errors() {
             // On-demand resolution compiles dependencies during elaboration;

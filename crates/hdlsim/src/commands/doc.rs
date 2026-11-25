@@ -53,7 +53,7 @@ impl Command for Doc {
         let mut design = Design::default();
         mgr.compile_files(&mut design, &files);
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            super::emit_diags(mgr.diags(), mgr.db());
             return Ok(1);
         }
         let all_files = mgr.compiled_files();

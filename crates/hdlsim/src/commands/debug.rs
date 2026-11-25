@@ -4,7 +4,7 @@
 //! Also usable as a library: `hdl_sim::debug::Watcher` is an `Observer` you can
 //! attach to any `Simulator` in your own tooling.
 
-use super::{build_manager, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
+use super::{build_manager, emit_diags, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -96,7 +96,7 @@ impl Command for Debug {
         mgr.compile_files(&mut design, &files);
         compile_phase.done(format!("{} modules", design.modules.len()));
         if mgr.diags().has_errors() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
             return Ok(1);
         }
         let elab_phase = crate::phase::Phase::start("elaborate");
@@ -109,7 +109,7 @@ impl Command for Debug {
             flat.assigns.len()
         ));
         if !mgr.diags().is_empty() {
-            eprint!("{}", mgr.diags().render_all(mgr.db()));
+            emit_diags(mgr.diags(), mgr.db());
         }
         // Refuse runaway allocations with the top-allocator report instead
         // of aborting inside the first big `vec![…]`.

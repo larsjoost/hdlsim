@@ -60,7 +60,7 @@ impl Command for Ir {
         compile_phase.done(format!("{} modules", design.modules.len()));
         let diags = mgr.diags();
         if !diags.is_empty() {
-            eprint!("{}", diags.render_all(mgr.db()));
+            super::emit_diags(diags, mgr.db());
         }
         if diags.has_errors() {
             println!("hdlsim ir: {} error(s)", diags.items.len());
