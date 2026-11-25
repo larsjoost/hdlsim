@@ -4009,13 +4009,17 @@ fn ce_stmt(
             }
         }
         Stmt::If { cond, then, els } => match ev(cond, slots).and_then(|v| v.to_u64()) {
-            Some(0) => {
+            // An unknown condition is not TRUE: VHDL runs the sequence only
+            // on TRUE (LRM 1076 §10.8) and Verilog takes the else branch on
+            // x/z (IEEE 1800 §4.1) — the runtime behaves the same, and the
+            // loop arms already terminate on an unknown condition, so
+            // const-eval mirrors that instead of aborting the fold.
+            Some(0) | None => {
                 if let Some(els) = els {
                     ce_stmt(els, slots, env, funcs, extras, flow);
                 }
             }
             Some(_) => ce_stmt(then, slots, env, funcs, extras, flow),
-            None => *flow = CeFlow::Abort,
         },
         Stmt::Assign { lhs, rhs, .. } => {
             let v = ev(rhs, slots);
