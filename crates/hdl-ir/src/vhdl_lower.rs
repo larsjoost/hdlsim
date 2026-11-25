@@ -1573,6 +1573,11 @@ struct Lower<'a> {
     /// `x` characters X-poison the value and kill `'length` downstream. Set
     /// around initializer lowering only (see `string_typed`).
     str_ctx: bool,
+    /// Generic names currently bound to no value (a required formal with no
+    /// default and no override): constant initializers referencing them are
+    /// constant per instance, so their bare-context fold failure warns
+    /// misleadingly and is skipped instead.
+    unset_generics: std::collections::HashSet<String>,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -1681,6 +1686,7 @@ impl<'a> Lower<'a> {
             cur_entity: String::new(),
             cur_scope: String::new(),
             str_ctx: false,
+            unset_generics: std::collections::HashSet::new(),
             prot_types: HashMap::new(),
             prot_body_ctx: None,
             sig_prot: HashMap::new(),
@@ -3207,6 +3213,13 @@ impl<'a> Lower<'a> {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
+                if !val.is_known() {
+                    // Insert-only marker: instance contexts re-lower the same
+                    // generic with a known value, and the suppression check
+                    // gates on the const being unknown right now, so stale
+                    // entries from other contexts stay harmless.
+                    self.unset_generics.insert(key.clone());
+                }
                 let status = if val.is_known() { "ok" } else { "unset" };
                 self.dump_const(n, "generic", d.span(), status, &val);
                 if let Some(tn) = &rec_ty {
@@ -4126,6 +4139,13 @@ impl<'a> Lower<'a> {
             Rc::make_mut(&mut self.consts)
                 .entry(key.clone())
                 .or_insert_with(|| prm.default.clone());
+            // Mirror the unset-generic marker (see `lower_generic_decls`):
+            // this path restores the entity's generics into a fresh Lower
+            // for an out-of-file architecture, so without it the constant
+            // initializer suppression never sees the unbound formals.
+            if self.consts.get(&key).is_some_and(|v| !v.is_known()) {
+                self.unset_generics.insert(key.clone());
+            }
             if let Some(ty) = &prm.ty {
                 self.const_types.entry(key).or_insert_with(|| ty.clone());
             }
@@ -5097,10 +5117,30 @@ impl<'a> Lower<'a> {
                 // Keep the name bound to X (e.g. a generic with no default is
                 // not constant at analysis time) so uses resolve instead of
                 // cascading into unknown-identifier errors.
-                self.warn(
-                    d.span(),
-                    "constant initializer is not constant; treated as X",
-                );
+                // An initializer that references an unbound formal generic is
+                // constant per instance (the generic map rebinds it), so the
+                // bare-context fold failure is not a warning — established
+                // simulators evaluate these at elaboration and stay silent.
+                let on_unset_generic = init
+                    .descendants()
+                    .filter(|n| matches!(n.kind(), SyntaxKind::Name | SyntaxKind::Ident))
+                    .any(|n| {
+                        let t = self.text(&n).to_ascii_lowercase();
+                        // Selected names (`pkg.G_SIZE`) match on their last
+                        // segment; the currently-unknown gate keeps stale
+                        // markers from other contexts harmless.
+                        let last = t.rsplit('.').next().unwrap_or(&t);
+                        [t.as_str(), last].iter().any(|cand| {
+                            self.unset_generics.contains(*cand)
+                                && matches!(self.consts.get(*cand), Some(v) if !v.is_known())
+                        })
+                    });
+                if !on_unset_generic {
+                    self.warn(
+                        d.span(),
+                        "constant initializer is not constant; treated as X",
+                    );
+                }
                 for n in &names {
                     Rc::make_mut(&mut self.consts)
                         .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
