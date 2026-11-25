@@ -14,6 +14,15 @@ use std::process::Command;
 /// Default issue repository (override with `HDLSIM_ISSUE_REPO=owner/repo`).
 const DEFAULT_REPO: &str = "larsjoost/hdlsim";
 
+/// `str::floor_char_boundary` without the MSRV jump (stable since 1.91;
+/// the workspace targets 1.85): greatest char boundary ≤ `i`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub struct ReportRequest {
     pub message: String,
     pub dry_run: bool,
@@ -66,7 +75,7 @@ pub fn extract_report_args(args: &[String]) -> (Vec<String>, Option<ReportReques
 /// Tiny base64 (standard alphabet) encoder — avoids a new dependency.
 fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -192,7 +201,7 @@ fn compose_issue(
     const OUTPUT_CAP: usize = 16_000;
     let mut shown = output.trim_end().to_string();
     if shown.len() > OUTPUT_CAP {
-        let cut = shown.floor_char_boundary(OUTPUT_CAP);
+        let cut = floor_char_boundary(&shown, OUTPUT_CAP);
         shown = format!(
             "{}\n... [truncated {} bytes; full output in the bundle's OUTPUT.txt]",
             &shown[..cut],
@@ -227,7 +236,7 @@ fn compose_issue(
                     None => s.push_str(&format!("- `{c}`\n")),
                 }
             }
-            s.push_str("\n");
+            s.push('\n');
             s
         }
     };
@@ -293,7 +302,7 @@ pub fn maybe_file_issue(req: &ReportRequest, original_args: &[String], exit_code
     if !output.is_empty() {
         // Keep the full (untruncated) output inside the bundle.
         let capped = if output.len() > 1_000_000 {
-            output[..output.floor_char_boundary(1_000_000)].to_string()
+            output[..floor_char_boundary(&output, 1_000_000)].to_string()
         } else {
             output.clone()
         };

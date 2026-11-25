@@ -39,7 +39,7 @@ impl Command for Wave {
             Some(p) => p.clone(),
             None => input.with_extension("html"),
         };
-        let bytes = std::fs::read(&input)
+        let bytes = std::fs::read(input)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {}", input.display(), e))?;
         let (flat, events) = match input.extension().and_then(|e| e.to_str()) {
             Some("fst") => hdl_wave::fst::read_fst(&bytes).map_err(anyhow::Error::msg)?,

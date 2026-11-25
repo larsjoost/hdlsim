@@ -690,10 +690,10 @@ fn decode_records(
             vec![ch]
         } else if vli & 1 == 0 {
             // binary-packed: byte j holds chars 8j..8j+7, first char = bit 7
-            let nbytes = (width + 7) / 8;
+            let nbytes = width.div_ceil(8);
             let bytes = c.take(nbytes)?;
             (0..width)
-                .map(|j| (((bytes[j / 8] >> (7 - (j % 8))) & 1) as u8) | b'0')
+                .map(|j| ((bytes[j / 8] >> (7 - (j % 8))) & 1) | b'0')
                 .collect()
         } else {
             c.take(width)?.to_vec()
@@ -722,8 +722,8 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
     // Endian test: the 8 bytes of the f64 constant e = 2.718... in native
     // order; we read doubles little-endian iff the file wrote them so.
     let endian = c.take(8)?;
-    let double_le = endian == 2.7182818284590452354f64.to_le_bytes();
-    let double_be = endian == 2.7182818284590452354f64.to_be_bytes();
+    let double_le = endian == std::f64::consts::E.to_le_bytes();
+    let double_be = endian == std::f64::consts::E.to_be_bytes();
     if !double_le && !double_be {
         return Err("fst: bad endian test word".to_string());
     }
@@ -806,10 +806,11 @@ pub fn read_fst(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
     let nhandles = maxhandle as usize;
     let mut by_handle: Vec<Option<&HierVar>> = vec![None; nhandles.max(1)];
     for v in &hier_vars {
-        if v.handle >= 1 && (v.handle as usize) <= by_handle.len() {
-            if by_handle[v.handle as usize - 1].is_none() {
-                by_handle[v.handle as usize - 1] = Some(v);
-            }
+        if v.handle >= 1
+            && (v.handle as usize) <= by_handle.len()
+            && by_handle[v.handle as usize - 1].is_none()
+        {
+            by_handle[v.handle as usize - 1] = Some(v);
         }
     }
     let width_of = |h: usize| -> usize {

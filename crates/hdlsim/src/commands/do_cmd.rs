@@ -104,7 +104,7 @@ impl Command for DoCmd {
         if finish_exit.is_some() {
             super::mark_design_finish_exit();
         }
-        Ok(finish_exit.map_or(0, |c| (c & 0xFF) as i32))
+        Ok(finish_exit.map_or(0, |c| c & 0xFF))
     }
 }
 

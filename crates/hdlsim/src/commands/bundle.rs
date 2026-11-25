@@ -200,7 +200,7 @@ pub fn build_bundle_entries(
         utc_now(),
         env!("CARGO_PKG_VERSION"),
         argv.join(" "),
-        top.unwrap_or("<none>").to_string(),
+        top.unwrap_or("<none>"),
         if label.is_empty() {
             "hdlsim failed or produced wrong results on this project".to_string()
         } else {
@@ -310,7 +310,7 @@ fn walk_files(
     for p in children {
         if p.is_dir() {
             // Never pack VCS dirs, build output or caches.
-            if p.file_name().map_or(false, |n| {
+            if p.file_name().is_some_and(|n| {
                 let n = n.to_string_lossy();
                 n.starts_with('.') || matches!(n.as_ref(), "target" | "node_modules")
             }) {

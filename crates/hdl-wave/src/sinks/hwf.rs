@@ -329,8 +329,10 @@ mod tests {
         assert!(read_hwf(b"NOPE....").is_err());
         let f = flat();
         let mut buf: Vec<u8> = Vec::new();
-        let sink = HwfSink::new(&mut buf, &f);
-        drop(sink);
+        // HwfSink writes a header on construction; it does not implement
+        // Drop, so no end tag is written and the trailing byte below makes
+        // the read fail.
+        let _sink = HwfSink::new(&mut buf, &f);
         buf.push(9); // trailing byte -> error (no end tag written either)
         assert!(read_hwf(&buf).is_err());
         let _ = VX;

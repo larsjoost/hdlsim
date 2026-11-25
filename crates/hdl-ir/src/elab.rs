@@ -193,7 +193,7 @@ pub fn elaborate_with_opts(
         match try_elaborate(design, top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
             Err(ElabError::UnknownUnit { name, .. }) => {
-                if tried.iter().any(|t| *t == name) {
+                if tried.contains(&name) {
                     return Err(ElabError::Message(format!(
                         "dependency cycle involving '{}'",
                         name
@@ -489,6 +489,9 @@ impl Flat {
 
     /// Instantiate one module. `conns` are the parent's port connections.
     /// Returns the signal map (module sig id → flat sig id) for this instance.
+    // Elaboration threading: design + parent scope + per-kind connection
+    // lists; a params struct would just relocate the same fields.
+    #[allow(clippy::too_many_arguments)]
     fn instantiate(
         &mut self,
         design: &Design,
@@ -797,7 +800,7 @@ fn conn_for<'a>(conns: &'a [Conn], ports: &[PortIr], i: usize) -> Option<&'a Exp
     for c in conns {
         match c {
             Conn::Named(n, e) => {
-                if ports.get(i).map_or(false, |p| p.name == *n) {
+                if ports.get(i).is_some_and(|p| p.name == *n) {
                     return Some(e);
                 }
             }
@@ -862,7 +865,7 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
         Expr::Signed(e) => Expr::Signed(Box::new(remap_expr(e, map))),
         Expr::SigAttr { sig, attr } => Expr::SigAttr {
             sig: map[*sig as usize],
-            attr: *attr,
+            attr,
         },
         Expr::Sel { e, msb, lsb } => Expr::Sel {
             e: Box::new(remap_expr(e, map)),

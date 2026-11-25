@@ -15,6 +15,8 @@ pass/fail. This file is the map; follow it instead of rediscovering it.
   lowering + core CLI semantics, see `.cargo/config.toml`); run it after
   every change, full `cargo test` before opening a PR.
 - `cargo fmt --check` must pass — run `cargo fmt` before committing.
+- `cargo clippy --all-targets -- -D warnings` must pass (CI gate, zero
+  findings) — run `cargo clippy --fix` and fix the rest before opening a PR.
 
 ## Workflow (required)
 

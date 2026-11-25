@@ -676,11 +676,11 @@ fn stmt_has_sva(s: &Stmt) -> bool {
         Stmt::Spanned { inner, .. } => stmt_has_sva(inner),
         Stmt::Block(ss) => ss.iter().any(stmt_has_sva),
         Stmt::If { then, els, .. } => {
-            stmt_has_sva(then) || els.as_ref().map_or(false, |e| stmt_has_sva(e))
+            stmt_has_sva(then) || els.as_ref().is_some_and(|e| stmt_has_sva(e))
         }
         Stmt::Case { items, default, .. } => {
             items.iter().any(|(_, b)| stmt_has_sva(b))
-                || default.as_ref().map_or(false, |d| stmt_has_sva(d))
+                || default.as_ref().is_some_and(|d| stmt_has_sva(d))
         }
         Stmt::Assign { .. } | Stmt::AssignDelayed { .. } | Stmt::Return(_) => false,
         Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
@@ -1117,8 +1117,8 @@ impl<'a> Encoder<'a> {
             for (s, v) in results {
                 let w = self.width(s);
                 let bits = resize_bits(&self.b, &v, w);
-                for i in 0..w {
-                    let eq = self.b.eq_lit(self.lits[0][s as usize][i], bits[i]);
+                for (i, &bit) in bits.iter().enumerate().take(w) {
+                    let eq = self.b.eq_lit(self.lits[0][s as usize][i], bit);
                     self.b.clause(&[eq]);
                 }
             }
@@ -1157,8 +1157,8 @@ impl<'a> Encoder<'a> {
                 written.insert(s);
                 let w = self.width(s);
                 let bits = resize_bits(&self.b, &v, w);
-                for i in 0..w {
-                    let eq = self.b.eq_lit(self.lits[t + 1][s as usize][i], bits[i]);
+                for (i, &bit) in bits.iter().enumerate().take(w) {
+                    let eq = self.b.eq_lit(self.lits[t + 1][s as usize][i], bit);
                     self.b.clause(&[eq]);
                 }
             }
@@ -1456,6 +1456,9 @@ impl<'e, 'a> Exec<'e, 'a> {
     /// Merge two branch states under condition `c`: written keys become
     /// c ? then-value : else-value; unwritten keys keep the base value.
     /// Merges both the blocking env and the NBA env.
+    // BMC state threading: the two envs and their NBA twins; a params
+    // struct would just relocate the same fields.
+    #[allow(clippy::too_many_arguments)]
     fn merge_envs(
         &mut self,
         c: Lit,
@@ -1832,9 +1835,7 @@ impl<'e, 'a> Exec<'e, 'a> {
                 bits: vec![self.enc.b.false_lit()],
                 signed: false,
             }),
-            Expr::Prev(_) => {
-                return Err("prove: 'last_value (Prev) unsupported".to_string());
-            }
+            Expr::Prev(_) => Err("prove: 'last_value (Prev) unsupported".to_string()),
             Expr::ToInt(e) => {
                 let v = self.eval(e)?;
                 let b = &self.enc.b;
@@ -1904,7 +1905,7 @@ impl<'e, 'a> Exec<'e, 'a> {
                     let bits = resize_bits(&self.enc.b, av, w);
                     locals.insert(i as u32, bits);
                 }
-                let saved_locals = std::mem::replace(&mut self.locals, Some(locals));
+                let saved_locals = self.locals.replace(locals);
                 let saved_env = std::mem::take(&mut self.env);
                 let saved_nba = std::mem::take(&mut self.nba_env);
                 let r = self.exec_stmt(&f.body);
@@ -2075,14 +2076,7 @@ fn const_binop(op: BinOp, a: &[bool], b: &[bool], w: usize, signed: bool) -> Opt
         BinOp::Add => to_u(a).wrapping_add(to_u(b)),
         BinOp::Sub => to_u(a).wrapping_sub(to_u(b)),
         BinOp::Mul => to_u(a).wrapping_mul(to_u(b)),
-        BinOp::Div => {
-            let (x, y) = (to_u(a), to_u(b));
-            if y == 0 {
-                0
-            } else {
-                x / y
-            }
-        }
+        BinOp::Div => to_u(a).checked_div(to_u(b)).unwrap_or(0),
         BinOp::Mod => {
             let (x, y) = (to_u(a), to_u(b));
             if y == 0 {
@@ -2193,7 +2187,7 @@ fn sig_root(e: &Expr) -> Result<FlatSigId, String> {
 fn expr_has_dash(e: &Expr) -> bool {
     match e {
         Expr::SigAttr { .. } => false,
-        Expr::Lit(v) => v.bits.iter().any(|&b| b == hdl_ir::value::VDASH),
+        Expr::Lit(v) => v.bits.contains(&hdl_ir::value::VDASH),
         Expr::Bin { l, r, .. } => expr_has_dash(l) || expr_has_dash(r),
         Expr::Un { e, .. } => expr_has_dash(e),
         Expr::Cond { c, t, e } => expr_has_dash(c) || expr_has_dash(t) || expr_has_dash(e),

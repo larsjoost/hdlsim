@@ -44,7 +44,7 @@ pub enum ProjectFormat {
 }
 
 impl ProjectFormat {
-    pub fn from_str(s: &str) -> Result<ProjectFormat, String> {
+    pub fn parse(s: &str) -> Result<ProjectFormat, String> {
         match s {
             "vivado" => Ok(ProjectFormat::Vivado),
             "json" | "manifest" => Ok(ProjectFormat::Json),
@@ -85,7 +85,7 @@ fn library_of(spec: &ProjectSpec, file: &Path) -> String {
         if let Ok(cdir) = std::fs::canonicalize(dir) {
             if canon.starts_with(&cdir) {
                 let l = cdir.as_os_str().len();
-                if best.map_or(true, |(bl, _)| l > bl) {
+                if best.is_none_or(|(bl, _)| l > bl) {
                     best = Some((l, name));
                 }
             }
@@ -376,14 +376,11 @@ mod tests {
     #[test]
     fn format_parsing() {
         assert_eq!(
-            ProjectFormat::from_str("vivado").unwrap(),
+            ProjectFormat::parse("vivado").unwrap(),
             ProjectFormat::Vivado
         );
-        assert_eq!(
-            ProjectFormat::from_str("json").unwrap(),
-            ProjectFormat::Json
-        );
-        assert!(ProjectFormat::from_str("quartus").is_err());
+        assert_eq!(ProjectFormat::parse("json").unwrap(), ProjectFormat::Json);
+        assert!(ProjectFormat::parse("quartus").is_err());
         assert_eq!(ProjectFormat::Vivado.extension(), "tcl");
     }
 }

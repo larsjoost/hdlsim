@@ -2,7 +2,7 @@
 //! (overlapping, pre-NBA sample) and `|=>` (next edge), immediate `assert`
 //! statements, and assume/cover stubs. A failed assertion must exit 1.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn hdlsim() -> Command {
@@ -17,7 +17,7 @@ fn tmp(name: &str, content: &str) -> PathBuf {
     p
 }
 
-fn run(f: &PathBuf) -> std::process::Output {
+fn run(f: &Path) -> std::process::Output {
     hdlsim()
         .args(["run", "--top", "tb", f.to_str().unwrap()])
         .output()

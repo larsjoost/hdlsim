@@ -46,6 +46,10 @@ use std::path::{Path, PathBuf};
 /// by the CLI — environment variables have no spell check.
 static PROGRESS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Scanned candidates for one unit, grouped as (declaration files, body
+/// files) in scan order — bodies must lower after their declaration.
+type UnitCandidates = HashMap<String, (Vec<(usize, PathBuf)>, Vec<(usize, PathBuf)>)>;
+
 /// Arm the compile watchdog heartbeat. Library users call this instead of
 /// setting an environment variable; the CLI maps `--progress-sec` here.
 pub fn set_progress_interval(d: std::time::Duration) {
@@ -167,7 +171,7 @@ pub struct LibraryManager {
     entity_maps_by_dir: HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
     /// Per-file lower-side object dims (constant/generic name → array
     /// dims [(low, size), …]), retained for `--dump-maps` diagnosis dumps.
-    file_obj_dims: Vec<(PathBuf, HashMap<String, Vec<(i64, usize)>>)>,
+    file_obj_dims: Vec<(PathBuf, hdl_ir::vhdl_lower::ObjDims)>,
     /// `use`d library units that failed to resolve while compiling a file:
     /// (unit name, resolve error). Warned about at the end of `compile_files`
     /// if still unresolved (a later explicit file may still provide them).
@@ -247,7 +251,7 @@ impl LibraryManager {
     /// `target`, `node_modules` and `.hdlsim-cache` are skipped.
     pub fn add_search_root(&mut self, p: impl Into<PathBuf>) {
         let p = p.into();
-        if !self.search_roots.iter().any(|r| *r == p) {
+        if !self.search_roots.contains(&p) {
             self.search_roots.push(p);
         }
     }
@@ -306,7 +310,7 @@ impl LibraryManager {
 
     /// Per-file lower-side object dims (constant/generic name → array dims)
     /// retained during compilation; consumed by `hdlsim ir --dump-maps`.
-    pub fn file_obj_dims(&self) -> &[(PathBuf, HashMap<String, Vec<(i64, usize)>>)] {
+    pub fn file_obj_dims(&self) -> &[(PathBuf, hdl_ir::vhdl_lower::ObjDims)] {
         &self.file_obj_dims
     }
 
@@ -547,8 +551,7 @@ impl LibraryManager {
             .collect();
         // Declaration files first: candidates are compiled in order, and a
         // package body must be lowered after its declaration is registered.
-        let mut grouped: HashMap<String, (Vec<(usize, PathBuf)>, Vec<(usize, PathBuf)>)> =
-            HashMap::new();
+        let mut grouped: UnitCandidates = HashMap::new();
         for (i, unit, file, is_body) in scanned {
             let e = grouped.entry(unit.to_ascii_lowercase()).or_default();
             if is_body {
@@ -591,8 +594,7 @@ impl LibraryManager {
         // Declarations first per unit: candidates are compiled in order, and
         // a package body must be lowered after its declaration is registered
         // (same invariant as `full_scan_dir_providers`).
-        let mut grouped: HashMap<String, (Vec<(usize, PathBuf)>, Vec<(usize, PathBuf)>)> =
-            HashMap::new();
+        let mut grouped: UnitCandidates = HashMap::new();
         for (unit, file, is_body) in scanned {
             let e = grouped.entry(unit.to_ascii_lowercase()).or_default();
             if is_body {
@@ -1436,6 +1438,11 @@ fn store_parse(
 /// Compile one source file into `design` (preprocess → parse → lower), using
 /// the persistent parse cache when `cache` is Some. The cache key is the hash
 /// of the text that was actually parsed (post-preprocessor for Verilog).
+// One file's lower-and-register step threads every accumulator the
+// library manager keeps (entity roots/maps by name and by dir, module
+// slots, obj dims, module sources, the Verilog scope); grouping them
+// into a struct is the follow-up if this grows again.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_one(
     path: &Path,
     text: &str,
@@ -1449,7 +1456,7 @@ pub fn compile_one(
     entity_roots: &mut HashMap<String, hdl_syntax::cst::SyntaxNode>,
     entity_maps: &mut HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
     entity_maps_by_dir: &mut HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
-    file_obj_dims: &mut Vec<(PathBuf, HashMap<String, Vec<(i64, usize)>>)>,
+    file_obj_dims: &mut Vec<(PathBuf, hdl_ir::vhdl_lower::ObjDims)>,
     entity_module_by_dir: &mut HashMap<(String, String), usize>,
     entity_module_by_stem: &mut HashMap<(String, String, String), usize>,
     module_source: &mut HashMap<usize, PathBuf>,

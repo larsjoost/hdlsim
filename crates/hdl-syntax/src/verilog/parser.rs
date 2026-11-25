@@ -430,10 +430,8 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("endmodule") {
             // Optional label: `endmodule : name`.
-            if self.eat_punct(':') {
-                if self.peek().kind == TokenKind::Ident {
-                    self.bump();
-                }
+            if self.eat_punct(':') && self.peek().kind == TokenKind::Ident {
+                self.bump();
             }
         } else {
             self.error_here("expected `endmodule`");
@@ -780,9 +778,8 @@ impl<'a> Parser<'a> {
         while self.at_punct(':') && self.peek2_text() == ":" {
             self.bump();
             self.bump();
-            if self.at_punct('*') {
-                self.bump();
-            } else if self.peek().kind == TokenKind::Ident {
+            // Either `*` or the loop variable name: both are skipped.
+            if self.at_punct('*') || self.peek().kind == TokenKind::Ident {
                 self.bump();
             }
         }
@@ -1248,7 +1245,7 @@ impl<'a> Parser<'a> {
     fn parse_function(&mut self) {
         self.builder.start_node(SyntaxKind::Function);
         self.bump(); // function
-        if self.eat_kw("automatic") {}
+        self.eat_kw("automatic");
         if self.at_kw("void") {
             self.bump();
         } else {
@@ -1494,8 +1491,8 @@ impl<'a> Parser<'a> {
         if is_union {
             // keyword already consumed; `packed`/`signed` may follow either way
         }
-        if self.eat_kw("packed") {}
-        if self.eat_kw("signed") {}
+        self.eat_kw("packed");
+        self.eat_kw("signed");
         self.expect_punct('{', "to open the struct body");
         loop {
             if self.at_punct('}') || self.peek().kind == TokenKind::Eof {
@@ -1615,12 +1612,10 @@ impl<'a> Parser<'a> {
     fn parse_gen_block(&mut self) {
         self.builder.start_node(SyntaxKind::GenBlock);
         self.bump(); // begin
-        if self.eat_punct(':') {
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
-            }
+        if self.eat_punct(':') && self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
         }
         while !self.at_kw("end")
             && !self.at_kw("endgenerate")
@@ -1865,12 +1860,10 @@ impl<'a> Parser<'a> {
                 self.builder.start_node(SyntaxKind::Block);
                 self.bump();
                 // Optional `: name`.
-                if self.eat_punct(':') {
-                    if self.peek().kind == TokenKind::Ident {
-                        self.builder.start_node(SyntaxKind::Name);
-                        self.bump();
-                        self.builder.finish_node();
-                    }
+                if self.eat_punct(':') && self.peek().kind == TokenKind::Ident {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    self.builder.finish_node();
                 }
                 while !self.at_kw("end") && self.peek().kind != TokenKind::Eof {
                     self.parse_statement();
@@ -1985,12 +1978,10 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if text == "fork" => {
                 self.builder.start_node(SyntaxKind::ForkJoin);
                 self.bump(); // fork
-                if self.eat_punct(':') {
-                    if self.peek().kind == TokenKind::Ident {
-                        self.builder.start_node(SyntaxKind::Name);
-                        self.bump();
-                        self.builder.finish_node();
-                    }
+                if self.eat_punct(':') && self.peek().kind == TokenKind::Ident {
+                    self.builder.start_node(SyntaxKind::Name);
+                    self.bump();
+                    self.builder.finish_node();
                 }
                 while !self.at_kw("join")
                     && !self.at_kw("join_any")
@@ -2698,9 +2689,8 @@ impl<'a> Parser<'a> {
                     } else if self.at_punct(':') && self.peek2_text() == ":" {
                         self.bump();
                         self.bump();
-                        if self.at_punct('*') {
-                            self.bump();
-                        } else if self.peek().kind == TokenKind::Ident {
+                        // Either `*` or the loop variable name: both are skipped.
+                        if self.at_punct('*') || self.peek().kind == TokenKind::Ident {
                             self.bump();
                         } else {
                             break;
@@ -2932,7 +2922,7 @@ endmodule
         let inner = &sexp[plus..];
         assert!(inner
             .find("(BinExpr")
-            .map_or(false, |p2| inner[p2..].contains("Literal \"3\"") || true));
+            .is_some_and(|p2| inner[p2..].contains("Literal \"3\"") || true));
         assert!(
             sexp.contains("(BinExpr (Literal \"1\"") || sexp.contains("(BinExpr"),
             "{}",

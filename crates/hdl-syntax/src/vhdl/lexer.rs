@@ -205,7 +205,7 @@ impl<'a> Lexer<'a> {
                         && !self
                             .text
                             .get(self.pos.wrapping_sub(1))
-                            .map_or(false, |&p| is_ident_continue(p))
+                            .is_some_and(|&p| is_ident_continue(p))
                     {
                         self.emit(TokenKind::Ident, 1);
                         self.string();
@@ -362,7 +362,7 @@ impl<'a> Lexer<'a> {
             return;
         }
         let mut real = false;
-        if self.peek(0) == Some(b'.') && self.peek(1).map_or(false, |c| c.is_ascii_digit()) {
+        if self.peek(0) == Some(b'.') && self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
             real = true;
             self.pos += 1;
             while self.pos < self.text.len()

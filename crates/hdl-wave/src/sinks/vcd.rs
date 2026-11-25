@@ -24,8 +24,7 @@ pub struct VcdSink<W: Write> {
 impl<W: Write> VcdSink<W> {
     pub fn new(w: W, flat: &Flat) -> VcdSink<W> {
         let mut ids = Vec::with_capacity(flat.signals.len());
-        let mut next = 0usize;
-        for _ in 0..flat.signals.len() {
+        for next in 0..flat.signals.len() {
             // VCD id codes: printable ASCII 33..126, then multi-char.
             let mut code = String::new();
             let mut n = next;
@@ -37,7 +36,6 @@ impl<W: Write> VcdSink<W> {
                 }
             }
             ids.push(code);
-            next += 1;
         }
         VcdSink {
             w,
@@ -58,9 +56,7 @@ impl<W: Write> VcdSink<W> {
         // Scope tree.
         let mut scope_stack: Vec<u32> = Vec::new();
         for (id, scope) in flat.scopes.iter().enumerate() {
-            while scope_stack.len() > 1
-                && scope.parent != scope_stack.get(scope_stack.len() - 1).copied()
-            {
+            while scope_stack.len() > 1 && scope.parent != scope_stack.last().copied() {
                 let _ = writeln!(self.w, "$upscope $end");
                 scope_stack.pop();
             }

@@ -44,6 +44,12 @@ pub struct Server {
     pub exit_requested: bool,
 }
 
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Server {
     pub fn new() -> Server {
         Server {
@@ -174,10 +180,10 @@ impl Server {
                     .unwrap_or(0) as u32;
                 let result = match uri.and_then(|u| self.docs.get(u).map(|t| (u, t))) {
                     Some((uri, text)) => {
-                        let off = position_to_offset(&text, line, character)
+                        let off = position_to_offset(text, line, character)
                             .unwrap_or(0)
                             .min(text.len().saturating_sub(1) as u32);
-                        match uri_to_path(uri).and_then(|p| parse_root(&p, &text)) {
+                        match uri_to_path(uri).and_then(|p| parse_root(&p, text)) {
                             Some((db, root, _diags)) => {
                                 if is_hover {
                                     match hover_at(&db, &root, off) {
@@ -192,7 +198,7 @@ impl Server {
                                     }
                                 } else {
                                     match definition_at(&db, &root, off) {
-                                        Some(span) => location_json(uri, &text, span),
+                                        Some(span) => location_json(uri, text, span),
                                         None => Json::Null,
                                     }
                                 }
@@ -406,13 +412,10 @@ fn percent_decode(s: &str) -> String {
                     continue;
                 }
             };
-            match u8::from_str_radix(hex, 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-                Err(_) => {}
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
             }
         }
         out.push(bytes[i]);

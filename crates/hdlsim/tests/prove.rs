@@ -2,7 +2,7 @@
 //! CDCL solver): safe designs exit 0, violated properties exit 1 with a
 //! counterexample trace, unsupported constructs are clean errors (exit 2).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn hdlsim() -> Command {
@@ -17,7 +17,7 @@ fn tmp(name: &str, content: &str) -> PathBuf {
     p
 }
 
-fn prove(f: &PathBuf, top: &str, bmc: usize) -> std::process::Output {
+fn prove(f: &Path, top: &str, bmc: usize) -> std::process::Output {
     hdlsim()
         .args([
             "prove",

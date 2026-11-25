@@ -62,7 +62,6 @@ fn report_dry_run_prints_issue_without_uploading() {
             .split("reproducer bundle:")
             .nth(1)
             .unwrap()
-            .trim()
             .split_whitespace()
             .next()
             .unwrap(),

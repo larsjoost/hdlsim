@@ -40,6 +40,12 @@ pub struct Interp {
 /// Callback for non-builtin commands: receives the expanded argument words.
 pub type Cmd<'a> = dyn FnMut(&mut Interp, &[String]) -> Result<Flow, String> + 'a;
 
+impl Default for Interp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Interp {
     pub fn new() -> Interp {
         Interp {
@@ -190,7 +196,7 @@ impl Interp {
             }
             "quit" | "exit" => {
                 let all = self.expand_slice(rest)?;
-                let code = match all.get(0) {
+                let code = match all.first() {
                     Some(v) => v.parse().map_err(|_| "quit: bad exit code")?,
                     None => 0,
                 };
@@ -690,9 +696,8 @@ mod tests {
         let mut it = Interp::new();
         let flow = it
             .eval(script, &mut |_i, args| {
-                Ok(Flow::Continue).map(|f| {
+                Ok(Flow::Continue).inspect(|_f| {
                     let _ = args;
-                    f
                 })
             })
             .unwrap();

@@ -119,40 +119,37 @@ impl Transcript {
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {
         let color = hdl_syntax::diagnostic::color_enabled();
-        match ev {
-            SimEvent::Message { text, span, .. } => {
-                // Colorize severity-ish message lines ($error/$fatal/assert
-                // failures, warnings); plain $display output stays uncolored.
-                // Those same lines get a `file:line:` prefix when the kernel
-                // attached the emitting statement's span.
-                let t = text.trim_start();
-                let failureish = t.starts_with("error")
-                    || t.starts_with("fatal")
-                    || t.contains("assertion failed")
-                    || t.starts_with("warning");
-                let text = if failureish {
-                    format!("{}{}", Self::loc(&self.db, *span), text)
-                } else {
-                    text.clone()
-                };
-                let painted = if t.starts_with("error")
-                    || t.starts_with("fatal")
-                    || t.contains("assertion failed")
-                {
-                    hdl_syntax::diagnostic::paint(color, "1;31", &text)
-                } else if t.starts_with("warning") {
-                    hdl_syntax::diagnostic::paint(color, "1;33", &text)
-                } else {
-                    text
-                };
-                print!("{}", painted);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-            // TestFailed is not printed here: its text also arrives as a
-            // Message (colorized above) — printing both would duplicate it.
-            _ => {}
+        if let SimEvent::Message { text, span, .. } = ev {
+            // Colorize severity-ish message lines ($error/$fatal/assert
+            // failures, warnings); plain $display output stays uncolored.
+            // Those same lines get a `file:line:` prefix when the kernel
+            // attached the emitting statement's span.
+            let t = text.trim_start();
+            let failureish = t.starts_with("error")
+                || t.starts_with("fatal")
+                || t.contains("assertion failed")
+                || t.starts_with("warning");
+            let text = if failureish {
+                format!("{}{}", Self::loc(&self.db, *span), text)
+            } else {
+                text.clone()
+            };
+            let painted = if t.starts_with("error")
+                || t.starts_with("fatal")
+                || t.contains("assertion failed")
+            {
+                hdl_syntax::diagnostic::paint(color, "1;31", &text)
+            } else if t.starts_with("warning") {
+                hdl_syntax::diagnostic::paint(color, "1;33", &text)
+            } else {
+                text
+            };
+            print!("{}", painted);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
         }
+        // TestFailed is not printed here: its text also arrives as a
+        // Message (colorized above) — printing both would duplicate it.
     }
 }
 
@@ -447,7 +444,7 @@ impl Command for Run {
             // The tb chose this exit code — main must not print the
             // issue-reporting hint for it.
             super::mark_design_finish_exit();
-            return Ok((status & 0xFF) as i32);
+            return Ok(status & 0xFF);
         }
         if let Some(bus) = &live_bus {
             // End the SSE streams (they drain their backlog first), but keep

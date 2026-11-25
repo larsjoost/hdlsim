@@ -57,8 +57,8 @@ struct Parser<'a> {
     builder: TreeBuilder,
     diags: Vec<Diagnostic>,
     /// >0 while parsing a waveform value, where `when`/`else` belongs to the
-    /// waveform (conditional signal assignment), not to a conditional
-    /// expression.
+    /// > waveform (conditional signal assignment), not to a conditional
+    /// > expression.
     in_waveform: u32,
 }
 
@@ -2182,9 +2182,11 @@ impl<'a> Parser<'a> {
     fn assoc_is_named(&self) -> bool {
         let mut i = self.skip_trivia_from(self.pos);
         // The formal may also be an operator symbol: `"<"(a => b, ...)`.
-        if self.tokens.get(i).map_or(false, |t| {
-            matches!(t.kind, TokenKind::Ident | TokenKind::StrLiteral)
-        }) {
+        if self
+            .tokens
+            .get(i)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Ident | TokenKind::StrLiteral))
+        {
             i = self.skip_trivia_from(i + 1);
             // Skip `(...)` / `[...]` suffixes and `.name` selects.
             loop {
@@ -2216,7 +2218,7 @@ impl<'a> Parser<'a> {
                     if self
                         .tokens
                         .get(i)
-                        .map_or(false, |t| t.kind == TokenKind::Ident)
+                        .is_some_and(|t| t.kind == TokenKind::Ident)
                     {
                         i = self.skip_trivia_from(i + 1);
                     } else {
@@ -2315,10 +2317,8 @@ impl<'a> Parser<'a> {
         if self.eat_kw("report") {
             self.parse_expression();
         }
-        if self.eat_kw("severity") {
-            if self.peek().kind == TokenKind::Ident {
-                self.bump();
-            }
+        if self.eat_kw("severity") && self.peek().kind == TokenKind::Ident {
+            self.bump();
         }
         self.expect_punct(';', "to end the assert statement");
         self.builder.finish_node();
@@ -2939,10 +2939,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binops(&mut self, mark: crate::cst::Mark, min_prec: u8) {
-        loop {
-            let Some(op) = self.current_binop() else {
-                break;
-            };
+        while let Some(op) = self.current_binop() {
             let Some((prec, right_assoc)) = binop_prec(&op) else {
                 break;
             };

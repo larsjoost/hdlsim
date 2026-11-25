@@ -121,7 +121,7 @@ impl Command for Check {
             let _ = elab::elaborate_with_opts(&mut design, t, &mut mgr, false);
             slowest.push((t0.elapsed(), t.clone()));
         }
-        slowest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        slowest.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
         slowest.truncate(5);
         elab_phase.done(format!(
             "{} tops; slowest: {}",
