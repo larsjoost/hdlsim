@@ -1,0 +1,9 @@
+# Repo-local cargo aliases.
+#
+# `cargo smoke` runs the fast regression subset — the loop to run after
+# every change (attribute/port/generic lowering + core CLI semantics, all
+# groups together well under a minute). The `corpus` tests are #[ignore]d
+# (they compile thousands of third-party sources, ~minutes); the release CI
+# corpus job runs them via `cargo test --test corpus -- --ignored`.
+[alias]
+smoke = "test -p hdlsim --test vhdl_len_dim --test vhdl_fn_slot_rec --test vhdl_deep_chain --test vhdl_unconport --test vhdl_genpkg --test ir_dump --test exit_code --test mixed --test golden --test regress --test oob --test mem_guard --test vhdl_r19 --test vhdl_r20"
