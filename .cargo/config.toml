@@ -6,4 +6,4 @@
 # (they compile thousands of third-party sources, ~minutes); the release CI
 # corpus job runs them via `cargo test --test corpus -- --ignored`.
 [alias]
-smoke = "test -p hdlsim --test vhdl_len_dim --test vhdl_fn_slot_rec --test vhdl_deep_chain --test vhdl_unconport --test vhdl_genpkg --test ir_dump --test trace_lower --test exit_code --test mixed --test golden --test regress --test oob --test mem_guard --test vhdl_r19 --test vhdl_r20"
+smoke = "test -p hdlsim --test vhdl_len_dim --test vhdl_fn_slot_rec --test vhdl_deep_chain --test vhdl_unconport --test vhdl_genpkg --test ir_dump --test trace_lower --test exit_code --test mixed --test golden --test regress --test oob --test mem_guard --test vhdl_r19 --test vhdl_r20 --test coding_standards"
