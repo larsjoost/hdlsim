@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 mod dims;
+mod dump;
 mod expr;
 
 /// Lower one parsed VHDL file into modules (entities with their architectures
@@ -1563,6 +1564,9 @@ struct Lower<'a> {
     pending_funcs: Vec<FuncIr>,
     /// Entity currently being lowered (variant override matching).
     cur_entity: String,
+    /// Scope label for `--dump-consts` records: the package name, or the
+    /// `entity` / `entity/arch` module currently being lowered.
+    cur_scope: String,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -1669,6 +1673,7 @@ impl<'a> Lower<'a> {
             attr_decls: std::collections::HashSet::new(),
             variant: None,
             cur_entity: String::new(),
+            cur_scope: String::new(),
             prot_types: HashMap::new(),
             prot_body_ctx: None,
             sig_prot: HashMap::new(),
@@ -2903,6 +2908,7 @@ impl<'a> Lower<'a> {
         };
         self.names.clear();
         self.cur_entity = module.name.to_ascii_lowercase();
+        self.cur_scope = module.name.clone();
         // Snapshot scope so the entity declarative part's constants/types can
         // be exported to the entity's architectures (SigMaps).
         let consts_before: std::collections::HashSet<String> =
@@ -3156,6 +3162,8 @@ impl<'a> Lower<'a> {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
+                let status = if val.is_known() { "ok" } else { "unset" };
+                self.dump_const(n, "generic", d.span(), status, &val);
                 if let Some(tn) = &rec_ty {
                     self.const_types.insert(key.clone(), tn.clone());
                 }
@@ -3576,6 +3584,7 @@ impl<'a> Lower<'a> {
         // is …` and `package body NAME is …` both yield NAME (a naive nth(1)
         // would return "body" for package bodies).
         let name = package_decl_name(p, self.db);
+        self.cur_scope = name.to_ascii_lowercase();
         let kids0 = real_children(p);
         // A package body sees the package declaration's items, even when the
         // declaration lives in another file compiled earlier: merge the
@@ -4052,6 +4061,7 @@ impl<'a> Lower<'a> {
             .unwrap_or_default();
         let mut module_owned = modules[midx].clone();
         module_owned.name = format!("{disp}/{arch_name}");
+        self.cur_scope = module_owned.name.clone();
         let module = &mut module_owned;
         self.names = module
             .signals
@@ -5028,6 +5038,8 @@ impl<'a> Lower<'a> {
                         Some(&init),
                         &v,
                     );
+                    let status = if v.is_known() { "ok" } else { "x" };
+                    self.dump_const(n, "constant", d.span(), status, &v);
                 }
             }
             None => {
@@ -5041,6 +5053,7 @@ impl<'a> Lower<'a> {
                 for n in &names {
                     Rc::make_mut(&mut self.consts)
                         .insert(n.to_ascii_lowercase(), Value::x(width.max(1)));
+                    self.dump_const(n, "constant", d.span(), "unfolded", &Value::x(width.max(1)));
                 }
             }
         }
@@ -5150,6 +5163,8 @@ impl<'a> Lower<'a> {
             Some(v) => {
                 for n in &names {
                     Rc::make_mut(&mut self.consts).insert(n.to_ascii_lowercase(), v.clone());
+                    let status = if v.is_known() { "ok" } else { "x" };
+                    self.dump_const(n, "local", d.span(), status, &v);
                 }
             }
             None => {
@@ -5171,6 +5186,7 @@ impl<'a> Lower<'a> {
                     // default width silently — the real value is computed per
                     // call.
                     pending.push((id, ex.clone()));
+                    self.dump_const(n, "local", d.span(), "dynamic", &Value::x(width.max(1)));
                 }
             }
         }
