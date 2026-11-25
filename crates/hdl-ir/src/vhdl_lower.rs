@@ -2196,7 +2196,23 @@ impl<'a> Lower<'a> {
                 let w = bits_for(lits.len());
                 (w, false, None, false)
             }
-            TypeInfo::Array { elem, depth, .. } => (elem, false, Some(depth), false),
+            TypeInfo::Array {
+                elem, depth, dims, ..
+            } => {
+                // A constrained array type mark (`array (field_id) of
+                // field_t`) covers every element of its own dims: the flat
+                // width is elem × ∏ sizes, not the bare element width —
+                // otherwise objects of the type collapse to one element and
+                // named-choice/OTHERS aggregates cannot re-size them.
+                // Unconstrained marks (empty dims) keep the element width;
+                // the object's own constraint sizes those.
+                let w = if dims.is_empty() {
+                    elem
+                } else {
+                    elem.max(1) * dims.iter().map(|(_, n)| (*n).max(1)).product::<usize>()
+                };
+                (w, false, Some(depth), false)
+            }
             TypeInfo::Record { fields } => (
                 fields.iter().map(|f| f.1).sum::<usize>().max(1),
                 false,
@@ -2204,6 +2220,25 @@ impl<'a> Lower<'a> {
                 false,
             ),
             TypeInfo::Handle => (64, false, None, false),
+        }
+    }
+
+    /// Row width for a memory-backed object (`mem` set): `resolve_type`
+    /// returns an array type mark's full flat width, but a memory stores
+    /// `depth` rows of element width, so the slot must stay one row.
+    fn mem_row_width(&self, tm: Option<&SyntaxNode>, width: usize) -> usize {
+        let Some(tm) = tm else {
+            return width;
+        };
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match self.types.get(&tn) {
+            Some(TypeInfo::Array { elem, .. }) => (*elem).max(1),
+            _ => width,
         }
     }
 
@@ -3268,6 +3303,7 @@ impl<'a> Lower<'a> {
                 Some(tm) => self.resolve_type(tm, constraint.as_ref(), span),
                 None => (1, false, None, false),
             };
+            let width = self.mem_row_width(type_mark.as_ref(), width);
             let dir = match mode.as_str() {
                 "out" | "buffer" => Dir::Out,
                 "inout" => Dir::Inout,
@@ -4775,6 +4811,7 @@ impl<'a> Lower<'a> {
             Some(tm) => self.resolve_type(tm, constraint, span),
             None => (1, false, None, false),
         };
+        let width = self.mem_row_width(type_mark, width);
         let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
             let ex = self.lower_expr(&e, &self.consts.clone());
