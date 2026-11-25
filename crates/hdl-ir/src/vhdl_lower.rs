@@ -5518,20 +5518,33 @@ impl<'a> Lower<'a> {
                             // (constrained subtypes carry their sizes in
                             // dims and need no extra factor).
                             let ftn = self.kw(tm);
-                            let w =
-                                match self.types.get(&ftn) {
-                                    Some(TypeInfo::Array { dims, .. })
-                                        if dims.is_empty() && constraint.is_some() =>
-                                    {
-                                        w.max(1)
-                                            * self
-                                                .constraint_width(constraint.expect(
+                            let w = match self.types.get(&ftn) {
+                                Some(TypeInfo::Array { dims, .. })
+                                    if dims.is_empty() && constraint.is_some() =>
+                                {
+                                    w.max(1)
+                                        * self
+                                            .constraint_width(
+                                                constraint.expect(
                                                     "match guard checked constraint.is_some()",
-                                                ))
-                                                .max(1)
-                                    }
-                                    _ => w,
-                                };
+                                                ),
+                                            )
+                                            .max(1)
+                                }
+                                // Constrained array type mark
+                                // (`fields : fields_t` where `fields_t is
+                                // array (field_id) of field_t`): resolve_type
+                                // returns the element width, but the field's
+                                // flat slice must cover every element of the
+                                // type's own dims — otherwise the field
+                                // aggregates to one element and chain selects
+                                // past index 0 fold to X.
+                                Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
+                                    w.max(1)
+                                        * dims.iter().map(|(_, n)| (*n).max(1)).product::<usize>()
+                                }
+                                _ => w,
+                            };
                             let fty = self.kw(tm);
                             for n in names {
                                 self.rec_field_ty
