@@ -1014,6 +1014,18 @@ impl UnitResolver for LibraryManager {
         }
         if cands.is_empty() {
             cands = self.search_project(&lname);
+        } else {
+            // The stem index keys raw file stems: a sibling architecture file
+            // (`foo_rtl.vhd` for `foo_entity.vhd`) never matches the unit name,
+            // so a stem-index hit alone would re-lower the variant entity
+            // without its architectures (an empty module). Merge the unit-name
+            // search index — extra candidates are skipped by the unit check
+            // below, and the entity file itself comes from `module_source`.
+            for p in self.search_project(&lname) {
+                if !cands.contains(&p) {
+                    cands.push(p);
+                }
+            }
         }
         // Classify the candidates: the entity's declaration file plus the
         // sibling files holding its architectures (this codebase splits
@@ -1082,10 +1094,21 @@ impl UnitResolver for LibraryManager {
         let eparsed = hdl_syntax::vhdl::parser::parse_file(eid, self.db.file(eid));
         let mut arch_roots: Vec<hdl_syntax::cst::SyntaxNode> = Vec::new();
         let edir = epath.parent();
+        // Canonicalized directory of the entity file: CLI paths ("tb.vhd") and
+        // search results ("./tb.vhd") yield different raw parents ("" vs "."),
+        // which would wrongly fail the sibling check below.
+        let edir_c = std::fs::canonicalize(&epath)
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| edir.map(|d| d.to_path_buf()));
         for (apath, atext) in arch_files {
             // Sibling files only: a same-named entity in another directory
             // must not bind its architectures to this one.
-            if apath.parent() != edir {
+            let adir = std::fs::canonicalize(&apath)
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .or_else(|| apath.parent().map(|d| d.to_path_buf()));
+            if adir != edir_c {
                 continue;
             }
             let Ok(aid) = self.db.add_file(apath.display().to_string(), atext) else {

@@ -3703,7 +3703,24 @@ fn ce_impl(
             }
         }
         Expr::Signed(e) => ce_impl(e, env, funcs, extras, slots.as_deref_mut()),
-        Expr::SigAttr { .. } => None, // width only known after port connection
+        Expr::SigAttr { sig, attr } => {
+            // Function-local slots share the id space with flat signals; a
+            // formal's `sig'length` / `'range` inside a const-evaluated
+            // function body reads the bound value's width (same rule as the
+            // runtime kernel). Signals proper stay unevaluated here — the
+            // runtime resolves them after elaboration.
+            let s = *sig as usize;
+            let w = slots
+                .as_deref()
+                .and_then(|l| l.get(s))
+                .map(|v| v.width().max(1))?;
+            let v = match *attr {
+                "length" => w,
+                "high" | "left" => w.saturating_sub(1),
+                _ => 0, // low | right
+            };
+            Some(Value::from_u64(32, v as u64))
+        }
         Expr::Call { name, args } => {
             // System functions usable in constant expressions.
             // lower_expr strips the `$` from system tasks, so both spellings.
@@ -3711,6 +3728,25 @@ fn ce_impl(
                 let v = ce_impl(&args[0], env, funcs, extras, slots.as_deref_mut())?;
                 let n = v.to_u64()?;
                 return Some(Value::from_u64(32, (64 - n.leading_zeros()).max(1) as u64));
+            }
+            // `$const_idx(val, i, w)`: element `i` (MSB-first) of a flat array
+            // value with element width `w` — array-constant indexing
+            // (`C_VERSION(0)`, `const_arr(i).field`) and record-internal array
+            // reads lower to this call. Same semantics as the simulator's
+            // eval_call arm.
+            if name == "$const_idx" && args.len() == 3 {
+                let v = ce_impl(&args[0], env, funcs, extras, slots.as_deref_mut())?;
+                let a = ce_impl(&args[1], env, funcs, extras, slots.as_deref_mut())?
+                    .to_u64()? as usize;
+                let w = ce_impl(&args[2], env, funcs, extras, slots.as_deref_mut())?
+                    .to_u64()?
+                    .max(1) as usize;
+                let total = v.width();
+                return Some(if total >= (a + 1) * w && a * w < total {
+                    v.slice(total - 1 - a * w, total - (a + 1) * w)
+                } else {
+                    Value::x(w)
+                });
             }
             // VHDL `type'val(x)` / `type'pos(x)` — numeric identity (the 'val
             // result width is applied by a Resize at the lower site).

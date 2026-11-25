@@ -121,6 +121,19 @@ pub struct PackageIr {
     /// Typed constants `(name, type mark)` — exported so `pkg_const.field`
     /// (record-typed constant select) resolves in files that `use` the package.
     pub const_tys: Vec<(String, String)>,
+    /// Subtype widths `(name, width)` — `resolve_type` falls back to this for
+    /// vector subtypes; without it a subtype imported from a package (`use
+    /// lib.p.subtype_t;` or `.all`) resolves to width 1. Exported for the same
+    /// cross-file reason as `const_tys`.
+    pub type_widths: Vec<(String, usize)>,
+    /// Vector-subtype constrained ranges `(name, [(low, size), …])` —
+    /// crosses files with [`PackageIr::type_widths`].
+    pub type_dims: Vec<(String, Vec<(i64, usize)>)>,
+    /// Array-typed constant dims `(name, [(low, size), …])` from the
+    /// constant's decl constraint — lets `'length(d)`/`'high(d)` on an
+    /// imported multidimensional constant fold in files that `use` the
+    /// package (per-file `obj_dims` maps don't cross files).
+    pub const_dims: Vec<(String, Vec<(i64, usize)>)>,
     /// The package's own declaration node and the design-file root that
     /// declared it — retained so a package instantiation can re-lower the
     /// generic package with the `generic map` values as overrides.
@@ -496,6 +509,9 @@ pub fn lower_file(
                         sig_types: Vec::new(),
                         sig_widths: Vec::new(),
                         const_tys: Vec::new(),
+                        const_dims: Vec::new(),
+                        type_widths: Vec::new(),
+                        type_dims: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
                         uses,
@@ -1297,6 +1313,48 @@ pub struct ProtType {
     pub inits: Vec<(String, Expr)>,
 }
 
+/// One step of a folded selected-name chain: a record field select (`.f`)
+/// or an index group (`(i)` / `(i, j)`). The parser folds `a.b(i).c` into
+/// nested Name/Call nodes; `flatten_selected_name` recovers the order.
+#[derive(Debug)]
+enum ChainSeg {
+    Field(String),
+    Index(Vec<SyntaxNode>),
+}
+
+/// Linearize a multi-dimensional index group against per-dimension
+/// `(low, size)` bounds: `(i-lo0)*n1*n2 + (j-lo1)*n2 + (k-lo2)`. Same
+/// formula as `lower_call`'s signal-array path and
+/// `lower_const_array_index`.
+fn flatten_dims(
+    args: &[SyntaxNode],
+    dims: &[(i64, usize)],
+    env: &HashMap<String, Value>,
+    lx: &mut Lower,
+) -> Expr {
+    let mut flat: Option<Expr> = None;
+    for (arg, (lo, n)) in args.iter().zip(dims.iter()) {
+        let a = Expr::Bin {
+            op: BinOp::Sub,
+            l: Box::new(lx.lower_expr(arg, env)),
+            r: Box::new(Expr::Lit(Value::from_u64(32, *lo as u64))),
+        };
+        flat = Some(match flat {
+            None => a,
+            Some(f) => Expr::Bin {
+                op: BinOp::Add,
+                l: Box::new(Expr::Bin {
+                    op: BinOp::Mul,
+                    l: Box::new(f),
+                    r: Box::new(Expr::Lit(Value::from_u64(32, *n as u64))),
+                }),
+                r: Box::new(a),
+            },
+        });
+    }
+    flat.unwrap_or_else(|| Expr::Lit(Value::from_u64(32, 0)))
+}
+
 struct Lower<'a> {
     db: &'a SourceDb,
     diags: &'a mut Vec<Diagnostic>,
@@ -1327,6 +1385,10 @@ struct Lower<'a> {
     /// Subtype name -> constrained width, so `signal x : my_subtype` (no
     /// constraint at the use site) keeps the subtype's width.
     type_widths: HashMap<String, usize>,
+    /// Subtype name -> constrained range [(low, size), …] for vector
+    /// subtypes, so aggregates and `'range`/`'length` see the subtype's
+    /// bounds (Array subtypes carry theirs in `TypeInfo::Array.dims`).
+    type_dims: HashMap<String, Vec<(i64, usize)>>,
     /// Signal/variable name → signal id in the current module.
     names: HashMap<String, SigId>,
     /// Signal id → memory depth (for `name'range` loops over arrays).
@@ -1335,6 +1397,11 @@ struct Lower<'a> {
     sig_signed: HashMap<SigId, bool>,
     /// Signal id → record type name (for `sig.field` selects), if record-typed.
     sig_rec: HashMap<SigId, String>,
+    /// (record type, field name) → effective element dims [(low, size), …]
+    /// for fields whose type is an unconstrained array with a decl-site
+    /// constraint (`leaves : leaf_vec_t(0 to 3)`) — the chain walker needs
+    /// the low bound to flatten indexes over the field's slice.
+    rec_field_dims: HashMap<(String, String), Vec<(i64, usize)>>,
     /// Package-level signal / shared variable name → type mark, so that
     /// `name.field` (record field) and `name.method(...)` (protected type)
     /// resolve when lowering package bodies.
@@ -1348,6 +1415,16 @@ struct Lower<'a> {
     sig_width: HashMap<SigId, usize>,
     /// Signal id → array dimensions [(low, size), …] (for `m(i, j)` flat index).
     sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
+    /// Constant/generic name → array dimensions [(low, size), …] from its
+    /// decl constraint, default, or aggregate actual — lets `'length(d)` /
+    /// `'high(d)` fold on multidimensional constants and generics (the
+    /// object constraint is not part of the type mark, so `types` alone
+    /// only knows the unconstrained base's dims).
+    obj_dims: HashMap<String, Vec<(i64, usize)>>,
+    /// Signal id → (low bound, ascending?) of a vector's own index
+    /// constraint — ascending ranges (`0 to N-1`) address flat bits
+    /// mirrored (element k = value bit W-1-k), so slices must remap.
+    sig_asc: HashMap<SigId, (i64, bool)>,
     /// Access type name → designated type name, so `p.field` on an
     /// access-to-record lowers as an implicit `.all` dereference.
     access_inner: HashMap<String, String>,
@@ -1386,6 +1463,12 @@ struct Lower<'a> {
     /// specifications: actuals name signals of the enclosing architecture,
     /// which are not in scope design-wide, so E0401s are suppressed.
     suppress_err: u32,
+    /// Depth of function-body lowering. Inside a body, `names` holds exactly
+    /// the formals/locals (slot map), so a formal must shadow an outer
+    /// constant that reached the lowering env snapshot (an architecture
+    /// constant `C_DATA` colliding with a formal `C_DATA` resolves to the
+    /// formal — LRM 10.3 inner visibility).
+    fn_scope: usize,
     /// All packages visible while lowering this file (library packages from
     /// other files plus same-file ones), keyed by lowercased unit name —
     /// backs `use lib.pkg...;` inside declarative parts and package
@@ -1456,6 +1539,7 @@ pub struct SigMaps {
     sig_elem_rec: HashMap<SigId, String>,
     sig_width: HashMap<SigId, usize>,
     sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
+    sig_asc: HashMap<SigId, (i64, bool)>,
     uncon_ports: std::collections::HashSet<SigId>,
     /// Constants and types declared in the entity's declarative part — an
     /// architecture sees them (the entity's declarative region encompasses
@@ -1482,6 +1566,7 @@ impl<'a> Lower<'a> {
             funcs_ce: HashMap::new(),
             types: HashMap::new(),
             type_widths: HashMap::new(),
+            type_dims: HashMap::new(),
             names: HashMap::new(),
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
@@ -1491,6 +1576,9 @@ impl<'a> Lower<'a> {
             sig_elem_rec: HashMap::new(),
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
+            obj_dims: HashMap::new(),
+            sig_asc: HashMap::new(),
+            rec_field_dims: HashMap::new(),
             access_inner: HashMap::new(),
             rec_field_ty: HashMap::new(),
             phys_units: HashMap::new(),
@@ -1502,6 +1590,7 @@ impl<'a> Lower<'a> {
             aliases: HashMap::new(),
             alias_rec: HashMap::new(),
             suppress_err: 0,
+            fn_scope: 0,
             pkgs: HashMap::new(),
             cfgs: HashMap::new(),
             file_root: None,
@@ -1533,6 +1622,7 @@ impl<'a> Lower<'a> {
             sig_elem_rec: self.sig_elem_rec.clone(),
             sig_width: self.sig_width.clone(),
             sig_dims: self.sig_dims.clone(),
+            sig_asc: self.sig_asc.clone(),
             uncon_ports: self.uncon_ports.clone(),
             consts: self.entity_consts.clone(),
             types: self.entity_types.clone(),
@@ -1552,6 +1642,7 @@ impl<'a> Lower<'a> {
         self.sig_elem_rec.clear();
         self.sig_width.clear();
         self.sig_dims.clear();
+        self.sig_asc.clear();
         self.uncon_ports.clear();
     }
 
@@ -1577,6 +1668,7 @@ impl<'a> Lower<'a> {
         self.sig_elem_rec = m.sig_elem_rec;
         self.sig_width = m.sig_width;
         self.sig_dims = m.sig_dims;
+        self.sig_asc = m.sig_asc;
         self.uncon_ports = m.uncon_ports;
         for (k, v) in m.consts {
             Rc::make_mut(&mut self.consts).entry(k).or_insert(v);
@@ -2106,6 +2198,26 @@ impl<'a> Lower<'a> {
     }
 
     /// Dimensions of an array constraint: [(low, size), …] per index range.
+    /// Direction of a vector's own index constraint (`(0 to N-1)` vs
+    /// `(N-1 downto 0)`) — the flat bit order of ascending vectors is
+    /// mirrored, so slices on them must remap (see the `PartSelect` arm).
+    fn constraint_ascending(&self, c: &SyntaxNode) -> Option<bool> {
+        let kids = real_children(c);
+        let r = kids
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Range)
+            .unwrap_or(c);
+        let dir = real_children(r)
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))?;
+        match dir.as_str() {
+            "downto" => Some(false),
+            "to" => Some(true),
+            _ => None,
+        }
+    }
+
     fn constraint_dims(&mut self, c: &SyntaxNode) -> Vec<(i64, usize)> {
         let kids = real_children(c);
         let subs: Vec<SyntaxNode> = kids
@@ -2181,6 +2293,26 @@ impl<'a> Lower<'a> {
         dims
     }
 
+    /// Shape of a positional aggregate: element count per nesting level
+    /// (`((1,2,3),(4,5,6))` → `[(0, 2), (0, 3)]`). Low bounds are unknown
+    /// for unconstrained bases — 0 is enough for `'length(d)`-style
+    /// attributes, which only need the sizes.
+    fn aggregate_dims(&self, agg: &SyntaxNode) -> Vec<(i64, usize)> {
+        let elems: Vec<SyntaxNode> = real_children(agg)
+            .into_iter()
+            .filter(|k| is_expr_node(k.kind()))
+            .collect();
+        let n = elems.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut dims = vec![(0i64, n)];
+        if let Some(first) = elems.iter().find(|k| k.kind() == SyntaxKind::Aggregate) {
+            dims.extend(self.aggregate_dims(first));
+        }
+        dims
+    }
+
     /// Materialize a record/array-typed constant as a hidden signal holding
     /// its value, so runtime selection works: `c(i)`, `c(i).field`, `c.field`
     /// on a constant lower to Idx/Sel over `__const_<name>`.
@@ -2218,18 +2350,29 @@ impl<'a> Lower<'a> {
                     dims,
                     elem_name,
                 } => {
+                    // An unconstrained array type carries its declaration
+                    // depth (1 for `array (natural range <>)`); the folded
+                    // VALUE knows the real element count — derive the depth
+                    // from the value so `c(i)` for every folded element
+                    // resolves (a 1-word memory X-fills the rest).
+                    let elem = elem.max(1);
+                    let depth = if dims.is_empty() && depth <= 1 {
+                        (val.width() / elem).max(1)
+                    } else {
+                        depth.max(1)
+                    };
                     let id = module.signals.len() as SigId;
                     module.signals.push(SignalIr {
                         name: hidden.clone(),
-                        width: elem.max(1),
+                        width: elem,
                         kind: SigKind::Wire,
                         init: Some(val),
-                        mem: Some(depth.max(1)),
+                        mem: Some(depth),
                         signed: false,
                     });
                     self.names.insert(hidden, id);
-                    self.mems.insert(id, depth.max(1));
-                    self.sig_width.insert(id, elem.max(1));
+                    self.mems.insert(id, depth);
+                    self.sig_width.insert(id, elem);
                     if !dims.is_empty() {
                         self.sig_dims.insert(id, dims);
                     }
@@ -2331,6 +2474,14 @@ impl<'a> Lower<'a> {
             }
         }
         None
+    }
+
+    /// Resolve a name to a flat signal id, falling back to the hidden signal
+    /// a materialized constant lowers to (`c_arr` → `__const_c_arr`): array
+    /// attributes on constants (`c'range`, `c'length`) index that signal.
+    fn object_id(&self, name: &str) -> Option<SigId> {
+        self.sig_id(name)
+            .or_else(|| self.names.get(&format!("__const_{}", name.to_ascii_lowercase())).copied())
     }
 
     /// Xilinx implicit globals (`GSR`/`GRESTORE`/`GTS` from the auto-instantiated
@@ -2457,6 +2608,253 @@ impl<'a> Lower<'a> {
             }
         }
         None
+    }
+
+    /// Flatten a folded selected-name chain (`a.b(i).c`) into the root name
+    /// (the first identifier) and the ordered segments after it. The parser
+    /// folds the chain into nested Name/Call nodes: dotted segments stay
+    /// flat in one Name, an index introduces a Call, and every `.field`
+    /// after a Call wraps an outer Name.
+    fn flatten_selected_name(&self, e: &SyntaxNode, segs: &mut Vec<ChainSeg>) -> String {
+        let mut root = String::new();
+        for k in real_children(e) {
+            match k.kind() {
+                SyntaxKind::Ident => {
+                    if root.is_empty() && segs.is_empty() {
+                        root = self.kw(&k);
+                    } else {
+                        segs.push(ChainSeg::Field(self.kw(&k)));
+                    }
+                }
+                SyntaxKind::Name => {
+                    root = self.flatten_selected_name(&k, segs);
+                }
+                SyntaxKind::Call => {
+                    let ck: Vec<SyntaxNode> = real_children(&k);
+                    // The callee base is the first Name child; the index
+                    // arguments are the remaining expression children.
+                    let base_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+                    if let Some(bp) = base_pos {
+                        root = self.flatten_selected_name(&ck[bp], segs);
+                    }
+                    let args: Vec<SyntaxNode> = ck
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, c)| Some(*i) != base_pos && is_expr_node(c.kind()))
+                        .map(|(_, c)| c.clone())
+                        .collect();
+                    if !args.is_empty() {
+                        segs.push(ChainSeg::Index(args));
+                    }
+                }
+                _ => {}
+            }
+        }
+        root
+    }
+
+    /// Structural lowering of a selected-name chain rooted at a signal,
+    /// constant, or alias: walk the segments, applying record field selects
+    /// (slices of the flat record vector) and array element reads. Arrays
+    /// inside records (and constant arrays) read as `$const_idx` over the
+    /// flat value; whole signal arrays keep the kernel's memory `Idx`.
+    /// Returns `None` when the chain does not resolve this way — the caller
+    /// falls back to the legacy per-shape handling.
+    fn lower_selected_chain(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Option<Expr> {
+        let mut segs: Vec<ChainSeg> = Vec::new();
+        let root = self.flatten_selected_name(e, &mut segs);
+        if root.is_empty() || segs.is_empty() {
+            return None;
+        }
+        // Resolve the root. Function names are not chains (a call's own
+        // lowering handles them); leave those to `lower_call`.
+        let root_lc = root.to_ascii_lowercase();
+        if self.funcs.contains_key(&root_lc) {
+            return None;
+        }
+        // A constant root with a known type folds from its VALUE: constant
+        // initializers (`constant x : t := c.field;`) cannot read the
+        // materialized hidden signal, and the value is equally valid at
+        // runtime (field selects and `$const_idx` evaluate over literals).
+        // Real signals still win (inner declarations shadow outer consts);
+        // only the materialized-constant fallback yields to the value.
+        let const_root = env
+            .get(&root_lc)
+            .cloned()
+            .or_else(|| self.consts.get(&root_lc).cloned())
+            .zip(self.const_types.get(&root_lc).cloned());
+        let (mut cur, mut cur_ty, mut root_elem) = if let Some(id) = self.sig_id(&root) {
+            let rec = self.sig_rec.get(&id).cloned();
+            let elem_rec = self.sig_elem_rec.get(&id).cloned();
+            match (rec, elem_rec) {
+                (Some(rn), _) => (Expr::Sig(id), rn, None),
+                (None, Some(en)) => (Expr::Sig(id), en.clone(), Some(en)),
+                _ => {
+                    return match const_root {
+                        Some((v, _ty)) => Some(Expr::Lit(v)),
+                        None => None,
+                    }
+                }
+            }
+        } else if let Some((v, ty)) = const_root {
+            (Expr::Lit(v), ty, None)
+        } else if let Some(id) = self
+            .names
+            .get(&format!("__const_{}", root_lc))
+            .copied()
+        {
+            let rec = self.sig_rec.get(&id).cloned();
+            let elem_rec = self.sig_elem_rec.get(&id).cloned();
+            match (rec, elem_rec) {
+                (Some(rn), _) => (Expr::Sig(id), rn, None),
+                (None, Some(en)) => (Expr::Sig(id), en.clone(), Some(en)),
+                _ => return None,
+            }
+        } else if let Some(a) = self.aliases.get(&root_lc).cloned() {
+            let ty = self.alias_rec.get(&root_lc).cloned()?;
+            (a, ty, None)
+        } else if let Some(v) = self.consts.get(&root_lc).cloned() {
+            let ty = self.const_types.get(&root_lc).cloned()?;
+            (Expr::Lit(v), ty, None)
+        } else {
+            return None;
+        };
+        // Effective index dims of the current array context: the type's own
+        // dims, overridden by a record field's decl constraint (an
+        // unconstrained array type with `(0 to 3)` at the field).
+        let mut cur_dims: Option<Vec<(i64, usize)>> = match self.types.get(&cur_ty) {
+            Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => Some(dims.clone()),
+            _ => None,
+        };
+        for seg in segs {
+            match seg {
+                ChainSeg::Field(f) => {
+                    let Some(TypeInfo::Record { fields }) = self.types.get(&cur_ty) else {
+                        return None;
+                    };
+                    let total: usize = fields.iter().map(|fd| fd.1).sum();
+                    let mut run = 0usize;
+                    let mut hit: Option<(usize, usize)> = None;
+                    for (fn_, w, _) in fields {
+                        let lsb = total - run - w;
+                        if *fn_ == f {
+                            hit = Some((lsb, *w));
+                            break;
+                        }
+                        run += w;
+                    }
+                    let (lsb, w) = hit?;
+                    let outer_ty = cur_ty.clone();
+                    cur_ty = self.rec_field_ty.get(&(cur_ty.clone(), f.clone()))?.clone();
+                    cur_dims = self
+                        .rec_field_dims
+                        .get(&(outer_ty, f.clone()))
+                        .cloned()
+                        .or_else(|| match self.types.get(&cur_ty) {
+                            Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
+                                Some(dims.clone())
+                            }
+                            _ => None,
+                        });
+                    cur = Expr::Sel {
+                        msb: Box::new(Expr::Lit(Value::from_u64(32, (lsb + w - 1) as u64))),
+                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+                        e: Box::new(cur),
+                    };
+                }
+                ChainSeg::Index(args) => {
+                    // Array-of-records root: the element type is known from
+                    // the slot registration; other bases resolve it from the
+                    // current type's Array info.
+                    let root_ty = root_elem.take();
+                    let elem_rec_w = root_ty.as_ref().and_then(|en| {
+                        match self.types.get(en) {
+                            Some(TypeInfo::Record { fields }) => Some(
+                                fields.iter().map(|f| f.1).sum::<usize>().max(1),
+                            ),
+                            _ => None,
+                        }
+                    });
+                    if let Expr::Sig(sid) = cur {
+                        // Memory-backed signal arrays index by element;
+                        // flat value slots (function formals) read elements
+                        // out of the flat vector — record elements via
+                        // `$const_idx` (scalar elements keep the kernel's
+                        // established bit read).
+                        let is_mem = self.mems.get(&sid).copied().is_some();
+                        if !is_mem && args.len() == 1 {
+                            if let Some(ew) = elem_rec_w {
+                                let idx = self.lower_expr(&args[0], env);
+                                cur = Expr::Call {
+                                    name: "$const_idx".into(),
+                                    args: vec![
+                                        Expr::Sig(sid),
+                                        idx,
+                                        Expr::Lit(Value::from_u64(32, ew as u64)),
+                                    ],
+                                };
+                                cur_ty = root_ty.unwrap_or(cur_ty);
+                                continue;
+                            }
+                        }
+                        if args.len() == 1 {
+                            let idx = self.lower_expr(&args[0], env);
+                            cur = Expr::Idx {
+                                e: Box::new(Expr::Sig(sid)),
+                                i: Box::new(idx),
+                            };
+                        } else {
+                            let Some(sd) = self.sig_dims.get(&sid).cloned() else {
+                                return None;
+                            };
+                            if sd.len() != args.len() {
+                                return None;
+                            }
+                            let flat = flatten_dims(&args, &sd, env, self);
+                            cur = Expr::Idx {
+                                e: Box::new(Expr::Sig(sid)),
+                                i: Box::new(flat),
+                            };
+                        }
+                    } else {
+                        let Some(TypeInfo::Array { elem, dims, .. }) =
+                            self.types.get(&cur_ty).cloned()
+                        else {
+                            return None;
+                        };
+                        // A record field's decl constraint overrides the
+                        // (empty) dims of an unconstrained array type; a
+                        // single index with no dims at all keeps the raw
+                        // value (0-based assumption beats dropping it).
+                        let dims = cur_dims.take().unwrap_or(dims);
+                        let flat = if args.len() == 1 && dims.is_empty() {
+                            self.lower_expr(&args[0], env)
+                        } else {
+                            flatten_dims(&args, &dims, env, self)
+                        };
+                        cur = Expr::Call {
+                            name: "$const_idx".into(),
+                            args: vec![
+                                cur,
+                                flat,
+                                Expr::Lit(Value::from_u64(32, elem.max(1) as u64)),
+                            ],
+                        };
+                    }
+                    cur_ty = match root_ty {
+                        Some(en) => en,
+                        None => match self.types.get(&cur_ty).cloned() {
+                            Some(TypeInfo::Array { elem_name: Some(en), .. }) => en,
+                            _ => return None,
+                        },
+                    };
+                    // The element itself is not the constrained field array
+                    // anymore; a following Field seg re-derives the dims.
+                    cur_dims = None;
+                }
+            }
+        }
+        Some(cur)
     }
 
     /// Inclusive bit ranges of real-typed leaves within record type `tn`
@@ -2724,12 +3122,61 @@ impl<'a> Lower<'a> {
             let rec_ty = type_mark
                 .as_ref()
                 .and_then(|tm| self.as_record(&self.kw(tm)));
+            // Array dims of a multidimensional generic: from its own decl
+            // constraint, from a constrained constant named as the default,
+            // or from the shape of an aggregate default (`'length(d)` on the
+            // generic must fold in the architecture without the actual's
+            // type — overrides carry values, not constraints).
+            let mut gen_dims: Option<Vec<(i64, usize)>> = None;
+            if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
+                let tn = self.kw(tm).rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. }))
+                    && !self.text(c).contains("<>")
+                {
+                    let cd = self.constraint_dims(c);
+                    if !cd.is_empty() {
+                        gen_dims = Some(cd);
+                    }
+                }
+            }
+            if gen_dims.is_none() {
+                if let Some(d) = &default {
+                    match d.kind() {
+                        SyntaxKind::Name => {
+                            let dn = self
+                                .kw(d)
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            gen_dims = self.obj_dims.get(&dn).cloned();
+                        }
+                        SyntaxKind::Aggregate => {
+                            let ad = self.aggregate_dims(d);
+                            if ad.len() > 1 {
+                                gen_dims = Some(ad);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             for n in &names {
                 let key = n.to_ascii_lowercase();
                 let val = overrides.get(&key).cloned().unwrap_or_else(|| def.clone());
                 Rc::make_mut(&mut self.consts).insert(key.clone(), val.clone());
                 if let Some(tn) = &rec_ty {
                     self.const_types.insert(key.clone(), tn.clone());
+                }
+                if let Some(gd) = &gen_dims {
+                    // Default-derived dims describe the default's shape only
+                    // while the generic keeps it: an override may bind a
+                    // differently shaped actual (values carry no shape), and
+                    // a wrong dims entry would fold `'length(d)` to a wrong
+                    // number instead of X.
+                    if !overrides.contains_key(&key) {
+                        self.obj_dims.insert(key.clone(), gd.clone());
+                    }
                 }
                 out.push((n.clone(), val, rec_ty.clone()));
             }
@@ -2840,6 +3287,16 @@ impl<'a> Lower<'a> {
                 }
                 self.sig_signed.insert(id, signed);
                 self.sig_width.insert(id, width);
+                if let Some(c) = &constraint {
+                    if let Some(asc) = self.constraint_ascending(c) {
+                        let lo = self
+                            .constraint_dims(c)
+                            .first()
+                            .map(|&(l, _)| l)
+                            .unwrap_or(0);
+                        self.sig_asc.insert(id, (lo, asc));
+                    }
+                }
                 // Block-header ports must be visible to the block body (entity
                 // ports get their names map rebuilt by lower_architecture, but
                 // a block header adds signals mid-body).
@@ -2862,7 +3319,23 @@ impl<'a> Lower<'a> {
                                 None => dims.clone(),
                             };
                             self.sig_dims.insert(id, d);
+                        } else if let Some(td) = self.type_dims.get(&tn).cloned() {
+                            // Vector subtype carrying its own range
+                            // (`subtype r is slv(0 to W-1)`).
+                            self.sig_dims.insert(id, td);
+                        } else if let Some(c) = &constraint {
+                            // Unconstrained array base with an inline object
+                            // constraint: the dims belong to the object (see
+                            // the signal-decl site for the 1-D caveat).
+                            if !self.text(c).contains("<>") {
+                                let cd = self.constraint_dims(c);
+                                if !cd.is_empty() {
+                                    self.sig_dims.insert(id, cd);
+                                }
+                            }
                         }
+                    } else if let Some(td) = self.type_dims.get(&tn).cloned() {
+                        self.sig_dims.insert(id, td);
                     }
                 }
                 module.ports.push(PortIr {
@@ -2965,6 +3438,20 @@ impl<'a> Lower<'a> {
         if item.is_none() && !force && visited.contains(&p.name.to_ascii_lowercase()) {
             return;
         }
+        // `use pkg.enum_type;` makes the type's enumeration literals directly
+        // visible along with the type mark (LRM 10.4 applied to a type mark;
+        // matches Questa) — collect them so the const loop below merges them.
+        let mut lit_ok: Option<std::collections::HashSet<String>> = None;
+        if let Some(i) = item {
+            for (tname, tinfo) in &p.types {
+                if tname == i {
+                    if let TypeInfo::Enum(lits) = tinfo {
+                        lit_ok = Some(lits.iter().cloned().collect());
+                    }
+                    break;
+                }
+            }
+        }
         for (tname, tinfo) in &p.types {
             if item.is_none_or(|i| i == tname) {
                 if force {
@@ -2977,7 +3464,9 @@ impl<'a> Lower<'a> {
             }
         }
         for (cname, cval) in &p.consts {
-            if item.is_none_or(|i| i == cname) {
+            if item.is_none_or(|i| i == cname)
+                || lit_ok.as_ref().is_some_and(|l| l.contains(cname))
+            {
                 if force {
                     Rc::make_mut(&mut self.consts).insert(cname.clone(), cval.clone());
                 } else {
@@ -3025,6 +3514,21 @@ impl<'a> Lower<'a> {
                 self.const_types
                     .entry(n.clone())
                     .or_insert_with(|| tn.clone());
+            }
+        }
+        for (n, d) in &p.const_dims {
+            if item.is_none_or(|i| i == n) {
+                self.obj_dims.entry(n.clone()).or_insert_with(|| d.clone());
+            }
+        }
+        for (n, w) in &p.type_widths {
+            if item.is_none_or(|i| i == n) {
+                self.type_widths.entry(n.clone()).or_insert(*w);
+            }
+        }
+        for (n, d) in &p.type_dims {
+            if item.is_none_or(|i| i == n) {
+                self.type_dims.entry(n.clone()).or_insert_with(|| d.clone());
             }
         }
         // Use clauses are transitive through packages: `use work.p.all` also
@@ -3253,6 +3757,30 @@ impl<'a> Lower<'a> {
             .filter(|(k, _)| const_names.contains(k))
             .map(|(k, t)| (k.clone(), t.clone()))
             .collect();
+        let const_dims = self
+            .obj_dims
+            .iter()
+            .filter(|(k, _)| const_names.contains(k))
+            .map(|(k, d)| (k.clone(), d.clone()))
+            .collect();
+        // Subtype widths: a vector subtype declared here must keep its width
+        // when another file `use`s this package (`resolve_type` consults the
+        // width map for Vector types; per-file maps don't cross files).
+        let type_widths = types
+            .iter()
+            .filter(|(n, t)| {
+                matches!(t, TypeInfo::Vector { .. })
+                    && self.type_widths.contains_key(n.as_str())
+            })
+            .filter_map(|(n, _)| self.type_widths.get(n.as_str()).map(|w| (n.clone(), *w)))
+            .collect();
+        // Same for the subtype's constrained range (aggregate layout and
+        // `sig'range` need the low bound, not just the width).
+        let type_dims = types
+            .iter()
+            .filter(|(_, t)| matches!(t, TypeInfo::Vector { .. }))
+            .filter_map(|(n, _)| self.type_dims.get(n.as_str()).cloned().map(|d| (n.clone(), d)))
+            .collect();
         PackageIr {
             name,
             types,
@@ -3265,6 +3793,9 @@ impl<'a> Lower<'a> {
             sig_types,
             sig_widths,
             const_tys,
+            type_widths,
+            type_dims,
+            const_dims,
             decl: Some(p.clone()),
             src: Some(root.clone()),
             uses,
@@ -3427,8 +3958,11 @@ impl<'a> Lower<'a> {
             pkg.rec_field_tys.extend(part.rec_field_tys);
             pkg.prot_tys.extend(part.prot_tys);
             pkg.sig_types.extend(part.sig_types);
+            pkg.type_widths.extend(part.type_widths);
+            pkg.type_dims.extend(part.type_dims);
             pkg.sig_widths.extend(part.sig_widths);
             pkg.const_tys.extend(part.const_tys);
+            pkg.const_dims.extend(part.const_dims);
             if pkg.generics.is_empty() {
                 pkg.generics = part.generics;
             }
@@ -3802,7 +4336,11 @@ impl<'a> Lower<'a> {
             return;
         };
         let (decls, body) = self.gen_body(&kids[gen_pos + 1..]);
-        let saved = var.as_ref().and_then(|v| self.consts.get(v).cloned());
+        // Generate-local declarations and the loop parameter are scoped to
+        // the generate (LRM 11.2): snapshot the const map so a constant
+        // declared inside the generate does not leak into statements
+        // lowered after it.
+        let saved_consts = self.consts.clone();
         // Bounds may be real-typed (invalid VHDL) whose f64 bit pattern reads
         // as a huge u64; check the iteration count before allocating.
         let n = if downto {
@@ -3847,15 +4385,7 @@ impl<'a> Lower<'a> {
                 self.lower_conc_stmt(module, k, proc_idx);
             }
         }
-        match (var, saved) {
-            (Some(v), Some(old)) => {
-                Rc::make_mut(&mut self.consts).insert(v, old);
-            }
-            (Some(v), None) => {
-                Rc::make_mut(&mut self.consts).remove(&v);
-            }
-            _ => {}
-        }
+        self.consts = saved_consts;
     }
 
     /// `if cond generate … [elsif …] [else …] end if generate;` — the first
@@ -4000,10 +4530,17 @@ impl<'a> Lower<'a> {
     ) {
         let saved = std::mem::take(&mut self.names);
         self.names_stack.push(saved);
+        // Block/generate declarations are lexically scoped (LRM 11.2): a
+        // block-local `CONSTANT C_DATA_WIDTH : positive := 1;` must not
+        // shadow the enclosing architecture's same-named constant for the
+        // statements lowered *after* the block, so snapshot the const map
+        // and restore it when the scope ends.
+        let saved_consts = self.consts.clone();
         self.lower_gen_decls(module, decls, false);
         for st in stmts {
             self.lower_conc_stmt(module, st, proc_idx);
         }
+        self.consts = saved_consts;
         self.names = self.names_stack.pop().unwrap_or_default();
     }
 
@@ -4224,6 +4761,16 @@ impl<'a> Lower<'a> {
             }
             self.sig_signed.insert(id, signed);
             self.sig_width.insert(id, width);
+            if let Some(c) = constraint {
+                if let Some(asc) = self.constraint_ascending(c) {
+                    let lo = self
+                        .constraint_dims(c)
+                        .first()
+                        .map(|&(l, _)| l)
+                        .unwrap_or(0);
+                    self.sig_asc.insert(id, (lo, asc));
+                }
+            }
             if let Some(tn) = &type_name {
                 if let Some(rn) = self.as_record(tn) {
                     self.sig_rec.insert(id, rn.clone());
@@ -4245,7 +4792,25 @@ impl<'a> Lower<'a> {
                             None => dims.clone(),
                         };
                         self.sig_dims.insert(id, d);
+                    } else if let Some(td) = self.type_dims.get(tn).cloned() {
+                        self.sig_dims.insert(id, td);
+                    } else if let Some(c) = &constraint {
+                        // Unconstrained array base with an inline object
+                        // constraint (`signal m : matrix_t(0 to 2, 0 to 4)`):
+                        // the dims belong to the object, not the type —
+                        // `'length(d)`-style attributes and `m(i, j)` flat
+                        // indexes must see them. 1-D objects keep the
+                        // existing mems/width handling.
+                        if !self.text(c).contains("<>") {
+                            let cd = self.constraint_dims(c);
+                            if !cd.is_empty() {
+                                self.sig_dims.insert(id, cd);
+                            }
+                        }
                     }
+                } else if let Some(td) = self.type_dims.get(tn).cloned() {
+                    // Vector subtype carrying its own range.
+                    self.sig_dims.insert(id, td);
                 }
                 // Protected-type object: the signal holds a 64-bit handle.
                 // Remember the type for member selects even when the type
@@ -4355,17 +4920,66 @@ impl<'a> Lower<'a> {
             return;
         };
         // Record-typed constant: order named aggregate fields by the record.
+        // Array-typed constant: place named-index/others choices over the
+        // constraint range. Both recurse into nested aggregate-typed fields.
+        let constraint = kids[colon + 1..]
+            .iter()
+            .take_while(|k| !(k.kind() == SyntaxKind::Punct && self.text(k) == "="))
+            .find(|k| k.kind() == SyntaxKind::Range)
+            .cloned();
+        // Inline array constraint (`constant m : matrix_t(0 to 2, 0 to 4) :=
+        // …`): register the object's dims so `'length(d)`-style attributes on
+        // the constant fold (the constraint is not part of the type mark).
+        if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
+            let tn = self.text(tm).rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. })) {
+                if !self.text(c).contains("<>") {
+                    let cd = self.constraint_dims(c);
+                    if !cd.is_empty() {
+                        for n in &names {
+                            self.obj_dims
+                                .insert(n.to_ascii_lowercase(), cd.clone());
+                        }
+                    }
+                }
+            }
+        }
         let ex = match type_mark {
-            Some(tm)
-                if init.kind() == SyntaxKind::Aggregate
-                    && matches!(
-                        self.types.get(&self.text(tm).to_ascii_lowercase()),
-                        Some(TypeInfo::Record { .. })
-                    ) =>
-            {
+            Some(tm) if init.kind() == SyntaxKind::Aggregate => {
                 let tn = self.text(tm).to_ascii_lowercase();
-                let fields = self.record_fields_of_type(&tn);
-                self.lower_record_aggregate(&init, &fields, &env)
+                match self.types.get(&tn).cloned() {
+                    Some(TypeInfo::Record { .. }) => {
+                        let fields = self.record_fields_of_type(&tn);
+                        if fields.is_empty() {
+                            self.lower_expr(&init, &env)
+                        } else {
+                            self.lower_typed_record_aggregate(&init, &tn, &fields, &env)
+                        }
+                    }
+                    Some(TypeInfo::Array { elem, .. }) => {
+                        let elem = elem.max(1);
+                        let (n, lo) = match &constraint {
+                            Some(c) => {
+                                let n = self.constraint_width(c);
+                                let lo = self
+                                    .range_low(c, &env)
+                                    .unwrap_or(0);
+                                (Some(n), lo)
+                            }
+                            None => {
+                                let w = self.resolve_type(tm, None, d.span()).0;
+                                self.array_agg_len(w, elem)
+                            }
+                        };
+                        match n {
+                            Some(n) if n > 0 => self
+                                .lower_array_aggregate(&init, &tn, n, lo, &env)
+                                .unwrap_or_else(|| self.lower_expr(&init, &env)),
+                            _ => self.lower_expr(&init, &env),
+                        }
+                    }
+                    _ => self.lower_expr(&init, &env),
+                }
             }
             _ => self.lower_expr(&init, &env),
         };
@@ -4463,16 +5077,37 @@ impl<'a> Lower<'a> {
             return;
         };
         let ex = match type_mark {
-            Some(tm)
-                if init.kind() == SyntaxKind::Aggregate
-                    && matches!(
-                        self.types.get(&self.text(tm).to_ascii_lowercase()),
-                        Some(TypeInfo::Record { .. })
-                    ) =>
-            {
+            Some(tm) if init.kind() == SyntaxKind::Aggregate => {
                 let tn = self.text(tm).to_ascii_lowercase();
-                let fields = self.record_fields_of_type(&tn);
-                self.lower_record_aggregate(&init, &fields, &env)
+                match self.types.get(&tn).cloned() {
+                    Some(TypeInfo::Record { .. }) => {
+                        let fields = self.record_fields_of_type(&tn);
+                        if fields.is_empty() {
+                            self.lower_expr(&init, &env)
+                        } else {
+                            self.lower_typed_record_aggregate(&init, &tn, &fields, &env)
+                        }
+                    }
+                    Some(TypeInfo::Array { elem, .. }) => {
+                        let elem = elem.max(1);
+                        let (n, lo) = match constraint {
+                            Some(c) => (Some(self.constraint_width(c)), {
+                                self.range_low(c, &env).unwrap_or(0)
+                            }),
+                            None => {
+                                let w = self.resolve_type(tm, None, d.span()).0;
+                                self.array_agg_len(w, elem)
+                            }
+                        };
+                        match n {
+                            Some(n) if n > 0 => self
+                                .lower_array_aggregate(&init, &tn, n, lo, &env)
+                                .unwrap_or_else(|| self.lower_expr(&init, &env)),
+                            _ => self.lower_expr(&init, &env),
+                        }
+                    }
+                    _ => self.lower_expr(&init, &env),
+                }
             }
             _ => self.lower_expr(&init, &env),
         };
@@ -4799,10 +5434,43 @@ impl<'a> Lower<'a> {
                             let constraint =
                                 kids.get(j + 2).filter(|k| k.kind() == SyntaxKind::Range);
                             let (w, signed, _, _) = self.resolve_type(tm, constraint, d.span());
+                            // Unconstrained array type mark with a decl-site
+                            // constraint (`leaves : leaf_vec_t(0 to 3)`):
+                            // resolve_type returns the element width for
+                            // arrays, but a record field's flat slice must
+                            // cover every element the constraint adds
+                            // (constrained subtypes carry their sizes in
+                            // dims and need no extra factor).
+                            let ftn = self.kw(tm);
+                            let w = match self.types.get(&ftn) {
+                                Some(TypeInfo::Array { dims, .. })
+                                    if dims.is_empty() && constraint.is_some() =>
+                                {
+                                    w.max(1)
+                                        * self.constraint_width(constraint.unwrap()).max(1)
+                                }
+                                _ => w,
+                            };
                             let fty = self.kw(tm);
                             for n in names {
                                 self.rec_field_ty
                                     .insert((name.clone(), n.clone()), fty.clone());
+                                // Unconstrained array field with a decl
+                                // constraint: record the effective dims so
+                                // chain indexes flatten with the right low
+                                // bound (the bare type has none).
+                                if let (true, Some(c)) = (
+                                    matches!(
+                                        self.types.get(&ftn),
+                                        Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
+                                    ),
+                                    constraint,
+                                ) {
+                                    let lo = self.range_low(c, &self.consts.clone()).unwrap_or(0);
+                                    let cnt = self.constraint_width(c).max(1) as usize;
+                                    self.rec_field_dims
+                                        .insert((name.clone(), n.clone()), vec![(lo, cnt)]);
+                                }
                                 fields.push((n, w.max(1), signed));
                             }
                             i = j + 2;
@@ -4854,7 +5522,21 @@ impl<'a> Lower<'a> {
                     .skip(i + 1)
                     .find(|k| k.kind() == SyntaxKind::Range)
             });
-            let dims = range.map(|r| self.constraint_dims(r)).unwrap_or_default();
+            // An unconstrained index (`array (natural range <>) of ...`) has
+            // no dims: the object's constraint or the folded value sizes it.
+            // `constraint_dims` would report a (0, 1) unknown-sentinel dim,
+            // which materialized constants would take as a real 1-element
+            // constraint.
+            let unconstrained = range
+                .map(|r| self.text(r).contains("<>"))
+                .unwrap_or(true);
+            let dims = if unconstrained {
+                Vec::new()
+            } else {
+                range
+                    .map(|r| self.constraint_dims(r))
+                    .unwrap_or_default()
+            };
             let depth = if dims.is_empty() {
                 range.map(|r| self.constraint_width(r)).unwrap_or(1).max(1)
             } else {
@@ -5029,7 +5711,23 @@ impl<'a> Lower<'a> {
             // `subtype POSITIVE_REAL is REAL range 0.0 to REAL'HIGH`
             // must still be a 64-bit real, not a width-from-range vector).
             match self.types.get(&base_name).cloned() {
-                Some(ti @ (TypeInfo::Record { .. } | TypeInfo::Array { .. })) => {
+                Some(mut ti @ (TypeInfo::Record { .. } | TypeInfo::Array { .. })) => {
+                    // An array subtype's constraint bounds its objects:
+                    // carry it in the dims so signal declarations,
+                    // aggregates, and `'length` see the subtype's range,
+                    // not the unconstrained base's. A box `<>` constraint
+                    // adds nothing — keep the base dims.
+                    if let TypeInfo::Array { depth, dims, .. } = &mut ti {
+                        if let Some(c) = &constraint {
+                            if !self.text(c).contains("<>") {
+                                let cd = self.constraint_dims(c);
+                                if !cd.is_empty() {
+                                    *depth = cd.iter().map(|(_, s)| (*s).max(1)).product();
+                                    *dims = cd;
+                                }
+                            }
+                        }
+                    }
                     self.types.insert(name, ti);
                 }
                 _ if is_real => {
@@ -5038,6 +5736,22 @@ impl<'a> Lower<'a> {
                 _ => {
                     if constraint.is_some() {
                         self.type_widths.insert(name.clone(), w.max(1));
+                        // Keep the constrained range for vector subtypes:
+                        // aggregates onto such signals and their `'range`
+                        // loops need the low bound, not only the width.
+                        if matches!(
+                            self.types.get(&base_name),
+                            Some(TypeInfo::Vector { .. })
+                        ) {
+                            if let Some(c) = &constraint {
+                                if !self.text(c).contains("<>") {
+                                    let cd = self.constraint_dims(c);
+                                    if !cd.is_empty() {
+                                        self.type_dims.insert(name.clone(), cd);
+                                    }
+                                }
+                            }
+                        }
                     }
                     self.types.insert(name, TypeInfo::Vector { signed });
                 }
@@ -5251,9 +5965,40 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Formals/locals now in `names`: outer constants of the same name in
+        // the lowering env must not shadow them (see `fn_scope`).
+        self.fn_scope += 1;
         // Record-typed parameters: remember the record type so `arg.field`
         // resolves even in declarative-item initializers (constants), which
-        // are lowered before the loop below.
+        // are lowered before the loop below. Slot ids are per-function, so
+        // entries left by a previously lowered function must be dropped
+        // first — a formal whose type is not a record/array-of-records
+        // would otherwise inherit the stale record of an earlier function's
+        // same-numbered slot.
+        // Slot ids share the flat-signal id space: module signals (ports)
+        // can hold the same ids, and function formals must not leak their
+        // record mappings into the enclosing scope after the body is
+        // lowered (a later same-numbered non-record formal would otherwise
+        // inherit this function's record — see the reset after the body).
+        // Capture the entry state so the exit reset restores it exactly.
+        let saved_rec: HashMap<SigId, Option<String>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_rec.get(&id).cloned())
+            })
+            .collect();
+        let saved_elem: HashMap<SigId, Option<String>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_elem_rec.get(&id).cloned())
+            })
+            .collect();
+        let saved_prot: HashMap<SigId, Option<String>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_prot.get(&id).cloned())
+            })
+            .collect();
         for (i, (n, _)) in slots.iter().enumerate() {
             let tn = arg_types
                 .iter()
@@ -5421,6 +6166,7 @@ impl<'a> Lower<'a> {
         }
         self.extra_base = 0;
         self.names = self.names_stack.pop().unwrap_or_default();
+        self.fn_scope -= 1;
         // Unconstrained vector/string return type (`return bit_vector` /
         // `return string`): take the width of the returned expressions.
         let ret_is_uncon_vector = ret_mark
@@ -5433,6 +6179,42 @@ impl<'a> Lower<'a> {
             collect_return_exprs(&body, &mut rets);
             for r in &rets {
                 ret_width = ret_width.max(self.expr_width_est(r));
+            }
+        }
+        // Reset the slot-id record mappings to their entry state: entries
+        // the body inserted for record-typed formals must not leak into the
+        // enclosing scope (slot ids alias module signal ids), and module
+        // entries the body must not touch keep their pre-call values. This
+        // runs after the return-width fixups above, which still read the
+        // function's own slot mappings.
+        for (id, v) in saved_rec {
+            match v {
+                Some(v) => {
+                    self.sig_rec.insert(id, v);
+                }
+                None => {
+                    self.sig_rec.remove(&id);
+                }
+            }
+        }
+        for (id, v) in saved_elem {
+            match v {
+                Some(v) => {
+                    self.sig_elem_rec.insert(id, v);
+                }
+                None => {
+                    self.sig_elem_rec.remove(&id);
+                }
+            }
+        }
+        for (id, v) in saved_prot {
+            match v {
+                Some(v) => {
+                    self.sig_prot.insert(id, v);
+                }
+                None => {
+                    self.sig_prot.remove(&id);
+                }
             }
         }
         Some(FuncIr {
@@ -6160,8 +6942,7 @@ impl<'a> Lower<'a> {
                     let mut ex = self.lower_expr(e, &self.consts.clone());
                     if in_generic {
                         ex = self.fold_generic_actual(ex);
-                    }
-                    match (assoc_name, in_generic) {
+                    }                    match (assoc_name, in_generic) {
                         (Some(n), true) => param_overrides.push((Some(n), ex)),
                         (Some(n), false) => conns.push(Conn::Named(n, ex)),
                         // Positional generic actuals bind to the target's
@@ -6699,6 +7480,28 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `name'range` bounds for a flat value slot (function formal, unsized
+    /// signal): `0 to width-1`, resolved from the bound value at evaluation
+    /// time via `SigAttr`. Only applies when the slot is not memory-backed
+    /// and has no static dims — real array signals keep their static bounds.
+    fn flat_slot_range(&self, id: SigId) -> Option<(Expr, Expr)> {
+        if self.mems.get(&id).copied().is_some() || self.sig_dims.get(&id).is_some() {
+            return None;
+        }
+        // Unconstrained-formal widths are only known from the bound value;
+        // sized slots use their static width the same way (width-1).
+        Some((
+            Expr::SigAttr {
+                sig: id,
+                attr: "low".into(),
+            },
+            Expr::SigAttr {
+                sig: id,
+                attr: "high".into(),
+            },
+        ))
+    }
+
     fn lower_for(&mut self, s: &SyntaxNode) -> Stmt {
         let kids = real_children(s);
         // for <var> in <range> loop <body> end loop
@@ -6753,8 +7556,16 @@ impl<'a> Lower<'a> {
                     if attr == "range" || attr == "reverse_range" {
                         if let Some(b) = ak.iter().find(|k| k.kind() == SyntaxKind::Name) {
                             let bn = self.text(b);
+                            // Flat slot (function formal, unsized signal):
+                            // runtime bounds from the bound value's width.
+                            if let Some((lo, hi)) =
+                                self.object_id(&bn).and_then(|id| self.flat_slot_range(id))
+                            {
+                                let body = self.lower_seq_block(s);
+                                return self.make_for(var_id, lo, hi, false, body);
+                            }
                             let dims = self
-                                .sig_id(&bn)
+                                .object_id(&bn)
                                 .and_then(|id| self.sig_dims.get(&id).cloned())
                                 .or_else(|| {
                                     self.types.get(&bn.to_ascii_lowercase()).and_then(|t| {
@@ -6782,6 +7593,25 @@ impl<'a> Lower<'a> {
                                         body,
                                     );
                                 }
+                            }
+                            // Memory-backed object without dims (materialized
+                            // array constant of an unconstrained type): the
+                            // element count is the memory depth; hidden
+                            // consts pack element 0 at the top, so the range
+                            // is 0 to depth-1.
+                            if let Some(depth) = self
+                                .object_id(&bn)
+                                .and_then(|id| self.mems.get(&id).copied())
+                                .filter(|&d| d > 0)
+                            {
+                                let body = self.lower_seq_block(s);
+                                return self.make_for(
+                                    var_id,
+                                    Expr::Lit(Value::from_u64(32, 0)),
+                                    Expr::Lit(Value::from_u64(32, depth as u64 - 1)),
+                                    false,
+                                    body,
+                                );
                             }
                         }
                     }
@@ -6821,7 +7651,7 @@ impl<'a> Lower<'a> {
                 let base = ak.iter().find(|k| k.kind() == SyntaxKind::Name);
                 if let Some(b) = base {
                     let bn = self.text(b);
-                    if let Some(id) = self.sig_id(&bn) {
+                    if let Some(id) = self.object_id(&bn) {
                         if let Some(depth) = self.mems.get(&id).copied() {
                             let body = self.lower_seq_block(s);
                             return self.make_for(
@@ -6831,6 +7661,13 @@ impl<'a> Lower<'a> {
                                 false,
                                 body,
                             );
+                        }
+                        // Flat slot (function formal, unsized signal): the
+                        // element count comes from the bound value at
+                        // runtime / const-eval (`SigAttr`).
+                        if let Some((lo, hi)) = self.flat_slot_range(id) {
+                            let body = self.lower_seq_block(s);
+                            return self.make_for(var_id, lo, hi, false, body);
                         }
                     }
                 }
@@ -7150,6 +7987,15 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
+                // Structural selected-name chain (`sig.f(i).g`, rooted at a
+                // signal/constant/alias): walk field + index segments with
+                // type tracking. Falls back to the per-shape handling below
+                // when the chain does not resolve this way.
+                if name.contains('.') {
+                    if let Some(ex) = self.lower_selected_chain(e, env) {
+                        return ex;
+                    }
+                }
                 // `arr(i).field` — the parser folds this into one Name node
                 // wrapping a Call plus `.field`. Lower the call, then select
                 // the record field inside the element (slice of the memory
@@ -7341,8 +8187,21 @@ impl<'a> Lower<'a> {
                 // Local scope (env: loop vars, params) first, then signals, then
                 // constants — so an enum literal from a `use`d package (e.g. 'U'
                 // from std_logic_1164) cannot shadow a signal named `u`.
+                // Inside a function body `names` holds exactly the
+                // formals/locals, so a formal shadowing an outer constant that
+                // reached the env snapshot wins (LRM 10.3 inner visibility):
+                // an architecture constant `C_DATA` must not override a
+                // formal `C_DATA` in the body.
                 if let Some(v) = env.get(&key) {
-                    return Expr::Lit(v.clone());
+                    // Inside a function body `names` holds exactly the
+                    // formals/locals, so a formal shadowing an outer constant
+                    // that reached the env snapshot wins (LRM 10.3 inner
+                    // visibility): an architecture constant `C_DATA` must not
+                    // override a formal `C_DATA` in the body. `sig_id` is
+                    // case-insensitive; `names` keys keep the source case.
+                    if self.fn_scope == 0 || self.sig_id(base).is_none() {
+                        return Expr::Lit(v.clone());
+                    }
                 }
                 if let Some(id) = self.sig_id(base) {
                     return Expr::Sig(id);
@@ -7609,6 +8468,74 @@ impl<'a> Lower<'a> {
                     Some(b) => self.lower_expr(b, env),
                     None => Expr::Lit(Value::x(1)),
                 };
+                // Element slice on a memory-backed array (`int_sig(0 to
+                // DELAY-2)`): the kernel reads element k as word k, packed
+                // MSB-first (element 0 = most significant bits), so the
+                // element bounds must map to that bit range — using them as
+                // flat bit indices selects from the wrong end and a shift
+                // register packs X into its first word forever. Element e
+                // occupies bits [total-1-e·w … total-(e+1)·w]; `sig_width`
+                // holds the element width, `mems` the depth.
+                if let Expr::Sig(sid) = &base_e {
+                    if let (Some(&depth), Some(&ew)) = (
+                        self.mems.get(sid),
+                        self.sig_width.get(sid),
+                    ) {
+                        let (e_lo, e_hi) = if dir == "downto" {
+                            (lsb, msb)
+                        } else {
+                            (msb, lsb)
+                        };
+                        let total = depth.saturating_mul(ew).max(1);
+                        let e_lo = self.lower_expr(e_lo, env);
+                        let e_hi = self.lower_expr(e_hi, env);
+                        let word = |base: u64, e: Expr| Expr::Bin {
+                            op: BinOp::Sub,
+                            l: Box::new(Expr::Lit(Value::from_u64(32, base))),
+                            r: Box::new(Expr::Bin {
+                                op: BinOp::Mul,
+                                l: Box::new(e),
+                                r: Box::new(Expr::Lit(Value::from_u64(32, ew as u64))),
+                            }),
+                        };
+                        return Expr::Sel {
+                            e: Box::new(base_e),
+                            msb: Box::new(word(total as u64 - 1, e_lo)),
+                            lsb: Box::new(word(total as u64 - ew as u64, e_hi)),
+                        };
+                    }
+                }
+                // Ascending vector (`0 to N-1`): element k addresses value
+                // bit W-1-(k-lo) — element 0 is the most significant bit,
+                // mirroring the memory-backed mapping above — so a slice
+                // (a to b) covers value bits [W-1-(b-lo) … W-1-(a-lo)].
+                // Descending ranges already address value bits directly.
+                if let Expr::Sig(sid) = &base_e {
+                    if !self.mems.contains_key(sid) {
+                        if let Some(&(lo, true)) = self.sig_asc.get(sid) {
+                            let w = self.sig_width.get(sid).copied().unwrap_or(0).max(1) as u64;
+                            let lo = lo.max(0) as u64;
+                            let a = self.lower_expr(msb, env);
+                            let b = self.lower_expr(lsb, env);
+                            // value bit = (w-1) - (element - lo)
+                            let off = |e: Expr| Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(e),
+                                r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
+                            };
+                            let bit = |e: Expr| Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(Expr::Lit(Value::from_u64(32, w - 1))),
+                                r: Box::new(e),
+                            };
+                            return Expr::Sel {
+                                e: Box::new(base_e),
+                                msb: Box::new(bit(off(b))),
+                                lsb: Box::new(bit(off(a))),
+                            };
+                        }
+                    }
+                }
                 Expr::Sel {
                     e: Box::new(base_e),
                     msb: Box::new(self.lower_expr(msb, env)),
@@ -7847,6 +8774,44 @@ impl<'a> Lower<'a> {
 
     /// `T'length` / `T'high` / `T'low` / `T'left` / `T'right` for a type mark
     /// or subtype name (no signal involved), e.g. `integer'high`, `my_arr'length`.
+    /// Value of a dimension-suffixed array attribute (`'length(d)`,
+    /// `'high(d)`, …) when the dimension's bounds are statically known.
+    /// Sources, in order: signal dims (`sig_dims`), constant/generic dims
+    /// (`obj_dims`), subtype dims (`type_dims`), array type dims
+    /// (`TypeInfo::Array`). `None` — unknown dims or not an array.
+    fn attr_dim_value(&self, base: &str, attr: &str, dim: usize) -> Option<u64> {
+        if dim == 0 {
+            return None;
+        }
+        let val = |(lo, sz): (i64, usize)| -> u64 {
+            match attr {
+                "length" => sz as u64,
+                "high" | "left" => (lo + sz as i64 - 1).max(0) as u64,
+                _ => lo.max(0) as u64, // low | right
+            }
+        };
+        let blc = base.to_ascii_lowercase();
+        if let Some(id) = self.sig_id(&blc) {
+            return self
+                .sig_dims
+                .get(&id)
+                .and_then(|d| d.get(dim - 1))
+                .copied()
+                .map(val);
+        }
+        if let Some(dims) = self.obj_dims.get(&blc) {
+            return dims.get(dim - 1).copied().map(val);
+        }
+        let tn = blc.rsplit('.').next().unwrap_or("");
+        if let Some(dims) = self.type_dims.get(tn) {
+            return dims.get(dim - 1).copied().map(val);
+        }
+        if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
+            return dims.get(dim - 1).copied().map(val);
+        }
+        None
+    }
+
     fn type_attr(&self, name: &str, attr: &str) -> Expr {
         let n = name.to_ascii_lowercase();
         // REAL bounds are f64 extremes and must carry the real flag: an X(32)
@@ -7872,6 +8837,17 @@ impl<'a> Lower<'a> {
                 Some(TypeInfo::Array { dims, .. }) => {
                     dims.first().map(|(l, sz)| (*l, *l + *sz as i64 - 1))
                 }
+                // Vector subtypes: TypeInfo::Vector carries no constraint (the
+                // base array is unconstrained); the width lives in
+                // `type_widths` (declared subtypes and package-imported ones
+                // alike). Bounds assume `0 to w-1` / `w-1 downto 0` — both
+                // give low=0, high=w-1; only 'left/'right differ, and those
+                // are rare in constant expressions.
+                Some(TypeInfo::Vector { .. }) => self
+                    .type_widths
+                    .get(&n)
+                    .copied()
+                    .map(|w| (0, w.max(1) as i64 - 1)),
                 _ => None,
             },
         };
@@ -7905,6 +8881,41 @@ impl<'a> Lower<'a> {
                 .last()
                 .map(|k| self.kw(k))
                 .unwrap_or_default();
+            // Array attributes with an explicit dimension — `A'length(1)`,
+            // `A'high(2)` (LRM 1076 §5.2.1) arrive as Call(Attr(prefix, attr),
+            // [dim]). Fold when the dimension's bounds are statically known
+            // (signals, constants/generics with known dims, array types and
+            // subtypes); otherwise X.
+            if matches!(
+                attr_name.as_str(),
+                "length" | "high" | "low" | "left" | "right" | "ascending"
+            ) {
+                let arg = kids
+                    .iter()
+                    .enumerate()
+                    .find(|(i, k)| *i != ap && is_expr_node(k.kind()))
+                    .map(|(_, k)| k);
+                if let Some(a) = arg {
+                    let dim_e = self.lower_expr(a, env);
+                    let dim = self
+                        .ce(&dim_e)
+                        .and_then(|v| v.to_u64())
+                        .unwrap_or(1)
+                        .max(1) as usize;
+                    let base = ak
+                        .iter()
+                        .find(|k| k.kind() == SyntaxKind::Name)
+                        .map(|k| self.kw(k))
+                        .unwrap_or_default();
+                    if let Some(v) = self.attr_dim_value(&base, &attr_name, dim) {
+                        if attr_name == "ascending" {
+                            return Expr::Lit(Value::from_u64(1, v));
+                        }
+                        return Expr::Lit(Value::from_u64(32, v));
+                    }
+                    return Expr::Lit(Value::x(if attr_name == "ascending" { 1 } else { 32 }));
+                }
+            }
             if attr_name == "image" {
                 if let Some(arg) = kids
                     .iter()
@@ -8002,6 +9013,42 @@ impl<'a> Lower<'a> {
         // method call — lower as a plain call of the field name.
         if base_id.is_none() && name.contains('.') {
             let base = name.split('.').next().unwrap_or(name.as_str());
+            // `rec.field(i)` where `field` is an array-typed field of a
+            // record signal: index the field's slice. Emitting the method
+            // call fallback here would call a function named after the
+            // field (→ X at runtime) and drop the select entirely.
+            if args.len() == 1 {
+                if let Some(id) = self.sig_id(base) {
+                    if let Some(tn) = self.sig_rec.get(&id).cloned() {
+                        if let Some(TypeInfo::Record { fields }) = self.types.get(&tn) {
+                            let fl = fname.to_ascii_lowercase();
+                            let total: usize = fields.iter().map(|f| f.1).sum();
+                            let mut run = 0usize;
+                            for (fn_, w, _) in fields {
+                                let lsb = total - run - w;
+                                if fn_.to_ascii_lowercase() == fl {
+                                    let sel = Expr::Sel {
+                                        e: Box::new(Expr::Sig(id)),
+                                        msb: Box::new(Expr::Lit(Value::from_u64(
+                                            32,
+                                            (lsb + w - 1) as u64,
+                                        ))),
+                                        lsb: Box::new(Expr::Lit(Value::from_u64(
+                                            32,
+                                            lsb as u64,
+                                        ))),
+                                    };
+                                    return Expr::Idx {
+                                        e: Box::new(sel),
+                                        i: Box::new(args[0].clone()),
+                                    };
+                                }
+                                run += w;
+                            }
+                        }
+                    }
+                }
+            }
             if self.sig_id(base).is_some()
                 || self.pkg_sig_types.contains_key(&base.to_ascii_lowercase())
             {
@@ -8329,6 +9376,262 @@ impl<'a> Lower<'a> {
         Expr::Concat(parts)
     }
 
+    /// Lower an aggregate against a record type `tn`, recursing into
+    /// aggregate-typed fields with their own types (nested record/array
+    /// aggregates keep their layout instead of degrading to X). Falls back
+    /// to plain `lower_expr` per field when a field is not itself an
+    /// aggregate of an aggregate type — so behavior matches
+    /// [`Self::lower_record_aggregate`] for scalar fields.
+    fn lower_typed_record_aggregate(
+        &mut self,
+        e: &SyntaxNode,
+        tn: &str,
+        fields: &[(String, usize, usize)],
+        env: &HashMap<String, Value>,
+    ) -> Expr {
+        let kids = real_children(e);
+        let mut named: Vec<(String, usize)> = Vec::new();
+        let mut positional: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < kids.len() {
+            let k = &kids[i];
+            let arrow = kids
+                .get(i + 1)
+                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
+                .unwrap_or(false)
+                && kids
+                    .get(i + 2)
+                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
+                    .unwrap_or(false);
+            if arrow {
+                named.push((self.text(k).to_ascii_lowercase(), i + 3));
+                i += 4;
+            } else if is_expr_node(k.kind()) {
+                positional.push(i);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let others = named.iter().find(|(n, _)| n == "others").map(|(_, v)| *v);
+        let mut parts: Vec<Expr> = Vec::new();
+        for (fi, (fname, _, fw)) in fields.iter().enumerate() {
+            let vi = named
+                .iter()
+                .find(|(n, _)| n == fname)
+                .map(|(_, v)| *v)
+                .or(others);
+            let raw = match vi {
+                Some(vi) => {
+                    let vnode = &kids[vi];
+                    let fty = self
+                        .rec_field_ty
+                        .get(&(tn.to_string(), fname.clone()))
+                        .cloned();
+                    self.lower_typed_field(vnode, fty.as_deref(), *fw, env)
+                }
+                None => positional
+                    .get(fi)
+                    .map(|&pi| self.lower_expr(&kids[pi], env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(*fw))),
+            };
+            parts.push(Expr::Resize {
+                e: Box::new(raw),
+                width: *fw,
+                signed: false,
+            });
+        }
+        Expr::Concat(parts)
+    }
+
+    /// Lower one aggregate element/field value against its type: nested
+    /// aggregates of record/array types recurse (typed layout); everything
+    /// else lowers normally. `fw` is the target width for the fallback
+    /// X-literal. `constraint` (decl-site range) supplies the array length
+    /// and low bound when the value is an array aggregate.
+    fn lower_typed_field(
+        &mut self,
+        vnode: &SyntaxNode,
+        fty: Option<&str>,
+        fw: usize,
+        env: &HashMap<String, Value>,
+    ) -> Expr {
+        if vnode.kind() != SyntaxKind::Aggregate {
+            return self.lower_expr(vnode, env);
+        }
+        let Some(tn) = fty else {
+            return self.lower_expr(vnode, env);
+        };
+        match self.types.get(tn).cloned() {
+            Some(TypeInfo::Record { .. }) => {
+                let fields = self.record_fields_of_type(tn);
+                if fields.is_empty() {
+                    return self.lower_expr(vnode, env);
+                }
+                self.lower_typed_record_aggregate(vnode, tn, &fields, env)
+            }
+            Some(TypeInfo::Array { elem, .. }) => {
+                let (n, lo) = self.array_agg_len(fw, elem);
+                match n {
+                    Some(n) => self
+                        .lower_array_aggregate(vnode, tn, n, lo, env)
+                        .unwrap_or_else(|| self.lower_expr(vnode, env)),
+                    None => self.lower_expr(vnode, env),
+                }
+            }
+            _ => self.lower_expr(vnode, env),
+        }
+    }
+
+    /// Element count and flat low bound for an array aggregate derived from
+    /// a width that already includes the constraint (record field width):
+    /// `n = width / element_width`. Decl-site ranges lose their low bound at
+    /// this level — flat positions assume it is the low index;
+    /// `others`-only and positional aggregates are unaffected.
+    fn array_agg_len(&self, fw: usize, elem: usize) -> (Option<usize>, i64) {
+        let elem = elem.max(1);
+        if fw >= elem && fw % elem == 0 {
+            (Some(fw / elem), 0)
+        } else {
+            (None, 0)
+        }
+    }
+
+    /// Low bound of a declaration constraint's first range
+    /// (`(0 to 3)` → 0, `(2 downto 1)` → 2), const-folded.
+    fn range_low(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Option<i64> {
+        let sub = real_children(c)
+            .into_iter()
+            .find(|k| k.kind() == SyntaxKind::Range)?;
+        let first = real_children(&sub)
+            .into_iter()
+            .find(|k| is_expr_node(k.kind()))?;
+        let ex = self.lower_expr(&first, env);
+        self.ce_env(&ex, env)
+            .and_then(|v| v.to_u64())
+            .map(|v| v as i64)
+    }
+
+    /// Lower an array aggregate against element type `tn` with `n` elements
+    /// flat-indexed from `lo`: named index choices (`0 => v`) place by
+    /// value, `others` fills the rest, positional elements fill in order.
+    /// Every element is resized to the element width; the result concatenates
+    /// element 0 first (flat convention: element 0 = MSB).
+    fn lower_array_aggregate(
+        &mut self,
+        e: &SyntaxNode,
+        tn: &str,
+        n: usize,
+        lo: i64,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let Some(TypeInfo::Array { elem, elem_name, .. }) = self.types.get(tn).cloned() else {
+            return None;
+        };
+        self.lower_array_aggregate_specs(e, n, lo, elem, elem_name, env)
+    }
+
+    /// Aggregate assigned to an array-typed signal: same element-ordinal
+    /// layout as [`Self::lower_array_aggregate`] (element `lo` first = most
+    /// significant), driven by the signal's declared dims/depth instead of
+    /// a type name.
+    fn lower_array_aggregate_for_sig(
+        &mut self,
+        e: &SyntaxNode,
+        id: SigId,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let (lo, n) = match self.sig_dims.get(&id) {
+            Some(d) if !d.is_empty() => (d[0].0, d[0].1.max(1)),
+            _ => (0, (*self.mems.get(&id)?).max(1)),
+        };
+        // `sig_width` is the element width for memory-backed signals, the
+        // flat width otherwise — divide out the element count there.
+        let ew = if self.mems.contains_key(&id) {
+            (*self.sig_width.get(&id)?).max(1)
+        } else {
+            (*self.sig_width.get(&id)?).max(1).saturating_div(n)
+        };
+        let elem_rec = self.sig_elem_rec.get(&id).cloned();
+        self.lower_array_aggregate_specs(e, n, lo, ew.max(1), elem_rec, env)
+    }
+
+    fn lower_array_aggregate_specs(
+        &mut self,
+        e: &SyntaxNode,
+        n: usize,
+        lo: i64,
+        elem: usize,
+        elem_name: Option<String>,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let elem = elem.max(1);
+        let kids = real_children(e);
+        let mut named: Vec<(i64, usize)> = Vec::new();
+        let mut positional: Vec<usize> = Vec::new();
+        let mut others: Option<usize> = None;
+        let mut i = 0;
+        while i < kids.len() {
+            let k = &kids[i];
+            let arrow = kids
+                .get(i + 1)
+                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
+                .unwrap_or(false)
+                && kids
+                    .get(i + 2)
+                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
+                    .unwrap_or(false);
+            if arrow {
+                if k.kind() == SyntaxKind::Others {
+                    others = Some(i + 3);
+                } else if is_expr_node(k.kind()) {
+                    let cex = self.lower_expr(k, env);
+                    let iv = self
+                        .ce_env(&cex, env)
+                        .and_then(|v| v.to_u64())
+                        .map(|v| v as i64)?;
+                    named.push((iv, i + 3));
+                }
+                i += 4;
+            } else if is_expr_node(k.kind()) {
+                positional.push(i);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut slots: Vec<Option<usize>> = vec![None; n];
+        for (iv, vi) in named {
+            let p = iv - lo;
+            if p < 0 || p as usize >= n {
+                return None; // choice outside the constraint: legacy path
+            }
+            slots[p as usize] = Some(vi);
+        }
+        for (j, &pi) in positional.iter().enumerate() {
+            if j >= n {
+                return None;
+            }
+            slots[j] = Some(pi);
+        }
+        let mut parts: Vec<Expr> = Vec::with_capacity(n);
+        for p in 0..n {
+            let raw = match slots[p].or(others) {
+                Some(vi) => {
+                    let vnode = kids[vi].clone();
+                    self.lower_typed_field(&vnode, elem_name.as_deref(), elem, env)
+                }
+                None => Expr::Lit(Value::x(elem)),
+            };
+            parts.push(Expr::Resize {
+                e: Box::new(raw),
+                width: elem,
+                signed: false,
+            });
+        }
+        Some(Expr::Concat(parts))
+    }
+
     /// Field layout of a record type name: (field name, lsb offset, width)
     /// per field, in declaration order (first field = MSB of the flat vector).
     fn record_fields_of_type(&self, type_name: &str) -> Vec<(String, usize, usize)> {
@@ -8490,8 +9793,33 @@ impl<'a> Lower<'a> {
             if let Some(fields) = self.record_fields_of_lhs(lhs) {
                 return self.lower_record_aggregate(rhs, &fields, env);
             }
+            // Array-typed target: named choices (`0 => '1', others => '0`)
+            // must place their elements — the width-only fallback keeps
+            // only `others` and turns the rest into the others-value.
+            if let Some(id) = self.array_lhs_sig(lhs) {
+                if let Some(ex) = self.lower_array_aggregate_for_sig(rhs, id, env) {
+                    return ex;
+                }
+            }
         }
         self.lower_expr(rhs, env)
+    }
+
+    /// The signal id behind an assignment target whose type is an array
+    /// (declared dims or memory-backed) — the anchor for typed aggregate
+    /// lowering of the RHS.
+    fn array_lhs_sig(&self, lhs: &SyntaxNode) -> Option<SigId> {
+        if lhs.kind() != SyntaxKind::Name {
+            return None;
+        }
+        let name = self.text(lhs);
+        let base = name.split('.').next().unwrap_or("").to_ascii_lowercase();
+        let id = self.sig_id(&base)?;
+        if self.sig_dims.contains_key(&id) || self.mems.contains_key(&id) {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     fn lower_literal(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
