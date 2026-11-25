@@ -51,7 +51,8 @@ cargo build
 ## Test commands
 
 ```bash
-cargo test
+cargo test        # corpus tests are #[ignore]d; the release CI corpus job runs -- --ignored
+cargo smoke       # fast regression subset (see .cargo/config.toml)
 ```
 
 ## Workflow

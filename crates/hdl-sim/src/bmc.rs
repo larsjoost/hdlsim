@@ -217,6 +217,7 @@ pub fn wrap_top(design: &mut hdl_ir::Design, top: &str) -> Result<(), String> {
         is_vhdl: m.is_vhdl,
         // The DUT's own real-field layout drives its signals' flat ranges.
         real_ranges: m.real_ranges.clone(),
+        sig_dims_debug: None,
     };
     design.modules.push(wrapper);
     Ok(())

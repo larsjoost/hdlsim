@@ -98,7 +98,14 @@ impl Command for Ir {
             flat.procs.len(),
             flat.functions.len()
         ));
-        let json = serde_json::to_string_pretty(&flat)?;
+        // `--dump-maps` wraps the flat IR with the lower-side diagnosis
+        // maps — one JSON document either way, so consumers never have to
+        // split concatenated documents.
+        let json = if crate::commands::run_options().dump_maps {
+            maps_wrapped_json(&mgr, &design, &flat)?
+        } else {
+            serde_json::to_string_pretty(&flat)?
+        };
         if let Some(out) = &a.out {
             std::fs::write(out, json).with_context(|| format!("writing {}", out.display()))?;
             println!("hdlsim ir: wrote {}", out.display());
@@ -107,4 +114,51 @@ impl Command for Ir {
         }
         Ok(0)
     }
+}
+
+/// The `--dump-maps` view: the flat IR wrapped with the lower-side maps
+/// that previously existed only inside the lowerer — per-module signal
+/// dims (architecture-local signals included; ids module-relative, as
+/// believed at the end of lowering), per-entity signal maps, per-file
+/// object dims (constants/generics), and parse-cache provenance. All keys
+/// BTreeMap-sorted for deterministic output.
+fn maps_wrapped_json(
+    mgr: &hdl_lib::LibraryManager,
+    design: &Design,
+    flat: &elab::Flat,
+) -> anyhow::Result<String> {
+    let ro = crate::commands::run_options();
+    let files: std::collections::BTreeMap<String, serde_json::Value> = mgr
+        .file_obj_dims()
+        .iter()
+        .map(|(p, m)| {
+            (
+                p.display().to_string(),
+                serde_json::json!({ "obj_dims": m }),
+            )
+        })
+        .collect();
+    let entities: std::collections::BTreeMap<String, serde_json::Value> = mgr
+        .entity_maps()
+        .iter()
+        .map(|(name, m)| (name.clone(), m.debug_json()))
+        .collect();
+    let modules: std::collections::BTreeMap<String, serde_json::Value> = design
+        .modules
+        .iter()
+        .filter_map(|m| {
+            m.sig_dims_debug
+                .as_ref()
+                .map(|d| (m.name.clone(), serde_json::json!({ "sig_dims": d })))
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ir": flat,
+        "maps": {
+            "cache": { "no_cache": ro.no_cache, "hits": mgr.cache_hits() },
+            "entities": entities,
+            "modules": modules,
+            "files": files,
+        },
+    }))?)
 }

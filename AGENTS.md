@@ -8,9 +8,12 @@ pass/fail. This file is the map; follow it instead of rediscovering it.
 ## Build, test, lint (run from the repo root)
 
 - `cargo build` — build the workspace (debug profile).
-- `cargo test -- --skip corpus` — the test suite. CI runs exactly this in
-  debug (`.github/workflows/ci.yml`); the `corpus` tests compile thousands of
-  third-party files and run only in the release CI job, so skip them locally.
+- `cargo test` — the test suite. The `corpus` tests are `#[ignore]`d (they
+  compile thousands of third-party files, ~minutes) and run only in the
+  release CI corpus job, which passes `-- --ignored` to them explicitly.
+- `cargo smoke` — the fast regression subset (attribute/port/generic
+  lowering + core CLI semantics, see `.cargo/config.toml`); run it after
+  every change, full `cargo test` before opening a PR.
 - `cargo fmt --check` must pass — run `cargo fmt` before committing.
 
 ## Workflow (required)

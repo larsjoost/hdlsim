@@ -301,6 +301,7 @@ mod tests {
                 time_unit_fs: 1_000_000,
                 is_vhdl: false,
                 real_ranges: HashMap::new(),
+                sig_dims_debug: None,
             }],
         };
         let (lines, branches) = coverage_universe(&design);

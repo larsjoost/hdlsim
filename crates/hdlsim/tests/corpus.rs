@@ -354,6 +354,7 @@ fn run_with_big_stack(f: impl FnOnce() + Send + 'static) {
 }
 
 #[test]
+#[ignore = "long: compiles thousands of third-party sources; the release CI corpus job runs it via `cargo test --test corpus -- --ignored`"]
 fn corpus_files_lex_and_parse_without_errors() {
     let mut failures = Vec::new();
     let all = corpus_sources();
@@ -388,6 +389,7 @@ fn corpus_files_lex_and_parse_without_errors() {
 /// the parse cache only skips lex/parse, not lowering. Merging halves
 /// the corpus runtime.
 #[test]
+#[ignore = "long: compiles thousands of third-party sources; the release CI corpus job runs it via `cargo test --test corpus -- --ignored`"]
 fn corpus_group_compiles_meet_expected_status_with_rustc_diags() {
     run_with_big_stack(|| {
         let expected_path = corpus_dir().join("expected.json");

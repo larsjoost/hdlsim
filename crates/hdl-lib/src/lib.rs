@@ -165,6 +165,9 @@ pub struct LibraryManager {
     /// (source directory, lowercase entity name) → signal maps; disambiguates
     /// same-named entities from different directories (sibling binding).
     entity_maps_by_dir: HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
+    /// Per-file lower-side object dims (constant/generic name → array
+    /// dims [(low, size), …]), retained for `--dump-maps` diagnosis dumps.
+    file_obj_dims: Vec<(PathBuf, HashMap<String, Vec<(i64, usize)>>)>,
     /// `use`d library units that failed to resolve while compiling a file:
     /// (unit name, resolve error). Warned about at the end of `compile_files`
     /// if still unresolved (a later explicit file may still provide them).
@@ -225,6 +228,7 @@ impl LibraryManager {
             entity_roots: HashMap::new(),
             entity_maps: HashMap::new(),
             entity_maps_by_dir: HashMap::new(),
+            file_obj_dims: Vec::new(),
             entity_module_of: HashMap::new(),
             entity_module_by_dir: HashMap::new(),
             entity_module_by_stem: HashMap::new(),
@@ -292,6 +296,18 @@ impl LibraryManager {
     /// Parse-cache hits this session.
     pub fn cache_hits(&self) -> u64 {
         self.cache_hits
+    }
+
+    /// Per-entity lower-side signal maps retained during compilation
+    /// (`SigId`s are module-relative); consumed by `hdlsim ir --dump-maps`.
+    pub fn entity_maps(&self) -> &HashMap<String, hdl_ir::vhdl_lower::SigMaps> {
+        &self.entity_maps
+    }
+
+    /// Per-file lower-side object dims (constant/generic name → array dims)
+    /// retained during compilation; consumed by `hdlsim ir --dump-maps`.
+    pub fn file_obj_dims(&self) -> &[(PathBuf, HashMap<String, Vec<(i64, usize)>>)] {
+        &self.file_obj_dims
     }
 
     /// Add a provider at the end of the search path.
@@ -800,6 +816,7 @@ impl LibraryManager {
             &mut self.entity_roots,
             &mut self.entity_maps,
             &mut self.entity_maps_by_dir,
+            &mut self.file_obj_dims,
             &mut self.entity_module_by_dir,
             &mut self.entity_module_by_stem,
             &mut self.module_source,
@@ -1432,6 +1449,7 @@ pub fn compile_one(
     entity_roots: &mut HashMap<String, hdl_syntax::cst::SyntaxNode>,
     entity_maps: &mut HashMap<String, hdl_ir::vhdl_lower::SigMaps>,
     entity_maps_by_dir: &mut HashMap<(String, String), hdl_ir::vhdl_lower::SigMaps>,
+    file_obj_dims: &mut Vec<(PathBuf, HashMap<String, Vec<(i64, usize)>>)>,
     entity_module_by_dir: &mut HashMap<(String, String), usize>,
     entity_module_by_stem: &mut HashMap<(String, String, String), usize>,
     module_source: &mut HashMap<usize, PathBuf>,
@@ -1557,6 +1575,7 @@ pub fn compile_one(
             for ((dir, name), m) in lowered.entity_maps_by_dir {
                 entity_maps_by_dir.insert((dir, name), m);
             }
+            file_obj_dims.push((path.to_path_buf(), lowered.obj_dims));
             for c in lowered.configurations {
                 design
                     .configurations

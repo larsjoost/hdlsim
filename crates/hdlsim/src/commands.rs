@@ -165,7 +165,9 @@ impl Command for Help {
         println!("    HDLSIM_REPORT_GIST=public   opt in to public gist upload for --report");
         println!("                                (NO_COLOR is honored for diagnostics)");
         println!("  Debug and limit options are CLI flags on the commands that use them");
-        println!("  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir): run");
+        println!(
+            "  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir, --dump-maps): run"
+        );
         println!("  `hdlsim run --help` for the full list. Environment variables have no");
         println!("  spell check, so per-run debugging knobs are not environment variables.");
         Ok(0)
@@ -397,6 +399,10 @@ pub struct RunOptions {
     pub progress_sec: Option<f64>,
     pub no_cache: bool,
     pub cache_dir: Option<PathBuf>,
+    /// `--dump-maps`: wrap `hdlsim ir` output with lower-side diagnosis
+    /// maps (per-module signal dims, per-entity signal maps, per-file
+    /// object dims, cache provenance).
+    pub dump_maps: bool,
 }
 
 static RUN_OPTIONS: std::sync::OnceLock<RunOptions> = std::sync::OnceLock::new();
@@ -995,6 +1001,9 @@ pub fn apply_global_args(
         } else if a == "--cache-dir" || a.starts_with("--cache-dir=") {
             let v = flag_value(args, &mut i, a, "--cache-dir");
             ro.cache_dir = Some(PathBuf::from(v));
+        } else if a == "--dump-maps" {
+            ro.dump_maps = true;
+            i += 1;
         } else {
             rest.push(a.clone());
             i += 1;
