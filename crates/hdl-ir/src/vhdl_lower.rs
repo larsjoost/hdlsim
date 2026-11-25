@@ -35,6 +35,7 @@ pub(crate) const TEXTIO_PROCS: &[&str] = &[
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod dims;
 mod expr;
 
 /// Lower one parsed VHDL file into modules (entities with their architectures
@@ -142,6 +143,12 @@ pub struct PackageIr {
     /// Vector-subtype constrained ranges `(name, [(low, size), …])` —
     /// crosses files with [`PackageIr::type_widths`].
     pub type_dims: Vec<(String, Vec<(i64, usize)>)>,
+    /// Vector-subtype element widths `(name, width)` — `string` subtypes
+    /// are character arrays (8), other vector subtypes 1. Crosses files
+    /// with [`PackageIr::type_widths`] so a value-shape fold
+    /// (`dims_from_init`) divides by the right element width in files
+    /// that `use` the package.
+    pub type_elem: Vec<(String, usize)>,
     /// Array-typed constant dims `(name, [(low, size), …])` from the
     /// constant's decl constraint — lets `'length(d)`/`'high(d)` on an
     /// imported multidimensional constant fold in files that `use` the
@@ -531,6 +538,7 @@ pub fn lower_file(
                         const_dims: Vec::new(),
                         type_widths: Vec::new(),
                         type_dims: Vec::new(),
+                        type_elem: Vec::new(),
                         decl: Some(child.clone()),
                         src: Some(root.clone()),
                         uses,
@@ -1409,6 +1417,10 @@ struct Lower<'a> {
     /// Subtype name -> constrained width, so `signal x : my_subtype` (no
     /// constraint at the use site) keeps the subtype's width.
     type_widths: HashMap<String, usize>,
+    /// Element width per Vector-subtype name (`string` subtypes: 8) —
+    /// `array_elem_width` consults it; exported via
+    /// [`PackageIr::type_elem`] for cross-file folds.
+    type_elem: HashMap<String, usize>,
     /// Subtype name -> constrained range [(low, size), …] for vector
     /// subtypes, so aggregates and `'range`/`'length` see the subtype's
     /// bounds (Array subtypes carry theirs in `TypeInfo::Array.dims`).
@@ -1524,6 +1536,11 @@ struct Lower<'a> {
     /// exported to the entity's architectures via `SigMaps`.
     entity_consts: HashMap<String, Value>,
     entity_types: HashMap<String, TypeInfo>,
+    /// Delta of `obj_dims` recorded in the entity declarative part (generics
+    /// and entity constants), exported to the entity's architectures via
+    /// `SigMaps` — per-file `obj_dims` maps don't cross files, so a generic's
+    /// `'length(d)` in the architecture needs this handoff.
+    entity_obj_dims: ObjDims,
     /// Delta of `aliases`/`alias_rec` declared in the entity declarative part,
     /// exported to the entity's architectures via `SigMaps` (entity-level
     /// `alias`/`signal` declarations are visible in every architecture of the
@@ -1570,6 +1587,10 @@ pub struct SigMaps {
     /// its architectures, LRM 1076 §1.2).
     consts: HashMap<String, Value>,
     types: HashMap<String, TypeInfo>,
+    /// `obj_dims` recorded in the entity's declarative part (generic and
+    /// constant shapes) — the architecture consults them for
+    /// `'length`-family folds on those names.
+    obj_dims: ObjDims,
     /// Aliases (and their record types) declared in the entity's declarative
     /// part — visible in its architectures too. `SigId`s are module-relative
     /// and the architecture reuses the entity module's signal table, so the
@@ -1608,6 +1629,7 @@ impl<'a> Lower<'a> {
             funcs_ce: std::rc::Rc::new(HashMap::new()),
             types: HashMap::new(),
             type_widths: HashMap::new(),
+            type_elem: HashMap::new(),
             type_dims: HashMap::new(),
             names: HashMap::new(),
             mems: HashMap::new(),
@@ -1641,6 +1663,7 @@ impl<'a> Lower<'a> {
             entity_maps_by_dir: HashMap::new(),
             entity_consts: HashMap::new(),
             entity_types: HashMap::new(),
+            entity_obj_dims: HashMap::new(),
             entity_aliases: HashMap::new(),
             entity_alias_rec: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
@@ -1668,6 +1691,7 @@ impl<'a> Lower<'a> {
             uncon_ports: self.uncon_ports.clone(),
             consts: self.entity_consts.clone(),
             types: self.entity_types.clone(),
+            obj_dims: self.entity_obj_dims.clone(),
             aliases: self.entity_aliases.clone(),
             alias_rec: self.entity_alias_rec.clone(),
         };
@@ -1717,6 +1741,9 @@ impl<'a> Lower<'a> {
         }
         for (k, v) in m.types {
             self.types.entry(k).or_insert(v);
+        }
+        for (k, v) in m.obj_dims {
+            self.obj_dims.entry(k).or_insert(v);
         }
     }
 
@@ -1983,6 +2010,7 @@ impl<'a> Lower<'a> {
                 args: Vec::new(),
                 defaults: Vec::new(),
                 locals: Vec::new(),
+                dyn_locals: Vec::new(),
                 body: Stmt::Null,
             });
         }
@@ -2258,101 +2286,6 @@ impl<'a> Lower<'a> {
             "to" => Some(true),
             _ => None,
         }
-    }
-
-    fn constraint_dims(&mut self, c: &SyntaxNode) -> Vec<(i64, usize)> {
-        let kids = real_children(c);
-        let subs: Vec<SyntaxNode> = kids
-            .into_iter()
-            .filter(|k| k.kind() == SyntaxKind::Range)
-            .collect();
-        let ranges: Vec<SyntaxNode> = if subs.is_empty() {
-            vec![c.clone()]
-        } else {
-            subs
-        };
-        let mut dims = Vec::new();
-        for r in ranges {
-            if self.text(&r).contains("<>") {
-                dims.push((0, 1));
-                continue;
-            }
-            let rk = real_children(&r);
-            if let Some(n) = rk.iter().find(|k| k.kind() == SyntaxKind::Name) {
-                let tn = self.text(n).to_ascii_lowercase();
-                match self.types.get(&tn) {
-                    Some(TypeInfo::Enum(lits)) => {
-                        dims.push((0, lits.len()));
-                        continue;
-                    }
-                    Some(_) => {
-                        dims.push((0, 1));
-                        continue;
-                    }
-                    None => {}
-                }
-            }
-            let exprs: Vec<Expr> = rk
-                .iter()
-                .filter(|k| is_expr_node(k.kind()))
-                .map(|k| self.lower_expr(k, &HashMap::new()))
-                .collect();
-            if exprs.len() >= 2 {
-                let a = self
-                    .ce_env(&exprs[0], &HashMap::new())
-                    .and_then(|v| v.to_i64());
-                let b = self
-                    .ce_env(&exprs[1], &HashMap::new())
-                    .and_then(|v| v.to_i64());
-                if let (Some(a), Some(b)) = (a, b) {
-                    // Direction decides low/high: `5 to -1` (e.g. an
-                    // under-evaluated `0 to N-1`) is a null range of size 0,
-                    // not the descending range -1 to 5 — swapping bounds
-                    // without the keyword turned a null range into 2³² words
-                    // and OOM-killed the run. VHDL keywords are
-                    // case-insensitive — match `DOWNTO`/`downto`.
-                    let descending = self.text(&r).to_ascii_lowercase().contains("downto");
-                    let (low, high) = if descending { (b, a) } else { (a, b) };
-                    let size = if high >= low {
-                        (high as i128 - low as i128 + 1).min(usize::MAX as i128) as usize
-                    } else {
-                        0
-                    };
-                    dims.push((low, size));
-                } else {
-                    dims.push((0, 1));
-                }
-            } else if exprs.len() == 1 {
-                let n = self
-                    .ce_env(&exprs[0], &HashMap::new())
-                    .and_then(|v| v.to_u64())
-                    .unwrap_or(1);
-                dims.push((0, n as usize));
-            } else {
-                dims.push((0, 1));
-            }
-        }
-        dims
-    }
-
-    /// Shape of a positional aggregate: element count per nesting level
-    /// (`((1,2,3),(4,5,6))` → `[(0, 2), (0, 3)]`). Low bounds are unknown
-    /// for unconstrained bases — 0 is enough for `'length(d)`-style
-    /// attributes, which only need the sizes.
-    fn aggregate_dims(&self, agg: &SyntaxNode) -> Vec<(i64, usize)> {
-        let elems: Vec<SyntaxNode> = real_children(agg)
-            .into_iter()
-            .filter(|k| is_expr_node(k.kind()))
-            .collect();
-        let n = elems.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let mut dims = vec![(0i64, n)];
-        if let Some(first) = elems.iter().find(|k| k.kind() == SyntaxKind::Aggregate) {
-            dims.extend(self.aggregate_dims(first));
-        }
-        dims
     }
 
     /// Materialize a record/array-typed constant as a hidden signal holding
@@ -2979,6 +2912,8 @@ impl<'a> Lower<'a> {
             self.aliases.keys().cloned().collect();
         let alias_rec_before: std::collections::HashSet<String> =
             self.alias_rec.keys().cloned().collect();
+        let obj_dims_before: std::collections::HashSet<String> =
+            self.obj_dims.keys().cloned().collect();
         for k in &kids {
             // Arm the hidden-signal allocator for this phase (ports/generics
             // push directly into `module.signals`, so re-arm per item).
@@ -3029,6 +2964,12 @@ impl<'a> Lower<'a> {
             .types
             .iter()
             .filter(|(k, _)| !types_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.entity_obj_dims = self
+            .obj_dims
+            .iter()
+            .filter(|(k, _)| !obj_dims_before.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.entity_aliases = self
@@ -3204,7 +3145,10 @@ impl<'a> Lower<'a> {
                                 gen_dims = Some(ad);
                             }
                         }
-                        _ => {}
+                        // Literal default on an unconstrained array type: the
+                        // packed value carries the shape (`G_F : string := ""`
+                        // folds `'length` to 0, closing file-name branches).
+                        _ => gen_dims = self.dims_from_init(type_mark, Some(d), &def),
                     }
                 }
             }
@@ -3223,6 +3167,21 @@ impl<'a> Lower<'a> {
                     // number instead of X.
                     if !overrides.contains_key(&key) {
                         self.obj_dims.insert(key.clone(), gd.clone());
+                    }
+                }
+                if overrides.contains_key(&key) {
+                    // An overridden generic: the actual's packed value still
+                    // carries one-dimensional shape, so fold dims from it —
+                    // `'length` must describe the actual, not the default. An
+                    // unknown-shaped actual clears any stale default-derived
+                    // entry: `'length` folds to X, never to a wrong number.
+                    match self.dims_from_init(type_mark, None, &val) {
+                        Some(dims) => {
+                            self.obj_dims.insert(key.clone(), dims);
+                        }
+                        None => {
+                            self.obj_dims.remove(&key);
+                        }
                     }
                 }
                 out.push((n.clone(), val, rec_ty.clone()));
@@ -3572,6 +3531,11 @@ impl<'a> Lower<'a> {
                 self.type_widths.entry(n.clone()).or_insert(*w);
             }
         }
+        for (n, w) in &p.type_elem {
+            if item.is_none_or(|i| i == n) {
+                self.type_elem.entry(n.clone()).or_insert(*w);
+            }
+        }
         for (n, d) in &p.type_dims {
             if item.is_none_or(|i| i == n) {
                 self.type_dims.entry(n.clone()).or_insert_with(|| d.clone());
@@ -3819,6 +3783,14 @@ impl<'a> Lower<'a> {
             })
             .filter_map(|(n, _)| self.type_widths.get(n.as_str()).map(|w| (n.clone(), *w)))
             .collect();
+        // Same shape rules for the element width (`string` subtypes are
+        // character arrays): value-shape folds must divide by 8, not 1,
+        // in files that `use` this package.
+        let type_elem = types
+            .iter()
+            .filter(|(_, t)| matches!(t, TypeInfo::Vector { .. }))
+            .filter_map(|(n, _)| self.type_elem.get(n.as_str()).map(|e| (n.clone(), *e)))
+            .collect();
         // Same for the subtype's constrained range (aggregate layout and
         // `sig'range` need the low bound, not just the width).
         let type_dims = types
@@ -3845,6 +3817,7 @@ impl<'a> Lower<'a> {
             const_tys,
             type_widths,
             type_dims,
+            type_elem,
             const_dims,
             decl: Some(p.clone()),
             src: Some(root.clone()),
@@ -4011,6 +3984,7 @@ impl<'a> Lower<'a> {
             pkg.sig_types.extend(part.sig_types);
             pkg.type_widths.extend(part.type_widths);
             pkg.type_dims.extend(part.type_dims);
+            pkg.type_elem.extend(part.type_elem);
             pkg.sig_widths.extend(part.sig_widths);
             pkg.const_tys.extend(part.const_tys);
             pkg.const_dims.extend(part.const_dims);
@@ -5045,6 +5019,15 @@ impl<'a> Lower<'a> {
             Some(v) => {
                 for n in &names {
                     Rc::make_mut(&mut self.consts).insert(n.to_ascii_lowercase(), v.clone());
+                    // Unconstrained array constants take their shape from the
+                    // value (`C_OPTS : opts_t := (f(...), f(...));` —
+                    // `'length` must fold without a decl constraint).
+                    self.set_obj_dims_from_init(
+                        &n.to_ascii_lowercase(),
+                        type_mark,
+                        Some(&init),
+                        &v,
+                    );
                 }
             }
             None => {
@@ -5254,6 +5237,7 @@ impl<'a> Lower<'a> {
             args,
             defaults: Vec::new(),
             locals: Vec::new(),
+            dyn_locals: Vec::new(),
             body: Stmt::Null,
         });
     }
@@ -5451,6 +5435,7 @@ impl<'a> Lower<'a> {
                 args: Vec::new(),
                 defaults: Vec::new(),
                 locals: Vec::new(),
+                dyn_locals: Vec::new(),
                 body: Stmt::Block(ctor_stmts),
             };
             self.register_func(ctor.clone());
@@ -5809,6 +5794,14 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
+                    // Element width of a Vector-based subtype: `string`
+                    // subtypes are character arrays (8), others 1 —
+                    // `array_elem_width` consults this for value-shape
+                    // folds (`dims_from_init`). Recorded before `name`
+                    // moves into `types`.
+                    if let Some(e) = self.array_elem_width(&base_name) {
+                        self.type_elem.insert(name.clone(), e);
+                    }
                     self.types.insert(name, TypeInfo::Vector { signed });
                 }
             }
@@ -5886,7 +5879,127 @@ impl<'a> Lower<'a> {
                 .collect(),
             defaults: Vec::new(),
             locals: Vec::new(),
+            dyn_locals: Vec::new(),
             body: Stmt::Null,
+        })
+    }
+
+    /// Whether an index constraint's bounds const-fold at registration time.
+    /// Formals have no values yet, so a constraint naming one does not fold.
+    fn constraint_folds(&mut self, c: &SyntaxNode) -> bool {
+        if self.text(c).contains("<>") {
+            return true; // box: unconstrained by intent, not unfoldable
+        }
+        // The node may be the parenthesized group `(1 to 4)` — descend to
+        // the nested Range(s) like `constraint_width` does.
+        let subs: Vec<SyntaxNode> = real_children(c)
+            .into_iter()
+            .filter(|k| k.kind() == SyntaxKind::Range)
+            .collect();
+        let ranges: Vec<SyntaxNode> = if subs.is_empty() {
+            vec![c.clone()]
+        } else {
+            subs
+        };
+        let env = self.consts.clone();
+        ranges.iter().all(|r| {
+            let exprs: Vec<Expr> = real_children(r)
+                .into_iter()
+                .filter(|k| is_expr_node(k.kind()))
+                .map(|k| self.lower_expr(&k, &env))
+                .collect();
+            !exprs.is_empty()
+                && exprs
+                    .iter()
+                    .all(|e| self.ce_env(e, &env).and_then(|v| v.to_i64()).is_some())
+        })
+    }
+
+    /// Bit-width expression for a local's formal-dependent index constraint:
+    /// `string(1 to size)` → `size * 8`, `bit_vector(size-1 downto 0)` →
+    /// `size` (element width follows `resolve_type`: `string` packs 8 bits
+    /// per character, other vectors 1). Direction decides which bound is
+    /// high; a null or reversed range still yields the (hi - lo + 1) shape
+    /// the runtime assign would produce.
+    fn dyn_width_expr(&mut self, tm: &SyntaxNode, c: &SyntaxNode) -> Expr {
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Element width follows the declared type: `string` packs 8-bit
+        // characters, a declared array's `TypeInfo::Array.elem` carries its
+        // element width (an `integer` array element is 32 bits), unconstrained
+        // vectors are bit arrays.
+        let elem = self.array_elem_width(&tn).unwrap_or(1);
+        // Descend into the nested Range of a parenthesized group; a
+        // multi-dimensional dynamic constraint falls back to X (rare).
+        let subs: Vec<SyntaxNode> = real_children(c)
+            .into_iter()
+            .filter(|k| k.kind() == SyntaxKind::Range)
+            .collect();
+        let r = match subs.len() {
+            1 => &subs[0],
+            0 => c,
+            _ => return Expr::Lit(Value::x(32)),
+        };
+        let env = self.consts.clone();
+        let exprs: Vec<Expr> = real_children(r)
+            .into_iter()
+            .filter(|k| is_expr_node(k.kind()))
+            .map(|k| self.lower_expr(&k, &env))
+            .collect();
+        let (hi, lo) = match exprs.len() {
+            2 if self.text(r).to_ascii_lowercase().contains("downto") => {
+                (exprs[0].clone(), exprs[1].clone())
+            }
+            2 => (exprs[1].clone(), exprs[0].clone()),
+            1 => (exprs[0].clone(), Expr::Lit(Value::from_u64(32, 1))),
+            _ => return Expr::Lit(Value::x(32)),
+        };
+        let count = Expr::Bin {
+            op: BinOp::Add,
+            l: Box::new(Expr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(hi),
+                r: Box::new(lo),
+            }),
+            r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+        };
+        Expr::Bin {
+            op: BinOp::Mul,
+            l: Box::new(count),
+            r: Box::new(Expr::Lit(Value::from_u64(32, elem as u64))),
+        }
+    }
+
+    /// Re-emit an OTHERS aggregate initializer for a dynamic-width local:
+    /// `Replicate { count: width_expr / element_bits, e: value }` — the
+    /// initializer folds to the per-call constraint width instead of the
+    /// registration fallback. `None` keeps the generic lowering (non-OTHERS
+    /// aggregates, already-lowered inits).
+    fn dyn_others_init(&mut self, node: &SyntaxNode, wexpr: &Expr) -> Option<Expr> {
+        if node.kind() != SyntaxKind::Aggregate {
+            return None;
+        }
+        let kids = real_children(node);
+        if !kids.iter().any(|k| k.kind() == SyntaxKind::Others) {
+            return None;
+        }
+        let val = kids.iter().rev().find(|k| is_expr_node(k.kind()))?;
+        let inner = self.lower_expr(val, &self.consts.clone());
+        let iw = match &inner {
+            Expr::Lit(v) => v.width().max(1),
+            _ => 1,
+        };
+        Some(Expr::Replicate {
+            count: Box::new(Expr::Bin {
+                op: BinOp::Div,
+                l: Box::new(wexpr.clone()),
+                r: Box::new(Expr::Lit(Value::from_u64(32, iw as u64))),
+            }),
+            e: Box::new(inner),
         })
     }
 
@@ -6127,6 +6240,9 @@ impl<'a> Lower<'a> {
         // std_logic_arith): they get a runtime slot and the initializer is
         // evaluated on every call, prepended to the body as an assignment.
         let mut pending_const_inits: Vec<(SigId, Expr)> = Vec::new();
+        // Locals whose constraint depends on subprogram formals — const-eval
+        // re-folds their widths per call (see `FuncIr.dyn_locals`).
+        let mut dyn_locals: Vec<(SigId, Expr)> = Vec::new();
         for d in &decl_nodes {
             match d.kind() {
                 SyntaxKind::PortDecl => {} // parameters were slotted above
@@ -6168,11 +6284,25 @@ impl<'a> Lower<'a> {
                         Some(tm) => self.resolve_type(tm, constraint, d.span()),
                         None => (32, false, None, false),
                     };
+                    // A constraint that references subprogram formals
+                    // (`variable s : string(1 to size)`) can't fold at
+                    // registration — formals have no values yet — so the
+                    // recorded width is a fallback. Record a bit-width
+                    // expression for const-eval to fold per call, and size
+                    // an OTHERS initializer from it too.
+                    let dyn_w = match (tmark, constraint) {
+                        (Some(tm), Some(c))
+                            if !self.text(c).contains("<>") && !self.constraint_folds(c) =>
+                        {
+                            Some(self.dyn_width_expr(tm, c))
+                        }
+                        _ => None,
+                    };
                     // `variable v : integer := 0;` — the initializer runs on
                     // every call (VHDL subprogram variables are re-initialized
                     // per call), so lower it and prepend `v := init;` to the
                     // body like a dynamic local constant.
-                    let init_ex = dk[colon + 1..]
+                    let init_node = dk[colon + 1..]
                         .iter()
                         .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
                         .and_then(|e| {
@@ -6180,8 +6310,19 @@ impl<'a> Lower<'a> {
                                 .iter()
                                 .find(|k| is_expr_node(k.kind()))
                                 .cloned()
-                        })
-                        .map(|node| self.lower_expr(&node, &self.consts.clone()));
+                        });
+                    let mut init_ex = init_node
+                        .as_ref()
+                        .map(|node| self.lower_expr(node, &self.consts.clone()));
+                    // A dynamic-width local with an OTHERS initializer must
+                    // self-size: re-emit the replicate with the count derived
+                    // from the dynamic width expression (the generic lowering
+                    // baked the fallback width).
+                    if let (Some(wexpr), Some(node)) = (&dyn_w, &init_node) {
+                        if let Some(ex) = self.dyn_others_init(node, wexpr) {
+                            init_ex = Some(ex);
+                        }
+                    }
                     for n in names {
                         let id = slots.len() as SigId;
                         if let Some(tm) = &tmark {
@@ -6189,6 +6330,9 @@ impl<'a> Lower<'a> {
                         }
                         slots.push((n.clone(), w));
                         self.names.insert(n.clone(), id);
+                        if let Some(wexpr) = &dyn_w {
+                            dyn_locals.push((id, wexpr.clone()));
+                        }
                         if let Some(ex) = &init_ex {
                             pending_const_inits.push((id, ex.clone()));
                         }
@@ -6316,6 +6460,7 @@ impl<'a> Lower<'a> {
             args,
             defaults,
             locals,
+            dyn_locals,
             body,
         })
     }
@@ -7964,52 +8109,6 @@ impl<'a> Lower<'a> {
     }
 
     // ---- expressions ---------------------------------------------------------------
-
-    /// `T'length` / `T'high` / `T'low` / `T'left` / `T'right` for a type mark
-    /// or subtype name (no signal involved), e.g. `integer'high`, `my_arr'length`.
-    /// Value of a dimension-suffixed array attribute (`'length(d)`,
-    /// `'high(d)`, …) when the dimension's bounds are statically known.
-    /// Sources, in order: signal dims (`sig_dims`), constant/generic dims
-    /// (`obj_dims`), subtype dims (`type_dims`), array type dims
-    /// (`TypeInfo::Array`). `None` — unknown dims or not an array.
-    /// Insert `sig_dims`, tracing the population under `--trace-lower`
-    /// (the population half of the `'length(d)` diagnosis trail — the
-    /// duplicate-warning-class regressions lived exactly at these sites).
-    fn set_sig_dims_from_constraint(&mut self, id: SigId, dims: Vec<(i64, usize)>, name: &str) {
-        if super::debug::TRACE_LOWER.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("[lower] sig_dims[{id}] = {dims:?} via inline constraint ({name})");
-        }
-        self.sig_dims.insert(id, dims);
-    }
-
-    /// Element count and flat low bound for an array aggregate derived from
-    /// a width that already includes the constraint (record field width):
-    /// `n = width / element_width`. Decl-site ranges lose their low bound at
-    /// this level — flat positions assume it is the low index;
-    /// `others`-only and positional aggregates are unaffected.
-    fn array_agg_len(&self, fw: usize, elem: usize) -> (Option<usize>, i64) {
-        let elem = elem.max(1);
-        if fw >= elem && fw % elem == 0 {
-            (Some(fw / elem), 0)
-        } else {
-            (None, 0)
-        }
-    }
-
-    /// Low bound of a declaration constraint's first range
-    /// (`(0 to 3)` → 0, `(2 downto 1)` → 2), const-folded.
-    fn range_low(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Option<i64> {
-        let sub = real_children(c)
-            .into_iter()
-            .find(|k| k.kind() == SyntaxKind::Range)?;
-        let first = real_children(&sub)
-            .into_iter()
-            .find(|k| is_expr_node(k.kind()))?;
-        let ex = self.lower_expr(&first, env);
-        self.ce_env(&ex, env)
-            .and_then(|v| v.to_u64())
-            .map(|v| v as i64)
-    }
 
     /// Lower an array aggregate against element type `tn` with `n` elements
     /// flat-indexed from `lo`: named index choices (`0 => v`) place by

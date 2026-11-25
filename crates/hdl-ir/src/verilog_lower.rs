@@ -557,6 +557,7 @@ impl<'a> Lower<'a> {
                     args: m.args.clone(),
                     defaults: m.defaults.clone(),
                     locals: m.locals.clone(),
+                    dyn_locals: Vec::new(),
                     body: m.body.clone(),
                 })
             })
@@ -2700,6 +2701,7 @@ impl<'a> Lower<'a> {
             args,
             defaults: Vec::new(),
             locals,
+            dyn_locals: Vec::new(),
             body,
         }
     }
@@ -3688,6 +3690,11 @@ fn ce_impl(
         }
         Expr::Replicate { count, e } => {
             let n = ce_impl(count, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
+            // A replication count beyond a few MB of bits is a misfolded
+            // count, never a constant — abort the fold.
+            if n > (1 << 21) {
+                return None;
+            }
             let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             Some(Value::concat(&vec![v; n]))
         }
@@ -3832,6 +3839,20 @@ fn ce_impl(
                 .iter()
                 .find(|f| viable(f) && width_ok(f, false))
                 .or_else(|| cands.iter().find(|f| viable(f) && width_ok(f, true)))
+                // No candidate matched every actual width: score the rest by
+                // formal fit, best first — a `(record_t, boolean, natural, …)`
+                // overload stays ahead of a `(natural, string, string, …)`
+                // namesake when a record actual arrives, though neither
+                // matched exactly (a scalar actual folds to a width the
+                // formal does not declare).
+                .or_else(|| {
+                    cands
+                        .iter()
+                        .filter(|f| viable(f))
+                        .filter_map(|f| ce_overload_fit(f, &argv).map(|c| (c, f)))
+                        .min_by_key(|(c, _)| *c)
+                        .map(|(_, f)| f)
+                })
                 .or_else(|| cands.iter().find(|f| f.args.len() == argv.len()))
                 .or_else(|| cands.iter().find(|f| fits_defaults(f, argv.len())))
                 .or_else(|| cands.first())?;
@@ -3888,6 +3909,37 @@ enum CeFlow {
 /// Const-evaluate a user function body: slot 0 is the return value, then
 /// args, then locals. Supports the statement subset that appears in pure
 /// package functions (block/if/case/assign/for/return).
+/// Score how well an overload's formals fit a call's actuals when no
+/// candidate matched every width exactly (see the `Call` arm): lower fits
+/// better, `None` disqualifies. A declared-numeric formal can never take a
+/// multi-word array/record actual — widths beyond 64 bits are arrays or
+/// records, not scalars — and other formals match by width distance, which
+/// keeps a `(record_t, boolean, natural, …)` overload ahead of a
+/// `(natural, string, string, …)` namesake when a record actual arrives.
+/// Viability (exact arity or trailing defaults) is checked by the caller.
+fn ce_overload_fit(f: &FuncIr, argv: &[Value]) -> Option<u64> {
+    let mut cost = 0u64;
+    for ((_, w, t), v) in f.args.iter().zip(argv.iter()) {
+        let aw = v.width() as u64;
+        if *w as u64 == aw {
+            continue;
+        }
+        if matches!(
+            t.as_str(),
+            "natural" | "integer" | "positive" | "boolean" | "bit" | "character" | "real" | "time",
+        ) {
+            // A scalar formal cannot bind an array/record actual.
+            if aw > 64 {
+                return None;
+            }
+            cost += 1;
+        } else {
+            cost += aw.abs_diff(*w as u64);
+        }
+    }
+    Some(cost)
+}
+
 fn const_eval_func(
     f: &FuncIr,
     argv: &[Value],
@@ -3902,6 +3954,25 @@ fn const_eval_func(
             .iter()
             .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
     );
+    // Locals with formal-dependent constraints (`string(1 to size)`)
+    // registered with a fallback width: re-fold the recorded bit-width
+    // expression now that the actuals are in the slots. Unfoldable — the
+    // body will fold to X on use anyway.
+    for (slot, wexpr) in &f.dyn_locals {
+        if let Some(w) = ce_impl(wexpr, env, funcs, extras, Some(&mut slots))
+            .as_ref()
+            .and_then(|v| v.to_u64())
+        {
+            if w > (1 << 24) {
+                return None;
+            }
+            let s = *slot as usize;
+            while slots.len() <= s {
+                slots.push(Value::x(32));
+            }
+            slots[s] = Value::x(w.max(1) as usize);
+        }
+    }
     let mut flow = CeFlow::Continue;
     ce_stmt(&f.body, &mut slots, env, funcs, extras, &mut flow);
     if flow == CeFlow::Abort
@@ -3968,6 +4039,12 @@ fn ce_stmt(
                             slots.push(Value::x(32));
                         }
                         let w = v.width().max(1);
+                        // A bit index near 2^32 is a folded-negative index
+                        // (`v(i - 1)` with i = 0) read as u64 — abort the
+                        // fold instead of growing the slot by gigabytes.
+                        if idx + w > (1 << 24) {
+                            return None::<()>;
+                        }
                         if slots[s].bits.len() < idx + w {
                             let mut bits = slots[s].bits.clone();
                             bits.resize(idx + w, VX);
@@ -3986,19 +4063,44 @@ fn ce_stmt(
                     let spliced = (|| {
                         let msb = ev(msb, slots)?.to_u64()? as usize;
                         let lsb = ev(lsb, slots)?.to_u64()? as usize;
-                        let Expr::Sig(s) = &**e else { return None };
-                        let s = *s as usize;
+                        // Walk Sel chains down to the base slot: a record
+                        // field slice-assign (`result.description(1 TO n)`)
+                        // is Sel-of-Sel; each inner field select's low bit
+                        // offsets the splice target (record field offsets
+                        // are static bit ranges).
+                        let mut off = 0usize;
+                        let mut node = &**e;
+                        let s = loop {
+                            match node {
+                                Expr::Sig(s) => break *s as usize,
+                                Expr::Sel {
+                                    e: inner, msb, lsb, ..
+                                } => {
+                                    off += ev(lsb, slots)?.to_u64()? as usize;
+                                    let _ = ev(msb, slots)?.to_u64()?;
+                                    node = &**inner;
+                                }
+                                _ => return None::<()>,
+                            }
+                        };
                         while slots.len() <= s {
                             slots.push(Value::x(32));
                         }
                         let w = msb.saturating_sub(lsb) + 1;
-                        if slots[s].bits.len() < lsb + w {
+                        // Guard the slot growth: a slice beyond a few MB is
+                        // a misfolded index (a negative bound read as u64),
+                        // never a real constant — abort the fold instead of
+                        // gigabytes of X.
+                        if w > (1 << 24) || lsb + off > (1 << 24) {
+                            return None::<()>;
+                        }
+                        if slots[s].bits.len() < lsb + off + w {
                             let mut bits = slots[s].bits.clone();
-                            bits.resize(lsb + w, VX);
+                            bits.resize(lsb + off + w, VX);
                             slots[s] = Value { bits, real: false };
                         }
                         for b in 0..w {
-                            slots[s].set_bit(lsb + b, v.bit(b));
+                            slots[s].set_bit(lsb + off + b, v.bit(b));
                         }
                         Some(())
                     })();
@@ -4079,6 +4181,55 @@ fn ce_stmt(
             }
             if let Some(d) = default {
                 ce_stmt(d, slots, env, funcs, extras, flow);
+            }
+        }
+        Stmt::SysCall { name, args } => {
+            // VHDL `report`/`assert` inside a constant initializer: a note or
+            // warning only annotates elaboration, so const-eval continues past
+            // it (a `log2` that warns on non-power-of-2 input must still
+            // produce a value). Error/failure — and a failing `assert`, whose
+            // default severity is error (LRM 1076 §10.8) — mean the
+            // initializer would fail at elaboration, so it folds to X. Other
+            // syscalls (file I/O, $display) have no constant meaning.
+            let severity = |i: usize, slots: &mut Vec<Value>| {
+                args.get(i)
+                    .and_then(|a| ev(a, slots))
+                    .map(|v| {
+                        v.bits
+                            .chunks(8)
+                            .rev()
+                            .filter_map(|c| {
+                                let mut b = 0u8;
+                                for (j, &bit) in c.iter().enumerate() {
+                                    if bit == V1 {
+                                        b |= 1 << j;
+                                    }
+                                }
+                                (b != 0).then_some(b as char)
+                            })
+                            .collect::<String>()
+                            .to_ascii_lowercase()
+                    })
+                    .unwrap_or_default()
+            };
+            match name.as_str() {
+                "report" => {
+                    if matches!(severity(1, slots).as_str(), "error" | "failure") {
+                        *flow = CeFlow::Abort;
+                    }
+                }
+                "assert" => {
+                    let ok = args
+                        .first()
+                        .and_then(|a| ev(a, slots))
+                        .and_then(|v| v.to_u64())
+                        .map(|n| n != 0)
+                        .unwrap_or(true);
+                    if !ok && !matches!(severity(2, slots).as_str(), "note" | "warning") {
+                        *flow = CeFlow::Abort;
+                    }
+                }
+                _ => *flow = CeFlow::Abort,
             }
         }
         _ => *flow = CeFlow::Abort,
