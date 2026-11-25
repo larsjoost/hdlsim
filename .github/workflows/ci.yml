@@ -74,7 +74,7 @@ jobs:
           prefix-key: v0-rust-release
 
       - name: Run corpus tests
-        run: cargo test --release --test corpus
+        run: cargo test --release --test corpus -- --ignored
 
   release-smoke:
     name: release binary smoke test
