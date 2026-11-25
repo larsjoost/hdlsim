@@ -153,3 +153,16 @@ fn failures_print_report_hint() {
     assert!(out.status.success());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("issues/new"));
 }
+
+#[test]
+fn design_finish_exit_prints_no_report_hint() {
+    // A testbench's own std.env.finish(status) chooses the exit code — that
+    // is the tb author's verdict, not an hdlsim failure, so the
+    // "to report this … open an issue" hint (and with it any automatic
+    // issue filing) must not fire for it.
+    let out = run("tb_proc_finish", "tests/fixtures/vhdl_proc_finish_tb.vhd");
+    assert_eq!(out.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("to report this"), "{}", err);
+    assert!(!err.contains("issues/new"), "{}", err);
+}

@@ -36,6 +36,25 @@ mod wave;
 use anyhow::Context as _;
 use hdl_lib::LibraryManager;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set when a subcommand returns an exit code the *design* chose — a
+/// testbench `std.env.finish(status)` — rather than a tool failure. `main`
+/// suppresses the "to report this" issue hint for it: the tb author maps
+/// success/failure to exit codes however they like, and a non-zero one is
+/// not a reason to file an hdlsim issue.
+static DESIGN_FINISH_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Mark the exit code about to be returned as design-requested
+/// (`std.env.finish(status)`).
+pub(crate) fn mark_design_finish_exit() {
+    DESIGN_FINISH_EXIT.store(true, Ordering::Relaxed);
+}
+
+/// True when the last dispatch returned a design-requested exit status.
+pub fn design_finish_exit() -> bool {
+    DESIGN_FINISH_EXIT.load(Ordering::Relaxed)
+}
 
 /// Extension seam: implement for a new subcommand, add one entry to [`COMMANDS`].
 pub trait Command {

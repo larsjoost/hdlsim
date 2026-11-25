@@ -299,7 +299,16 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                 for (n, e) in &design.modules[mi].instances[ii].param_overrides {
                     let Some(n) = n else { continue }; // resolved by resolve_positional_params
                     if let Expr::Lit(v) = e {
-                        params.insert(n.to_ascii_lowercase(), v.clone());
+                        // An X-valued actual carries no binding information:
+                        // it is what an initializer fell back to when it
+                        // could not be const-folded. Keying a variant on it
+                        // duplicates the whole entity/architecture lowering
+                        // (and its diagnostics) for a garbage key — skip it
+                        // so the instance shares the base (or a variant
+                        // keyed by the real-valued params only).
+                        if v.is_known() {
+                            params.insert(n.to_ascii_lowercase(), v.clone());
+                        }
                     }
                 }
                 if params.is_empty() {

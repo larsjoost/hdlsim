@@ -785,6 +785,11 @@ impl Simulator {
     }
 
     pub fn signal_value(&self, id: FlatSigId) -> Value {
+        // Memory-backed signals report the concatenated words, not the
+        // (possibly stale) flat slot — element writes never touch `vals`.
+        if self.is_mem[id as usize] {
+            return self.mem_flat(id as usize);
+        }
         self.vals[id as usize].clone()
     }
 
@@ -1298,7 +1303,7 @@ impl Simulator {
                         break;
                     }
                     self.cur_proc = drv;
-                    self.set_sig(sig, v);
+                    self.apply_whole_assign(sig, v);
                 }
                 let exprs = std::mem::take(&mut self.nba_exprs);
                 for (n, (lhs, v, drv)) in exprs.into_iter().enumerate() {
@@ -1808,7 +1813,8 @@ impl Simulator {
                 let v = self.eval_expr(&rhs, None);
                 let t = self.eval_expr(&delay, None).to_u64().unwrap_or(0);
                 if t == 0 {
-                    if let Some(sig) = lhs_sig(&lhs) {
+                    // Memory-backed target: keep full width, see Stmt::Assign.
+                    if let Some(sig) = lhs_sig(&lhs).filter(|&s| !self.is_mem[s as usize]) {
                         let w = self.flat.signals[sig as usize].width;
                         let v = self.convert_for_target(&lhs, &rhs, v, None);
                         self.nba.push((sig, v.resize(w.max(1)), self.cur_proc));
@@ -1816,7 +1822,7 @@ impl Simulator {
                         let lhs = self.concretize_target(&lhs);
                         self.nba_apply_later(lhs, v);
                     }
-                } else if let Some(sig) = lhs_sig(&lhs) {
+                } else if let Some(sig) = lhs_sig(&lhs).filter(|&s| !self.is_mem[s as usize]) {
                     let w = self.flat.signals[sig as usize].width;
                     let v = self.convert_for_target(&lhs, &rhs, v, None);
                     self.time_events
@@ -1835,7 +1841,13 @@ impl Simulator {
             Stmt::Assign { lhs, rhs, nba } => {
                 let v = self.eval_expr(&rhs, None);
                 if nba {
-                    if let Some(sig) = lhs_sig(&lhs) {
+                    // A memory-backed signal must not take the scalar NBA
+                    // fast path: `vals` holds only the element width, so
+                    // `v.resize(w)` would truncate a whole-array RHS
+                    // (`int_sig <= input & int_sig(0 to …)`) to one bit
+                    // before `mem_distribute` ever sees it. Route it through
+                    // the expression path, which distributes across words.
+                    if let Some(sig) = lhs_sig(&lhs).filter(|&s| !self.is_mem[s as usize]) {
                         let cur = self.vals[sig as usize].clone();
                         let w = self.flat.signals[sig as usize].width;
                         let v = self.convert_for_target(&lhs, &rhs, v, None);
@@ -3104,6 +3116,68 @@ impl Simulator {
         }
     }
 
+    /// Whole-value view of a memory-backed signal: words concatenated
+    /// MSB-first (element 0 = most significant), the same packing the
+    /// elaboration init distribution, aggregate lowering, and `$const_idx`
+    /// use. Before the first write the words are the declared depth of X —
+    /// the element width alone would shrink every slice/concat built on a
+    /// whole-array read (a delayline shift `int_sig <= input & int_sig(0
+    /// to …)` then packs its first word with X and never recovers).
+    fn mem_flat(&self, sig: usize) -> Value {
+        let w = self.flat.signals[sig].width.max(1);
+        let m = &self.mems[sig];
+        if m.is_empty() {
+            let depth = self.flat.signals[sig].mem.unwrap_or(0).max(1);
+            return Value::x(w.saturating_mul(depth));
+        }
+        let words: Vec<Value> = m.iter().map(|el| el.clone().resize(w)).collect();
+        Value::concat(&words)
+    }
+
+    /// Whole-signal update from every path that assigns a bare signal id
+    /// (continuous assigns, NBA region, time-wheel events): memory-backed
+    /// signals distribute across their words, plain signals take the flat
+    /// value. All whole-array semantics live here so the paths cannot
+    /// diverge.
+    fn apply_whole_assign(&mut self, sig: FlatSigId, v: Value) -> bool {
+        if self.is_mem[sig as usize] {
+            self.mem_distribute(sig as usize, v)
+        } else {
+            let w = self.flat.signals[sig as usize].width.max(1);
+            self.set_sig(sig, v.resize(w))
+        }
+    }
+
+    /// Whole-array assign onto a memory-backed signal: distribute the flat
+    /// value across the words (element 0 takes the most significant part),
+    /// then mirror the flat value into `vals` so watch/wave output and
+    /// scalar sensitivity see the same value a whole-signal read returns.
+    fn mem_distribute(&mut self, sig: usize, v: Value) -> bool {
+        let w = self.flat.signals[sig].width.max(1);
+        // First write materializes the words at the declared depth — an
+        // empty `mems` here would drop the write and the array would stay
+        // empty (every later element read X) forever.
+        if self.mems[sig].is_empty() {
+            let depth = self.flat.signals[sig].mem.unwrap_or(0);
+            if depth == 0 {
+                return false;
+            }
+            self.mems[sig].resize(depth, Value::x(w));
+        }
+        let n = self.mems[sig].len();
+        let total = w * n;
+        let flat = v.resize(total);
+        for i in 0..n {
+            let el = flat.slice(total - 1 - i * w, total - (i + 1) * w);
+            if self.mems[sig][i] != el {
+                let old = self.mems[sig][i].clone();
+                self.mems[sig][i] = el;
+                self.wake_mem_watchers(sig, i, old);
+            }
+        }
+        self.set_sig(sig as FlatSigId, flat)
+    }
+
     fn schedule_sensitive(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
         // Lowering-internal signals (`__for_i` loop variables, `__pN_var_*`
         // variable mirrors) are not VHDL signals: writing them must never
@@ -3198,11 +3272,9 @@ impl Simulator {
         match lhs {
             Expr::Sig(s) => {
                 let sig = *s as FlatSigId;
-                if self.is_mem[sig as usize] {
-                    return false; // bare memory assign not meaningful
-                }
-                let w = self.flat.signals[sig as usize].width.max(1);
-                self.set_sig(sig, v.resize(w))
+                // Whole-array assign (`arr <= arr_port`): distribute the
+                // value across the memory words instead of dropping it.
+                self.apply_whole_assign(sig, v)
             }
             Expr::Idx { e, i } => {
                 let addr = self.eval_expr(i, locals);
@@ -3550,12 +3622,22 @@ impl Simulator {
                         return Value::from_u64(32, v);
                     }
                 }
-                let w = self.flat.signals[sig].width.max(1);
-                let n = self
-                    .mems
-                    .get(sig)
-                    .filter(|m| !m.is_empty())
-                    .map_or(w, |m| m.len().max(1));
+                // Element count: the live word count once words exist, the
+                // declared depth before the first write (`sig'length` on an
+                // array signal must not collapse to the element width), the
+                // flat bit width for plain vector signals. `mems` holds an
+                // entry for every signal (empty for non-memories), so the
+                // declared-depth fallback must be gated on `is_mem` — a
+                // connected unconstrained formal resized to a plain vector
+                // (flat width N, mem None) would otherwise report 1.
+                let n = if self.is_mem[sig] {
+                    match self.mems.get(sig) {
+                        Some(m) if !m.is_empty() => m.len().max(1),
+                        _ => self.flat.signals[sig].mem.unwrap_or(0).max(1),
+                    }
+                } else {
+                    self.flat.signals[sig].width.max(1)
+                };
                 let v = match *attr {
                     "length" => n as u64,
                     "high" | "left" => (n as u64).saturating_sub(1),
@@ -3571,6 +3653,12 @@ impl Simulator {
                     }
                 }
                 if i < self.vals.len() {
+                    // Memory-backed signal read as a whole: concatenate the
+                    // words (element 0 = MSB) — element writes bypass `vals`,
+                    // so the words are the value's home.
+                    if self.is_mem[i] {
+                        return self.mem_flat(i);
+                    }
                     self.vals[i].clone()
                 } else {
                     Value::x(1)
@@ -4306,7 +4394,11 @@ impl Simulator {
         lvals.push(Value::x(f.ret_width)); // slot 0 = function name (return value)
         for (i, a) in args.iter().enumerate() {
             let w = f.slots.get(i + 1).copied().unwrap_or(1);
-            lvals.push(self.eval_expr(a, locals).resize(w));
+            let v = self.eval_expr(a, locals);
+            // Same rule as `run_procedure`: an actual wider than the declared
+            // slot (unconstrained array-of-record formals) keeps its full
+            // width — the slot is a lower bound, never a truncation.
+            lvals.push(v.resize(w.max(v.width())));
         }
         // Omitted trailing actuals take the formals' recorded interface
         // defaults (`w : natural := 8`); anything after the formals (locals)

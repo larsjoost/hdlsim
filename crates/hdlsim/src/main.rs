@@ -64,7 +64,10 @@ fn main() {
     }
     match hdlsim::commands::dispatch(&args) {
         Ok(code) => {
-            if code != 0 {
+            // A testbench `std.env.finish(status)` picks its own exit code —
+            // the tb author's verdict, not an hdlsim failure — so the
+            // issue-reporting hint and auto-filing do not apply.
+            if code != 0 && !hdlsim::commands::design_finish_exit() {
                 report_hint();
                 if let Some(req) = &report {
                     hdlsim::commands::report::maybe_file_issue(req, &args, code);
