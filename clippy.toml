@@ -7,3 +7,9 @@
 # enabled — the standards-audit CI job today; the strict `-D warnings`
 # gate adopts it once the existing long functions are extracted.
 too-many-lines-threshold = 50
+
+# Cognitive complexity split line for the standards-audit job, on the same
+# plan as the function-length threshold: report-only until the existing
+# offenders are extracted. (clippy's default would be 25; 30 mirrors the
+# "target ≤ 30 lines" reading of the standard.)
+cognitive-complexity-threshold = 30

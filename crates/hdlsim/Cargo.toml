@@ -32,3 +32,6 @@ clap.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true
 log.workspace = true
+
+[lints]
+workspace = true
