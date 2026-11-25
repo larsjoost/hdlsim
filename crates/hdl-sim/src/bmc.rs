@@ -412,7 +412,7 @@ fn extend(b: &Builder, bits: &[Lit], w: usize, signed: bool) -> Vec<Lit> {
         out.truncate(w);
     } else {
         let fill = if signed && !out.is_empty() {
-            *out.last().unwrap()
+            *out.last().expect("checked !out.is_empty()")
         } else {
             b.false_lit()
         };

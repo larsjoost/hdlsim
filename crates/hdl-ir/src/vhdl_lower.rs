@@ -5498,14 +5498,20 @@ impl<'a> Lower<'a> {
                             // (constrained subtypes carry their sizes in
                             // dims and need no extra factor).
                             let ftn = self.kw(tm);
-                            let w = match self.types.get(&ftn) {
-                                Some(TypeInfo::Array { dims, .. })
-                                    if dims.is_empty() && constraint.is_some() =>
-                                {
-                                    w.max(1) * self.constraint_width(constraint.unwrap()).max(1)
-                                }
-                                _ => w,
-                            };
+                            let w =
+                                match self.types.get(&ftn) {
+                                    Some(TypeInfo::Array { dims, .. })
+                                        if dims.is_empty() && constraint.is_some() =>
+                                    {
+                                        w.max(1)
+                                            * self
+                                                .constraint_width(constraint.expect(
+                                                    "match guard checked constraint.is_some()",
+                                                ))
+                                                .max(1)
+                                    }
+                                    _ => w,
+                                };
                             let fty = self.kw(tm);
                             for n in names {
                                 self.rec_field_ty
@@ -6760,7 +6766,7 @@ impl<'a> Lower<'a> {
                 return None; // every element `unaffected`: no assignment
             }
             let body = if stmts.len() == 1 {
-                stmts.pop().unwrap()
+                stmts.pop().expect("checked stmts.len() == 1")
             } else {
                 Stmt::Block(stmts)
             };
@@ -7060,7 +7066,7 @@ impl<'a> Lower<'a> {
             .map(|k| self.lower_seq_stmt(k))
             .collect();
         if stmts.len() == 1 {
-            stmts.into_iter().next().unwrap()
+            stmts.into_iter().next().expect("checked stmts.len() == 1")
         } else {
             Stmt::Block(stmts)
         }
@@ -7191,7 +7197,7 @@ impl<'a> Lower<'a> {
                                 });
                             }
                             return if stmts.len() == 1 {
-                                stmts.pop().unwrap()
+                                stmts.pop().expect("checked stmts.len() == 1")
                             } else {
                                 Stmt::Block(stmts)
                             };
@@ -7528,7 +7534,7 @@ impl<'a> Lower<'a> {
             let body = {
                 let ss: Vec<Stmt> = stmts.iter().map(|k| self.lower_seq_stmt(k)).collect();
                 if ss.len() == 1 {
-                    ss.into_iter().next().unwrap()
+                    ss.into_iter().next().expect("checked ss.len() == 1")
                 } else {
                     Stmt::Block(ss)
                 }
@@ -7636,7 +7642,7 @@ impl<'a> Lower<'a> {
         // Range bounds.
         let (lo, hi, downto) = match range.map(|r| r.kind()) {
             Some(SyntaxKind::Range) => {
-                let rk = real_children(range.unwrap());
+                let rk = real_children(range.expect("matched on range's kind, so range is Some"));
                 // `for i in s'range loop` — the range is a Range node holding an
                 // Attr child; resolve the bounds from the signal's dims.
                 if let Some(at) = rk.iter().find(|k| k.kind() == SyntaxKind::Attr) {
@@ -7740,7 +7746,7 @@ impl<'a> Lower<'a> {
             }
             Some(SyntaxKind::Attr) => {
                 // `name'range` on an array signal: 0 to depth-1.
-                let ak = real_children(range.unwrap());
+                let ak = real_children(range.expect("matched on range's kind, so range is Some"));
                 let base = ak.iter().find(|k| k.kind() == SyntaxKind::Name);
                 if let Some(b) = base {
                     let bn = self.text(b);
@@ -9245,7 +9251,7 @@ impl<'a> Lower<'a> {
             // the result slot (slot 0), which must not turn a recursive call
             // into an index of that slot.
             _ if base_id.is_some() && !args.is_empty() && !self.funcs.contains_key(&fname) => {
-                let base = base_id.unwrap();
+                let base = base_id.expect("arm guard checked base_id.is_some()");
                 if let Some(dims) = self.sig_dims.get(&base).cloned() {
                     if dims.len() == args.len() {
                         let mut flat: Option<Expr> = None;
@@ -9270,14 +9276,18 @@ impl<'a> Lower<'a> {
                         }
                         return Expr::Idx {
                             e: Box::new(Expr::Sig(base)),
-                            i: Box::new(flat.unwrap()),
+                            i: Box::new(flat.expect("dims.len() == args.len() and args is non-empty, so the fold assigned flat")),
                         };
                     }
                 }
                 if args.len() == 1 {
                     return Expr::Idx {
                         e: Box::new(Expr::Sig(base)),
-                        i: Box::new(args.into_iter().next().unwrap()),
+                        i: Box::new(
+                            args.into_iter()
+                                .next()
+                                .expect("match guard requires exactly one argument"),
+                        ),
                     };
                 }
                 Expr::Call { name: fname, args }
@@ -9338,16 +9348,24 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            "rising_edge" if args.len() == 1 => {
-                Expr::Rising(Box::new(args.into_iter().next().unwrap()))
-            }
-            "falling_edge" if args.len() == 1 => {
-                Expr::Falling(Box::new(args.into_iter().next().unwrap()))
-            }
+            "rising_edge" if args.len() == 1 => Expr::Rising(Box::new(
+                args.into_iter()
+                    .next()
+                    .expect("match guard requires exactly one argument"),
+            )),
+            "falling_edge" if args.len() == 1 => Expr::Falling(Box::new(
+                args.into_iter()
+                    .next()
+                    .expect("match guard requires exactly one argument"),
+            )),
             "to_integer" | "conv_integer" | "integer" | "natural" | "positive"
                 if args.len() == 1 =>
             {
-                Expr::ToInt(Box::new(args.into_iter().next().unwrap()))
+                Expr::ToInt(Box::new(
+                    args.into_iter()
+                        .next()
+                        .expect("match guard requires exactly one argument"),
+                ))
             }
             // Real/fixed/float conversions: `x * 1.0` (real-typed f64).
             // `real(x)` is a value conversion (LRM 8.6) — integer bits do
@@ -9355,18 +9373,33 @@ impl<'a> Lower<'a> {
             // `RETURN conv_float(real(arg))` call itself with the same
             // integer and recurse forever.
             "to_real" | "real" | "to_ufixed" | "to_sfixed" | "to_float" if !args.is_empty() => {
-                as_real(args.into_iter().next().unwrap())
+                as_real(
+                    args.into_iter()
+                        .next()
+                        .expect("match guard requires a non-empty argument list"),
+                )
             }
-            "resize" if args.len() == 3 => as_real(args.into_iter().next().unwrap()),
+            "resize" if args.len() == 3 => as_real(
+                args.into_iter()
+                    .next()
+                    .expect("match guard requires exactly three arguments"),
+            ),
             // `to_slv(x)`: bit-identical view as std_logic_vector.
-            "to_slv" if args.len() == 1 => args.into_iter().next().unwrap(),
+            "to_slv" if args.len() == 1 => args
+                .into_iter()
+                .next()
+                .expect("match guard requires exactly one argument"),
             "to_unsigned" | "conv_unsigned" | "conv_std_logic_vector" if args.len() == 2 => {
                 let w = self
                     .ce_env(&args[1], env)
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
                 Expr::Resize {
-                    e: Box::new(args.into_iter().next().unwrap()),
+                    e: Box::new(
+                        args.into_iter()
+                            .next()
+                            .expect("match guard requires exactly two arguments"),
+                    ),
                     width: w,
                     signed: false,
                 }
@@ -9377,7 +9410,11 @@ impl<'a> Lower<'a> {
                     .and_then(|w| w.to_u64())
                     .unwrap_or(32) as usize;
                 Expr::Resize {
-                    e: Box::new(args.into_iter().next().unwrap()),
+                    e: Box::new(
+                        args.into_iter()
+                            .next()
+                            .expect("match guard requires exactly two arguments"),
+                    ),
                     width: w,
                     signed: true,
                 }
@@ -9395,25 +9432,36 @@ impl<'a> Lower<'a> {
                     _ => false,
                 };
                 Expr::Resize {
-                    e: Box::new(args.into_iter().next().unwrap()),
+                    e: Box::new(
+                        args.into_iter()
+                            .next()
+                            .expect("match guard requires exactly two arguments"),
+                    ),
                     width: w,
                     signed,
                 }
             }
             // `signed(x)` keeps the bits but marks signed semantics.
-            "signed" if args.len() == 1 => Expr::Signed(Box::new(args.into_iter().next().unwrap())),
+            "signed" if args.len() == 1 => Expr::Signed(Box::new(
+                args.into_iter()
+                    .next()
+                    .expect("match guard requires exactly one argument"),
+            )),
             // Other type conversions are bit-identical.
             "std_logic_vector" | "std_ulogic_vector" | "unsigned" | "bit_vector" | "std_logic"
             | "bit" | "boolean" | "string" | "char"
                 if args.len() == 1 =>
             {
-                args.into_iter().next().unwrap()
+                args.into_iter()
+                    .next()
+                    .expect("match guard requires exactly one argument")
             }
             // Alias to a subprogram: `alias a is f[...];` — calls to `a(...)`
             // become calls to the target `f(...)`.
             // Operator-symbol call: `"<"(a, b)`, `"+"(x, y)`.
             _ if args.len() == 2 && vhdl_binop(fname.trim_matches('"')).is_some() => {
-                let op = vhdl_binop(fname.trim_matches('"')).unwrap();
+                let op = vhdl_binop(fname.trim_matches('"'))
+                    .expect("arm guard checked vhdl_binop(...).is_some()");
                 Expr::Bin {
                     op,
                     l: Box::new(args[0].clone()),
@@ -9425,7 +9473,11 @@ impl<'a> Lower<'a> {
                 .get(&fname)
                 .is_some_and(|a| matches!(a, Expr::Call { .. })) =>
             {
-                match self.aliases.get(&fname).unwrap() {
+                match self
+                    .aliases
+                    .get(&fname)
+                    .expect("arm guard checked that this alias is a Call")
+                {
                     Expr::Call { name: target, .. } => Expr::Call {
                         name: target.clone(),
                         args,

@@ -291,13 +291,17 @@ pub fn units_in_file_tagged(path: &Path) -> Vec<(String, bool)> {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
         crate::cache::hash64(&text),
     );
-    if let Some(v) = unit_names_memo().lock().unwrap().get(&key) {
+    if let Some(v) = unit_names_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
         return v.as_ref().clone();
     }
     let units = units_in_text_tagged(lang, path, &text);
     unit_names_memo()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key, Arc::new(units.clone()));
     units
 }

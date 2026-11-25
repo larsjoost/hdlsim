@@ -82,7 +82,7 @@ impl LiveBus {
     fn push(&self, payload: String) {
         const CAP: usize = 500_000;
         const TRUNC_EVERY: u64 = 100_000;
-        let mut ev = self.inner.events.lock().unwrap();
+        let mut ev = self.inner.events.lock().unwrap_or_else(|e| e.into_inner());
         ev.push(payload);
         // Cap history so long sims do not grow memory without bound.
         if ev.len() > CAP {
@@ -252,7 +252,12 @@ fn handle_conn(mut stream: TcpStream, bus: LiveBus) -> std::io::Result<()> {
             Ok(())
         }
         ("GET", "/signals") => {
-            let sigs = bus.inner.sigs.lock().unwrap().clone();
+            let sigs = bus
+                .inner
+                .sigs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             respond(stream, "200 OK", "application/json", sigs.as_bytes());
             Ok(())
         }
@@ -276,7 +281,7 @@ fn sse_stream(mut stream: TcpStream, bus: LiveBus) -> std::io::Result<()> {
     let mut cursor = 0usize;
     loop {
         let (batch, closed) = {
-            let ev = bus.inner.events.lock().unwrap();
+            let ev = bus.inner.events.lock().unwrap_or_else(|e| e.into_inner());
             // Re-base cursor if history was trimmed.
             let base = ev.len().saturating_sub(500_000);
             if cursor < base {
@@ -297,12 +302,12 @@ fn sse_stream(mut stream: TcpStream, bus: LiveBus) -> std::io::Result<()> {
             return Ok(());
         }
         // Wait for more events (or shutdown) with a timeout so we stay responsive.
-        let ev = bus.inner.events.lock().unwrap();
+        let ev = bus.inner.events.lock().unwrap_or_else(|e| e.into_inner());
         let _ = bus
             .inner
             .cond
             .wait_timeout(ev, Duration::from_millis(250))
-            .unwrap();
+            .unwrap_or_else(|e| e.into_inner());
     }
 }
 

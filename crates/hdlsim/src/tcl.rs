@@ -394,7 +394,10 @@ impl Interp {
                 }
                 _ => {
                     // Copy one UTF-8 char.
-                    let ch = s[i..].chars().next().unwrap();
+                    let ch = s[i..]
+                        .chars()
+                        .next()
+                        .expect("this arm only runs with i < s.len(), so the slice is non-empty");
                     out.push(ch);
                     i += ch.len_utf8();
                 }
