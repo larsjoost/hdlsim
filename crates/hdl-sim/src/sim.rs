@@ -17,6 +17,7 @@
 use crate::events::{Observer, SimEvent};
 use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
+use hdl_syntax::source::Span;
 
 mod ckpt;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
@@ -258,6 +259,14 @@ pub struct Simulator {
     /// Process currently executing (for driver tracing); `None` outside
     /// processes, `Some(u32::MAX)` while re-evaluating continuous assigns.
     cur_proc: Option<u32>,
+    /// Source span of the statement currently executing — latched by the
+    /// `Stmt::Spanned` arm of `exec_stmt` and attached to Message/TestFailed
+    /// events, so a transcript line can point at the responsible source.
+    cur_span: Option<Span>,
+    /// Span of the first failing statement (latched by `fail`) — reported in
+    /// the CLI's FAILED summary so the failure has a jump-to location even if
+    /// the transcript line was missed.
+    first_failure_span: Option<Span>,
     /// Per-signal last driver: (proc, time_fs). proc == u32::MAX = assign.
     last_driver: Vec<Option<(u32, u64)>>,
     /// "Parked at a wait" per process — O(1) park check and wake. The wait's
@@ -472,6 +481,8 @@ impl Simulator {
             active: VecDeque::new(),
             nba: Vec::new(),
             cur_proc: None,
+            cur_span: None,
+            first_failure_span: None,
             last_driver: vec![None; n],
             time_events: BTreeMap::new(),
             time: 0,
@@ -704,6 +715,12 @@ impl Simulator {
     // These let external tools (and `hdlsim debug`) inspect the running design
     // without the kernel changing: find signals, read values, dump memories.
 
+    /// Span of the first test failure's statement, if any failed — the CLI
+    /// prints it in the FAILED summary so a failure has a jump-to location.
+    pub fn first_failure_span(&self) -> Option<Span> {
+        self.first_failure_span
+    }
+
     /// Number of test failures so far (severity error/failure, `$error`/`$fatal`).
     /// CLI runners exit non-zero when this is > 0 after `run`.
     pub fn failures(&self) -> u64 {
@@ -877,11 +894,21 @@ impl Simulator {
         }
     }
 
-    /// Record a test failure (emits [`SimEvent::TestFailed`]).
+    /// Record a test failure (emits [`SimEvent::TestFailed`]). The event
+    /// carries the currently executing statement's span, and the first
+    /// failure's span is latched for the CLI summary (see
+    /// [`Simulator::first_failure_span`]).
     fn fail(&mut self, text: String) {
         self.failures += 1;
         let time_fs = self.time;
-        self.emit(SimEvent::TestFailed { text, time_fs });
+        if self.first_failure_span.is_none() {
+            self.first_failure_span = self.cur_span;
+        }
+        self.emit(SimEvent::TestFailed {
+            text,
+            time_fs,
+            span: self.cur_span,
+        });
     }
 
     /// Report a latched function-recursion stop (latched by
@@ -916,7 +943,8 @@ impl Simulator {
                     tail.join(" > ")
                 ),
                 time_fs: self.time,
-            });
+                span: self.cur_span,
+                });
             self.stopped = true;
             self.error_stopped = true;
             return true;
@@ -956,7 +984,8 @@ impl Simulator {
                     tail.join(" > ")
                 ),
                 time_fs: self.time,
-            });
+                span: self.cur_span,
+                });
             self.stopped = true;
             self.error_stopped = true;
             return true;
@@ -986,6 +1015,7 @@ impl Simulator {
         self.emit(SimEvent::Message {
             text: crate::meminfo::limit_message("simulate", peak_kb, limit_kb),
             time_fs: self.time,
+            span: self.cur_span,
         });
         self.stopped = true;
         self.error_stopped = true;
@@ -1125,6 +1155,7 @@ impl Simulator {
                 self.where_am_i()
             ),
             time_fs: self.time,
+            span: self.cur_span,
         });
         self.interrupt_info = Some((reason.to_string(), rc));
         self.stopped = true;
@@ -1196,7 +1227,8 @@ impl Simulator {
                         delta_count, fmt_time(self.time)
                     ),
                     time_fs: self.time,
-                });
+                    span: self.cur_span,
+                    });
                 self.stopped = true;
                 self.error_stopped = true;
                 break;
@@ -1240,7 +1272,8 @@ impl Simulator {
                             fmt_time(self.time)
                         ),
                         time_fs: self.time,
-                    });
+                        span: self.cur_span,
+                        });
                     self.stopped = true;
                     self.error_stopped = true;
                     break;
@@ -1531,7 +1564,8 @@ impl Simulator {
                         fmt_time(self.time)
                     ),
                     time_fs: self.time,
-                });
+                    span: self.cur_span,
+                    });
                 self.stopped = true;
                 self.error_stopped = true;
                 return Control::Done;
@@ -1704,6 +1738,9 @@ impl Simulator {
                     span,
                     time_fs: self.time,
                 });
+                // Latch the statement's source span so Message/TestFailed
+                // events emitted while it executes carry a jump-to location.
+                self.cur_span = Some(span);
                 return self.exec_stmt(pid, *inner);
             }
             Stmt::Null => Control::Done,
@@ -2109,6 +2146,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text,
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
             }
             "monitor" => {
@@ -2121,6 +2159,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text: format!("{}\n", text),
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
             }
             "assert" => {
@@ -2141,6 +2180,7 @@ impl Simulator {
                     self.emit(SimEvent::Message {
                         text: format!("assertion failed at t={}: {}\n", self.time, msg),
                         time_fs: self.time,
+                        span: self.cur_span,
                     });
                     if matches!(severity.as_str(), "error" | "failure") {
                         self.fail(format!("assertion failed at t={}: {}", self.time, msg));
@@ -2152,6 +2192,7 @@ impl Simulator {
                                 self.time
                             ),
                             time_fs: self.time,
+                            span: self.cur_span,
                         });
                         self.stopped = true;
                     }
@@ -2170,6 +2211,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
                 if matches!(severity.as_str(), "error" | "failure") {
                     self.fail(format!("report severity {}: {}", severity, msg));
@@ -2181,6 +2223,7 @@ impl Simulator {
                             self.time
                         ),
                         time_fs: self.time,
+                        span: self.cur_span,
                     });
                     self.stopped = true;
                 }
@@ -2200,6 +2243,7 @@ impl Simulator {
                     self.emit(SimEvent::Message {
                         text: format!("assertion failed at t={}: {}\n", self.time, text),
                         time_fs: self.time,
+                        span: self.cur_span,
                     });
                     self.fail(format!("sva assertion failed at t={}: {}", self.time, text));
                 }
@@ -2210,6 +2254,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
                 self.fail(format!("${} at t={}: {}", name, self.time, text));
                 if name == "fatal" {
@@ -2221,6 +2266,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
             }
             "finish" => {
@@ -2274,6 +2320,7 @@ impl Simulator {
                                         name, self.time
                                     ),
                                     time_fs: self.time,
+                                    span: self.cur_span,
                                 }),
                             }
                             i += 2;
@@ -2285,6 +2332,7 @@ impl Simulator {
                                     self.time
                                 ),
                                 time_fs: self.time,
+                                span: self.cur_span,
                             });
                         }
                     }
@@ -2292,6 +2340,7 @@ impl Simulator {
                         self.emit(SimEvent::Message {
                             text: format!("warning: $rand_solve at t={}: {}\n", self.time, msg),
                             time_fs: self.time,
+                            span: self.cur_span,
                         });
                     }
                 }
@@ -2366,6 +2415,7 @@ impl Simulator {
                     self.emit(SimEvent::Message {
                         text: format!("{}\n", text),
                         time_fs: self.time,
+                        span: self.cur_span,
                     });
                 } else {
                     use std::io::Write;
@@ -2383,6 +2433,7 @@ impl Simulator {
                                 path, self.time
                             ),
                             time_fs: self.time,
+                            span: self.cur_span,
                         }),
                     }
                 }
@@ -2506,6 +2557,7 @@ impl Simulator {
                             name, self.time
                         ),
                         time_fs: self.time,
+                        span: self.cur_span,
                     });
                 }
             }
@@ -2608,6 +2660,7 @@ impl Simulator {
             self.emit(SimEvent::Message {
                 text: format!("error: cannot read memory file '{}'", fname),
                 time_fs: self.time,
+                span: self.cur_span,
             });
             return;
         };
@@ -2716,6 +2769,7 @@ impl Simulator {
                 self.emit(SimEvent::Message {
                     text: format!("{}\n", text),
                     time_fs: self.time,
+                    span: self.cur_span,
                 });
             }
         }
@@ -2728,6 +2782,9 @@ impl Simulator {
     fn eval_assigns_fixpoint(&mut self) -> bool {
         let mut any = false;
         self.cur_proc = Some(u32::MAX);
+        // The sweep is not a source statement: messages emitted here must not
+        // inherit the last process statement's span.
+        self.cur_span = None;
         self.fn_calls.set(0); // per-fixpoint call budget (see run_func)
         for sweep in 0..10_000 {
             self.delta_guard += 1;
@@ -2777,7 +2834,8 @@ impl Simulator {
                 fmt_time(self.time)
             ),
             time_fs: self.time,
-        });
+            span: self.cur_span,
+            });
         // Unconverged continuous assigns will oscillate every delta — an
         // unbounded failure would otherwise spin the delta loop forever
         // without time ever advancing (so --max-time could not stop it).
@@ -3127,6 +3185,7 @@ impl Simulator {
                     self.flat.signals[sig].mem.unwrap_or(0)
                 ),
                 time_fs: self.time,
+                span: self.cur_span,
             });
         }
         self.stopped = true;
@@ -4780,7 +4839,8 @@ impl<'a> ProcRunner<'a> {
                         self.sim.time
                     ),
                     time_fs: self.sim.time,
-                });
+                    span: self.sim.cur_span,
+                    });
                 Control::Done
             }
             Stmt::Null => Control::Done,

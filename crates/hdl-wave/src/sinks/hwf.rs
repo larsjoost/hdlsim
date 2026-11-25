@@ -78,7 +78,7 @@ impl<W: Write> WaveSink for HwfSink<W> {
                 w_u32(&mut self.w, *sig);
                 w_value(&mut self.w, new);
             }
-            SimEvent::Message { text, time_fs } => {
+            SimEvent::Message { text, time_fs, .. } => {
                 w_u8(&mut self.w, 2);
                 w_u64(&mut self.w, *time_fs);
                 w_str(&mut self.w, text);
@@ -197,7 +197,11 @@ pub fn read_hwf(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
             2 => {
                 let t = r.u64()?;
                 let text = r.str()?;
-                events.push(SimEvent::Message { text, time_fs: t });
+                events.push(SimEvent::Message {
+                    text,
+                    time_fs: t,
+                    span: None,
+                });
             }
             3 => {
                 let t = r.u64()?;
@@ -286,6 +290,7 @@ mod tests {
             &SimEvent::Message {
                 text: "hello\n".to_string(),
                 time_fs: 15,
+                span: None,
             },
             &f,
         );
@@ -315,7 +320,7 @@ mod tests {
             e => panic!("{:?}", e),
         }
         assert!(
-            matches!(&events[3], SimEvent::Message { text, time_fs } if text == "hello\n" && *time_fs == 15)
+            matches!(&events[3], SimEvent::Message { text, time_fs, .. } if text == "hello\n" && *time_fs == 15)
         );
     }
 

@@ -429,6 +429,16 @@ pub fn emit_diags(diags: &hdl_syntax::diagnostic::Diagnostics, db: &hdl_syntax::
     }
 }
 
+/// Render an event span as `file:line` for transcript prefixes and failure
+/// summaries. The line is taken at the span's *end* (last byte): Verilog
+/// statement spans start right after the previous token, so the start can sit
+/// on the line above the statement, while the end is on the statement's own
+/// last line.
+pub fn span_loc(db: &hdl_syntax::source::SourceDb, span: hdl_syntax::source::Span) -> String {
+    let f = db.file(span.file);
+    format!("{}:{}", f.name(), f.line_col(span.end.saturating_sub(1)).0)
+}
+
 /// Default config lookup: `./hdlsim.ini`, then each parent directory (like git
 /// searching upward for `.git`), so running hdlsim from a project
 /// subdirectory still picks up the project root's `hdlsim.ini`. Relative
@@ -903,7 +913,9 @@ pub fn apply_global_args(
                 "human" => ErrorFormat::Human,
                 "json" => ErrorFormat::Json,
                 _ => {
-                    eprintln!("error: invalid value '{v}' for '--error-format' (expected human|json)");
+                    eprintln!(
+                        "error: invalid value '{v}' for '--error-format' (expected human|json)"
+                    );
                     std::process::exit(2);
                 }
             });

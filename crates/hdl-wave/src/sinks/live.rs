@@ -144,12 +144,12 @@ impl WaveSink for LiveSink {
                     json_str(&v)
                 )
             }
-            SimEvent::Message { text, time_fs } => format!(
+            SimEvent::Message { text, time_fs, .. } => format!(
                 "{{\"e\":\"m\",\"t\":{},\"m\":{}}}",
                 time_fs,
                 json_str(text.trim_end())
             ),
-            SimEvent::TestFailed { text, time_fs } => format!(
+            SimEvent::TestFailed { text, time_fs, .. } => format!(
                 "{{\"e\":\"m\",\"t\":{},\"m\":{},\"fail\":true}}",
                 time_fs,
                 json_str(text.trim_end())
@@ -561,6 +561,7 @@ mod tests {
             &SimEvent::Message {
                 text: "hi\n".into(),
                 time_fs: 2_000_000,
+                span: None,
             },
             &flat,
         );

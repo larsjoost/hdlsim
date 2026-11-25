@@ -1,6 +1,8 @@
 //! `hdlsim run` — compile (with libraries) and simulate one design.
 
-use super::{build_manager, emit_diags, parse_time, parse_with, remap_into_bundle, Command, CommonArgs};
+use super::{
+    build_manager, emit_diags, parse_time, parse_with, remap_into_bundle, Command, CommonArgs,
+};
 use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
@@ -93,25 +95,55 @@ struct RunArgs {
 }
 
 /// Prints `$display`/`report` messages to stdout, like a simulator transcript.
-pub(crate) struct Transcript;
+/// Failure/warning lines that carry a source span are prefixed with
+/// `file:line: `, so the transcript line is a jump-to location (the span is
+/// resolved through the compilation's `SourceDb`).
+pub(crate) struct Transcript {
+    db: hdl_syntax::source::SourceDb,
+}
+
+impl Transcript {
+    pub(crate) fn new(db: hdl_syntax::source::SourceDb) -> Transcript {
+        Transcript { db }
+    }
+
+    /// `file:line: ` prefix for a span, or "" when the span is unknown.
+    fn loc(db: &hdl_syntax::source::SourceDb, span: Option<hdl_syntax::source::Span>) -> String {
+        match span {
+            Some(sp) => format!("{}: ", super::span_loc(db, sp)),
+            None => String::new(),
+        }
+    }
+}
 
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {
         let color = hdl_syntax::diagnostic::color_enabled();
         match ev {
-            SimEvent::Message { text, .. } => {
+            SimEvent::Message { text, span, .. } => {
                 // Colorize severity-ish message lines ($error/$fatal/assert
                 // failures, warnings); plain $display output stays uncolored.
+                // Those same lines get a `file:line:` prefix when the kernel
+                // attached the emitting statement's span.
                 let t = text.trim_start();
+                let failureish = t.starts_with("error")
+                    || t.starts_with("fatal")
+                    || t.contains("assertion failed")
+                    || t.starts_with("warning");
+                let text = if failureish {
+                    format!("{}{}", Self::loc(&self.db, *span), text)
+                } else {
+                    text.clone()
+                };
                 let painted = if t.starts_with("error")
                     || t.starts_with("fatal")
                     || t.contains("assertion failed")
                 {
-                    hdl_syntax::diagnostic::paint(color, "1;31", text)
+                    hdl_syntax::diagnostic::paint(color, "1;31", &text)
                 } else if t.starts_with("warning") {
-                    hdl_syntax::diagnostic::paint(color, "1;33", text)
+                    hdl_syntax::diagnostic::paint(color, "1;33", &text)
                 } else {
-                    text.clone()
+                    text
                 };
                 print!("{}", painted);
                 use std::io::Write;
@@ -265,7 +297,7 @@ impl Command for Run {
         if let Some(s) = seed {
             sim.set_seed(s);
         }
-        sim.add_observer(Box::new(Transcript));
+        sim.add_observer(Box::new(Transcript::new(mgr.db().clone())));
         // Coverage collector, kept behind a shared handle so we can report
         // after the run.
         let cov = if coverage {
@@ -387,12 +419,18 @@ impl Command for Run {
         // A failed unit test (assert/report severity error|failure, $error/$fatal)
         // makes the whole run fail: exit code 1 so CI/scripts catch it.
         if sim.failures() > 0 {
+            let mut msg = format!("hdlsim: FAILED — {} test failure(s)", sim.failures());
+            // First failure gets a jump-to location when the kernel latched
+            // the failing statement's span.
+            if let Some(span) = sim.first_failure_span() {
+                msg = format!("{} (first at {})", msg, super::span_loc(mgr.db(), span));
+            }
             println!(
                 "{}",
                 hdl_syntax::diagnostic::paint(
                     hdl_syntax::diagnostic::color_enabled(),
                     "1;31",
-                    &format!("hdlsim: FAILED — {} test failure(s)", sim.failures())
+                    &msg
                 )
             );
             return Ok(1);

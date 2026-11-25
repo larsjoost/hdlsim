@@ -1,7 +1,10 @@
 //! `hdlsim check` — compile only (parse + lower + resolve), print diagnostics,
 //! no simulation. Like `vlog -lint` / `ghdl -a`.
 
-use super::{build_manager, emit_diags, error_format, parse_with, remap_into_bundle, Command, CommonArgs, ErrorFormat};
+use super::{
+    build_manager, emit_diags, error_format, parse_with, remap_into_bundle, Command, CommonArgs,
+    ErrorFormat,
+};
 use anyhow::Context as _;
 use clap::Parser;
 use hdl_ir::elab;

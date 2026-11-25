@@ -34,11 +34,22 @@ pub enum SimEvent {
         active: bool,
         time_fs: u64,
     },
-    /// A `$display`/`$write`/`report` line of text.
-    Message { text: String, time_fs: u64 },
+    /// A `$display`/`$write`/`report` line of text. `span` is the source
+    /// statement that produced it when known, so a transcript reader (human
+    /// or agent) can jump straight to the source line.
+    Message {
+        text: String,
+        time_fs: u64,
+        span: Option<Span>,
+    },
     /// A test failed: `assert`/`report` with severity `error`/`failure`, or a
     /// Verilog `$error`/`$fatal`. CLI runners exit non-zero when this fires.
-    TestFailed { text: String, time_fs: u64 },
+    /// `span` is the failing statement's source span when known.
+    TestFailed {
+        text: String,
+        time_fs: u64,
+        span: Option<Span>,
+    },
     /// `$finish` / `std.env.finish` was called.
     Finish { time_fs: u64 },
     /// Simulation stopped (end of events, no $finish).

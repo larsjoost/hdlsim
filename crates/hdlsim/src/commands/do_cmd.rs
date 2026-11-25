@@ -79,6 +79,7 @@ impl Command for DoCmd {
             vcd_path: None,
             history: Vec::new(),
             seed: None,
+            db: None,
         };
         let mut interp = Interp::new();
         let flow = interp
@@ -119,6 +120,9 @@ struct DoSession {
     history: Vec<(u64, Vec<u8>)>,
     /// `$random` seed from a `seed N` command; applied to (re)built sims.
     seed: Option<u64>,
+    /// Source files of the session, kept so restored sims can attach a
+    /// transcript that resolves event spans to `file:line`.
+    db: Option<hdl_syntax::source::SourceDb>,
 }
 
 impl DoSession {
@@ -146,7 +150,10 @@ impl DoSession {
         if let Some(s) = self.seed {
             sim.set_seed(s);
         }
-        sim.add_observer(Box::new(Transcript));
+        self.db = Some(mgr.db().clone());
+        sim.add_observer(Box::new(Transcript::new(
+            self.db.clone().unwrap_or_default(),
+        )));
         if let Some(p) = &self.vcd_path {
             attach_vcd(&mut sim, p)?;
         }
@@ -204,7 +211,9 @@ impl DoSession {
                 };
                 let mut sim = Simulator::restore_checkpoint_bytes(flat, &bytes)
                     .map_err(anyhow::Error::msg)?;
-                sim.add_observer(Box::new(Transcript));
+                sim.add_observer(Box::new(Transcript::new(
+                    self.db.clone().unwrap_or_default(),
+                )));
                 if let Some(p) = &self.vcd_path {
                     attach_vcd(&mut sim, p)?;
                 }
@@ -292,7 +301,9 @@ impl DoSession {
                 let flat = self.sim.as_ref().unwrap().flat().clone();
                 let mut sim = Simulator::restore_checkpoint(flat, std::path::Path::new(path))
                     .map_err(anyhow::Error::msg)?;
-                sim.add_observer(Box::new(Transcript));
+                sim.add_observer(Box::new(Transcript::new(
+                    self.db.clone().unwrap_or_default(),
+                )));
                 if let Some(p) = &self.vcd_path {
                     attach_vcd(&mut sim, p)?;
                 }
