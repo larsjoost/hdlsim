@@ -12,6 +12,20 @@ repository = "https://github.com/larsjoost/hdlsim"
 readme = "README.md"
 authors = ["Lars Joost Jensen <larsjoostjensen@gmail.com>"]
 
+# Workspace-wide lint baseline; every crate opts in with `[lints]
+# workspace = true`. The warn entries are enforced by the CI gate's
+# `-D warnings` (all measured zero findings on adoption); `unsafe_code`
+# is denied outright. Lints with existing findings stay audit-only —
+# see the standards-audit job and AGENTS.md.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+undocumented_unsafe_blocks = "warn"
+
 # Path deps also carry a version so `cargo publish` can rewrite them to
 # registry deps in the packaged manifests.
 [workspace.dependencies]

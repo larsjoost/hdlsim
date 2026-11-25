@@ -49,7 +49,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   lib-unwrap:
-    name: "lib lints: no unguarded unwrap"
+    name: "lib lints: no unguarded unwrap or panic"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +66,12 @@ jobs:
 
       # The hard line of "no unguarded crashes in library/runtime code":
       # `.unwrap()` never states an invariant, so it is denied in library
-      # code (tests and the CLI entry points are outside this rule). Where
-      # an invariant is statically guaranteed, state it with `.expect("…")`;
-      # where a lock may be poisoned, recover with into_inner().
-      - name: Deny unwrap in library code
-        run: cargo clippy --workspace --lib -- -D clippy::unwrap_used
+      # code, and explicit `panic!` belongs in tests, not the kernel.
+      # Where an invariant is statically guaranteed, state it with
+      # `.expect("…")`; where a lock may be poisoned, recover with
+      # into_inner(). Tests and the CLI entry points are outside this rule.
+      - name: Deny unwrap and panic in library code
+        run: cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::panic
 
   standards-audit:
     name: standards audit (report only)
@@ -103,6 +104,17 @@ jobs:
           cargo clippy --all-targets -- -W clippy::too_many_lines > /tmp/tml.txt 2>&1 || true
           echo "functions over 50 lines: $(grep -cE '^\s+--> ' /tmp/tml.txt)"
           grep -oE '^\s+--> [^:]+\.rs' /tmp/tml.txt | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
+
+      # Cognitive complexity (threshold 30 in clippy.toml), library code
+      # only — tests are exempt from the shape rules, like the crash rules.
+      - name: Functions over the complexity split line
+        env:
+          # Same plain-output requirement as the function-length step.
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo clippy --workspace --lib -- -W clippy::cognitive_complexity > /tmp/cc.txt 2>&1 || true
+          echo "lib functions over complexity 30: $(grep -cE '^\s+--> ' /tmp/cc.txt)"
+          grep -oE '^\s+--> [^:]+\.rs' /tmp/cc.txt | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
 
       # Module size ("well under ~600 lines"): census only, same plan —
       # extract incrementally, block when the burn-down is done.

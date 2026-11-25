@@ -15,3 +15,6 @@ categories = ["parser-implementations", "simulation"]
 [dependencies]
 hdl-syntax.workspace = true
 hdl-ir.workspace = true
+
+[lints]
+workspace = true

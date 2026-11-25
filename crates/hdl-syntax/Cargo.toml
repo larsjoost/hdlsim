@@ -13,3 +13,6 @@ keywords = ["vhdl", "verilog", "parser", "cst", "hdl"]
 categories = ["parser-implementations"]
 
 [dependencies]
+
+[lints]
+workspace = true

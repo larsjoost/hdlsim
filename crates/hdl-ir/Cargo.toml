@@ -21,3 +21,6 @@ thiserror.workspace = true
 [dev-dependencies]
 # Note: hdl-ir deliberately does NOT depend on hdl-lib (that would be circular).
 # Name resolution is injected via a ResolveCtx trait implemented by hdl-lib users.
+
+[lints]
+workspace = true

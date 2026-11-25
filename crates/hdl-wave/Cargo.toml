@@ -16,3 +16,6 @@ categories = ["simulation", "visualization"]
 hdl-ir.workspace = true
 hdl-sim.workspace = true
 log.workspace = true
+
+[lints]
+workspace = true
