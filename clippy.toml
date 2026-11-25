@@ -1,0 +1,9 @@
+# Clippy configuration for the coding-standards checks.
+#
+# `too-many-lines-threshold` backs the function-length standard ("target
+# ≤ 30 lines, split candidates at 50"): 50 is the hard lint line, and the
+# ≤ 30 target stays review-level. `clippy::too_many_lines` is
+# allow-by-default, so this value only takes effect where the lint is
+# enabled — the standards-audit CI job today; the strict `-D warnings`
+# gate adopts it once the existing long functions are extracted.
+too-many-lines-threshold = 50

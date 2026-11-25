@@ -48,6 +48,84 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+  lib-unwrap:
+    name: lib lints: no unguarded unwrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo (lib lints)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # The hard line of "no unguarded crashes in library/runtime code":
+      # `.unwrap()` never states an invariant, so it is denied in library
+      # code (tests and the CLI entry points are outside this rule). Where
+      # an invariant is statically guaranteed, state it with `.expect("…")`;
+      # where a lock may be poisoned, recover with into_inner().
+      - name: Deny unwrap in library code
+        run: cargo clippy --workspace --lib -- -D clippy::unwrap_used
+
+  standards-audit:
+    name: standards audit (report only)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (stable) with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo (standards audit)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Function length ("split candidates at 50"): the threshold lives in
+      # clippy.toml; the ≤ 30 target stays review-level. Report only until
+      # the existing long functions are extracted, then flip to blocking.
+      - name: Functions over the 50-line split line
+        run: |
+          cargo clippy --all-targets -- -W clippy::too_many_lines > /tmp/tml.txt 2>&1 || true
+          echo "functions over 50 lines: $(grep -cE '^\s+--> ' /tmp/tml.txt)"
+          grep -oE '^\s+--> [^:]+\.rs' /tmp/tml.txt | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
+
+      # Module size ("well under ~600 lines"): census only, same plan —
+      # extract incrementally, block when the burn-down is done.
+      - name: Modules over ~600 lines
+        run: |
+          find crates -name '*.rs' -path '*/src/*' | xargs wc -l | awk '$1>600 && $2!="total"' | sort -rn
+          echo "modules over 600 lines: $(find crates -name '*.rs' -path '*/src/*' | xargs wc -l | awk '$1>600 && $2!="total"' | wc -l)"
+
+      # Stacked changes ("≤ ~400 changed lines each"): one check per commit
+      # in the PR. Report only until agreed otherwise; binary files do not
+      # count as changed lines.
+      - name: Per-commit change sizes
+        run: |
+          base="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+          status=0
+          for sha in $(git rev-list --no-merges "$base"..HEAD); do
+            n="$(git show --numstat --pretty=format: "$sha" | awk 'NF==3 && $1!="-" {a+=$1; d+=$2} END {print a+d+0}')"
+            short="$(git log -1 --format='%h %s' "$sha")"
+            if [ "$n" -gt 400 ]; then
+              echo "::error::commit $short touches $n changed lines (standard: <= ~400): $short"
+              status=1
+            else
+              echo "ok ($n changed lines): $short"
+            fi
+          done
+          exit $status
+
   test:
     name: build + test (debug)
     runs-on: ubuntu-latest
