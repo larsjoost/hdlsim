@@ -166,7 +166,8 @@ impl Command for Help {
         println!("                                (NO_COLOR is honored for diagnostics)");
         println!("  Debug and limit options are CLI flags on the commands that use them");
         println!(
-            "  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir, --dump-maps): run"
+            "  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir, --dump-maps, \
+             --dump-consts): run"
         );
         println!("  `hdlsim run --help` for the full list. Environment variables have no");
         println!("  spell check, so per-run debugging knobs are not environment variables.");
@@ -404,6 +405,10 @@ pub struct RunOptions {
     /// maps (per-module signal dims, per-entity signal maps, per-file
     /// object dims, cache provenance).
     pub dump_maps: bool,
+    /// `--dump-consts`: print every constant/generic as the lowerer binds
+    /// it (scope, kind, source line, width, fold status, value) — the
+    /// elaboration-time view behind W0401 cascades.
+    pub dump_consts: bool,
 }
 
 static RUN_OPTIONS: std::sync::OnceLock<RunOptions> = std::sync::OnceLock::new();
@@ -1009,6 +1014,9 @@ pub fn apply_global_args(
         } else if a == "--dump-maps" {
             ro.dump_maps = true;
             i += 1;
+        } else if a == "--dump-consts" {
+            ro.dump_consts = true;
+            i += 1;
         } else {
             rest.push(a.clone());
             i += 1;
@@ -1051,6 +1059,8 @@ fn arm_run_options(ro: &RunOptions) {
         ro.trace_genrange,
         ro.trace_lower,
     );
+    // Both flags are known by now, whichever order they appeared in.
+    hdl_ir::debug::set_dump_consts(ro.dump_consts, error_format() == ErrorFormat::Json);
     let d = std::time::Duration::from_secs_f64(ro.progress_sec.unwrap_or(0.0).max(0.0));
     hdl_lib::set_progress_interval(d);
     hdl_sim::set_progress_interval(d);

@@ -13,9 +13,9 @@
   "module_lines": {
     "crates/hdl-ir/src/elab.rs": 1131,
     "crates/hdl-ir/src/value.rs": 1014,
-    "crates/hdl-ir/src/verilog_lower.rs": 4368,
-    "crates/hdl-ir/src/vhdl_lower.rs": 8939,
-    "crates/hdl-ir/src/vhdl_lower/expr.rs": 1929,
+    "crates/hdl-ir/src/verilog_lower.rs": 4519,
+    "crates/hdl-ir/src/vhdl_lower.rs": 9096,
+    "crates/hdl-ir/src/vhdl_lower/expr.rs": 1894,
     "crates/hdl-lib/src/lib.rs": 1959,
     "crates/hdl-sim/src/bmc.rs": 2405,
     "crates/hdl-sim/src/rand.rs": 784,
@@ -28,7 +28,7 @@
     "crates/hdl-wave/src/fst.rs": 1229,
     "crates/hdl-wave/src/sinks/fst.rs": 706,
     "crates/hdl-wave/src/sinks/live.rs": 656,
-    "crates/hdlsim/src/commands.rs": 1280,
+    "crates/hdlsim/src/commands.rs": 1290,
     "crates/hdlsim/src/commands/lsp.rs": 1249,
     "crates/hdlsim/src/commands/report.rs": 684,
     "crates/hdlsim/src/tcl.rs": 765
@@ -41,7 +41,7 @@
     "crates/hdl-ir/src/ir.rs": 1,
     "crates/hdl-ir/src/value.rs": 4,
     "crates/hdl-ir/src/verilog_lower.rs": 18,
-    "crates/hdl-ir/src/vhdl_lower.rs": 39,
+    "crates/hdl-ir/src/vhdl_lower.rs": 38,
     "crates/hdl-ir/src/vhdl_lower/expr.rs": 5,
     "crates/hdl-lib/src/builtin.rs": 1,
     "crates/hdl-lib/src/doctor.rs": 1,
@@ -93,6 +93,7 @@
     "crates/hdlsim/tests/lsp.rs": 3,
     "crates/hdlsim/tests/regress.rs": 1,
     "crates/hdlsim/tests/report.rs": 2,
-    "crates/hdlsim/tests/vhdl_arch_unknown_entity.rs": 1
+    "crates/hdlsim/tests/vhdl_arch_unknown_entity.rs": 1,
+    "crates/hdlsim/tests/vhdl_dump_consts.rs": 1
   }
 }

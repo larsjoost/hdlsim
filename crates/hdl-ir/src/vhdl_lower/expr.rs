@@ -698,6 +698,16 @@ impl<'a> Lower<'a> {
                 let bn = self.text(b);
                 match attr.as_str() {
                     "length" | "high" | "low" | "left" | "right" => {
+                        // Constants/generics: the object's recorded dims (decl
+                        // constraint or initializer shape) fold the attribute
+                        // even when the type mark is unconstrained. Checked
+                        // before the signal path: generic names also sit in
+                        // the signal table carrying only their packed slot
+                        // width, which would fold `s'length` of a string
+                        // generic to 1.
+                        if let Some(ex) = self.obj_attr_expr(&bn, &attr) {
+                            return ex;
+                        }
                         // Statically known for signals: arrays → element count
                         // (mem depth), vectors → bit width.
                         if let Some(id) = self.sig_id(&bn) {
@@ -794,6 +804,12 @@ impl<'a> Lower<'a> {
                                     return Expr::Lit(Value::from_u64(32, v));
                                 }
                             }
+                        }
+                        // Constants/generics: the object's recorded dims
+                        // (decl constraint or initializer shape) fold the
+                        // attribute even when the type mark is unconstrained.
+                        if let Some(ex) = self.obj_attr_expr(&bn, &attr) {
+                            return ex;
                         }
                         // Type marks and subtypes: `integer'high`, `my_arr'length`, ...
                         self.type_attr(&bn, &attr)
@@ -907,105 +923,6 @@ impl<'a> Lower<'a> {
             }
         }
     }
-    fn attr_dim_value(&self, base: &str, attr: &str, dim: usize) -> Option<u64> {
-        let hit = self.attr_dim_lookup(base, attr, dim);
-        if crate::debug::TRACE_LOWER.load(std::sync::atomic::Ordering::Relaxed) {
-            let outcome = match &hit {
-                Some((src, v)) => format!("{src} -> {v}"),
-                None => "unresolved".to_string(),
-            };
-            eprintln!("[lower] {base}'{attr}({dim}): {outcome}");
-        }
-        hit.map(|(_, v)| v)
-    }
-
-    /// The lookup order for dimension-suffix attributes: the signal's own
-    /// constraint dims, then object dims (constants/generics), then
-    /// package-exported type dims, then the type's own array dims. A signal
-    /// id short-circuits the chain even without an entry — a signal with no
-    /// dims (unconstrained port) does not fall through to the type's dims.
-    fn attr_dim_lookup(&self, base: &str, attr: &str, dim: usize) -> Option<(&'static str, u64)> {
-        if dim == 0 {
-            return None;
-        }
-        let val = |(lo, sz): (i64, usize)| -> u64 {
-            match attr {
-                "length" => sz as u64,
-                "high" | "left" => (lo + sz as i64 - 1).max(0) as u64,
-                _ => lo.max(0) as u64, // low | right
-            }
-        };
-        let blc = base.to_ascii_lowercase();
-        if let Some(id) = self.sig_id(&blc) {
-            return self
-                .sig_dims
-                .get(&id)
-                .and_then(|d| d.get(dim - 1))
-                .copied()
-                .map(|d| ("sig_dims", val(d)));
-        }
-        if let Some(dims) = self.obj_dims.get(&blc) {
-            return dims.get(dim - 1).copied().map(|d| ("obj_dims", val(d)));
-        }
-        let tn = blc.rsplit('.').next().unwrap_or("");
-        if let Some(dims) = self.type_dims.get(tn) {
-            return dims.get(dim - 1).copied().map(|d| ("type_dims", val(d)));
-        }
-        if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
-            return dims.get(dim - 1).copied().map(|d| ("type", val(d)));
-        }
-        None
-    }
-
-    fn type_attr(&self, name: &str, attr: &str) -> Expr {
-        let n = name.to_ascii_lowercase();
-        // REAL bounds are f64 extremes and must carry the real flag: an X(32)
-        // literal would read as X and — worse — fail overload width matching,
-        // so `LOG(REAL'HIGH)` fell back to the first-registered (complex)
-        // LOG overload and created a dispatch cycle. (LRM 1076 §3.1.4:
-        // REAL'HIGH/REAL'LOW are the largest/smallest representable reals.)
-        if n == "real" || matches!(self.types.get(&n), Some(TypeInfo::Real)) {
-            return match attr {
-                "high" | "right" => Expr::Lit(Value::from_f64(f64::MAX)),
-                "low" | "left" => Expr::Lit(Value::from_f64(f64::MIN)),
-                // 'length of a scalar type is 1.
-                _ => Expr::Lit(Value::from_u64(32, 1)),
-            };
-        }
-        let bounds: Option<(i64, i64)> = match n.as_str() {
-            "integer" => Some((i32::MIN as i64, i32::MAX as i64)),
-            "natural" | "positive" => Some((0, i32::MAX as i64)),
-            "boolean" | "bit" | "std_logic" | "std_ulogic" => Some((0, 1)),
-            _ => match self.types.get(&n) {
-                Some(TypeInfo::Integer { .. }) => Some((i32::MIN as i64, i32::MAX as i64)),
-                Some(TypeInfo::Enum(lits)) => Some((0, lits.len() as i64 - 1)),
-                Some(TypeInfo::Array { dims, .. }) => {
-                    dims.first().map(|(l, sz)| (*l, *l + *sz as i64 - 1))
-                }
-                // Vector subtypes: TypeInfo::Vector carries no constraint (the
-                // base array is unconstrained); the width lives in
-                // `type_widths` (declared subtypes and package-imported ones
-                // alike). Bounds assume `0 to w-1` / `w-1 downto 0` — both
-                // give low=0, high=w-1; only 'left/'right differ, and those
-                // are rare in constant expressions.
-                Some(TypeInfo::Vector { .. }) => self
-                    .type_widths
-                    .get(&n)
-                    .copied()
-                    .map(|w| (0, w.max(1) as i64 - 1)),
-                _ => None,
-            },
-        };
-        let Some((lo, hi)) = bounds else {
-            return Expr::Lit(Value::x(32)); // unconstrained vector etc.
-        };
-        let v = match attr {
-            "length" => (hi - lo + 1).max(0) as u64,
-            "high" | "left" => hi.max(0) as u64,
-            _ => lo.max(0) as u64, // low | right
-        };
-        Expr::Lit(Value::from_u64(32, v))
-    }
 
     fn lower_call(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         let kids = real_children(e);
@@ -1023,6 +940,13 @@ impl<'a> Lower<'a> {
             let attr_name = ak
                 .iter()
                 .rfind(|k| k.kind() == SyntaxKind::Ident)
+                .map(|k| self.kw(k))
+                .unwrap_or_default();
+            // Type mark the attribute is applied to (`boolean'image`,
+            // `A'length(1)`'s base, …).
+            let prefix = ak
+                .iter()
+                .find(|k| k.kind() == SyntaxKind::Name)
                 .map(|k| self.kw(k))
                 .unwrap_or_default();
             // Array attributes with an explicit dimension — `A'length(1)`,
@@ -1063,7 +987,25 @@ impl<'a> Lower<'a> {
                     .find(|(i, k)| *i != ap && is_expr_node(k.kind()))
                     .map(|(_, k)| k)
                 {
-                    return Expr::ToString(Box::new(self.lower_expr(arg, env)));
+                    let e = self.lower_expr(arg, env);
+                    // `boolean'image` spells `true`/`false`, not the decimal
+                    // bit value every `ToString` evaluator renders. Fold the
+                    // constant case here; non-constant arguments keep the
+                    // decimal fallback (enum/character'image likewise). Only
+                    // genuinely 1-bit values qualify — a wider operand under
+                    // a `boolean` prefix (loose typing, e.g. a natural)
+                    // keeps the decimal rendering.
+                    if prefix.eq_ignore_ascii_case("boolean") {
+                        if let Some(v) = self.ce(&e).filter(|v| v.width() == 1) {
+                            let s = if v.to_u64().unwrap_or(0) & 1 == 1 {
+                                "true"
+                            } else {
+                                "false"
+                            };
+                            return Expr::Lit(string_value(s));
+                        }
+                    }
+                    return Expr::ToString(Box::new(e));
                 }
             }
             // `type'val(x)` / `type'pos(x)` — numeric identity, but 'val takes
@@ -1527,10 +1469,15 @@ impl<'a> Lower<'a> {
             return match val {
                 Some(v) => {
                     let inner = self.lower_expr(v, env);
-                    let iw = 1; // element width unknown statically; replicate by bits
-                    let _ = iw;
+                    // Replicate by elements: a character value (`' '`) is
+                    // 8 bits, a std_logic value 1 — the target `width` is
+                    // total bits, so the count is width / element width.
+                    let iw = match &inner {
+                        Expr::Lit(v) => v.width().max(1),
+                        _ => 1,
+                    };
                     Expr::Replicate {
-                        count: Box::new(Expr::Lit(Value::from_u64(32, width as u64))),
+                        count: Box::new(Expr::Lit(Value::from_u64(32, (width / iw).max(1) as u64))),
                         e: Box::new(inner),
                     }
                 }
@@ -1858,13 +1805,26 @@ impl<'a> Lower<'a> {
             return Expr::Lit(Value { bits, real: false });
         }
         if t.starts_with('\'') && t.ends_with('\'') && t.len() == 3 {
-            // Character literal: std_logic value.
-            let c = t.as_bytes()[1].to_ascii_lowercase();
-            let b = match c {
+            // Character literal. The std_logic alphabet keeps its 1-bit value
+            // ('0'/'1'/'z', the rest X) — these literals overwhelmingly drive
+            // std_logic signals. Any other character is a `character` value:
+            // 8-bit ASCII, so string aggregates pad with real spaces
+            // (`(others => ' ')` used to poison the value with X and lose
+            // `'length`).
+            let c = t.as_bytes()[1];
+            let b = match c.to_ascii_lowercase() {
                 b'0' => V0,
                 b'1' => V1,
                 b'z' => VZ,
-                _ => VX,
+                b'-' | b'l' | b'h' | b'u' | b'w' | b'x' => VX,
+                _ => {
+                    return Expr::Lit(Value {
+                        bits: (0..8)
+                            .map(|j| if (c >> j) & 1 == 1 { V1 } else { V0 })
+                            .collect(),
+                        real: false,
+                    });
+                }
             };
             return Expr::Lit(Value {
                 bits: vec![b],
@@ -1874,8 +1834,13 @@ impl<'a> Lower<'a> {
         if t.starts_with('"') {
             let inner = t.trim_matches('"').replace("\"\"", "\"");
             // In VHDL a string of bit characters is a std_logic_vector value
-            // (`"0000"`), not ASCII text — otherwise a plain string.
-            if !inner.is_empty()
+            // (`"0000"`), not ASCII text — unless the literal sits in a
+            // string-typed object's initializer (`constant m : string :=
+            // "0x0000"`), where the characters are text: an all-alphabet
+            // literal lowered 1 bit/char X-poisons the value and kills
+            // `'length` downstream.
+            if !self.str_ctx
+                && !inner.is_empty()
                 && inner
                     .bytes()
                     .all(|c| matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'-' | b'?'))

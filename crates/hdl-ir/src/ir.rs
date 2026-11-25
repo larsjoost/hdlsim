@@ -215,6 +215,12 @@ pub struct FuncIr {
     /// actuals whose formals carry `Some`. Empty when no formal has one.
     pub defaults: Vec<Option<Value>>,
     pub locals: Vec<SignalIr>,
+    /// Locals whose declared constraint depends on subprogram formals
+    /// (`variable s : string(1 to size)`): registration folds them to the
+    /// fallback width because formals have no values yet, so const-eval
+    /// re-folds the recorded bit-width expression per call and grows the
+    /// slot. Empty for locals with static constraints.
+    pub dyn_locals: Vec<(SigId, Expr)>,
     pub body: Stmt,
 }
 
