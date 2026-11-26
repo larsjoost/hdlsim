@@ -74,6 +74,7 @@ impl<'a> Lower<'a> {
                 .map(|i| (format!("a{i}"), 32, String::new()))
                 .collect(),
             defaults: Vec::new(),
+            modes: vec![ArgMode::In; nargs],
             locals: Vec::new(),
             dyn_locals: Vec::new(),
             body: Stmt::Null,
@@ -278,15 +279,32 @@ impl<'a> Lower<'a> {
     }
 
     /// Split one PortDecl interface into its formals' names, type mark, and
-    /// optional range constraint.
+    /// optional range constraint, plus the formals' mode (`in`/`out`/`inout`).
     fn formal_parts(
         &self,
         pd: &SyntaxNode,
-    ) -> (Vec<String>, Option<SyntaxNode>, Option<SyntaxNode>) {
+    ) -> (Vec<String>, Option<SyntaxNode>, Option<SyntaxNode>, ArgMode) {
         let pk = real_children(pd);
         let colon = pk
             .iter()
             .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+        // Mode keyword between the colon and the type mark (`variable x :
+        // inout integer` — LRM 1076 §6.5.2); the class marker before the
+        // colon is not a mode. Absent or unknown → `in`.
+        let mode = colon
+            .and_then(|c| self.iface_type_mark(&pk[c + 1..]))
+            .and_then(|tm| pk.iter().position(|k| std::ptr::eq(k, tm)))
+            .and_then(|tp| {
+                pk[colon.unwrap_or(0) + 1..tp]
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Ident)
+                    .map(|k| self.kw(k))
+            })
+            .map_or(ArgMode::In, |w| match w.as_str() {
+                "inout" => ArgMode::Inout,
+                "out" => ArgMode::Out,
+                _ => ArgMode::In,
+            });
         let names: Vec<String> = pk[..colon.unwrap_or(pk.len())]
             .iter()
             .filter(|k| k.kind() == SyntaxKind::Name)
@@ -304,7 +322,7 @@ impl<'a> Lower<'a> {
             })
             .filter(|k| k.kind() == SyntaxKind::Range)
             .cloned();
-        (names, tmark, constraint)
+        (names, tmark, constraint, mode)
     }
 
     /// Interface default (`a, b : natural := 3`): const-eval now and record
@@ -353,6 +371,7 @@ impl<'a> Lower<'a> {
             arg_types: Vec::new(),
             arg_shapes: Vec::new(),
             defaults: Vec::new(),
+            modes: Vec::new(),
             ret_width: 32,
         };
         for pd in decl_nodes
@@ -360,7 +379,7 @@ impl<'a> Lower<'a> {
             .filter(|d| d.kind() == SyntaxKind::PortDecl)
         {
             let pk = real_children(pd);
-            let (names, tmark, constraint) = self.formal_parts(pd);
+            let (names, tmark, constraint, mode) = self.formal_parts(pd);
             // `b : a'subtype` — the base is an earlier formal of this
             // subprogram (VHDL-2019 subprogram generics); adopt its width.
             let (w, _, _, _) = match &tmark {
@@ -390,6 +409,7 @@ impl<'a> Lower<'a> {
                     .push((n.clone(), tmark.clone(), constraint.clone()));
                 fp.args.push((n, w, ty.clone()));
                 fp.defaults.push(default_v.clone());
+                fp.modes.push(mode);
             }
         }
         if let Some(tm) = ret_mark {
@@ -721,6 +741,7 @@ impl<'a> Lower<'a> {
             arg_types,
             arg_shapes,
             defaults,
+            modes,
             ret_width,
             ..
         } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
@@ -769,6 +790,7 @@ impl<'a> Lower<'a> {
             ret_width: ret_width.max(1),
             args,
             defaults,
+            modes,
             locals: fd.locals,
             dyn_locals: fd.dyn_locals,
             body,
@@ -788,6 +810,8 @@ struct FormalParams {
     arg_shapes: Vec<(String, Option<SyntaxNode>, Option<SyntaxNode>)>,
     /// per-formal interface default, const-evaled
     defaults: Vec<Option<Value>>,
+    /// per-formal mode (LRM 1076 §4.3) — `in` unless declared otherwise
+    modes: Vec<ArgMode>,
     /// return width, resolved after the formal loop
     ret_width: usize,
 }

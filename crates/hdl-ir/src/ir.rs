@@ -199,6 +199,16 @@ pub enum EdgeKind {
     Any,
 }
 
+/// Formal argument mode (LRM 1076 §4.3): `in` (default), `inout`, `out`.
+/// Only procedures carry non-`in` formals: on return, a caller's `variable`
+/// actual of an `inout`/`out` formal receives the formal's final value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ArgMode {
+    In,
+    Inout,
+    Out,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FuncIr {
     pub name: String,
@@ -210,6 +220,9 @@ pub struct FuncIr {
     /// `unsigned`, `std_ulogic_vector`, all w1) are told apart only by this,
     /// and picking wrong one makes the delegating bodies recurse forever.
     pub args: Vec<(String, usize, String)>,
+    /// Per-formal mode, parallel to `args`. Functions are always `In`;
+    /// Verilog tasks record no directions today and stay `In`.
+    pub modes: Vec<ArgMode>,
     /// Const-evaluated default value per formal (same order as `args`),
     /// `None` where the formal has no default. A call may omit trailing
     /// actuals whose formals carry `Some`. Empty when no formal has one.

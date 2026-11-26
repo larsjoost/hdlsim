@@ -556,6 +556,7 @@ impl<'a> Lower<'a> {
                     ret_width: m.ret_width,
                     args: m.args.clone(),
                     defaults: m.defaults.clone(),
+                    modes: vec![ArgMode::In; m.args.len()],
                     locals: m.locals.clone(),
                     dyn_locals: Vec::new(),
                     body: m.body.clone(),
@@ -2698,6 +2699,8 @@ impl<'a> Lower<'a> {
         FuncIr {
             name,
             ret_width,
+            // Verilog task formals record no directions today — all `in`.
+            modes: vec![ArgMode::In; args.len()],
             args,
             defaults: Vec::new(),
             locals,
