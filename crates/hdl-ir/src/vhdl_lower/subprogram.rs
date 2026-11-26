@@ -619,6 +619,46 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lower a subprogram's statement part: loop variables allocated while
+    /// lowering get slots after the declared ones (appended to `locals` so
+    /// the runtime and const-eval slot space match), and pending
+    /// constant-initializer assignments are prepended to the body (they run
+    /// on every call, before any statement).
+    fn lower_fn_body(
+        &mut self,
+        stmt_nodes: &[SyntaxNode],
+        slots: &[(String, usize)],
+        locals: &mut Vec<SignalIr>,
+        pending_const_inits: Vec<(SigId, Expr)>,
+    ) -> Stmt {
+        self.extra_base = slots.len();
+        self.extra_signals.clear();
+        let body = if stmt_nodes.len() == 1 {
+            self.lower_seq_stmt(&stmt_nodes[0])
+        } else {
+            Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
+        };
+        let body = if pending_const_inits.is_empty() {
+            body
+        } else {
+            let mut ss: Vec<Stmt> = pending_const_inits
+                .into_iter()
+                .map(|(id, e)| Stmt::Assign {
+                    lhs: Expr::Sig(id),
+                    rhs: e,
+                    nba: false,
+                })
+                .collect();
+            ss.push(body);
+            Stmt::Block(ss)
+        };
+        for sig in self.extra_signals.drain(..) {
+            locals.push(sig);
+        }
+        self.extra_base = 0;
+        body
+    }
+
     pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let hdr = self.split_subprogram_header(f)?;
         let SubprogramHeader {
@@ -705,34 +745,7 @@ impl<'a> Lower<'a> {
             &mut dyn_locals,
             &mut pending_const_inits,
         );
-        // Loop variables allocated while lowering the body get slots after the
-        // declared ones (they are appended to `locals` below so the runtime and
-        // const-eval slot space matches).
-        self.extra_base = slots.len();
-        self.extra_signals.clear();
-        let body = if stmt_nodes.len() == 1 {
-            self.lower_seq_stmt(&stmt_nodes[0])
-        } else {
-            Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
-        };
-        let body = if pending_const_inits.is_empty() {
-            body
-        } else {
-            let mut ss: Vec<Stmt> = pending_const_inits
-                .into_iter()
-                .map(|(id, e)| Stmt::Assign {
-                    lhs: Expr::Sig(id),
-                    rhs: e,
-                    nba: false,
-                })
-                .collect();
-            ss.push(body);
-            Stmt::Block(ss)
-        };
-        for sig in self.extra_signals.drain(..) {
-            locals.push(sig);
-        }
-        self.extra_base = 0;
+        let body = self.lower_fn_body(&stmt_nodes, &slots, &mut locals, pending_const_inits);
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
         // Unconstrained vector/string return type (`return bit_vector` /
