@@ -1,17 +1,17 @@
--- An impure-function constant initializer is legal VHDL evaluated once at
--- elaboration. hdlsim's const-eval cannot execute impure code (the body
--- calls a procedure), so the constant folds to X by design and the
--- constant-initializer warning must stay silent — the value is not a fold
--- gap but genuinely elaboration-time. Both call forms are covered: the
--- parameterless `seeded_vec` and the argument-position `2 * seeded_len`.
+-- An impure-function constant initializer is legal VHDL, evaluated once at
+-- elaboration. hdlsim's const-eval executes the body (procedure calls run
+-- with inout/out copy-back), so an effect-free impure function folds to its
+-- real value. What the const-eval cannot know — a signal read — falls back
+-- to X, and the constant-initializer warning must stay silent either way:
+-- the value is not a fold gap but genuinely elaboration-time.
 package impure_init_style is
-  procedure poke(variable dst : out std_ulogic_vector; constant v : in std_ulogic_vector);
+  procedure bump(variable x : inout integer);
 end package;
 
 package body impure_init_style is
-  procedure poke(variable dst : out std_ulogic_vector; constant v : in std_ulogic_vector) is
+  procedure bump(variable x : inout integer) is
   begin
-    dst := v;
+    x := x + 40;
   end procedure;
 end package body;
 
@@ -21,26 +21,27 @@ entity impure_init_tb is
 end entity;
 
 architecture sim of impure_init_tb is
-  impure function seeded_vec return std_ulogic_vector is
-    variable v : std_ulogic_vector(7 downto 0) := (others => '0');
+  signal s_live : integer := 0;
+
+  impure function seeded_int return integer is
+    variable v : integer := 0;
   begin
-    poke(v, "01000001");
-    return v;
+    bump(v);
+    return v + 2;
   end function;
 
-  impure function seeded_len return integer is
-    variable v : std_ulogic_vector(7 downto 0) := (others => '0');
+  impure function live_int return integer is
   begin
-    poke(v, "01000001");
-    return v'length + 1;
+    return s_live;  -- a signal read: no constant value exists
   end function;
 
-  constant C_SEED  : std_ulogic_vector(7 downto 0) := seeded_vec;
-  constant C_TWICE : integer := 2 * seeded_len;
+  constant C_SEED : integer := seeded_int;  -- effect-free: folds to 42
+  constant C_LIVE : integer := live_int;    -- signal read: X, silently
 begin
   main : process
   begin
-    report "impure_init_tb: C_SEED=" & to_string(C_SEED);
+    report "impure_init_tb: C_SEED=" & integer'image(C_SEED);
+    report "impure_init_tb: C_LIVE=" & integer'image(C_LIVE);
     wait;
   end process;
 end architecture;

@@ -29,9 +29,9 @@ fn unbound_generic_constant_initializer_does_not_warn_but_plain_one_does() {
         String::from_utf8_lossy(&out.stdout),
         stderr
     );
-    // The generic-dependent constant (C_W, :26) is silent; the plain one
-    // (C_PLN, :27) still warns.
+    // The generic-dependent constant (C_W) is silent; the plain one (C_PLN)
+    // still warns.
     assert_eq!(stderr.matches("W0401").count(), 1, "{}", stderr);
-    assert!(stderr.contains(":27:"), "{}", stderr);
-    assert!(!stderr.contains(":26:"), "{}", stderr);
+    assert!(stderr.contains("C_PLN"), "{}", stderr);
+    assert!(!stderr.contains("C_W"), "{}", stderr);
 }

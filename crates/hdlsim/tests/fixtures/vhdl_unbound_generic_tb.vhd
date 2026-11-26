@@ -9,10 +9,12 @@ entity sized_blk is
 end entity;
 
 architecture rtl of sized_blk is
-  -- A procedure call cannot be const-evaluated, so both constants below stay
-  -- X in the bare context — the difference is only the warning.
+  -- A procedure that fails elaboration aborts the const-eval, so both
+  -- constants below stay X in the bare context — the difference is only
+  -- the warning.
   procedure setr(variable r : out natural) is
   begin
+    report "setr: not constant" severity failure;
     r := 1;
   end procedure;
 

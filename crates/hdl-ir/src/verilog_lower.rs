@@ -17,6 +17,8 @@ use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::source::{FileId, SourceDb, Span};
 use std::collections::{HashMap, HashSet};
 
+mod ce_proc;
+
 /// Lower one parsed file into modules plus diagnostics, with the LRM default
 /// time unit of 1 ns.
 pub fn lower_file(
@@ -3968,22 +3970,10 @@ fn const_eval_func(
     );
     // Locals with formal-dependent constraints (`string(1 to size)`)
     // registered with a fallback width: re-fold the recorded bit-width
-    // expression now that the actuals are in the slots. Unfoldable — the
-    // body will fold to X on use anyway.
-    for (slot, wexpr) in &f.dyn_locals {
-        if let Some(w) = ce_impl(wexpr, env, funcs, extras, Some(&mut slots))
-            .as_ref()
-            .and_then(|v| v.to_u64())
-        {
-            if w > (1 << 24) {
-                return None;
-            }
-            let s = *slot as usize;
-            while slots.len() <= s {
-                slots.push(Value::x(32));
-            }
-            slots[s] = Value::x(w.max(1) as usize);
-        }
+    // expression now that the actuals are in the slots (shared with the
+    // procedure dispatcher). Unfoldable — the body will fold to X on use.
+    if !ce_proc::fold_dyn_locals(&f.dyn_locals, &mut slots, env, funcs, extras) {
+        return None;
     }
     let mut flow = CeFlow::Continue;
     ce_stmt(&f.body, &mut slots, env, funcs, extras, &mut flow);
@@ -4245,7 +4235,15 @@ fn ce_stmt(
                         *flow = CeFlow::Abort;
                     }
                 }
-                _ => *flow = CeFlow::Abort,
+                _ => {
+                    // A user procedure called as a statement: run its body
+                    // on a fresh frame and copy inout/out formals back (see
+                    // `ce_proc`). Builtin syscalls and unresolvable names
+                    // have no constant meaning and abort the fold.
+                    if !ce_proc::ce_call_procedure(name, args, slots, env, funcs, extras) {
+                        *flow = CeFlow::Abort;
+                    }
+                }
             }
         }
         _ => *flow = CeFlow::Abort,

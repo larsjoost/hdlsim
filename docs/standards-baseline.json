@@ -14,7 +14,7 @@
   "module_lines": {
     "crates/hdl-ir/src/elab.rs": 1143,
     "crates/hdl-ir/src/value.rs": 1014,
-    "crates/hdl-ir/src/verilog_lower.rs": 4535,
+    "crates/hdl-ir/src/verilog_lower.rs": 4533,
     "crates/hdl-ir/src/vhdl_lower.rs": 1701,
     "crates/hdl-ir/src/vhdl_lower/arch.rs": 776,
     "crates/hdl-ir/src/vhdl_lower/decls.rs": 673,

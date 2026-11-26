@@ -1,9 +1,10 @@
 //! Regression tests for the constant-initializer warning (W0401) and
-//! impure-function initializers. An impure function's value is legal VHDL —
-//! evaluated once, at elaboration — but the const-eval cannot execute
-//! impure code, so the X fallback there is by design and the warning stays
-//! silent. A pure-function initializer that fails to fold keeps warning:
-//! it signals a genuine const-eval gap worth reporting.
+//! impure-function initializers. The const-eval executes procedure bodies
+//! (with inout/out copy-back), so an effect-free impure function folds to
+//! its real value; what it cannot know (a signal read) falls back to X.
+//! Both impure outcomes stay silent — the value is not a fold gap but
+//! genuinely elaboration-time. A pure-function initializer that fails to
+//! fold keeps warning: it signals a genuine const-eval gap worth reporting.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,11 +19,12 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{}", name))
 }
 
-/// An impure-function initializer (parameterless and argument-position
-/// forms) folds to X without the constant-initializer warning, and the run
+/// An impure-function initializer folds when its body is effect-free (the
+/// procedure call runs with copy-back) and falls back to X when it reads a
+/// signal — both without the constant-initializer warning, and the run
 /// stays clean.
 #[test]
-fn impure_function_initializer_stays_silent() {
+fn impure_initializer_folds_or_falls_back_silently() {
     let out = hdlsim()
         .args(["run", "--top", "impure_init_tb"])
         .arg(fixture("impure_init_tb.vhd"))
@@ -34,8 +36,10 @@ fn impure_function_initializer_stays_silent() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out.status.success(), "run failed:\n{all}");
-    // The documented X fallback: the constant is bound to unknown.
-    assert!(all.contains("C_SEED=X"), "{all}");
+    // Effect-free body: the constant holds the procedure's result (0 + 40 + 2).
+    assert!(all.contains("C_SEED=42"), "{all}");
+    // Signal read: the documented X fallback, silent.
+    assert!(all.contains("C_LIVE=x"), "{all}");
     assert!(!all.contains("warning"), "{all}");
     assert!(!all.contains("W0401"), "{all}");
 }
