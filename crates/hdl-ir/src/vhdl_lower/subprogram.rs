@@ -399,6 +399,31 @@ impl<'a> Lower<'a> {
         fp
     }
 
+    /// Map a slot's declared type name to its record/elem-record/protected
+    /// entries, so `x.field` member selects resolve over formals and locals
+    /// alike. Only names present in `types` get entries; a slot whose type
+    /// is neither record, array-of-record, nor protected is left untouched.
+    fn map_slot_records(&mut self, slots: &[(String, usize)], types: &[(String, String)]) {
+        for (i, (n, _)) in slots.iter().enumerate() {
+            let tn = types
+                .iter()
+                .find(|(an, _)| an == n)
+                .map(|(_, tn)| tn.clone());
+            if let Some(tn) = tn {
+                if let Some(rn) = self.as_record(&tn) {
+                    self.sig_rec.insert(i as SigId, rn);
+                }
+                if let Some(en) = self.as_elem_record(&tn) {
+                    self.sig_elem_rec.insert(i as SigId, en);
+                }
+                // Protected-type object local: member selects placeholder.
+                if matches!(self.types.get(&tn), Some(TypeInfo::Handle)) {
+                    self.sig_prot.insert(i as SigId, tn.clone());
+                }
+            }
+        }
+    }
+
     pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let hdr = self.split_subprogram_header(f)?;
         let SubprogramHeader {
@@ -459,24 +484,7 @@ impl<'a> Lower<'a> {
         // would otherwise inherit the stale record of an earlier function's
         // same-numbered slot. The entry-state capture and exit reset are
         // part of `SlotShapeSave` above.
-        for (i, (n, _)) in slots.iter().enumerate() {
-            let tn = arg_types
-                .iter()
-                .find(|(an, _)| an == n)
-                .map(|(_, tn)| tn.clone());
-            if let Some(tn) = tn {
-                if let Some(rn) = self.as_record(&tn) {
-                    self.sig_rec.insert(i as SigId, rn);
-                }
-                if let Some(en) = self.as_elem_record(&tn) {
-                    self.sig_elem_rec.insert(i as SigId, en);
-                }
-                // Protected-type object local: member selects placeholder.
-                if matches!(self.types.get(&tn), Some(TypeInfo::Handle)) {
-                    self.sig_prot.insert(i as SigId, tn.clone());
-                }
-            }
-        }
+        self.map_slot_records(&slots, &arg_types);
         // Pre-register nested subprograms so constant initializers in the
         // declarative part can reference them (`constant r : string := f;`);
         // real bodies are lowered after the loop and overwrite the stubs.
@@ -647,24 +655,7 @@ impl<'a> Lower<'a> {
             }
         }
         // Record-typed locals (declared in the loop above): same treatment.
-        for (i, (n, _)) in slots.iter().enumerate() {
-            let tn = local_types
-                .iter()
-                .find(|(an, _)| an == n)
-                .map(|(_, tn)| tn.clone());
-            if let Some(tn) = tn {
-                if let Some(rn) = self.as_record(&tn) {
-                    self.sig_rec.insert(i as SigId, rn);
-                }
-                if let Some(en) = self.as_elem_record(&tn) {
-                    self.sig_elem_rec.insert(i as SigId, en);
-                }
-                // Protected-type object local: member selects placeholder.
-                if matches!(self.types.get(&tn), Some(TypeInfo::Handle)) {
-                    self.sig_prot.insert(i as SigId, tn.clone());
-                }
-            }
-        }
+        self.map_slot_records(&slots, &local_types);
         // Nested function declarations, now that all outer slots are visible.
         for k in &nested_fns {
             if let Some(fi) = self.lower_function_node(k) {
