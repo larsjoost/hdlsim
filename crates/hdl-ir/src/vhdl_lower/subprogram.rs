@@ -714,6 +714,32 @@ impl<'a> Lower<'a> {
         body
     }
 
+    /// Width for an unconstrained vector/string return type mark (`return
+    /// bit_vector` / `return string`): the widest returned expression. The
+    /// declared width (fallback 32) seeds the max.
+    fn unconstrained_ret_width(
+        &self,
+        ret_mark: &Option<SyntaxNode>,
+        body: &Stmt,
+        ret_width: usize,
+    ) -> usize {
+        let is_uncon = ret_mark
+            .as_ref()
+            .map(|tm| self.kw(tm))
+            .and_then(|tn| self.types.get(&tn))
+            .is_some_and(|ti| matches!(ti, TypeInfo::Vector { .. }));
+        if !is_uncon {
+            return ret_width;
+        }
+        let mut rets = Vec::new();
+        collect_return_exprs(body, &mut rets);
+        let mut w = ret_width;
+        for r in &rets {
+            w = w.max(self.expr_width_est(r));
+        }
+        w
+    }
+
     pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let hdr = self.split_subprogram_header(f)?;
         let SubprogramHeader {
@@ -766,26 +792,10 @@ impl<'a> Lower<'a> {
         let body = self.lower_fn_body(&stmt_nodes, &slots, &mut locals, pending_const_inits);
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
-        // Unconstrained vector/string return type (`return bit_vector` /
-        // `return string`): take the width of the returned expressions.
-        let ret_is_uncon_vector = ret_mark
-            .as_ref()
-            .map(|tm| self.kw(tm))
-            .and_then(|tn| self.types.get(&tn))
-            .is_some_and(|ti| matches!(ti, TypeInfo::Vector { .. }));
-        if ret_is_uncon_vector {
-            let mut rets = Vec::new();
-            collect_return_exprs(&body, &mut rets);
-            for r in &rets {
-                ret_width = ret_width.max(self.expr_width_est(r));
-            }
-        }
-        // Reset the slot-id record mappings to their entry state: entries
-        // the body inserted for record-typed formals must not leak into the
-        // enclosing scope (slot ids alias module signal ids), and module
-        // entries the body must not touch keep their pre-call values. This
-        // runs after the return-width fixups above, which still read the
-        // function's own slot mappings.
+        let ret_width = self.unconstrained_ret_width(&ret_mark, &body, ret_width);
+        // Reset the slot-id record mappings to their entry state (see
+        // `FnSlotScope`): this runs after the return-width fixup above,
+        // which still reads the function's own slot mappings.
         fn_slots.restore(self);
         Some(FuncIr {
             name,
