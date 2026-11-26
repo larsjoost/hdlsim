@@ -442,7 +442,13 @@ impl Command for Run {
         // code (OS exit codes are 0..=255; values are truncated to that range).
         if let Some(status) = sim.finish_status() {
             // The tb chose this exit code — main must not print the
-            // issue-reporting hint for it.
+            // issue-reporting hint for it. Name it in the transcript:
+            // hdlsim's own exit-code contract reserves 2 for usage errors,
+            // and a tb-chosen status is not an hdlsim failure.
+            println!(
+                "hdlsim: testbench std.env.finish({status}) — exit code {}",
+                status & 0xFF
+            );
             super::mark_design_finish_exit();
             return Ok(status & 0xFF);
         }

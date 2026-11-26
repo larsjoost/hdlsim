@@ -87,7 +87,10 @@ path from "something is wrong" to "here is the line":
 Exit codes: `0` = clean pass; `1` = compile error or failed test
 (assert/report severity error|failure, `$error`/`$fatal`) or an internal guard
 stop; `2` = usage error (bad flags); `124` = `--max-wall` expired; `130` =
-Ctrl-C/SIGTERM (dumps the active process and call chain first).
+Ctrl-C/SIGTERM (dumps the active process and call chain first). A testbench
+`std.env.finish(status)` (VHDL-2008) overrides all of these with the tb
+author's own verdict — the transcript prints
+`hdlsim: testbench std.env.finish(N) — exit code N` when it does.
 
 ## Hard rules
 

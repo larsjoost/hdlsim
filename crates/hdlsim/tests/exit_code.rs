@@ -74,6 +74,14 @@ fn finish_status_becomes_exit_code() {
         "std.env.finish(3) must exit 3\n{}",
         stdout
     );
+    // The transcript must name the tb-chosen code: exit 2 in hdlsim's own
+    // contract means usage error, so an unexplained non-zero exit from a
+    // passing tb reads as a simulator bug.
+    assert!(
+        stdout.contains("std.env.finish(3)"),
+        "transcript should name the testbench-chosen exit code:\n{}",
+        stdout
+    );
 }
 
 #[test]
