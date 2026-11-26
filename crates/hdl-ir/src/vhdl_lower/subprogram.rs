@@ -424,6 +424,55 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Resolve a subprogram local's declared width: `resolve_type`, then an
+    /// unconstrained array mark with a static constraint
+    /// (`register_definition_array_t(0 to 63)`) multiplies in the element
+    /// count — resolve_type returns the bare element width, but the local's
+    /// flat slot covers every element the constraint adds. Subprogram locals
+    /// are flat values, never mems. A dynamic constraint keeps the fallback
+    /// width and returns a recorded `dyn_w` instead: a constraint that
+    /// references subprogram formals (`variable s : string(1 to size)`)
+    /// can't fold at registration — formals have no values yet — so the
+    /// recorded width is a fallback and the expression is const-evaled per
+    /// call. Only array-like types qualify for `dyn_w`: a record's flat
+    /// width is the sum of its fields, and a record-element constraint
+    /// (`t_node(name(1 to n))`) selects field ranges — lowering its element
+    /// name as an identifier would misfire E0401.
+    fn resolve_fn_local_width(
+        &mut self,
+        tmark: Option<&SyntaxNode>,
+        constraint: Option<&SyntaxNode>,
+        span: Span,
+    ) -> (usize, bool, bool, Option<Expr>) {
+        let (w, signed, _, real) = match tmark {
+            Some(tm) => self.resolve_type(tm, constraint, span),
+            None => (32, false, None, false),
+        };
+        let w = match (tmark, constraint) {
+            (Some(tm), Some(c))
+                if matches!(
+                    self.types.get(&self.kw(tm)),
+                    Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
+                ) && !self.text(c).contains("<>")
+                    && self.constraint_folds(c) =>
+            {
+                w.max(1) * self.constraint_width(c).max(1)
+            }
+            _ => w,
+        };
+        let dyn_w = match (tmark, constraint) {
+            (Some(tm), Some(c))
+                if self.constraint_shapes_width(tm)
+                    && !self.text(c).contains("<>")
+                    && !self.constraint_folds(c) =>
+            {
+                Some(self.dyn_width_expr(tm, c))
+            }
+            _ => None,
+        };
+        (w, signed, real, dyn_w)
+    }
+
     /// Lower one `variable` declarative item of a subprogram: slot its
     /// names, resolve the width (with static array-constraint expansion and
     /// dynamic-constraint fallback), register shapes/dyn mappings, and queue
@@ -456,50 +505,7 @@ impl<'a> Lower<'a> {
         let constraint = dk[colon + 1..]
             .iter()
             .find(|k| k.kind() == SyntaxKind::Range);
-        let (w, signed, _, real) = match tmark {
-            Some(tm) => self.resolve_type(tm, constraint, d.span()),
-            None => (32, false, None, false),
-        };
-        // An unconstrained array mark with a static constraint
-        // (`register_definition_array_t(0 to 63)`): resolve_type
-        // returns the bare element width, but the local's flat
-        // slot covers every element the constraint adds.
-        // Subprogram locals are flat values, never mems. A
-        // dynamic constraint keeps the fallback width and the
-        // recorded `dyn_w` below.
-        let w = match (tmark, constraint) {
-            (Some(tm), Some(c))
-                if matches!(
-                    self.types.get(&self.kw(tm)),
-                    Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
-                ) && !self.text(c).contains("<>")
-                    && self.constraint_folds(c) =>
-            {
-                w.max(1) * self.constraint_width(c).max(1)
-            }
-            _ => w,
-        };
-        // A constraint that references subprogram formals
-        // (`variable s : string(1 to size)`) can't fold at
-        // registration — formals have no values yet — so the
-        // recorded width is a fallback. Record a bit-width
-        // expression for const-eval to fold per call, and size
-        // an OTHERS initializer from it too. Only array-like
-        // types qualify: a record's flat width is the sum of
-        // its fields, and a record-element constraint
-        // (`t_node(name(1 to n))`) selects field ranges —
-        // lowering its element name as an identifier would
-        // misfire E0401.
-        let dyn_w = match (tmark, constraint) {
-            (Some(tm), Some(c))
-                if self.constraint_shapes_width(tm)
-                    && !self.text(c).contains("<>")
-                    && !self.constraint_folds(c) =>
-            {
-                Some(self.dyn_width_expr(tm, c))
-            }
-            _ => None,
-        };
+        let (w, signed, real, dyn_w) = self.resolve_fn_local_width(tmark, constraint, d.span());
         // `variable v : integer := 0;` — the initializer runs on
         // every call (VHDL subprogram variables are re-initialized
         // per call), so lower it and prepend `v := init;` to the
