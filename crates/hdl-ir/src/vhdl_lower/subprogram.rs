@@ -275,6 +275,130 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Split one PortDecl interface into its formals' names, type mark, and
+    /// optional range constraint.
+    fn formal_parts(
+        &self,
+        pd: &SyntaxNode,
+    ) -> (Vec<String>, Option<SyntaxNode>, Option<SyntaxNode>) {
+        let pk = real_children(pd);
+        let colon = pk
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+        let names: Vec<String> = pk[..colon.unwrap_or(pk.len())]
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))
+            .collect();
+        // Type mark is the first Name after `:` — a mode keyword
+        // (`inout`, `out`, …) or a `view V of` prefix may sit between.
+        let tmark = colon.and_then(|c| self.iface_type_mark(&pk[c + 1..]).cloned());
+        let constraint = tmark
+            .as_ref()
+            .and_then(|tm| {
+                pk.iter()
+                    .position(|k| std::ptr::eq(k, tm))
+                    .and_then(|i| pk.get(i + 1))
+            })
+            .filter(|k| k.kind() == SyntaxKind::Range)
+            .cloned();
+        (names, tmark, constraint)
+    }
+
+    /// Interface default (`a, b : natural := 3`): const-eval now and record
+    /// one entry per formal of this decl — a call may omit the
+    /// corresponding actual. Defaults are static expressions; one
+    /// referencing a formal, a later declaration, or a name from a
+    /// package hdlsim does not have (ieee.fixed_pkg formal styles) stays
+    /// unrecorded (an omitted actual then reads X, as before this feature).
+    /// Lower leniently: a diagnostic here would fail files that never omit
+    /// these actuals. `:=` lexes as the `=` punct (same as declaration
+    /// initializers).
+    fn iface_default(&mut self, pk: &[SyntaxNode], w: usize) -> Option<Value> {
+        pk.iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+            .and_then(|eq| {
+                pk[eq + 1..]
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .cloned()
+            })
+            .map(|e| {
+                self.suppress_err += 1;
+                let ex = self.lower_expr(&e, &self.consts.clone());
+                self.suppress_err -= 1;
+                ex
+            })
+            .and_then(|ex| self.ce(&ex))
+            .map(|v| v.resize(w.max(1)))
+    }
+
+    /// Collect a subprogram's interface from its PortDecl declarative
+    /// items: per-formal slot width/type/shapes, interface defaults, and
+    /// the return width. The return mark resolves after the loop so a
+    /// `return a'subtype` mark (base = an earlier formal) finds its width.
+    fn lower_formal_params(
+        &mut self,
+        decl_nodes: &[SyntaxNode],
+        ret_mark: &Option<SyntaxNode>,
+        f: &SyntaxNode,
+    ) -> FormalParams {
+        // Params: PortDecl `a, b : integer [range] [:= default]` — names
+        // before ':', type after.
+        let mut fp = FormalParams {
+            param_w: HashMap::new(),
+            args: Vec::new(),
+            arg_types: Vec::new(),
+            arg_shapes: Vec::new(),
+            defaults: Vec::new(),
+            ret_width: 32,
+        };
+        for pd in decl_nodes
+            .iter()
+            .filter(|d| d.kind() == SyntaxKind::PortDecl)
+        {
+            let pk = real_children(pd);
+            let (names, tmark, constraint) = self.formal_parts(pd);
+            // `b : a'subtype` — the base is an earlier formal of this
+            // subprogram (VHDL-2019 subprogram generics); adopt its width.
+            let (w, _, _, _) = match &tmark {
+                Some(tm) if fp.param_w.contains_key(&self.kw(tm)) => {
+                    (fp.param_w[&self.kw(tm)], false, None, false)
+                }
+                Some(tm) => self.resolve_type(tm, constraint.as_ref(), pd.span()),
+                None => (32, false, None, false),
+            };
+            // The declared type name disambiguates same-width overloads at
+            // dispatch (see FlatFunc::formal_types).
+            let ty = tmark
+                .as_ref()
+                .map(|tm| self.text(tm).to_ascii_lowercase())
+                .unwrap_or_default();
+            let default_v = self.iface_default(&pk, w);
+            for n in names {
+                fp.param_w.insert(n.to_ascii_lowercase(), w);
+                if let Some(tm) = &tmark {
+                    fp.arg_types.push((n.clone(), self.kw(tm)));
+                }
+                // Per-formal type mark + constraint for `record_obj_shape` —
+                // the formal's element width (`string` → 8) and index
+                // direction must be known while the body lowers
+                // (`arg'length`, slices over locals).
+                fp.arg_shapes
+                    .push((n.clone(), tmark.clone(), constraint.clone()));
+                fp.args.push((n, w, ty.clone()));
+                fp.defaults.push(default_v.clone());
+            }
+        }
+        if let Some(tm) = ret_mark {
+            fp.ret_width = match fp.param_w.get(&self.kw(tm)) {
+                Some(w) => *w,
+                None => self.resolve_type(tm, None, f.span()).0,
+            };
+        }
+        fp
+    }
+
     pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let hdr = self.split_subprogram_header(f)?;
         let SubprogramHeader {
@@ -284,100 +408,14 @@ impl<'a> Lower<'a> {
             nested_fns,
             stmt_nodes,
         } = hdr;
-        let mut ret_width = 32usize;
-        // Params: PortDecl `a, b : integer [range] [:= default]` — names
-        // before ':', type after.
-        let mut param_w: HashMap<String, usize> = HashMap::new();
-        let mut args: Vec<(String, usize, String)> = Vec::new();
-        let mut arg_types: Vec<(String, String)> = Vec::new();
-        // Per-formal type mark + constraint for `record_obj_shape` — the
-        // formal's element width (`string` → 8) and index direction must be
-        // known while the body lowers (`arg'length`, slices over locals).
-        let mut arg_shapes: Vec<(String, Option<SyntaxNode>, Option<SyntaxNode>)> = Vec::new();
-        let mut defaults: Vec<Option<Value>> = Vec::new();
-        for pd in decl_nodes
-            .iter()
-            .filter(|d| d.kind() == SyntaxKind::PortDecl)
-        {
-            let pk = real_children(pd);
-            let colon = pk
-                .iter()
-                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
-            let names: Vec<String> = pk[..colon.unwrap_or(pk.len())]
-                .iter()
-                .filter(|k| k.kind() == SyntaxKind::Name)
-                .map(|k| self.text(k))
-                .collect();
-            // Type mark is the first Name after `:` — a mode keyword
-            // (`inout`, `out`, …) or a `view V of` prefix may sit between.
-            let tmark = colon.and_then(|c| self.iface_type_mark(&pk[c + 1..]).cloned());
-            let constraint = tmark
-                .as_ref()
-                .and_then(|tm| {
-                    pk.iter()
-                        .position(|k| std::ptr::eq(k, tm))
-                        .and_then(|i| pk.get(i + 1))
-                })
-                .filter(|k| k.kind() == SyntaxKind::Range);
-            // `b : a'subtype` — the base is an earlier formal of this
-            // subprogram (VHDL-2019 subprogram generics); adopt its width.
-            let (w, _, _, _) = match &tmark {
-                Some(tm) if param_w.contains_key(&self.kw(tm)) => {
-                    (param_w[&self.kw(tm)], false, None, false)
-                }
-                Some(tm) => self.resolve_type(tm, constraint, pd.span()),
-                None => (32, false, None, false),
-            };
-            // The declared type name disambiguates same-width overloads at
-            // dispatch (see FlatFunc::formal_types).
-            let ty = tmark
-                .as_ref()
-                .map(|tm| self.text(tm).to_ascii_lowercase())
-                .unwrap_or_default();
-            // Interface default (`a, b : natural := 3`): const-eval now and
-            // record one entry per formal of this decl — a call may omit the
-            // corresponding actual. Defaults are static expressions; one
-            // referencing a formal, a later declaration, or a name from a
-            // package hdlsim does not have (ieee.fixed_pkg formal styles)
-            // stays unrecorded (an omitted actual then reads X, as before
-            // this feature). Lower leniently: a diagnostic here would fail
-            // files that never omit these actuals. `:=` lexes as the `=`
-            // punct (same as declaration initializers).
-            let default_v = pk
-                .iter()
-                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
-                .and_then(|eq| {
-                    pk[eq + 1..]
-                        .iter()
-                        .find(|k| is_expr_node(k.kind()))
-                        .cloned()
-                })
-                .map(|e| {
-                    self.suppress_err += 1;
-                    let ex = self.lower_expr(&e, &self.consts.clone());
-                    self.suppress_err -= 1;
-                    ex
-                })
-                .and_then(|ex| self.ce(&ex))
-                .map(|v| v.resize(w.max(1)));
-            for n in names {
-                param_w.insert(n.to_ascii_lowercase(), w);
-                if let Some(tm) = &tmark {
-                    arg_types.push((n.clone(), self.kw(tm)));
-                }
-                arg_shapes.push((n.clone(), tmark.clone(), constraint.cloned()));
-                args.push((n, w, ty.clone()));
-                defaults.push(default_v.clone());
-            }
-        }
-        // Return type mark resolved after the parameter loop so a
-        // `return a'subtype` mark (base = an earlier formal) finds its width.
-        if let Some(tm) = &ret_mark {
-            ret_width = match param_w.get(&self.kw(tm)) {
-                Some(w) => *w,
-                None => self.resolve_type(tm, None, f.span()).0,
-            };
-        }
+        let FormalParams {
+            args,
+            arg_types,
+            arg_shapes,
+            defaults,
+            mut ret_width,
+            ..
+        } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
         // Lower the body in slot space (slot 0 = return value). Install the
         // return + parameter slots first so function-local constants can
         // reference parameters (`constant pos : time := ifelse(T >= 0 ns, T, -T);`).
@@ -695,6 +733,22 @@ impl<'a> Lower<'a> {
             body,
         })
     }
+}
+
+/// A subprogram's interface, collected from its PortDecl declarative items.
+struct FormalParams {
+    /// name → lowered width, so a `b : a'subtype` formal adopts its base
+    param_w: HashMap<String, usize>,
+    /// (name, width, declared type name) — the dispatch key set
+    args: Vec<(String, usize, String)>,
+    /// (name, type mark) for record/elem-record/protected mapping
+    arg_types: Vec<(String, String)>,
+    /// (name, type mark, constraint) for `record_obj_shape`
+    arg_shapes: Vec<(String, Option<SyntaxNode>, Option<SyntaxNode>)>,
+    /// per-formal interface default, const-evaled
+    defaults: Vec<Option<Value>>,
+    /// return width, resolved after the formal loop
+    ret_width: usize,
 }
 
 /// One subprogram's syntactic parts, split from the CST: the bare name, the
