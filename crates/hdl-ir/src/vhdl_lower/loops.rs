@@ -50,6 +50,33 @@ impl<'a> Lower<'a> {
         ))
     }
 
+    /// A 32-bit zero literal — the degenerate `for` range bound.
+    fn zero_lit(&self) -> Expr {
+        Expr::Lit(Value::from_u64(32, 0))
+    }
+
+    /// VHDL for-loop variables are implicitly declared by the loop: reuse
+    /// the slot if the name is already bound, else allocate a fresh 32-bit
+    /// wire named `__for_<var>`.
+    fn declare_for_var(&mut self, var: &str) -> SigId {
+        match self.sig_id(var) {
+            Some(id) => id,
+            None => {
+                let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                self.extra_signals.push(SignalIr {
+                    name: format!("__for_{}", var),
+                    width: 32,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: None,
+                    signed: false,
+                });
+                self.names.insert(var.to_string(), id);
+                id
+            }
+        }
+    }
+
     pub(super) fn lower_for(&mut self, s: &SyntaxNode) -> Stmt {
         let kids = real_children(s);
         // for <var> in <range> loop <body> end loop
@@ -70,29 +97,24 @@ impl<'a> Lower<'a> {
             self.err(s.span(), "malformed for loop");
             return Stmt::Null;
         };
-        // VHDL for-loop variables are implicitly declared by the loop.
-        let var_id = match self.sig_id(&var) {
-            Some(id) => id,
-            None => {
-                let id = (self.extra_base + self.extra_signals.len()) as SigId;
-                self.extra_signals.push(SignalIr {
-                    name: format!("__for_{}", var),
-                    width: 32,
-                    kind: SigKind::Wire,
-                    init: None,
-                    mem: None,
-                    signed: false,
-                });
-                self.names.insert(var.clone(), id);
-                id
-            }
-        };
-        // Range bounds.
-        let (lo, hi, downto) = match range.map(|r| r.kind()) {
+        let var_id = self.declare_for_var(&var);
+        let (lo, hi, downto) = self.for_range_bounds(range);
+        let body = self.lower_seq_block(s);
+        self.make_for(var_id, lo, hi, downto, body)
+    }
+
+    /// Bounds of a `for` loop's range: a discrete range (`a to b` /
+    /// `a downto b`), `s'range` / `s'reverse_range` (bounds from the named
+    /// object's dims, its type's dims, or its memory depth), or a bare
+    /// `name'range` attribute. Unresolvable ranges yield (0, 0) — the
+    /// loop body never executes.
+    fn for_range_bounds(&mut self, range: Option<&SyntaxNode>) -> (Expr, Expr, bool) {
+        match range.map(|r| r.kind()) {
             Some(SyntaxKind::Range) => {
                 let rk = real_children(range.expect("matched on range's kind, so range is Some"));
-                // `for i in s'range loop` — the range is a Range node holding an
-                // Attr child; resolve the bounds from the signal's dims.
+                // `for i in s'range loop` — the range is a Range node
+                // holding an Attr child; resolve the bounds from the
+                // signal's dims.
                 if let Some(at) = rk.iter().find(|k| k.kind() == SyntaxKind::Attr) {
                     let ak = real_children(at);
                     let attr = ak
@@ -102,136 +124,123 @@ impl<'a> Lower<'a> {
                         .unwrap_or_default();
                     if attr == "range" || attr == "reverse_range" {
                         if let Some(b) = ak.iter().find(|k| k.kind() == SyntaxKind::Name) {
-                            let bn = self.text(b);
-                            // Flat slot (function formal, unsized signal):
-                            // runtime bounds from the bound value's width.
-                            if let Some((lo, hi)) =
-                                self.object_id(&bn).and_then(|id| self.flat_slot_range(id))
+                            if let Some(bounds) =
+                                self.for_range_attr_bounds(&self.text(b), attr == "reverse_range")
                             {
-                                let body = self.lower_seq_block(s);
-                                return self.make_for(var_id, lo, hi, false, body);
-                            }
-                            let dims = self
-                                .object_id(&bn)
-                                .and_then(|id| self.sig_dims.get(&id).cloned())
-                                .or_else(|| {
-                                    self.types.get(&bn.to_ascii_lowercase()).and_then(|t| {
-                                        if let TypeInfo::Array { dims, .. } = t {
-                                            Some(dims.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                });
-                            if let Some(dims) = dims {
-                                if let Some(&(lo, n)) = dims.first() {
-                                    let hi = lo + n as i64 - 1;
-                                    let (a, b, dt) = if attr == "reverse_range" {
-                                        (hi, lo, true)
-                                    } else {
-                                        (lo, hi, false)
-                                    };
-                                    let body = self.lower_seq_block(s);
-                                    return self.make_for(
-                                        var_id,
-                                        Expr::Lit(Value::from_u64(32, a as u64)),
-                                        Expr::Lit(Value::from_u64(32, b as u64)),
-                                        dt,
-                                        body,
-                                    );
-                                }
-                            }
-                            // Memory-backed object without dims (materialized
-                            // array constant of an unconstrained type): the
-                            // element count is the memory depth; hidden
-                            // consts pack element 0 at the top, so the range
-                            // is 0 to depth-1.
-                            if let Some(depth) = self
-                                .object_id(&bn)
-                                .and_then(|id| self.mems.get(&id).copied())
-                                .filter(|&d| d > 0)
-                            {
-                                let body = self.lower_seq_block(s);
-                                return self.make_for(
-                                    var_id,
-                                    Expr::Lit(Value::from_u64(32, 0)),
-                                    Expr::Lit(Value::from_u64(32, depth as u64 - 1)),
-                                    false,
-                                    body,
-                                );
+                                return bounds;
                             }
                         }
                     }
                 }
-                let exprs: Vec<&SyntaxNode> =
-                    rk.iter().filter(|k| is_expr_node(k.kind())).collect();
-                let dir = rk
-                    .iter()
-                    .find(|k| k.kind() == SyntaxKind::Ident)
-                    .map(|k| self.kw(k))
-                    .unwrap_or_else(|| "to".to_string());
-                let a = exprs
-                    .first()
-                    .map(|k| self.lower_expr(k, &self.consts.clone()));
-                let b = exprs
-                    .get(1)
-                    .map(|k| self.lower_expr(k, &self.consts.clone()));
-                match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let downto = dir == "downto";
-                        if downto {
-                            (b, a, true)
-                        } else {
-                            (a, b, false)
-                        }
-                    }
-                    _ => (
-                        Expr::Lit(Value::from_u64(32, 0)),
-                        Expr::Lit(Value::from_u64(32, 0)),
-                        false,
-                    ),
-                }
+                self.for_discrete_range(&rk)
             }
             Some(SyntaxKind::Attr) => {
                 // `name'range` on an array signal: 0 to depth-1.
                 let ak = real_children(range.expect("matched on range's kind, so range is Some"));
                 let base = ak.iter().find(|k| k.kind() == SyntaxKind::Name);
-                if let Some(b) = base {
-                    let bn = self.text(b);
-                    if let Some(id) = self.object_id(&bn) {
-                        if let Some(depth) = self.mems.get(&id).copied() {
-                            let body = self.lower_seq_block(s);
-                            return self.make_for(
-                                var_id,
-                                Expr::Lit(Value::from_u64(32, 0)),
-                                Expr::Lit(Value::from_u64(32, depth as u64 - 1)),
-                                false,
-                                body,
-                            );
-                        }
-                        // Flat slot (function formal, unsized signal): the
-                        // element count comes from the bound value at
-                        // runtime / const-eval (`SigAttr`).
-                        if let Some((lo, hi)) = self.flat_slot_range(id) {
-                            let body = self.lower_seq_block(s);
-                            return self.make_for(var_id, lo, hi, false, body);
-                        }
-                    }
-                }
-                (
-                    Expr::Lit(Value::from_u64(32, 0)),
-                    Expr::Lit(Value::from_u64(32, 0)),
-                    false,
-                )
+                base.and_then(|b| self.for_bare_attr_bounds(&self.text(b)))
+                    .unwrap_or((self.zero_lit(), self.zero_lit(), false))
             }
-            _ => (
-                Expr::Lit(Value::from_u64(32, 0)),
-                Expr::Lit(Value::from_u64(32, 0)),
+            _ => (self.zero_lit(), self.zero_lit(), false),
+        }
+    }
+
+    /// Bounds of a plain discrete range `a to b` / `a downto b`: the first
+    /// two expression children with the direction ident; a bare direction
+    /// defaults to `to`, missing bounds yield (0, 0).
+    fn for_discrete_range(&mut self, rk: &[SyntaxNode]) -> (Expr, Expr, bool) {
+        let exprs: Vec<&SyntaxNode> = rk.iter().filter(|k| is_expr_node(k.kind())).collect();
+        let dir = rk
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .unwrap_or_else(|| "to".to_string());
+        let a = exprs
+            .first()
+            .map(|k| self.lower_expr(k, &self.consts.clone()));
+        let b = exprs
+            .get(1)
+            .map(|k| self.lower_expr(k, &self.consts.clone()));
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                if dir == "downto" {
+                    (b, a, true)
+                } else {
+                    (a, b, false)
+                }
+            }
+            _ => (self.zero_lit(), self.zero_lit(), false),
+        }
+    }
+
+    /// Bounds of `name'range` / `name'reverse_range` inside a discrete
+    /// range: flat-slot runtime bounds, else the object's/type's dims,
+    /// else the memory depth of a materialized array constant. `None`
+    /// falls through to the discrete-range expression form.
+    fn for_range_attr_bounds(&self, bn: &str, reverse: bool) -> Option<(Expr, Expr, bool)> {
+        // Flat slot (function formal, unsized signal): runtime bounds
+        // from the bound value's width.
+        if let Some((lo, hi)) = self.object_id(bn).and_then(|id| self.flat_slot_range(id)) {
+            return Some((lo, hi, false));
+        }
+        let dims = self
+            .object_id(bn)
+            .and_then(|id| self.sig_dims.get(&id).cloned())
+            .or_else(|| {
+                self.types.get(&bn.to_ascii_lowercase()).and_then(|t| {
+                    if let TypeInfo::Array { dims, .. } = t {
+                        Some(dims.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let Some(&(lo, n)) = dims.as_ref().and_then(|d| d.first()) {
+            let hi = lo + n as i64 - 1;
+            let (a, b, dt) = if reverse {
+                (hi, lo, true)
+            } else {
+                (lo, hi, false)
+            };
+            return Some((
+                Expr::Lit(Value::from_u64(32, a as u64)),
+                Expr::Lit(Value::from_u64(32, b as u64)),
+                dt,
+            ));
+        }
+        // Memory-backed object without dims (materialized array constant
+        // of an unconstrained type): the element count is the memory
+        // depth; hidden consts pack element 0 at the top, so the range
+        // is 0 to depth-1.
+        if let Some(depth) = self
+            .object_id(bn)
+            .and_then(|id| self.mems.get(&id).copied())
+            .filter(|&d| d > 0)
+        {
+            return Some((
+                self.zero_lit(),
+                Expr::Lit(Value::from_u64(32, depth as u64 - 1)),
                 false,
-            ),
-        };
-        let body = self.lower_seq_block(s);
-        self.make_for(var_id, lo, hi, downto, body)
+            ));
+        }
+        None
+    }
+
+    /// Bounds of a bare `name'range` attribute on an array signal: the
+    /// memory depth of a materialized array constant, else flat-slot
+    /// runtime bounds. `None` degenerates to a never-executing loop.
+    fn for_bare_attr_bounds(&self, bn: &str) -> Option<(Expr, Expr, bool)> {
+        let id = self.object_id(bn)?;
+        if let Some(depth) = self.mems.get(&id).copied() {
+            return Some((
+                self.zero_lit(),
+                Expr::Lit(Value::from_u64(32, depth as u64 - 1)),
+                false,
+            ));
+        }
+        // Flat slot (function formal, unsized signal): the element count
+        // comes from the bound value at runtime / const-eval (`SigAttr`).
+        self.flat_slot_range(id).map(|(lo, hi)| (lo, hi, false))
     }
 
     pub(super) fn make_for(
