@@ -196,6 +196,27 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// VHDL-2019 `return rv_t of elem_t`: register the return type mark as
+    /// an alias of an array of the `of` element type, so the mark resolves
+    /// when the formal loop reads it. A missing element type falls back to
+    /// the unsigned-vector default.
+    fn register_of_return_alias(
+        &mut self,
+        ret_mark: &Option<SyntaxNode>,
+        of_mark: &Option<SyntaxNode>,
+    ) {
+        if let (Some(rm), Some(om)) = (ret_mark, of_mark) {
+            let rn = self.kw(rm).to_ascii_lowercase();
+            let on = self.kw(om).to_ascii_lowercase();
+            let ti = self
+                .types
+                .get(&on)
+                .cloned()
+                .unwrap_or(TypeInfo::Vector { signed: false });
+            self.types.insert(rn, ti);
+        }
+    }
+
     /// Split a subprogram's CST into its syntactic parts, registering a
     /// VHDL-2019 subprogram-generic clause if present. `None` for a
     /// nameless (malformed) subprogram.
@@ -233,18 +254,7 @@ impl<'a> Lower<'a> {
                 }
                 // Declarative items in textual order: each may reference the
                 // ones before it (params, types, constants, locals).
-                SyntaxKind::PortDecl
-                | SyntaxKind::VariableDecl
-                | SyntaxKind::ConstantDecl
-                | SyntaxKind::AliasDecl
-                | SyntaxKind::AttrDecl
-                | SyntaxKind::TypeDecl
-                | SyntaxKind::SubtypeDecl
-                | SyntaxKind::FileDecl
-                    if !seen_begin =>
-                {
-                    decl_nodes.push(k.clone())
-                }
+                _ if !seen_begin && is_decl_item(k.kind()) => decl_nodes.push(k.clone()),
                 // Nested function declarations (`impure function f return t is
                 // ...`) — lowered after the outer slot map is installed below,
                 // so outer parameters/locals are visible via the names stack.
@@ -256,16 +266,7 @@ impl<'a> Lower<'a> {
         if name.is_empty() {
             return None;
         }
-        if let (Some(rm), Some(om)) = (&ret_mark, &of_mark) {
-            let rn = self.kw(rm).to_ascii_lowercase();
-            let on = self.kw(om).to_ascii_lowercase();
-            let ti = self
-                .types
-                .get(&on)
-                .cloned()
-                .unwrap_or(TypeInfo::Vector { signed: false });
-            self.types.insert(rn, ti);
-        }
+        self.register_of_return_alias(&ret_mark, &of_mark);
         Some(SubprogramHeader {
             name,
             ret_mark,
@@ -473,6 +474,48 @@ impl<'a> Lower<'a> {
         (w, signed, real, dyn_w)
     }
 
+    /// Lower a subprogram local's per-call initializer (`variable v :
+    /// integer := 0;` — subprogram variables are re-initialized per call,
+    /// so it is prepended to the body like a dynamic local constant). A
+    /// string target's `(others => ' ')` replicate must cover the whole
+    /// object (see `agg_target_w`); a dynamic-width local re-derives the
+    /// replicate count from the dynamic width expression (the generic
+    /// lowering baked the fallback width).
+    fn lower_fn_local_init(
+        &mut self,
+        dk: &[SyntaxNode],
+        colon: usize,
+        tmark: Option<&SyntaxNode>,
+        w: usize,
+        dyn_w: &Option<Expr>,
+    ) -> Option<Expr> {
+        let init_node = dk[colon + 1..]
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+            .and_then(|e| {
+                dk[colon + 1 + e + 1..]
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .cloned()
+            });
+        let mut init_ex = init_node.as_ref().map(|node| {
+            let saved_w = self.agg_target_w;
+            if node.kind() == SyntaxKind::Aggregate && tmark.is_some_and(|tm| self.string_typed(tm))
+            {
+                self.agg_target_w = Some(w);
+            }
+            let ex = self.lower_expr(node, &self.consts.clone());
+            self.agg_target_w = saved_w;
+            ex
+        });
+        if let (Some(wexpr), Some(node)) = (dyn_w, &init_node) {
+            if let Some(ex) = self.dyn_others_init(node, wexpr) {
+                init_ex = Some(ex);
+            }
+        }
+        init_ex
+    }
+
     /// Lower one `variable` declarative item of a subprogram: slot its
     /// names, resolve the width (with static array-constraint expansion and
     /// dynamic-constraint fallback), register shapes/dyn mappings, and queue
@@ -506,41 +549,7 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|k| k.kind() == SyntaxKind::Range);
         let (w, signed, real, dyn_w) = self.resolve_fn_local_width(tmark, constraint, d.span());
-        // `variable v : integer := 0;` — the initializer runs on
-        // every call (VHDL subprogram variables are re-initialized
-        // per call), so lower it and prepend `v := init;` to the
-        // body like a dynamic local constant.
-        let init_node = dk[colon + 1..]
-            .iter()
-            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
-            .and_then(|e| {
-                dk[colon + 1 + e + 1..]
-                    .iter()
-                    .find(|k| is_expr_node(k.kind()))
-                    .cloned()
-            });
-        let mut init_ex = init_node.as_ref().map(|node| {
-            // A string target's `(others => ' ')` replicate must
-            // cover the whole object (see `agg_target_w`); a
-            // dynamic-width local re-derives the count below.
-            let saved_w = self.agg_target_w;
-            if node.kind() == SyntaxKind::Aggregate && tmark.is_some_and(|tm| self.string_typed(tm))
-            {
-                self.agg_target_w = Some(w);
-            }
-            let ex = self.lower_expr(node, &self.consts.clone());
-            self.agg_target_w = saved_w;
-            ex
-        });
-        // A dynamic-width local with an OTHERS initializer must
-        // self-size: re-emit the replicate with the count derived
-        // from the dynamic width expression (the generic lowering
-        // baked the fallback width).
-        if let (Some(wexpr), Some(node)) = (&dyn_w, &init_node) {
-            if let Some(ex) = self.dyn_others_init(node, wexpr) {
-                init_ex = Some(ex);
-            }
-        }
+        let init_ex = self.lower_fn_local_init(&dk, colon, tmark, w, &dyn_w);
         for n in names {
             let id = slots.len() as SigId;
             if let Some(tm) = &tmark {
