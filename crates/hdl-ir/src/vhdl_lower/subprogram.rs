@@ -196,7 +196,10 @@ impl<'a> Lower<'a> {
         })
     }
 
-    pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
+    /// Split a subprogram's CST into its syntactic parts, registering a
+    /// VHDL-2019 subprogram-generic clause if present. `None` for a
+    /// nameless (malformed) subprogram.
+    fn split_subprogram_header(&mut self, f: &SyntaxNode) -> Option<SubprogramHeader> {
         let kids = real_children(f);
         let mut name = String::new();
         let mut ret_mark: Option<SyntaxNode> = None;
@@ -263,6 +266,24 @@ impl<'a> Lower<'a> {
                 .unwrap_or(TypeInfo::Vector { signed: false });
             self.types.insert(rn, ti);
         }
+        Some(SubprogramHeader {
+            name,
+            ret_mark,
+            decl_nodes,
+            nested_fns,
+            stmt_nodes,
+        })
+    }
+
+    pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
+        let hdr = self.split_subprogram_header(f)?;
+        let SubprogramHeader {
+            name,
+            ret_mark,
+            decl_nodes,
+            nested_fns,
+            stmt_nodes,
+        } = hdr;
         let mut ret_width = 32usize;
         // Params: PortDecl `a, b : integer [range] [:= default]` — names
         // before ':', type after.
@@ -674,6 +695,17 @@ impl<'a> Lower<'a> {
             body,
         })
     }
+}
+
+/// One subprogram's syntactic parts, split from the CST: the bare name, the
+/// return type mark, declarative items in textual order, nested function
+/// declarations, and the statement nodes after `begin`.
+struct SubprogramHeader {
+    name: String,
+    ret_mark: Option<SyntaxNode>,
+    decl_nodes: Vec<SyntaxNode>,
+    nested_fns: Vec<SyntaxNode>,
+    stmt_nodes: Vec<SyntaxNode>,
 }
 
 /// Entry-state snapshot of the per-slot shape and record maps for the slot
