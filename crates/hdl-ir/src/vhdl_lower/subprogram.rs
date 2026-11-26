@@ -375,49 +375,15 @@ impl<'a> Lower<'a> {
         // aliased slot id. Saved/restored for nested subprograms below.
         let saved_formals = std::mem::take(&mut self.fn_formals);
         self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
-        // Formals' element widths and index directions: `arg'length` on a
-        // string formal must report an element count (the eval sides report
-        // the bound value's bit width), and slice remaps over a dynamic-width
-        // local read the direction. Captured/restored with the other
-        // slot-id maps below — slot ids alias module signal ids.
-        let saved_shape_elem: HashMap<SigId, Option<usize>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_elem.get(&id).copied())
-            })
-            .collect();
-        let saved_shape_asc: HashMap<SigId, Option<(i64, bool)>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_asc.get(&id).copied())
-            })
-            .collect();
-        let saved_shape_dynw: HashMap<SigId, Option<Expr>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_dynw.get(&id).cloned())
-            })
-            .collect();
-        let saved_shape_dims: HashMap<SigId, Option<Vec<(i64, usize)>>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_dims.get(&id).cloned())
-            })
-            .collect();
         // Slot ids alias across subprograms: a previously lowered
         // subprogram's shape entries (`sig_asc`, `sig_elem`, `sig_dynw`,
-        // `sig_dims`) under the same id would mis-address this one's slices
-        // and fold its attributes from another function's object. Drop them
-        // for the slots about to be registered; the captures above restore
-        // the entry state at exit, and `record_obj_shape` re-adds what this
-        // subprogram's formals actually have.
-        for i in 0..slots.len() {
-            let id = i as SigId;
-            self.sig_asc.remove(&id);
-            self.sig_elem.remove(&id);
-            self.sig_dynw.remove(&id);
-            self.sig_dims.remove(&id);
-        }
+        // `sig_dims`) and record mappings under the same id would
+        // mis-address this one's slices and fold its attributes from
+        // another function's object. Capture the entry state, drop it for
+        // the slots about to be registered, and restore at exit;
+        // `record_obj_shape` re-adds what this subprogram's formals have.
+        let saved_shapes = SlotShapeSave::capture(self, slots.len());
+        saved_shapes.drop_entries(self);
         for (n, tmark, constraint) in &arg_shapes {
             if let Some(&id) = self.names.get(n) {
                 self.record_obj_shape(id, tmark.as_ref(), constraint.as_ref());
@@ -432,31 +398,8 @@ impl<'a> Lower<'a> {
         // entries left by a previously lowered function must be dropped
         // first — a formal whose type is not a record/array-of-records
         // would otherwise inherit the stale record of an earlier function's
-        // same-numbered slot.
-        // Slot ids share the flat-signal id space: module signals (ports)
-        // can hold the same ids, and function formals must not leak their
-        // record mappings into the enclosing scope after the body is
-        // lowered (a later same-numbered non-record formal would otherwise
-        // inherit this function's record — see the reset after the body).
-        // Capture the entry state so the exit reset restores it exactly.
-        let saved_rec: HashMap<SigId, Option<String>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_rec.get(&id).cloned())
-            })
-            .collect();
-        let saved_elem: HashMap<SigId, Option<String>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_elem_rec.get(&id).cloned())
-            })
-            .collect();
-        let saved_prot: HashMap<SigId, Option<String>> = (0..slots.len())
-            .map(|i| {
-                let id = i as SigId;
-                (id, self.sig_prot.get(&id).cloned())
-            })
-            .collect();
+        // same-numbered slot. The entry-state capture and exit reset are
+        // part of `SlotShapeSave` above.
         for (i, (n, _)) in slots.iter().enumerate() {
             let tn = arg_types
                 .iter()
@@ -719,76 +662,7 @@ impl<'a> Lower<'a> {
         // entries the body must not touch keep their pre-call values. This
         // runs after the return-width fixups above, which still read the
         // function's own slot mappings.
-        for (id, v) in saved_rec {
-            match v {
-                Some(v) => {
-                    self.sig_rec.insert(id, v);
-                }
-                None => {
-                    self.sig_rec.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_elem {
-            match v {
-                Some(v) => {
-                    self.sig_elem_rec.insert(id, v);
-                }
-                None => {
-                    self.sig_elem_rec.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_prot {
-            match v {
-                Some(v) => {
-                    self.sig_prot.insert(id, v);
-                }
-                None => {
-                    self.sig_prot.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_shape_elem {
-            match v {
-                Some(v) => {
-                    self.sig_elem.insert(id, v);
-                }
-                None => {
-                    self.sig_elem.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_shape_asc {
-            match v {
-                Some(v) => {
-                    self.sig_asc.insert(id, v);
-                }
-                None => {
-                    self.sig_asc.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_shape_dynw {
-            match v {
-                Some(v) => {
-                    self.sig_dynw.insert(id, v);
-                }
-                None => {
-                    self.sig_dynw.remove(&id);
-                }
-            }
-        }
-        for (id, v) in saved_shape_dims {
-            match v {
-                Some(v) => {
-                    self.sig_dims.insert(id, v);
-                }
-                None => {
-                    self.sig_dims.remove(&id);
-                }
-            }
-        }
+        saved_shapes.restore(self);
         self.fn_formals = saved_formals;
         Some(FuncIr {
             name,
@@ -799,5 +673,85 @@ impl<'a> Lower<'a> {
             dyn_locals,
             body,
         })
+    }
+}
+
+/// Entry-state snapshot of the per-slot shape and record maps for the slot
+/// ids a subprogram is about to register. Slot ids alias the flat-signal id
+/// space — module signals can hold the same ids — so a subprogram's entries
+/// must not leak into the enclosing scope after its body lowers: captured at
+/// entry, dropped for the new slots, restored exactly at exit. The record
+/// maps (`rec`/`elem_rec`/`prot`) are captured here too: nothing between the
+/// capture point and their original later capture site mutates them, so one
+/// snapshot is behavior-identical to the previous split capture.
+struct SlotShapeSave {
+    len: usize,
+    elem: HashMap<SigId, Option<usize>>,
+    asc: HashMap<SigId, Option<(i64, bool)>>,
+    dynw: HashMap<SigId, Option<Expr>>,
+    dims: HashMap<SigId, Option<Vec<(i64, usize)>>>,
+    rec: HashMap<SigId, Option<String>>,
+    elem_rec: HashMap<SigId, Option<String>>,
+    prot: HashMap<SigId, Option<String>>,
+}
+
+fn capture_map<T: Clone>(map: &HashMap<SigId, T>, len: usize) -> HashMap<SigId, Option<T>> {
+    (0..len)
+        .map(|i| {
+            let id = i as SigId;
+            (id, map.get(&id).cloned())
+        })
+        .collect()
+}
+
+fn restore_map<T: Clone>(map: &mut HashMap<SigId, T>, saved: HashMap<SigId, Option<T>>) {
+    for (id, v) in saved {
+        match v {
+            Some(v) => {
+                map.insert(id, v);
+            }
+            None => {
+                map.remove(&id);
+            }
+        }
+    }
+}
+
+impl SlotShapeSave {
+    fn capture(lx: &Lower<'_>, len: usize) -> Self {
+        Self {
+            len,
+            elem: capture_map(&lx.sig_elem, len),
+            asc: capture_map(&lx.sig_asc, len),
+            dynw: capture_map(&lx.sig_dynw, len),
+            dims: capture_map(&lx.sig_dims, len),
+            rec: capture_map(&lx.sig_rec, len),
+            elem_rec: capture_map(&lx.sig_elem_rec, len),
+            prot: capture_map(&lx.sig_prot, len),
+        }
+    }
+
+    /// Drop the shape entries under the subprogram's slot ids so a stale
+    /// entry from a previously lowered subprogram cannot mis-address this
+    /// one's slices or fold its attributes from another function's object.
+    /// `record_obj_shape` re-adds what this subprogram's objects have.
+    fn drop_entries(&self, lx: &mut Lower<'_>) {
+        for i in 0..self.len {
+            let id = i as SigId;
+            lx.sig_asc.remove(&id);
+            lx.sig_elem.remove(&id);
+            lx.sig_dynw.remove(&id);
+            lx.sig_dims.remove(&id);
+        }
+    }
+
+    fn restore(self, lx: &mut Lower<'_>) {
+        restore_map(&mut lx.sig_elem, self.elem);
+        restore_map(&mut lx.sig_asc, self.asc);
+        restore_map(&mut lx.sig_dynw, self.dynw);
+        restore_map(&mut lx.sig_dims, self.dims);
+        restore_map(&mut lx.sig_rec, self.rec);
+        restore_map(&mut lx.sig_elem_rec, self.elem_rec);
+        restore_map(&mut lx.sig_prot, self.prot);
     }
 }
