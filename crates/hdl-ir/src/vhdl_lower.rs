@@ -954,6 +954,8 @@ struct Lower<'a> {
     /// one): expressions referencing them are constant per instance, so their
     /// bare-context fold failure warns misleadingly and is skipped instead.
     per_instance_names: std::collections::HashSet<String>,
+    /// Impure function designators in this file (lowercase): `refs_impure_call`.
+    impure_fns: std::collections::HashSet<String>,
     /// User-defined attribute names in scope (`attribute a : T;` in this file
     /// or a `use`d package) — `x'a` lowers to X silently for these.
     attr_decls: std::collections::HashSet<String>,
@@ -1071,6 +1073,7 @@ impl<'a> Lower<'a> {
             cur_scope: String::new(),
             str_ctx: false,
             per_instance_names: std::collections::HashSet::new(),
+            impure_fns: std::collections::HashSet::new(),
             prot_types: HashMap::new(),
             prot_body_ctx: None,
             sig_prot: HashMap::new(),

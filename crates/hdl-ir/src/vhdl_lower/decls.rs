@@ -465,7 +465,7 @@ impl<'a> Lower<'a> {
                     for n in &names {
                         self.per_instance_names.insert(n.to_ascii_lowercase());
                     }
-                } else {
+                } else if !self.refs_impure_call(&ex) {
                     self.warn(
                         d.span(),
                         "constant initializer is not constant; treated as X",
