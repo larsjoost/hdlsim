@@ -7,6 +7,16 @@
 
 use super::*;
 
+/// The clauses of a `wait` statement: `until cond`, `on sens`, and
+/// `for time` (a physical literal in fs, or a lowered expression).
+#[derive(Default)]
+struct WaitClauses {
+    cond: Option<Expr>,
+    sens: Option<SyntaxNode>,
+    time_fs: Option<u64>,
+    time_expr: Option<Expr>,
+}
+
 impl<'a> Lower<'a> {
     /// `name'range` bounds for a flat value slot (function formal, unsized
     /// signal): `0 to width-1`, resolved from the bound value at evaluation
@@ -297,13 +307,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    pub(super) fn lower_wait(&mut self, s: &SyntaxNode) -> Stmt {
-        let kids = real_children(s);
-        // wait [until cond] [on sens] [for time];
-        let mut cond = None;
-        let mut sens = None;
-        let mut time_fs = None;
-        let mut time_expr = None;
+    /// Scan a `wait` statement's children for its clauses; later clauses
+    /// of the same kind overwrite earlier ones, as before.
+    fn wait_clauses(&mut self, kids: &[SyntaxNode]) -> WaitClauses {
+        let mut cl = WaitClauses::default();
         let mut i = 0;
         while i < kids.len() {
             let k = &kids[i];
@@ -311,83 +318,76 @@ impl<'a> Lower<'a> {
                 match self.kw(k).as_str() {
                     "until" => {
                         if let Some(e) = kids.get(i + 1).filter(|e| is_expr_node(e.kind())) {
-                            cond = Some(self.lower_expr(e, &self.consts.clone()));
+                            cl.cond = Some(self.lower_expr(e, &self.consts.clone()));
                             i += 1;
                         }
                     }
                     "on" => {
-                        sens = kids.get(i + 1).cloned();
+                        cl.sens = kids.get(i + 1).cloned();
                         i += 1;
                     }
                     "for" => {
-                        // Physical literal: `10 ns`. The parser may merge number
-                        // and unit into one Literal token, or leave the unit as
-                        // a separate Ident sibling. A non-literal expression
-                        // (`for C_TIMEOUT - now`) lowers to an arbitrary time
-                        // expression — evaluated when the wait executes.
-                        let num = kids.get(i + 1);
-                        if let Some(n) = num.filter(|k| k.kind() == SyntaxKind::Literal) {
-                            let t = self.text(n);
-                            let (v, mult) = match t.split_once(char::is_whitespace) {
-                                Some((a, b)) => (
-                                    self.parse_int_literal(a.trim())
-                                        .and_then(|v| v.to_u64())
-                                        .unwrap_or(0),
-                                    time_unit_fs(b.trim()),
-                                ),
-                                None => {
-                                    let unit =
-                                        kids.get(i + 2).filter(|k| k.kind() == SyntaxKind::Ident);
-                                    (
-                                        self.parse_int_literal(&t)
-                                            .and_then(|v| v.to_u64())
-                                            .unwrap_or(0),
-                                        unit.map(|k| time_unit_fs(&self.kw(k)))
-                                            .unwrap_or(1_000_000),
-                                    )
-                                }
-                            };
-                            time_fs = Some(v.saturating_mul(mult));
-                            i += 1;
-                        } else if let Some(e) = num.filter(|k| is_expr_node(k.kind())) {
-                            time_expr = Some(self.lower_expr(e, &self.consts.clone()));
-                            i += 1;
+                        let (fs, te, skip) = self.wait_for_clause(kids, i);
+                        if fs.is_some() {
+                            cl.time_fs = fs;
                         }
+                        if te.is_some() {
+                            cl.time_expr = te;
+                        }
+                        i += skip;
                     }
                     _ => {}
                 }
             }
             i += 1;
         }
-        // Timeout for `wait until`/`wait on`: literal fs, or the lowered
-        // expression (LRM 8.1: the timeout is evaluated when the wait runs).
-        let timeout = time_expr.or_else(|| time_fs.map(|fs| Expr::Lit(Value::from_u64(64, fs))));
+        cl
+    }
 
-        // `wait for T;` — pure timed wait: literal → Delay, expression →
-        // timeout-only WaitUntil. No until/on clauses.
-        if cond.is_none() && sens.is_none() {
-            if let Some(t) = time_fs {
-                return Stmt::Delay {
-                    time_fs: t,
-                    stmt: Box::new(Stmt::Null),
-                };
-            }
-            if let Some(te) = timeout {
-                return Stmt::WaitUntil {
-                    cond: None,
-                    sens: Vec::new(),
-                    timeout: Some(te),
-                };
-            }
-            // Bare `wait;` — park forever.
-            return Stmt::Wait {
-                sens: Vec::new(),
-                body: Box::new(Stmt::Null),
+    /// A `for T` clause: a physical literal (`10 ns`, merged into one
+    /// Literal token or with the unit as a separate Ident sibling) yields
+    /// fs; any other expression lowers to a time expression — evaluated
+    /// when the wait executes. Returns the parsed fs, the lowered
+    /// expression, and the consumed-sibling count.
+    fn wait_for_clause(
+        &mut self,
+        kids: &[SyntaxNode],
+        i: usize,
+    ) -> (Option<u64>, Option<Expr>, usize) {
+        let num = kids.get(i + 1);
+        if let Some(n) = num.filter(|k| k.kind() == SyntaxKind::Literal) {
+            let t = self.text(n);
+            let (v, mult) = match t.split_once(char::is_whitespace) {
+                Some((a, b)) => (self.wait_int_fs(a.trim()), time_unit_fs(b.trim())),
+                None => {
+                    let unit = kids.get(i + 2).filter(|k| k.kind() == SyntaxKind::Ident);
+                    (
+                        self.wait_int_fs(&t),
+                        unit.map(|k| time_unit_fs(&self.kw(k))).unwrap_or(1_000_000),
+                    )
+                }
             };
+            (Some(v.saturating_mul(mult)), None, 1)
+        } else if let Some(e) = num.filter(|k| is_expr_node(k.kind())) {
+            (None, Some(self.lower_expr(e, &self.consts.clone())), 1)
+        } else {
+            (None, None, 0)
         }
+    }
 
-        // Explicit `on` list wins over cond-derived edges (LRM 8.1).
-        let edges = if let Some(sl) = sens.as_ref() {
+    /// An integer wait-literal; unparseable text yields 0.
+    fn wait_int_fs(&mut self, t: &str) -> u64 {
+        self.parse_int_literal(t)
+            .and_then(|v| v.to_u64())
+            .unwrap_or(0)
+    }
+
+    /// Wake sources of a `wait until`/`wait on`: an explicit `on` list
+    /// wins over the edges derived from the condition (LRM 8.1). A
+    /// non-list `on` child or a condition with no analyzable edges
+    /// yields `None`.
+    fn wait_edges(&mut self, sens: Option<&SyntaxNode>, cond: Option<&Expr>) -> Option<Vec<Edge>> {
+        let edges = sens.and_then(|sl| {
             if sl.kind() == SyntaxKind::SensList {
                 Some(match self.lower_sens_list(sl) {
                     Sens::List(es) => es,
@@ -396,16 +396,58 @@ impl<'a> Lower<'a> {
             } else {
                 None
             }
-        } else {
-            None
-        };
-        let edges = edges.or_else(|| cond.as_ref().and_then(|c| edges_from_cond(c, self)));
+        });
+        edges.or_else(|| cond.and_then(|c| edges_from_cond(c, self)))
+    }
+
+    /// A pure timed wait (`wait for T;` with no until/on clauses): a
+    /// physical literal becomes a Delay, an expression a timeout-only
+    /// WaitUntil; a bare `wait;` parks forever.
+    fn wait_timed_only(&self, time_fs: Option<u64>, timeout: Option<Expr>) -> Stmt {
+        if let Some(t) = time_fs {
+            return Stmt::Delay {
+                time_fs: t,
+                stmt: Box::new(Stmt::Null),
+            };
+        }
+        if let Some(te) = timeout {
+            return Stmt::WaitUntil {
+                cond: None,
+                sens: Vec::new(),
+                timeout: Some(te),
+            };
+        }
+        // Bare `wait;` — park forever.
+        Stmt::Wait {
+            sens: Vec::new(),
+            body: Box::new(Stmt::Null),
+        }
+    }
+
+    pub(super) fn lower_wait(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        // wait [until cond] [on sens] [for time];
+        let cl = self.wait_clauses(&kids);
+        // Timeout for `wait until`/`wait on`: literal fs, or the lowered
+        // expression (LRM 8.1: the timeout is evaluated when the wait runs).
+        let timeout = cl
+            .time_expr
+            .or_else(|| cl.time_fs.map(|fs| Expr::Lit(Value::from_u64(64, fs))));
+
+        // `wait for T;` — pure timed wait: literal → Delay, expression →
+        // timeout-only WaitUntil. No until/on clauses.
+        if cl.cond.is_none() && cl.sens.is_none() {
+            return self.wait_timed_only(cl.time_fs, timeout);
+        }
+
+        // Explicit `on` list wins over cond-derived edges (LRM 8.1).
+        let edges = self.wait_edges(cl.sens.as_ref(), cl.cond.as_ref());
 
         // A pure `rising_edge(s)`/`falling_edge(s)` condition is fully encoded
         // by its edge kind — no re-check. Any other condition wakes on any
         // event of its signals and re-checks the full expression (slightly
         // over-sensitive vs the LRM, but never misses the true wake).
-        let recheck = match &cond {
+        let recheck = match &cl.cond {
             Some(Expr::Rising(inner)) | Some(Expr::Falling(inner)) => {
                 !matches!(inner.as_ref(), Expr::Sig(_))
             }
@@ -419,7 +461,7 @@ impl<'a> Lower<'a> {
             );
         }
         Stmt::WaitUntil {
-            cond: if recheck { cond } else { None },
+            cond: if recheck { cl.cond } else { None },
             sens: edges.unwrap_or_default(),
             timeout,
         }
