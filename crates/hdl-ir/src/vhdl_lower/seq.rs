@@ -74,6 +74,51 @@ impl<'a> Lower<'a> {
         pt.fields.iter().any(|(n, _, _, _)| *n == base)
     }
 
+    /// Conditional expression tail shared by signal and variable assignment
+    /// (`x := a when c else b;`): lower the conditional waveform over the
+    /// `when`-clause tail and wrap it in the assignment.
+    fn lower_cond_assign(
+        &mut self,
+        tail: &[SyntaxNode],
+        l: &SyntaxNode,
+        nba: bool,
+    ) -> Option<Stmt> {
+        self.lower_cond_waveform(tail, &self.consts.clone())
+            .map(|e| Stmt::Assign {
+                lhs: self.lower_expr(l, &self.consts.clone()),
+                rhs: e,
+                nba,
+            })
+    }
+
+    /// Plain scalar assignment tail shared by signal (`<=`, delta-delayed)
+    /// and variable (`:=`, blocking) statements: a protected-type field LHS
+    /// lowers to a `$setf` field write, a nested protected LHS is skipped
+    /// (unsupported), anything else is a plain assignment.
+    fn finish_scalar_assign(&mut self, l: &SyntaxNode, r: &SyntaxNode, nba: bool) -> Stmt {
+        if let Some((t, f, lsb, w)) = self.prot_field_lhs(l) {
+            let rv = self.lower_rhs(l, r, &self.consts.clone());
+            return Stmt::SysCall {
+                name: format!("$setf::{}::{}@{},{}", t, f, lsb, w),
+                args: vec![
+                    Expr::Call {
+                        name: "$this".into(),
+                        args: vec![],
+                    },
+                    rv,
+                ],
+            };
+        }
+        if self.prot_nested_lhs(l) {
+            return Stmt::Null;
+        }
+        Stmt::Assign {
+            lhs: self.lower_expr(l, &self.consts.clone()),
+            rhs: self.lower_rhs(l, r, &self.consts.clone()),
+            nba,
+        }
+    }
+
     pub(super) fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
         match s.kind() {
             SyntaxKind::SeqAssign => {
@@ -154,43 +199,16 @@ impl<'a> Lower<'a> {
                 }
                 if has_when {
                     if let (Some(l), Some(op)) = (lhs, op_pos) {
-                        if let Some(e) =
-                            self.lower_cond_waveform(&kids[op + 2..], &self.consts.clone())
-                        {
-                            return Stmt::Assign {
-                                lhs: self.lower_expr(l, &self.consts.clone()),
-                                rhs: e,
-                                nba: true,
-                            };
+                        if let Some(a) = self.lower_cond_assign(&kids[op + 2..], l, true) {
+                            return a;
                         }
                     }
                     return Stmt::Null;
                 }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
-                    (Some(l), Some(r)) => {
-                        if let Some((t, f, lsb, w)) = self.prot_field_lhs(l) {
-                            let rv = self.lower_rhs(l, r, &self.consts.clone());
-                            return Stmt::SysCall {
-                                name: format!("$setf::{}::{}@{},{}", t, f, lsb, w),
-                                args: vec![
-                                    Expr::Call {
-                                        name: "$this".into(),
-                                        args: vec![],
-                                    },
-                                    rv,
-                                ],
-                            };
-                        }
-                        if self.prot_nested_lhs(l) {
-                            return Stmt::Null;
-                        }
-                        Stmt::Assign {
-                            lhs: self.lower_expr(l, &self.consts.clone()),
-                            rhs: self.lower_rhs(l, r, &self.consts.clone()),
-                            nba: true, // VHDL signal assignment is delta-delayed
-                        }
-                    }
+                    // VHDL signal assignment is delta-delayed
+                    (Some(l), Some(r)) => self.finish_scalar_assign(l, r, true),
                     _ => Stmt::Null,
                 }
             }
@@ -210,43 +228,15 @@ impl<'a> Lower<'a> {
                         .iter()
                         .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
                     if let (Some(l), Some(cp)) = (lhs, colon_pos) {
-                        if let Some(e) =
-                            self.lower_cond_waveform(&kids[cp + 2..], &self.consts.clone())
-                        {
-                            return Stmt::Assign {
-                                lhs: self.lower_expr(l, &self.consts.clone()),
-                                rhs: e,
-                                nba: false,
-                            };
+                        if let Some(a) = self.lower_cond_assign(&kids[cp + 2..], l, false) {
+                            return a;
                         }
                     }
                     return Stmt::Null;
                 }
                 let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
                 match (lhs, rhs) {
-                    (Some(l), Some(r)) => {
-                        if let Some((t, f, lsb, w)) = self.prot_field_lhs(l) {
-                            let rv = self.lower_rhs(l, r, &self.consts.clone());
-                            return Stmt::SysCall {
-                                name: format!("$setf::{}::{}@{},{}", t, f, lsb, w),
-                                args: vec![
-                                    Expr::Call {
-                                        name: "$this".into(),
-                                        args: vec![],
-                                    },
-                                    rv,
-                                ],
-                            };
-                        }
-                        if self.prot_nested_lhs(l) {
-                            return Stmt::Null;
-                        }
-                        Stmt::Assign {
-                            lhs: self.lower_expr(l, &self.consts.clone()),
-                            rhs: self.lower_rhs(l, r, &self.consts.clone()),
-                            nba: false,
-                        }
-                    }
+                    (Some(l), Some(r)) => self.finish_scalar_assign(l, r, false),
                     _ => Stmt::Null,
                 }
             }
