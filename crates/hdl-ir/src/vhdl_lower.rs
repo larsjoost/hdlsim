@@ -6224,6 +6224,35 @@ impl<'a> Lower<'a> {
             0 => c,
             _ => return Expr::Lit(Value::x(32)),
         };
+        // `variable x : real_array_t(coefficients'range)`: an attribute
+        // range names no bounds — the local spans the object's own extent.
+        // Its bit width is the actual's bit width (`SigAttr length`): same
+        // element width, so count x elem == the object's bits. A type-mark
+        // range folds statically and never reaches here.
+        let expr_nodes: Vec<SyntaxNode> = real_children(r)
+            .into_iter()
+            .filter(|k| is_expr_node(k.kind()))
+            .collect();
+        if expr_nodes.len() == 1 {
+            let raw = self.text(&expr_nodes[0]);
+            let tl = raw.to_ascii_lowercase();
+            let attr_len = if tl.ends_with("'reverse_range") {
+                "'reverse_range".len()
+            } else if tl.ends_with("'range") {
+                "'range".len()
+            } else {
+                0
+            };
+            if attr_len > 0 {
+                let base = raw[..raw.len() - attr_len].trim();
+                if let Some(id) = self.sig_id(base) {
+                    return Expr::SigAttr {
+                        sig: id,
+                        attr: "length",
+                    };
+                }
+            }
+        }
         let env = self.consts.clone();
         let exprs: Vec<Expr> = real_children(r)
             .into_iter()
@@ -8179,16 +8208,36 @@ impl<'a> Lower<'a> {
         if self.mems.contains_key(&id) || self.sig_dims.contains_key(&id) {
             return None;
         }
-        // Unconstrained-formal widths are only known from the bound value;
-        // sized slots use their static width the same way (width-1).
+        // The loop variable walks ELEMENTS, so the high bound is the bound
+        // value's bit width divided by the element width, minus one — a
+        // 64-bit-real formal's 'range yields count-1, not bit-1 (a bit-index
+        // bound overran multi-bit-element formals by the element factor).
+        // 1-bit elements keep the plain width-1 bound.
+        let ew = self.sig_elem.get(&id).copied().unwrap_or(1).max(1) as u64;
+        let count = if ew == 1 {
+            Expr::SigAttr {
+                sig: id,
+                attr: "length",
+            }
+        } else {
+            Expr::Bin {
+                op: BinOp::Div,
+                l: Box::new(Expr::SigAttr {
+                    sig: id,
+                    attr: "length",
+                }),
+                r: Box::new(Expr::Lit(Value::from_u64(32, ew))),
+            }
+        };
         Some((
             Expr::SigAttr {
                 sig: id,
                 attr: "low",
             },
-            Expr::SigAttr {
-                sig: id,
-                attr: "high",
+            Expr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(count),
+                r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
             },
         ))
     }

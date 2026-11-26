@@ -4318,6 +4318,28 @@ impl Simulator {
     /// Execute function `fi` with the given argument expressions; returns
     /// slot 0 (the function-name slot, i.e. the return value). Shared by
     /// plain calls and class method calls.
+    /// Dynamic-width locals (`variable s : string(1 to size)`): the
+    /// registered slot width is a fallback because the constraint reads
+    /// formals with no values yet. Re-fold the recorded bit-width
+    /// expression with the actuals bound — the runtime twin of
+    /// `const_eval_func`'s per-call re-fold. Unfoldable (X actual) or
+    /// oversized: keep the fallback, the body folds to X on use.
+    fn fold_dyn_locals(&self, dyn_locals: &[(SigId, Expr)], lvals: &mut Vec<Value>) {
+        for (slot, wexpr) in dyn_locals {
+            let i = *slot as usize;
+            if i >= lvals.len() {
+                continue;
+            }
+            if let Some(w) = self
+                .eval_expr(wexpr, Some(lvals))
+                .to_u64()
+                .filter(|w| *w <= 1 << 24)
+            {
+                lvals[i] = Value::x(w.max(1) as usize);
+            }
+        }
+    }
+
     fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
         let f = &self.flat.functions[fi];
         // Runaway-loop budget: count every call made at runtime (not
@@ -4410,6 +4432,7 @@ impl Simulator {
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
+        self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         // Functions with delays are not supported — execute recursively.
         let saved_fn = self.cur_fn.replace(Some(fi));
         let mut runner = FnRunner {
@@ -4473,6 +4496,7 @@ impl Simulator {
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
+        self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         let saved_fn = self.cur_fn.replace(Some(fi));
         let mut runner = ProcRunner {
             sim: self,
@@ -4600,7 +4624,11 @@ impl<'a> FnRunner<'a> {
             Stmt::Return(e) => {
                 let v = self.sim.eval_expr(e, Some(self.locals));
                 let w = self.locals[0].width().max(1);
-                self.locals[0] = v.resize(w);
+                // The return slot is a lower bound (declared subtype or
+                // 32-slot fallback for unconstrained vector returns): a
+                // wider value — a per-call dynamic local — keeps its width,
+                // exactly like const-eval (`slots[0] = v`, no resize).
+                self.locals[0] = v.resize(w.max(v.width()));
                 self.returned = true;
             }
             Stmt::Block(ss) => {
@@ -4764,7 +4792,8 @@ impl<'a> ProcRunner<'a> {
             Stmt::Return(e) => {
                 let v = self.sim.eval_expr(e, Some(self.locals));
                 let w = self.locals[0].width().max(1);
-                self.locals[0] = v.resize(w);
+                // Same lower-bound rule as `FnRunner`'s return.
+                self.locals[0] = v.resize(w.max(v.width()));
                 self.returned = true;
                 Control::Done
             }
