@@ -266,193 +266,218 @@ impl<'a> Lower<'a> {
             SyntaxKind::Wait => self.lower_wait(s),
             // Sequential block statement: lower its body statements as a
             // block (block-local declarations are not simulated).
-            SyntaxKind::Block => {
-                let stmts: Vec<Stmt> = real_children(s)
-                    .iter()
-                    .filter(|k| !is_decl_kind(k.kind()))
-                    .filter(|k| !matches!(k.kind(), SyntaxKind::Ident | SyntaxKind::Punct))
-                    .map(|k| self.lower_seq_stmt(k))
-                    .collect();
-                Stmt::Block(stmts)
-            }
+            SyntaxKind::Block => self.lower_block_stmt(s),
             SyntaxKind::NullStmt => Stmt::Null,
-            SyntaxKind::AssertStmt => {
-                // Covers both `assert cond [report msg] [severity lvl]` and
-                // `report msg [severity lvl]` (the parser uses one node kind).
-                let kids = real_children(s);
-                let first_kw = kids
-                    .iter()
-                    .find(|k| k.kind() == SyntaxKind::Ident)
-                    .map(|k| self.kw(k))
-                    .unwrap_or_default();
-                let severity = kids
-                    .iter()
-                    .filter(|k| k.kind() == SyntaxKind::Ident)
-                    .map(|k| self.kw(k))
-                    .find(|w| matches!(w.as_str(), "note" | "warning" | "error" | "failure"))
-                    .unwrap_or_default();
-                let mut exprs: Vec<Expr> = kids
-                    .iter()
-                    .filter(|k| is_expr_node(k.kind()))
-                    .map(|k| self.lower_expr(k, &self.consts.clone()))
-                    .collect();
-                if !severity.is_empty() {
-                    exprs.push(Expr::Lit(string_value(&severity)));
-                }
-                Stmt::SysCall {
-                    name: if first_kw == "report" {
-                        "report"
-                    } else {
-                        "assert"
-                    }
-                    .to_string(),
-                    args: exprs,
-                }
-            }
-            SyntaxKind::ExitStmt => {
-                // The parser folds `exit` and `next` into one ExitStmt node:
-                // the first ident child is the keyword. `exit` ends the loop
-                // (break), `next` skips to the loop step (continue) — LRM
-                // 1076 §10.11/§10.12. Both take an optional `when cond;`.
-                let kids = real_children(s);
-                let is_next = kids
-                    .iter()
-                    .find(|k| k.kind() == SyntaxKind::Ident)
-                    .map(|k| self.kw(k).eq_ignore_ascii_case("next"))
-                    .unwrap_or(false);
-                let jump = if is_next { Stmt::Continue } else { Stmt::Break };
-                let cond = kids
-                    .iter()
-                    .find(|k| is_expr_node(k.kind()))
-                    .map(|k| self.lower_expr(k, &self.consts.clone()));
-                match cond {
-                    Some(c) => Stmt::If {
-                        cond: c,
-                        then: Box::new(jump),
-                        els: None,
-                    },
-                    None => jump,
-                }
-            }
-            SyntaxKind::ReturnStmt => {
-                let kids = real_children(s);
-                let e = kids.iter().find(|k| is_expr_node(k.kind()));
-                Stmt::Return(Box::new(
-                    e.map(|e| self.lower_expr(e, &self.consts.clone()))
-                        .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
-                ))
-            }
-            SyntaxKind::CallStmt => {
-                let kids = real_children(s);
-                // `foo(a, b);` parses as CallStmt(Call(Name foo, (, args…)));
-                // `foo;` as CallStmt(Name foo). Unwrap the Call so the callee
-                // and the real arguments are found in both forms.
-                let src: Vec<SyntaxNode> = match kids.first() {
-                    Some(c) if c.kind() == SyntaxKind::Call => real_children(c),
-                    _ => kids.clone(),
-                };
-                let name_pos = src.iter().position(|k| k.kind() == SyntaxKind::Name);
-                let raw = name_pos.map(|i| self.text(&src[i])).unwrap_or_default();
-                let fname = raw
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(raw.as_str())
-                    .to_ascii_lowercase();
-                let is_textio = TEXTIO_PROCS.contains(&fname.as_str());
-                // Association keys (`name => value`) are not arguments: drop
-                // a bare Name immediately followed by `=>`. Every other bare
-                // Name is a real positional argument — e.g. a variable passed
-                // to a user procedure — and must be kept.
-                let is_assoc_key: Vec<bool> = src
-                    .iter()
-                    .enumerate()
-                    .map(|(i, k)| {
-                        k.kind() == SyntaxKind::Name
-                            && src
-                                .get(i + 1)
-                                .map(|n| self.text(n) == "=>")
-                                .unwrap_or(false)
-                    })
-                    .collect();
-                let args: Vec<Expr> = src
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, k)| {
-                        Some(*i) != name_pos && is_expr_node(k.kind()) && !is_assoc_key[*i]
-                    })
-                    .map(|(_, k)| {
-                        if k.kind() == SyntaxKind::Name {
-                            // A bare-name argument may reference something from
-                            // an unseen package/context — lower leniently to a
-                            // placeholder, like port-map association actuals.
-                            self.suppress_err += 1;
-                            let e = self.lower_expr(k, &self.consts.clone());
-                            self.suppress_err -= 1;
-                            e
-                        } else {
-                            self.lower_expr(k, &self.consts.clone())
-                        }
-                    })
-                    .collect();
-                let name = if is_textio {
-                    format!("$textio_{fname}")
-                } else {
-                    fname
-                };
-                // `obj.m(args);` on a protected-type object →
-                // `$callmethod::t::m(obj, …)`.
-                if let Some(dot) = raw.find('.') {
-                    let (base, m) = (&raw[..dot], raw[dot + 1..].to_ascii_lowercase());
-                    if let Some(id) = self.sig_id(base) {
-                        if let Some(t) = self.sig_prot.get(&id).cloned() {
-                            let is_method = self
-                                .prot_types
-                                .get(&t)
-                                .is_some_and(|p| p.methods.contains(&m));
-                            if is_method {
-                                let mut args2 = vec![Expr::Sig(id)];
-                                args2.extend(args.iter().cloned());
-                                return Stmt::SysCall {
-                                    name: format!("$callmethod::{}::{}", t, m),
-                                    args: args2,
-                                };
-                            }
-                        }
-                    }
-                }
-                // Bare `m(args);` inside a protected-type body → self-call.
-                if let Some(t) = self.prot_body_ctx.clone() {
-                    if self
-                        .prot_types
-                        .get(&t)
-                        .is_some_and(|p| p.methods.contains(&name))
-                    {
-                        let mut args2 = vec![Expr::Call {
-                            name: "$this".into(),
-                            args: vec![],
-                        }];
-                        args2.extend(args.iter().cloned());
-                        return Stmt::SysCall {
-                            name: format!("$callmethod::{}::{}", t, name),
-                            args: args2,
-                        };
-                    }
-                }
-                // std.env.finish([status]) lowers to a distinct syscall so the
-                // kernel can capture the STATUS argument; Verilog `$finish(n)`
-                // keeps the plain "finish" name (its argument is a diagnostic
-                // level, not an exit status). A user-defined procedure that
-                // happens to be named `finish` is treated the same way — the
-                // simulation still stops, just without a status.
-                let name = if name == "finish" {
-                    "$env_finish".to_string()
-                } else {
-                    name
-                };
-                Stmt::SysCall { name, args }
-            }
+            SyntaxKind::AssertStmt => self.lower_assert_stmt(s),
+            SyntaxKind::ExitStmt => self.lower_exit_stmt(s),
+            SyntaxKind::ReturnStmt => self.lower_return_stmt(s),
+            SyntaxKind::CallStmt => self.lower_call_stmt(s),
             _ => Stmt::Null,
         }
+    }
+
+    /// Lower a sequential block statement: its body statements as a block
+    /// (block-local declarations are not simulated).
+    fn lower_block_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let stmts: Vec<Stmt> = real_children(s)
+            .iter()
+            .filter(|k| !is_decl_kind(k.kind()))
+            .filter(|k| !matches!(k.kind(), SyntaxKind::Ident | SyntaxKind::Punct))
+            .map(|k| self.lower_seq_stmt(k))
+            .collect();
+        Stmt::Block(stmts)
+    }
+
+    /// Lower an assert/report statement: covers both `assert cond [report
+    /// msg] [severity lvl]` and `report msg [severity lvl]` (the parser
+    /// uses one node kind).
+    fn lower_assert_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        let first_kw = kids
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .unwrap_or_default();
+        let severity = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .find(|w| matches!(w.as_str(), "note" | "warning" | "error" | "failure"))
+            .unwrap_or_default();
+        let mut exprs: Vec<Expr> = kids
+            .iter()
+            .filter(|k| is_expr_node(k.kind()))
+            .map(|k| self.lower_expr(k, &self.consts.clone()))
+            .collect();
+        if !severity.is_empty() {
+            exprs.push(Expr::Lit(string_value(&severity)));
+        }
+        Stmt::SysCall {
+            name: if first_kw == "report" {
+                "report"
+            } else {
+                "assert"
+            }
+            .to_string(),
+            args: exprs,
+        }
+    }
+
+    /// Lower an `exit`/`next` statement. The parser folds both into one
+    /// ExitStmt node: the first ident child is the keyword. `exit` ends the
+    /// loop (break), `next` skips to the loop step (continue) — LRM 1076
+    /// §10.11/§10.12. Both take an optional `when cond;`.
+    fn lower_exit_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        let is_next = kids
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k).eq_ignore_ascii_case("next"))
+            .unwrap_or(false);
+        let jump = if is_next { Stmt::Continue } else { Stmt::Break };
+        let cond = kids
+            .iter()
+            .find(|k| is_expr_node(k.kind()))
+            .map(|k| self.lower_expr(k, &self.consts.clone()));
+        match cond {
+            Some(c) => Stmt::If {
+                cond: c,
+                then: Box::new(jump),
+                els: None,
+            },
+            None => jump,
+        }
+    }
+
+    /// Lower a return statement; a bare `return;` returns a zero-width
+    /// placeholder value.
+    fn lower_return_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        let e = kids.iter().find(|k| is_expr_node(k.kind()));
+        Stmt::Return(Box::new(
+            e.map(|e| self.lower_expr(e, &self.consts.clone()))
+                .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
+        ))
+    }
+
+    /// Lower a procedure call statement `foo(a, b);` (or bare `foo;`):
+    /// Textio builtins get a `$textio_` prefix, protected-type method calls
+    /// dispatch to `$callmethod`, and `std.env.finish` lowers to
+    /// `$env_finish` so the kernel can capture the STATUS argument;
+    /// Verilog `$finish(n)` keeps the plain "finish" name (its argument is
+    /// a diagnostic level, not an exit status). A user-defined procedure
+    /// that happens to be named `finish` is treated the same way — the
+    /// simulation still stops, just without a status.
+    fn lower_call_stmt(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        // `foo(a, b);` parses as CallStmt(Call(Name foo, (, args…)));
+        // `foo;` as CallStmt(Name foo). Unwrap the Call so the callee
+        // and the real arguments are found in both forms.
+        let src: Vec<SyntaxNode> = match kids.first() {
+            Some(c) if c.kind() == SyntaxKind::Call => real_children(c),
+            _ => kids.clone(),
+        };
+        let name_pos = src.iter().position(|k| k.kind() == SyntaxKind::Name);
+        let raw = name_pos.map(|i| self.text(&src[i])).unwrap_or_default();
+        let fname = raw
+            .rsplit('.')
+            .next()
+            .unwrap_or(raw.as_str())
+            .to_ascii_lowercase();
+        let name = if TEXTIO_PROCS.contains(&fname.as_str()) {
+            format!("$textio_{fname}")
+        } else {
+            fname
+        };
+        let args = self.call_stmt_args(&src, name_pos);
+        if let Some(stmt) = self.prot_method_call(&raw, &name, &args) {
+            return stmt;
+        }
+        let name = if name == "finish" {
+            "$env_finish".to_string()
+        } else {
+            name
+        };
+        Stmt::SysCall { name, args }
+    }
+
+    /// Protected-type method dispatch for call statements: `obj.m(args);`
+    /// on a protected object lowers to `$callmethod::t::m(obj, …)`, and a
+    /// bare `m(args);` inside a protected-type body lowers to a self-call.
+    /// `None` when the callee is not a method.
+    fn prot_method_call(&mut self, raw: &str, name: &str, args: &[Expr]) -> Option<Stmt> {
+        if let Some(dot) = raw.find('.') {
+            let (base, m) = (&raw[..dot], raw[dot + 1..].to_ascii_lowercase());
+            if let Some(id) = self.sig_id(base) {
+                if let Some(t) = self.sig_prot.get(&id).cloned() {
+                    let is_method = self
+                        .prot_types
+                        .get(&t)
+                        .is_some_and(|p| p.methods.contains(&m));
+                    if is_method {
+                        let mut args2 = vec![Expr::Sig(id)];
+                        args2.extend(args.iter().cloned());
+                        return Some(Stmt::SysCall {
+                            name: format!("$callmethod::{}::{}", t, m),
+                            args: args2,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(t) = self.prot_body_ctx.clone() {
+            if self
+                .prot_types
+                .get(&t)
+                .is_some_and(|p| p.methods.iter().any(|m| m == name))
+            {
+                let mut args2 = vec![Expr::Call {
+                    name: "$this".into(),
+                    args: vec![],
+                }];
+                args2.extend(args.iter().cloned());
+                return Some(Stmt::SysCall {
+                    name: format!("$callmethod::{}::{}", t, name),
+                    args: args2,
+                });
+            }
+        }
+        None
+    }
+
+    /// Collect a call statement's argument expressions. Association keys
+    /// (`name => value`) are not arguments: drop a bare Name immediately
+    /// followed by `=>`. Every other bare Name is a real positional
+    /// argument — e.g. a variable passed to a user procedure — and must be
+    /// kept; it may reference something from an unseen package/context, so
+    /// it lowers leniently to a placeholder, like port-map association
+    /// actuals.
+    fn call_stmt_args(&mut self, src: &[SyntaxNode], name_pos: Option<usize>) -> Vec<Expr> {
+        let is_assoc_key: Vec<bool> = src
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                k.kind() == SyntaxKind::Name
+                    && src
+                        .get(i + 1)
+                        .map(|n| self.text(n) == "=>")
+                        .unwrap_or(false)
+            })
+            .collect();
+        src.iter()
+            .enumerate()
+            .filter(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()) && !is_assoc_key[*i])
+            .map(|(_, k)| {
+                if k.kind() == SyntaxKind::Name {
+                    self.suppress_err += 1;
+                    let e = self.lower_expr(k, &self.consts.clone());
+                    self.suppress_err -= 1;
+                    e
+                } else {
+                    self.lower_expr(k, &self.consts.clone())
+                }
+            })
+            .collect()
     }
 
     pub(super) fn lower_if(&mut self, s: &SyntaxNode) -> Stmt {
