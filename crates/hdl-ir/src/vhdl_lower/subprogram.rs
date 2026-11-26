@@ -619,6 +619,61 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Install a subprogram's slot space: push the enclosing `names` map
+    /// onto `names_stack`, build the slots (slot 0 = return value, then the
+    /// formals — installed first so function-local constants can reference
+    /// parameters: `constant pos : time := ifelse(T >= 0 ns, T, -T);`),
+    /// mark the formals in `fn_formals` (they are sized by the call's
+    /// actuals), drop stale per-slot shape entries from a previously lowered
+    /// subprogram (slot ids alias across subprograms), and record this
+    /// subprogram's object shapes and record/protected mappings. Returns
+    /// the slot list and the saved outer state to restore at exit.
+    fn install_fn_slots(
+        &mut self,
+        name: &str,
+        ret_width: usize,
+        args: &[(String, usize, String)],
+        arg_types: &[(String, String)],
+        arg_shapes: &[(String, Option<SyntaxNode>, Option<SyntaxNode>)],
+    ) -> (Vec<(String, usize)>, FnSlotScope) {
+        let saved_names = std::mem::take(&mut self.names);
+        self.names_stack.push(saved_names);
+        let mut slots: Vec<(String, usize)> = vec![(name.to_string(), ret_width.max(1))];
+        slots.extend(args.iter().map(|(n, w, _)| (n.clone(), *w)));
+        self.names = slots
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i as SigId))
+            .collect();
+        let saved_formals = std::mem::take(&mut self.fn_formals);
+        self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
+        // Capture the pre-call shape/record state and clear the shape
+        // entries under this subprogram's slot ids — a stale entry would
+        // mis-address this one's slices and fold its attributes from another
+        // function's object. `record_obj_shape` re-adds what this
+        // subprogram's objects have; the exit restore is the guard's.
+        let saved_shapes = SlotShapeSave::capture(self, slots.len());
+        saved_shapes.drop_entries(self);
+        for (n, tmark, constraint) in arg_shapes {
+            if let Some(&id) = self.names.get(n) {
+                self.record_obj_shape(id, tmark.as_ref(), constraint.as_ref());
+            }
+        }
+        // Record-typed parameters: remember the record type so `arg.field`
+        // resolves even in declarative-item initializers (constants), which
+        // are lowered after this. Slot ids are per-function, so entries left
+        // by a previously lowered function must be dropped first — a formal
+        // whose type is not a record/array-of-records would otherwise
+        // inherit the stale record of an earlier function's same-numbered
+        // slot. The entry-state capture and exit reset are the guard's.
+        self.map_slot_records(&slots, arg_types);
+        let guard = FnSlotScope {
+            saved_shapes,
+            saved_formals,
+        };
+        (slots, guard)
+    }
+
     /// Lower a subprogram's statement part: loop variables allocated while
     /// lowering get slots after the declared ones (appended to `locals` so
     /// the runtime and const-eval slot space match), and pending
@@ -676,50 +731,13 @@ impl<'a> Lower<'a> {
             mut ret_width,
             ..
         } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
-        // Lower the body in slot space (slot 0 = return value). Install the
-        // return + parameter slots first so function-local constants can
-        // reference parameters (`constant pos : time := ifelse(T >= 0 ns, T, -T);`).
-        let saved_names = std::mem::take(&mut self.names);
-        self.names_stack.push(saved_names);
-        let mut slots: Vec<(String, usize)> = vec![(name.clone(), ret_width.max(1))];
-        slots.extend(args.iter().map(|(n, w, _)| (n.clone(), *w)));
-        self.names = slots
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| (n.clone(), i as SigId))
-            .collect();
-        // Formals are sized by the call's actuals: mark their slot ids so
-        // `'length`/`'high` on them lower symbolically even when an earlier
-        // subprogram left a stale `sig_width`/`sig_dims` entry under the same
-        // aliased slot id. Saved/restored for nested subprograms below.
-        let saved_formals = std::mem::take(&mut self.fn_formals);
-        self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
-        // Slot ids alias across subprograms: a previously lowered
-        // subprogram's shape entries (`sig_asc`, `sig_elem`, `sig_dynw`,
-        // `sig_dims`) and record mappings under the same id would
-        // mis-address this one's slices and fold its attributes from
-        // another function's object. Capture the entry state, drop it for
-        // the slots about to be registered, and restore at exit;
-        // `record_obj_shape` re-adds what this subprogram's formals have.
-        let saved_shapes = SlotShapeSave::capture(self, slots.len());
-        saved_shapes.drop_entries(self);
-        for (n, tmark, constraint) in &arg_shapes {
-            if let Some(&id) = self.names.get(n) {
-                self.record_obj_shape(id, tmark.as_ref(), constraint.as_ref());
-            }
-        }
+        // Lower the body in slot space (slot 0 = return value; the install
+        // also pushes the enclosing `names` map for the scope guard below).
+        let (mut slots, fn_slots) =
+            self.install_fn_slots(&name, ret_width, &args, &arg_types, &arg_shapes);
         // Formals/locals now in `names`: outer constants of the same name in
         // the lowering env must not shadow them (see `fn_scope`).
         self.fn_scope += 1;
-        // Record-typed parameters: remember the record type so `arg.field`
-        // resolves even in declarative-item initializers (constants), which
-        // are lowered before the loop below. Slot ids are per-function, so
-        // entries left by a previously lowered function must be dropped
-        // first — a formal whose type is not a record/array-of-records
-        // would otherwise inherit the stale record of an earlier function's
-        // same-numbered slot. The entry-state capture and exit reset are
-        // part of `SlotShapeSave` above.
-        self.map_slot_records(&slots, &arg_types);
         // Function-local constants whose initializer is not const-evalable at
         // lower time (e.g. `constant msb := min(arg'length, size) - 1;` in
         // std_logic_arith): they get a runtime slot and the initializer is
@@ -768,8 +786,7 @@ impl<'a> Lower<'a> {
         // entries the body must not touch keep their pre-call values. This
         // runs after the return-width fixups above, which still read the
         // function's own slot mappings.
-        saved_shapes.restore(self);
-        self.fn_formals = saved_formals;
+        fn_slots.restore(self);
         Some(FuncIr {
             name,
             ret_width: ret_width.max(1),
@@ -779,6 +796,23 @@ impl<'a> Lower<'a> {
             dyn_locals,
             body,
         })
+    }
+}
+
+/// Saved outer-scope state from installing a subprogram's slot space:
+/// the per-slot shape/record maps and the enclosing `fn_formals` set.
+/// Both are restored together at exit — the shapes restore must run after
+/// the return-width fixups, which still read the function's own slot
+/// mappings.
+struct FnSlotScope {
+    saved_shapes: SlotShapeSave,
+    saved_formals: std::collections::HashSet<SigId>,
+}
+
+impl FnSlotScope {
+    fn restore(self, lx: &mut Lower<'_>) {
+        self.saved_shapes.restore(lx);
+        lx.fn_formals = self.saved_formals;
     }
 }
 
