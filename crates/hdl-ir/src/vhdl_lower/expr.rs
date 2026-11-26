@@ -671,63 +671,18 @@ impl<'a> Lower<'a> {
                                     Expr::Lit(Value::from_u64(32, w_lit))
                                 }
                             });
-                            let lo = lo.max(0) as u64;
+                            let lo_u = lo.max(0) as u64;
                             // `msb`/`lsb` hold the source range's high/low
                             // bounds; for `to` the left (MSB-most) element is
                             // `lsb`, for `downto` it is `msb`.
-                            let off_left = Expr::Bin {
-                                op: BinOp::Sub,
-                                l: Box::new(self.lower_expr(lsb, env)),
-                                r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
-                            };
-                            let off_right = Expr::Bin {
-                                op: BinOp::Sub,
-                                l: Box::new(self.lower_expr(msb, env)),
-                                r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
-                            };
-                            let scaled = |e: Expr, k: u64| Expr::Bin {
-                                op: BinOp::Mul,
-                                l: Box::new(e),
-                                r: Box::new(Expr::Lit(Value::from_u64(32, k))),
-                            };
-                            let (msb_e, lsb_e) = if asc {
-                                // slice (a to b) covers value bits
-                                // [W-1-(a-lo)·ew … W-(b-lo+1)·ew]
-                                (
-                                    Expr::Bin {
-                                        op: BinOp::Sub,
-                                        l: Box::new(Expr::Bin {
-                                            op: BinOp::Sub,
-                                            l: Box::new(w.clone()),
-                                            r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
-                                        }),
-                                        r: Box::new(scaled(off_left, ew)),
-                                    },
-                                    Expr::Bin {
-                                        op: BinOp::Sub,
-                                        l: Box::new(w),
-                                        r: Box::new(scaled(
-                                            Expr::Bin {
-                                                op: BinOp::Add,
-                                                l: Box::new(off_right),
-                                                r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
-                                            },
-                                            ew,
-                                        )),
-                                    },
-                                )
-                            } else {
-                                // slice (a downto b) covers value bits
-                                // [(a-lo)·ew+ew-1 … (b-lo)·ew]
-                                (
-                                    Expr::Bin {
-                                        op: BinOp::Add,
-                                        l: Box::new(scaled(off_right, ew)),
-                                        r: Box::new(Expr::Lit(Value::from_u64(32, ew - 1))),
-                                    },
-                                    scaled(off_left, ew),
-                                )
-                            };
+                            let (msb_e, lsb_e) = super::width::remapped_sel_bounds(
+                                w,
+                                ew,
+                                lo_u,
+                                asc,
+                                self.lower_expr(msb, env),
+                                self.lower_expr(lsb, env),
+                            );
                             return Expr::Sel {
                                 e: Box::new(base_e),
                                 msb: Box::new(msb_e),
@@ -735,6 +690,12 @@ impl<'a> Lower<'a> {
                             };
                         }
                     }
+                }
+                // Slice of a constant (`ASC_DATA(0 to 3)`): remap the index
+                // bounds to value-bit positions from the recorded decl
+                // direction, like the signal path above.
+                if let Some(sel) = self.const_slice_sel(base, &base_e, msb, lsb, env) {
+                    return sel;
                 }
                 // Slice of a record field that is itself an array
                 // (`r.options(0 to n)`, `r.description(1 to len)`): the
@@ -1297,11 +1258,11 @@ impl<'a> Lower<'a> {
                 };
             }
         }
-        // A record/array-typed constant is materialized as a hidden signal
-        // (`__const_<name>`); index it like a signal.
+        // A record/array-typed constant element read routes through
+        // `lower_const_array_index` below (`$const_idx` over the literal —
+        // the const-eval cannot see a materialized hidden signal).
         let base_id = self
             .sig_id(&name)
-            .or_else(|| self.names.get(&format!("__const_{}", fname)).copied())
             .or_else(|| match self.aliases.get(&fname) {
                 Some(Expr::Sig(id)) => Some(*id),
                 _ => None,

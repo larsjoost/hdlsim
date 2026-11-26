@@ -811,6 +811,9 @@ struct Lower<'a> {
     /// object constraint is not part of the type mark, so `types` alone
     /// only knows the unconstrained base's dims).
     obj_dims: ObjDims,
+    /// Constant/generic name → per-dim ascending flags (`obj_asc`), from the
+    /// decl constraint or value shape — index/slice addressing remaps.
+    obj_asc: HashMap<String, Vec<bool>>,
     /// Signal id → (low bound, ascending?) of a vector's own index
     /// constraint — ascending ranges (`0 to N-1`) address flat bits
     /// mirrored (element k = value bit W-1-k), so slices must remap.
@@ -918,6 +921,9 @@ struct Lower<'a> {
     /// `SigMaps` — per-file `obj_dims` maps don't cross files, so a generic's
     /// `'length(d)` in the architecture needs this handoff.
     entity_obj_dims: ObjDims,
+    /// Delta of `obj_asc` in the entity declarative part, via `SigMaps`
+    /// (see `entity_obj_dims`).
+    entity_obj_asc: HashMap<String, Vec<bool>>,
     /// Delta of `aliases`/`alias_rec` declared in the entity declarative part,
     /// exported to the entity's architectures via `SigMaps` (entity-level
     /// `alias`/`signal` declarations are visible in every architecture of the
@@ -988,6 +994,8 @@ pub struct SigMaps {
     /// constant shapes) — the architecture consults them for
     /// `'length`-family folds on those names.
     obj_dims: ObjDims,
+    /// `obj_asc` of the entity declarative part (see [`Lower::obj_asc`]).
+    obj_asc: HashMap<String, Vec<bool>>,
     /// Aliases (and their record types) declared in the entity's declarative
     /// part — visible in its architectures too. `SigId`s are module-relative
     /// and the architecture reuses the entity module's signal table, so the
@@ -1038,6 +1046,7 @@ impl<'a> Lower<'a> {
             sig_width: HashMap::new(),
             sig_dims: HashMap::new(),
             obj_dims: HashMap::new(),
+            obj_asc: HashMap::new(),
             sig_asc: HashMap::new(),
             sig_elem: HashMap::new(),
             sig_dynw: HashMap::new(),
@@ -1065,6 +1074,7 @@ impl<'a> Lower<'a> {
             entity_consts: HashMap::new(),
             entity_types: HashMap::new(),
             entity_obj_dims: HashMap::new(),
+            entity_obj_asc: HashMap::new(),
             entity_aliases: HashMap::new(),
             entity_alias_rec: HashMap::new(),
             attr_decls: std::collections::HashSet::new(),
@@ -1098,6 +1108,7 @@ impl<'a> Lower<'a> {
             consts: self.entity_consts.clone(),
             types: self.entity_types.clone(),
             obj_dims: self.entity_obj_dims.clone(),
+            obj_asc: self.entity_obj_asc.clone(),
             aliases: self.entity_aliases.clone(),
             alias_rec: self.entity_alias_rec.clone(),
         };
@@ -1152,6 +1163,9 @@ impl<'a> Lower<'a> {
         }
         for (k, v) in m.obj_dims {
             self.obj_dims.entry(k).or_insert(v);
+        }
+        for (k, v) in m.obj_asc {
+            self.obj_asc.entry(k).or_insert(v);
         }
     }
 

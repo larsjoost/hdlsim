@@ -43,6 +43,8 @@ impl<'a> Lower<'a> {
             self.alias_rec.keys().cloned().collect();
         let obj_dims_before: std::collections::HashSet<String> =
             self.obj_dims.keys().cloned().collect();
+        let obj_asc_before: std::collections::HashSet<String> =
+            self.obj_asc.keys().cloned().collect();
         for k in &kids {
             // Arm the hidden-signal allocator for this phase (ports/generics
             // push directly into `module.signals`, so re-arm per item).
@@ -99,6 +101,12 @@ impl<'a> Lower<'a> {
             .obj_dims
             .iter()
             .filter(|(k, _)| !obj_dims_before.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.entity_obj_asc = self
+            .obj_asc
+            .iter()
+            .filter(|(k, _)| !obj_asc_before.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.entity_aliases = self
@@ -243,6 +251,7 @@ impl<'a> Lower<'a> {
             // generic must fold in the architecture without the actual's
             // type — overrides carry values, not constraints).
             let mut gen_dims: Option<Vec<(i64, usize)>> = None;
+            let mut gen_dirs: Option<Vec<bool>> = None;
             if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
                 let tn = self
                     .kw(tm)
@@ -250,12 +259,15 @@ impl<'a> Lower<'a> {
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. }))
-                    && !self.text(c).contains("<>")
+                if matches!(
+                    self.types.get(&tn),
+                    Some(TypeInfo::Array { .. } | TypeInfo::Vector { .. })
+                ) && !self.text(c).contains("<>")
                 {
                     let cd = self.constraint_dims(c);
                     if !cd.is_empty() {
                         gen_dims = Some(cd);
+                        gen_dirs = Some(self.constraint_dirs(c));
                     }
                 }
             }
@@ -308,6 +320,9 @@ impl<'a> Lower<'a> {
                     // number instead of X.
                     if !overrides.contains_key(&key) {
                         self.obj_dims.insert(key.clone(), gd.clone());
+                        if let Some(dirs) = &gen_dirs {
+                            self.obj_asc.insert(key.clone(), dirs.clone());
+                        }
                     }
                 }
                 if overrides.contains_key(&key) {
@@ -318,10 +333,14 @@ impl<'a> Lower<'a> {
                     // entry: `'length` folds to X, never to a wrong number.
                     match self.dims_from_init(type_mark, None, &val) {
                         Some(dims) => {
+                            // Value-shape dims address MSB-first direct (see
+                            // `set_obj_dims_from_init`).
+                            self.obj_asc.insert(key.clone(), vec![true; dims.len()]);
                             self.obj_dims.insert(key.clone(), dims);
                         }
                         None => {
                             self.obj_dims.remove(&key);
+                            self.obj_asc.remove(&key);
                         }
                     }
                 }

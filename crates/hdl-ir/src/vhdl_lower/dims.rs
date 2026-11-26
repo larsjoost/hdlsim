@@ -246,6 +246,12 @@ impl<'a> Lower<'a> {
             if crate::debug::TRACE_LOWER.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[lower] obj_dims[{name}] = {dims:?} via initializer");
             }
+            // Value-shape dims address MSB-first direct (element k = value
+            // element k): the ascending mapping, so a recorded decl
+            // constraint's direction wins and stays untouched.
+            self.obj_asc
+                .entry(name.to_string())
+                .or_insert(vec![true; dims.len()]);
             self.obj_dims.insert(name.to_string(), dims);
         }
     }
@@ -307,20 +313,69 @@ impl<'a> Lower<'a> {
     /// right. Unconstrained (`<>`) ranges and unresolvable bounds count as
     /// size 1 — a wrong large size would mislayout aggregates.
     pub(super) fn constraint_dims(&mut self, c: &SyntaxNode) -> Vec<(i64, usize)> {
-        let kids = real_children(c);
-        let subs: Vec<SyntaxNode> = kids
-            .into_iter()
-            .filter(|k| k.kind() == SyntaxKind::Range)
-            .collect();
-        let ranges: Vec<SyntaxNode> = if subs.is_empty() {
-            vec![c.clone()]
-        } else {
-            subs
-        };
-        ranges
+        constraint_ranges(c)
             .iter()
             .map(|r| self.constraint_range_dim(r))
             .collect()
+    }
+
+    /// Ascending flag per dim of an index constraint, aligned with
+    /// `constraint_dims`' range order: element k of an ascending range is
+    /// value element k (MSB-first direct), of a descending range value
+    /// element size-1-k (the flat index flips). A range without keywords
+    /// defaults to descending, matching `bounds_dim`.
+    pub(super) fn constraint_dirs(&self, c: &SyntaxNode) -> Vec<bool> {
+        constraint_ranges(c)
+            .iter()
+            .map(|r| !self.text(r).to_ascii_lowercase().contains("downto"))
+            .collect()
+    }
+
+    /// Record object shape (dims + per-dim directions) for every name of a
+    /// constant declaration whose type mark resolves to an array-like type
+    /// with a concrete inline index constraint — the constraint is not part
+    /// of the type mark, so neither is derivable at use sites. A `<>`
+    /// (unconstrained) constraint records nothing.
+    pub(super) fn record_const_shapes(
+        &mut self,
+        tm: Option<&SyntaxNode>,
+        constraint: Option<&SyntaxNode>,
+        names: &[String],
+    ) {
+        let (Some(tm), Some(c)) = (tm, constraint) else {
+            return;
+        };
+        let tn = self
+            .kw(tm)
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            self.types.get(&tn),
+            Some(TypeInfo::Array { .. } | TypeInfo::Vector { .. })
+        ) || self.text(c).contains("<>")
+        {
+            return;
+        }
+        for n in names {
+            self.record_const_shape(&n.to_ascii_lowercase(), c);
+        }
+    }
+
+    /// Record a constant's object shape from its inline index constraint —
+    /// dims (`obj_dims`, for `'length(d)`-style folds) and per-dim
+    /// directions (`obj_asc`, for index/slice addressing). The constraint is
+    /// not part of the type mark, so neither is derivable at use sites.
+    pub(super) fn record_const_shape(&mut self, name: &str, c: &SyntaxNode) {
+        let cd = self.constraint_dims(c);
+        if !cd.is_empty() {
+            self.obj_dims.insert(name.to_string(), cd);
+        }
+        let dirs = self.constraint_dirs(c);
+        if !dirs.is_empty() {
+            self.obj_asc.insert(name.to_string(), dirs);
+        }
     }
 
     /// (low, size) of one constraint range: an enum type name gives its
@@ -413,6 +468,20 @@ impl<'a> Lower<'a> {
             eprintln!("[lower] sig_dims[{id}] = {dims:?} via inline constraint ({name})");
         }
         self.sig_dims.insert(id, dims);
+    }
+}
+
+/// The index constraint's ranges (or the node itself when it is a bare
+/// range), shared by `constraint_dims` and `constraint_dirs`.
+fn constraint_ranges(c: &SyntaxNode) -> Vec<SyntaxNode> {
+    let subs: Vec<SyntaxNode> = real_children(c)
+        .into_iter()
+        .filter(|k| k.kind() == SyntaxKind::Range)
+        .collect();
+    if subs.is_empty() {
+        vec![c.clone()]
+    } else {
+        subs
     }
 }
 
