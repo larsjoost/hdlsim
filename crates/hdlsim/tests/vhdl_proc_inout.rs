@@ -31,3 +31,27 @@ fn procedure_inout_copies_back_to_caller_variable() {
     assert!(all.contains("inout_tb: PASS"), "{all}");
     assert!(!all.contains("FAIL"), "{all}");
 }
+
+/// A user procedure called from a constant initializer's function runs at
+/// const-eval with inout/out copy-back (scalar inout, out mode, interface
+/// defaults, nesting, loops); a self-recursive procedure aborts the fold to
+/// X (W0401) instead of hanging elaboration.
+#[test]
+fn const_eval_runs_procedures_and_copies_back() {
+    let f = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vhdl_proc_ce_tb.vhd");
+    let out = hdlsim()
+        .args(["run", "--top", "proc_ce_tb"])
+        .arg(&f)
+        .output()
+        .expect("runs");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "run failed:\n{all}");
+    assert!(all.contains("ce_tb: PASS"), "{all}");
+    assert!(all.contains("W0401"), "recursive fold must warn:\n{all}");
+    assert!(all.contains("ce_tb: KS=x"), "{all}");
+    assert!(!all.contains("wrong"), "{all}");
+}

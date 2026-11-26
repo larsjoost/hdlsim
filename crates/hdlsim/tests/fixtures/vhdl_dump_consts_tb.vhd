@@ -2,7 +2,7 @@
 -- string constant, a generic with a default (overridden in one instance and
 -- defaulted in the other), an unset generic, a constant the constant
 -- evaluator folds (real exponentiation), and one it cannot (a procedure
--- call in the initializer).
+-- that fails elaboration: a failure-severity report aborts the fold).
 library ieee;
 use ieee.std_logic_1164.all;
 
@@ -27,15 +27,16 @@ end entity;
 architecture rtl of dmp_unit is
   constant C_ROOT2 : real := 2.0 ** 0.5;
 
-  procedure setr(variable r : out natural) is
+  procedure refusing(variable n : out natural) is
   begin
-    r := 1;
+    report "refusing: not a constant" severity failure;
+    n := 1;
   end procedure;
 
   function undependable return natural is
     variable r : natural := 0;
   begin
-    setr(r);
+    refusing(r);
     return r;
   end function;
 

@@ -1,8 +1,8 @@
 -- A pure-function constant initializer that fails to fold keeps the
 -- constant-initializer warning: unlike an impure call (expected X by
 -- design), a pure fold failure signals a genuine const-eval gap worth
--- reporting. Same shape as impure_init_tb with the `impure` marker
--- dropped.
+-- reporting. Here the initializer's procedure would suspend (wait) — it
+-- cannot complete during constant evaluation, so the fold aborts.
 package pure_init_style is
   procedure poke(variable dst : out std_ulogic_vector; constant v : in std_ulogic_vector);
 end package;
@@ -10,6 +10,7 @@ end package;
 package body pure_init_style is
   procedure poke(variable dst : out std_ulogic_vector; constant v : in std_ulogic_vector) is
   begin
+    wait for 1 ns;  -- a function's constant evaluation cannot suspend
     dst := v;
   end procedure;
 end package body;

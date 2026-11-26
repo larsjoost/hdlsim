@@ -95,7 +95,10 @@ fn dump_consts_text() {
             && l.contains("1.4142135623730951")),
         "{lines:?}"
     );
-    // A genuinely unfoldable initializer (procedure call) stays unfolded.
+    // A procedure that fails elaboration (failure-severity report) aborts
+    // the fold, so the initializer stays unfolded. A *successful* procedure
+    // call folds since const-eval executes procedure bodies (see
+    // vhdl_proc_ce_tb).
     assert!(
         lines
             .iter()
