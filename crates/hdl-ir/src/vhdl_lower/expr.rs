@@ -1258,11 +1258,11 @@ impl<'a> Lower<'a> {
             .next()
             .unwrap_or(name.as_str())
             .to_ascii_lowercase();
-        let arg_nodes: Vec<&SyntaxNode> = kids
+        let arg_nodes: Vec<SyntaxNode> = kids
             .iter()
             .enumerate()
             .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
-            .map(|(_, k)| k)
+            .map(|(_, k)| k.clone())
             .collect();
         let args: Vec<Expr> = arg_nodes.iter().map(|k| self.lower_expr(k, env)).collect();
         // `.all(i)` dereference of an access-to-array: `L.all(i)` -> L(i).
@@ -1665,7 +1665,7 @@ impl<'a> Lower<'a> {
                     .expect("arm guard checked that this alias is a Call")
                 {
                     Expr::Call { name: target, .. } => {
-                        let shapes = self.call_shape_binds(target, &args);
+                        let shapes = self.call_shape_binds(target, &args, &arg_nodes);
                         Expr::Call {
                             name: target.clone(),
                             args,
@@ -1676,7 +1676,7 @@ impl<'a> Lower<'a> {
                 }
             }
             _ => {
-                let shapes = self.call_shape_binds(&fname, &args);
+                let shapes = self.call_shape_binds(&fname, &args, &arg_nodes);
                 Expr::Call {
                     name: fname,
                     args,
@@ -1688,13 +1688,14 @@ impl<'a> Lower<'a> {
 
     /// A call's shape binds: for every formal position that is shape-bound
     /// in any same-name candidate, resolve the actual's index range in the
-    /// caller's context. The actual's shape, best-effort: an outer
-    /// shape-bound formal chains its own hidden slots; a recorded shape
-    /// (`sig_asc`) lowers to literals; a constrained formal actual keeps its
-    /// raw (0, descending) convention. Anything else omits the bind — the
-    /// callee falls back to its recorded convention, which is the
-    /// pre-shape-binding behavior bit for bit.
-    pub(super) fn call_shape_binds(&self, fname: &str, args: &[Expr]) -> Vec<ShapeBind> {
+    /// caller's context (see `actual_shape` for the per-actual cases).
+    /// Positions with an unresolvable actual omit the bind.
+    pub(super) fn call_shape_binds(
+        &self,
+        fname: &str,
+        args: &[Expr],
+        nodes: &[SyntaxNode],
+    ) -> Vec<ShapeBind> {
         let Some(cands) = self.funcs.get(fname) else {
             return Vec::new();
         };
@@ -1706,29 +1707,76 @@ impl<'a> Lower<'a> {
         positions.dedup();
         let mut binds = Vec::new();
         for p in positions {
-            let Some(Expr::Sig(s)) = args.get(p) else {
+            let Some(a) = args.get(p) else {
                 continue;
             };
-            let (lo, asc) = if let Some(&(flo, fasc)) = self.formal_dyn.get(s) {
-                (Expr::Sig(flo), Expr::Sig(fasc))
-            } else if let Some(&(lo, asc)) = self.sig_asc.get(s) {
-                (
-                    Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
-                    Expr::Lit(Value::from_u64(32, asc as u64)),
-                )
-            } else if self.fn_formals.contains(s) {
-                // A constrained formal actual (subtype-typed, no constraint
-                // node): its addressing convention is the raw (0, descending).
-                (
-                    Expr::Lit(Value::from_u64(32, 0)),
-                    Expr::Lit(Value::from_u64(32, 0)),
-                )
-            } else {
+            let Some((lo, asc)) = self.actual_shape(a, nodes.get(p)) else {
                 continue;
             };
             binds.push(ShapeBind { formal: p, lo, asc });
         }
         binds
+    }
+
+    /// One actual's index range in the caller's context, best-effort: an
+    /// outer shape-bound formal chains its own hidden slots; a recorded
+    /// shape (`sig_asc`) lowers to literals; a folded constant actual
+    /// carries no id, so its declared range comes from the recorded object
+    /// shape (`obj_dims`/`obj_asc`) under the actual's name; a constrained
+    /// formal actual keeps its raw (0, descending) convention. `None` omits
+    /// the bind — the callee falls back to its recorded convention, which
+    /// is the pre-shape-binding behavior bit for bit.
+    fn actual_shape(&self, a: &Expr, node: Option<&SyntaxNode>) -> Option<(Expr, Expr)> {
+        match a {
+            Expr::Sig(s) => {
+                if let Some(&(flo, fasc)) = self.formal_dyn.get(s) {
+                    return Some((Expr::Sig(flo), Expr::Sig(fasc)));
+                }
+                if let Some(&(lo, asc)) = self.sig_asc.get(s) {
+                    return Some((
+                        Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
+                        Expr::Lit(Value::from_u64(32, asc as u64)),
+                    ));
+                }
+                // A constrained formal actual (subtype-typed, no constraint
+                // node): its addressing convention is the raw (0, descending).
+                self.fn_formals.contains(s).then(|| {
+                    (
+                        Expr::Lit(Value::from_u64(32, 0)),
+                        Expr::Lit(Value::from_u64(32, 0)),
+                    )
+                })
+            }
+            // Folded constant: the recorded object shape under the actual's
+            // name.
+            _ => {
+                let key = self.obj_name(node);
+                let &(lo, _) = self.obj_dims.get(&key).and_then(|d| d.first())?;
+                let asc = self
+                    .obj_asc
+                    .get(&key)
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or(false);
+                Some((
+                    Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
+                    Expr::Lit(Value::from_u64(32, asc as u64)),
+                ))
+            }
+        }
+    }
+
+    /// The recorded-shape lookup key of an actual node: the node's full
+    /// (lowercased) text, falling back to its last dotted segment —
+    /// `obj_dims`/`obj_asc` are keyed by bare object name.
+    fn obj_name(&self, n: Option<&SyntaxNode>) -> String {
+        let Some(n) = n else {
+            return String::new();
+        };
+        let t = self.text(n).to_ascii_lowercase();
+        match t.rsplit_once('.') {
+            Some((_, last)) => last.to_string(),
+            None => t,
+        }
     }
 
     fn lower_aggregate(

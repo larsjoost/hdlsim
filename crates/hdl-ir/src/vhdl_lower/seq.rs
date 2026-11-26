@@ -392,7 +392,7 @@ impl<'a> Lower<'a> {
         } else {
             fname
         };
-        let args = self.call_stmt_args(&src, name_pos);
+        let (args, arg_nodes) = self.call_stmt_args(&src, name_pos);
         if let Some(stmt) = self.prot_method_call(&raw, &name, &args) {
             return stmt;
         }
@@ -403,7 +403,7 @@ impl<'a> Lower<'a> {
         };
         // A user procedure's shape-bound formals take the actuals' ranges:
         // bind what the actual's shape resolves to, omit the rest.
-        let shapes = self.call_shape_binds(&name, &args);
+        let shapes = self.call_shape_binds(&name, &args, &arg_nodes);
         Stmt::SysCall { name, args, shapes }
     }
 
@@ -461,7 +461,11 @@ impl<'a> Lower<'a> {
     /// kept; it may reference something from an unseen package/context, so
     /// it lowers leniently to a placeholder, like port-map association
     /// actuals.
-    fn call_stmt_args(&mut self, src: &[SyntaxNode], name_pos: Option<usize>) -> Vec<Expr> {
+    fn call_stmt_args(
+        &mut self,
+        src: &[SyntaxNode],
+        name_pos: Option<usize>,
+    ) -> (Vec<Expr>, Vec<SyntaxNode>) {
         let is_assoc_key: Vec<bool> = src
             .iter()
             .enumerate()
@@ -473,10 +477,15 @@ impl<'a> Lower<'a> {
                         .unwrap_or(false)
             })
             .collect();
-        src.iter()
+        let nodes: Vec<SyntaxNode> = src
+            .iter()
             .enumerate()
             .filter(|(i, k)| Some(*i) != name_pos && is_expr_node(k.kind()) && !is_assoc_key[*i])
-            .map(|(_, k)| {
+            .map(|(_, k)| k.clone())
+            .collect();
+        let args = nodes
+            .iter()
+            .map(|k| {
                 if k.kind() == SyntaxKind::Name {
                     self.suppress_err += 1;
                     let e = self.lower_expr(k, &self.consts.clone());
@@ -486,7 +495,8 @@ impl<'a> Lower<'a> {
                     self.lower_expr(k, &self.consts.clone())
                 }
             })
-            .collect()
+            .collect();
+        (args, nodes)
     }
 
     pub(super) fn lower_if(&mut self, s: &SyntaxNode) -> Stmt {
