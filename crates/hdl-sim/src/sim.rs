@@ -17,7 +17,7 @@
 use crate::events::{Observer, SimEvent};
 use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
-use hdl_ir::ShapeBind;
+use hdl_ir::{FormalShape, ShapeBind};
 use hdl_syntax::source::Span;
 
 mod ckpt;
@@ -1960,9 +1960,9 @@ impl Simulator {
                 self.eval_expr(&e, None);
                 Control::Done
             }
-            Stmt::SysCall { name, args, .. } => {
+            Stmt::SysCall { name, args, shapes } => {
                 // Process context: process variables are flat signals, no frame.
-                self.sys_call(&name, args, None);
+                self.sys_call(&name, args, &shapes, None);
                 Control::Done
             }
         }
@@ -2055,7 +2055,13 @@ impl Simulator {
     /// `locals` is the subprogram frame when called from one: frame slots
     /// (`Expr::Sig(i)` with `i < locals.len()`) shadow real signals, matching
     /// `eval_expr`.
-    fn sys_call(&mut self, name: &str, args: Vec<Expr>, mut locals: Option<&mut Vec<Value>>) {
+    fn sys_call(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        shapes: &[ShapeBind],
+        mut locals: Option<&mut Vec<Value>>,
+    ) {
         match name {
             // `arr = new[n]` — resize a dynamic array / queue.
             "$array_new" => {
@@ -2128,7 +2134,7 @@ impl Simulator {
                 let fname = format!("{}::new", cn);
                 if let Some(fi) = self.func_match(&fname, args.get(1..).unwrap_or(&[]), None) {
                     let saved = self.cur_obj.replace(handle);
-                    self.run_func(fi, &args[1..], None);
+                    self.run_func(fi, &args[1..], &[], None);
                     self.cur_obj.set(saved);
                 }
             }
@@ -2147,7 +2153,7 @@ impl Simulator {
                         })
                         .unwrap_or(u64::MAX);
                     let saved = self.cur_obj.replace(obj);
-                    self.run_func(fi, &args[1..], None);
+                    self.run_func(fi, &args[1..], &[], None);
                     self.cur_obj.set(saved);
                 }
             }
@@ -2564,7 +2570,7 @@ impl Simulator {
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
                 if let Some(fi) = self.func_match(name, &args, locals.as_deref()) {
-                    self.run_procedure(fi, &args, locals);
+                    self.run_procedure(fi, &args, shapes, locals);
                 } else {
                     self.emit(SimEvent::Message {
                         text: format!(
@@ -3885,11 +3891,17 @@ impl Simulator {
                     }
                 }
             }
-            Expr::Call { name, args, .. } => self.eval_call(name, args, locals),
+            Expr::Call { name, args, shapes } => self.eval_call(name, args, shapes, locals),
         }
     }
 
-    fn eval_call(&self, name: &str, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
+    fn eval_call(
+        &self,
+        name: &str,
+        args: &[Expr],
+        shapes: &[ShapeBind],
+        locals: Option<&Vec<Value>>,
+    ) -> Value {
         // System functions.
         match name {
             "clog2" => {
@@ -4092,14 +4104,14 @@ impl Simulator {
                     .map(|a| self.eval_expr(a, locals).to_u64().unwrap_or(u64::MAX))
                     .unwrap_or(u64::MAX);
                 let saved = self.cur_obj.replace(obj);
-                let out = self.run_func(fi, &args[1..], locals);
+                let out = self.run_func(fi, &args[1..], &[], locals);
                 self.cur_obj.set(saved);
                 return out;
             }
             return Value::x(32);
         }
         if let Some(fi) = self.func_match(name, args, locals) {
-            return self.run_func(fi, args, locals);
+            return self.run_func(fi, args, shapes, locals);
         }
         Value::x(32)
     }
@@ -4351,7 +4363,44 @@ impl Simulator {
         }
     }
 
-    fn run_func(&self, fi: usize, args: &[Expr], locals: Option<&Vec<Value>>) -> Value {
+    /// Fill a callee frame's hidden shape slots from the call's binds. The
+    /// bound lo/asc evaluate in the caller's context; a shape-bound formal
+    /// with no bind (the call site was lowered against an interface-only
+    /// stub) takes the formal's recorded fallback. Hidden slots sit between
+    /// the formals and the locals, so each lands at its own SigId index.
+    fn fill_hidden(
+        hidden: &[FormalShape],
+        shapes: &[ShapeBind],
+        lvals: &mut Vec<Value>,
+        mut eval: impl FnMut(&Expr) -> Value,
+    ) {
+        // Reserve and set one hidden slot, growing the frame with X.
+        fn put(lvals: &mut Vec<Value>, id: usize, v: Value) {
+            while lvals.len() <= id {
+                lvals.push(Value::x(32));
+            }
+            lvals[id] = v.resize(32);
+        }
+        for h in hidden {
+            let (lo, asc) = match shapes.iter().find(|b| b.formal == h.formal) {
+                Some(b) => (eval(&b.lo), eval(&b.asc)),
+                None => (
+                    Value::from_u64(32, h.fb_lo.max(0) as u64),
+                    Value::from_u64(32, h.fb_asc as u64),
+                ),
+            };
+            put(lvals, h.lo as usize, lo);
+            put(lvals, h.asc as usize, asc);
+        }
+    }
+
+    fn run_func(
+        &self,
+        fi: usize,
+        args: &[Expr],
+        shapes: &[ShapeBind],
+        locals: Option<&Vec<Value>>,
+    ) -> Value {
         let f = &self.flat.functions[fi];
         // Runaway-loop budget: count every call made at runtime (not
         // const-eval/elaboration, which run with cur_proc = None). A loop
@@ -4440,6 +4489,7 @@ impl Simulator {
             };
             lvals.push(v);
         }
+        Self::fill_hidden(&f.hidden, shapes, &mut lvals, |e| self.eval_expr(e, locals));
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
@@ -4463,7 +4513,13 @@ impl Simulator {
     /// (expression position, pure), the body executes with `&mut self`, so
     /// syscalls (report/assert/finish/textio) and signal assignment take
     /// effect instead of being silently dropped.
-    fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&mut Vec<Value>>) {
+    fn run_procedure(
+        &mut self,
+        fi: usize,
+        args: &[Expr],
+        shapes: &[ShapeBind],
+        caller: Option<&mut Vec<Value>>,
+    ) {
         let f = self.flat.functions[fi].clone();
         // Same recursion guard as `run_func` (shared `fn_depth`, so function
         // ↔ procedure call chains count together). Procedure calls from a
@@ -4507,6 +4563,9 @@ impl Simulator {
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
         }
+        Self::fill_hidden(&f.hidden, shapes, &mut lvals, |e| {
+            self.eval_expr(e, caller.as_deref())
+        });
         self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         let saved_fn = self.cur_fn.replace(Some(fi));
         let mut runner = ProcRunner {
@@ -4778,7 +4837,7 @@ impl<'a> FnRunner<'a> {
                 // as calls. Other syscalls need &mut self — only reachable
                 // here via `ProcRunner`-dispatched nested expression calls.
                 if (name.starts_with("$setf::") || name.starts_with("$randomize::")) => {
-                    self.sim.eval_call(name, args, Some(self.locals));
+                    self.sim.eval_call(name, args, &[], Some(self.locals));
                 }
             _ => {}
         }
@@ -4945,9 +5004,9 @@ impl<'a> ProcRunner<'a> {
                 }
                 Control::Done
             }
-            Stmt::SysCall { name, args, .. } => {
+            Stmt::SysCall { name, args, shapes } => {
                 self.sim
-                    .sys_call(name, args.clone(), Some(&mut *self.locals));
+                    .sys_call(name, args.clone(), shapes, Some(&mut *self.locals));
                 Control::Done
             }
             Stmt::Break => Control::Break,

@@ -35,7 +35,7 @@
 use crate::sat::{is_neg, lit_of, neg, var_of, Lit, Solver};
 use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::value::{BinOp, UnOp, Value, V1};
-use hdl_ir::{Expr, ProcKind, Sens, SigKind, Stmt};
+use hdl_ir::{Expr, ProcKind, Sens, ShapeBind, SigKind, Stmt};
 use std::collections::{HashMap, HashSet};
 
 /// A safety property extracted from an `assert property` / `assert` process.
@@ -1756,7 +1756,7 @@ impl<'e, 'a> Exec<'e, 'a> {
                     signed: tv.signed || ev.signed,
                 })
             }
-            Expr::Call { name, args, .. } => self.eval_call(name, args),
+            Expr::Call { name, args, shapes } => self.eval_call(name, args, shapes),
             Expr::Concat(parts) => {
                 let mut vals = Vec::new();
                 for p in parts {
@@ -1861,7 +1861,12 @@ impl<'e, 'a> Exec<'e, 'a> {
         }
     }
 
-    fn eval_call(&mut self, name: &str, args: &[Expr]) -> Result<Val, String> {
+    fn eval_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        shapes: &[ShapeBind],
+    ) -> Result<Val, String> {
         match name {
             "clog2" => {
                 let v = self
@@ -1904,6 +1909,24 @@ impl<'e, 'a> Exec<'e, 'a> {
                     let w = f.slots.get(i).copied().unwrap_or(1).max(1);
                     let bits = resize_bits(&self.enc.b, av, w);
                     locals.insert(i as u32, bits);
+                }
+                // Hidden shape slots: the bound lo/asc evaluate in the
+                // caller's context; an unbound formal takes its fallback
+                // convention (see `Sim::fill_hidden`).
+                for h in &f.hidden {
+                    let (lo, asc) = match shapes.iter().find(|b| b.formal == h.formal) {
+                        Some(b) => (self.eval(&b.lo)?.bits, self.eval(&b.asc)?.bits),
+                        None => {
+                            let fb = |v: u64| {
+                                (0..32)
+                                    .map(|i| self.enc.b.const_lit((v >> i) & 1 == 1))
+                                    .collect::<Vec<_>>()
+                            };
+                            (fb(h.fb_lo.max(0) as u64), fb(h.fb_asc as u64))
+                        }
+                    };
+                    locals.insert(h.lo, resize_bits(&self.enc.b, &lo, 32));
+                    locals.insert(h.asc, resize_bits(&self.enc.b, &asc, 32));
                 }
                 let saved_locals = self.locals.replace(locals);
                 let saved_env = std::mem::take(&mut self.env);
