@@ -119,99 +119,114 @@ impl<'a> Lower<'a> {
         }
     }
 
-    pub(super) fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
-        match s.kind() {
-            SyntaxKind::SeqAssign => {
-                let kids = real_children(s);
-                // `(a, b) := f(...);` — parenthesized target list: not
-                // lowered (no error).
-                if kids.first().is_some_and(|k| k.kind() == SyntaxKind::Punct) {
-                    return Stmt::Null;
-                }
-                let lhs = kids.iter().find(|k| {
-                    matches!(
-                        k.kind(),
-                        SyntaxKind::Name | SyntaxKind::Call | SyntaxKind::PartSelect
-                    )
-                });
-                let op_pos = kids
-                    .iter()
-                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "<");
-                let has_when = kids
-                    .iter()
-                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
-                let has_after = kids
-                    .iter()
-                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "after");
-                if has_after {
-                    // `s <= v [after t] [, v2 [after t2] ...] [when c] ...`:
-                    // each element is a transaction scheduled at now + its own
-                    // delay (VHDL waveform delays are relative to the statement
-                    // execution, not cumulative) — the process is not suspended.
-                    if let (Some(l), Some(op)) = (lhs, op_pos) {
-                        // `unaffected` elements schedule no transaction.
-                        let elems: Vec<WaveElem> = self
-                            .waveform_elems(&kids, op + 1)
-                            .into_iter()
-                            .filter(|e| !self.is_unaffected_val(&e.val))
-                            .collect();
-                        if !elems.is_empty() {
-                            let lhs_e = self.lower_expr(l, &self.consts.clone());
-                            let mut stmts = Vec::new();
-                            for e in &elems {
-                                // The delay may be a runtime expression (e.g.
-                                // OSVVM `after iDelayVal`): evaluated when the
-                                // statement executes.
-                                let delay = e
-                                    .delay
-                                    .as_ref()
-                                    .map(|d| self.lower_expr(d, &self.consts.clone()));
-                                let val = self.lower_rhs(l, &e.val, &self.consts.clone());
-                                let a = match &delay {
-                                    None => Stmt::Assign {
-                                        lhs: lhs_e.clone(),
-                                        rhs: val,
-                                        nba: true,
-                                    },
-                                    Some(dv) => Stmt::AssignDelayed {
-                                        lhs: lhs_e.clone(),
-                                        rhs: val,
-                                        delay: dv.clone(),
-                                    },
-                                };
-                                stmts.push(match &e.cond {
-                                    Some(c) => Stmt::If {
-                                        cond: self.lower_expr(c, &self.consts.clone()),
-                                        then: Box::new(a),
-                                        els: None,
-                                    },
-                                    None => a,
-                                });
-                            }
-                            return if stmts.len() == 1 {
-                                stmts.pop().expect("checked stmts.len() == 1")
-                            } else {
-                                Stmt::Block(stmts)
-                            };
-                        }
-                    }
-                    return Stmt::Null;
-                }
-                if has_when {
-                    if let (Some(l), Some(op)) = (lhs, op_pos) {
-                        if let Some(a) = self.lower_cond_assign(&kids[op + 2..], l, true) {
-                            return a;
-                        }
-                    }
-                    return Stmt::Null;
-                }
-                let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
-                match (lhs, rhs) {
-                    // VHDL signal assignment is delta-delayed
-                    (Some(l), Some(r)) => self.finish_scalar_assign(l, r, true),
-                    _ => Stmt::Null,
+    /// Lower a sequential signal assignment `s <= ...;`: a waveform with
+    /// per-element delays, a conditional waveform, or a plain delta-delayed
+    /// assignment. A parenthesized target list is not lowered.
+    fn lower_seq_assign(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        // `(a, b) := f(...);` — parenthesized target list: not
+        // lowered (no error).
+        if kids.first().is_some_and(|k| k.kind() == SyntaxKind::Punct) {
+            return Stmt::Null;
+        }
+        let lhs = kids.iter().find(|k| {
+            matches!(
+                k.kind(),
+                SyntaxKind::Name | SyntaxKind::Call | SyntaxKind::PartSelect
+            )
+        });
+        let op_pos = kids
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "<");
+        let has_when = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
+        let has_after = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "after");
+        if has_after {
+            return self.lower_waveform_assign(&kids, lhs, op_pos);
+        }
+        if has_when {
+            if let (Some(l), Some(op)) = (lhs, op_pos) {
+                if let Some(a) = self.lower_cond_assign(&kids[op + 2..], l, true) {
+                    return a;
                 }
             }
+            return Stmt::Null;
+        }
+        let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
+        match (lhs, rhs) {
+            // VHDL signal assignment is delta-delayed
+            (Some(l), Some(r)) => self.finish_scalar_assign(l, r, true),
+            _ => Stmt::Null,
+        }
+    }
+
+    /// Lower the waveform form of a signal assignment, `s <= v [after t]
+    /// [, v2 [after t2] ...] [when c] ...`: each element is a transaction
+    /// scheduled at now + its own delay (VHDL waveform delays are relative
+    /// to the statement execution, not cumulative) — the process is not
+    /// suspended.
+    fn lower_waveform_assign(
+        &mut self,
+        kids: &[SyntaxNode],
+        lhs: Option<&SyntaxNode>,
+        op_pos: Option<usize>,
+    ) -> Stmt {
+        if let (Some(l), Some(op)) = (lhs, op_pos) {
+            // `unaffected` elements schedule no transaction.
+            let elems: Vec<WaveElem> = self
+                .waveform_elems(kids, op + 1)
+                .into_iter()
+                .filter(|e| !self.is_unaffected_val(&e.val))
+                .collect();
+            if !elems.is_empty() {
+                let lhs_e = self.lower_expr(l, &self.consts.clone());
+                let mut stmts = Vec::new();
+                for e in &elems {
+                    // The delay may be a runtime expression (e.g.
+                    // OSVVM `after iDelayVal`): evaluated when the
+                    // statement executes.
+                    let delay = e
+                        .delay
+                        .as_ref()
+                        .map(|d| self.lower_expr(d, &self.consts.clone()));
+                    let val = self.lower_rhs(l, &e.val, &self.consts.clone());
+                    let a = match &delay {
+                        None => Stmt::Assign {
+                            lhs: lhs_e.clone(),
+                            rhs: val,
+                            nba: true,
+                        },
+                        Some(dv) => Stmt::AssignDelayed {
+                            lhs: lhs_e.clone(),
+                            rhs: val,
+                            delay: dv.clone(),
+                        },
+                    };
+                    stmts.push(match &e.cond {
+                        Some(c) => Stmt::If {
+                            cond: self.lower_expr(c, &self.consts.clone()),
+                            then: Box::new(a),
+                            els: None,
+                        },
+                        None => a,
+                    });
+                }
+                return if stmts.len() == 1 {
+                    stmts.pop().expect("checked stmts.len() == 1")
+                } else {
+                    Stmt::Block(stmts)
+                };
+            }
+        }
+        Stmt::Null
+    }
+
+    pub(super) fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
+        match s.kind() {
+            SyntaxKind::SeqAssign => self.lower_seq_assign(s),
             SyntaxKind::VarAssign => {
                 let kids = real_children(s);
                 let lhs = kids.iter().find(|k| {

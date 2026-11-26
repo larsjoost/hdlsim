@@ -21,7 +21,7 @@
     "crates/hdl-ir/src/vhdl_lower/expr.rs": 2122,
     "crates/hdl-ir/src/vhdl_lower/objects.rs": 629,
     "crates/hdl-ir/src/vhdl_lower/package.rs": 698,
-    "crates/hdl-ir/src/vhdl_lower/seq.rs": 927,
+    "crates/hdl-ir/src/vhdl_lower/seq.rs": 942,
     "crates/hdl-ir/src/vhdl_lower/subprogram.rs": 802,
     "crates/hdl-ir/src/vhdl_lower/types.rs": 946,
     "crates/hdl-lib/src/lib.rs": 1959,
