@@ -354,26 +354,10 @@ impl<'a> Lower<'a> {
             .find(|k| k.kind() == SyntaxKind::Range)
             .cloned();
         // Inline array constraint (`constant m : matrix_t(0 to 2, 0 to 4) :=
-        // …`): register the object's dims so `'length(d)`-style attributes on
-        // the constant fold (the constraint is not part of the type mark).
-        if let (Some(tm), Some(c)) = (&type_mark, &constraint) {
-            let tn = self
-                .text(tm)
-                .rsplit('.')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if matches!(self.types.get(&tn), Some(TypeInfo::Array { .. }))
-                && !self.text(c).contains("<>")
-            {
-                let cd = self.constraint_dims(c);
-                if !cd.is_empty() {
-                    for n in &names {
-                        self.obj_dims.insert(n.to_ascii_lowercase(), cd.clone());
-                    }
-                }
-            }
-        }
+        // …`): register the object's shape so `'length(d)`-style attributes
+        // on the constant fold and index/slice addressing remaps (the
+        // constraint is not part of the type mark).
+        self.record_const_shapes(type_mark, constraint.as_ref(), &names);
         let want_str = type_mark.is_some_and(|tm| self.string_typed(tm));
         let saved_str = self.str_ctx;
         self.str_ctx = want_str;
@@ -538,6 +522,10 @@ impl<'a> Lower<'a> {
                 local_types.push((n.clone(), self.kw(tm)));
             }
         }
+        // Inline array constraint: record the object's shape (dims +
+        // directions) the same way declaration-level constants do, so
+        // index/slice addressing of a local constant remaps too.
+        self.record_const_shapes(type_mark, constraint, &names);
         let Some(init) = init else {
             for n in &names {
                 Rc::make_mut(&mut self.consts)

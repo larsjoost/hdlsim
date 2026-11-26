@@ -59,6 +59,51 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Slice of a constant base (`ASC_DATA(0 to 3)`): the base lowers to a
+    /// literal whose value-bit order is fixed, so the index bounds must be
+    /// remapped to value-bit positions from the decl constraint's recorded
+    /// direction (`obj_asc`) — the same mapping the signal path applies from
+    /// `sig_asc`. Names without a recorded shape (or a descending 1-bit
+    /// range from 0, whose addressing is already the flat default) return
+    /// None and keep the raw lowering.
+    pub(super) fn const_slice_sel(
+        &mut self,
+        base: Option<&SyntaxNode>,
+        base_e: &Expr,
+        msb: &SyntaxNode,
+        lsb: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> Option<Expr> {
+        let name = self.kw(base?).to_ascii_lowercase();
+        if self.sig_id(&name).is_some() || !self.consts.contains_key(&name) {
+            return None;
+        }
+        let asc = self.obj_asc.get(&name)?.first().copied()?;
+        let (lo, _size) = self.obj_dims.get(&name)?.first().copied()?;
+        let ew = {
+            let tn = self.const_types.get(&name)?;
+            self.const_elem_width(tn)? as u64
+        };
+        let val = self.consts.get(&name)?;
+        let w = Expr::Lit(Value::from_u64(32, val.width().max(1) as u64));
+        if !asc && lo == 0 && ew <= 1 {
+            return None;
+        }
+        let (msb_e, lsb_e) = remapped_sel_bounds(
+            w,
+            ew,
+            lo.max(0) as u64,
+            asc,
+            self.lower_expr(msb, env),
+            self.lower_expr(lsb, env),
+        );
+        Some(Expr::Sel {
+            e: Box::new(base_e.clone()),
+            msb: Box::new(msb_e),
+            lsb: Box::new(lsb_e),
+        })
+    }
+
     /// Whether the lowered initializer expression calls an impure function
     /// declared in this file. An impure function's value is legal VHDL —
     /// evaluated once, at elaboration — but it may read files or shared
@@ -340,5 +385,73 @@ impl<'a> Lower<'a> {
             Expr::ToString(_) => 8 * 12,
             _ => 32,
         }
+    }
+}
+
+/// Value-bit `(msb, lsb)` slice bounds for element-index bounds over a flat
+/// value of width expression `w` with `ew`-bit elements, low bound `lo`,
+/// direction `asc`: ascending element k is value element k, descending
+/// element k is value element size-1-k. `hi_idx`/`lo_idx` are the
+/// already-lowered index bounds in the source range's own high/low roles
+/// (for `to` the left MSB-most element arrives as the low bound). Shared by
+/// the signal slice remap and constant slices.
+pub(super) fn remapped_sel_bounds(
+    w: Expr,
+    ew: u64,
+    lo: u64,
+    asc: bool,
+    hi_idx: Expr,
+    lo_idx: Expr,
+) -> (Expr, Expr) {
+    let scaled = |e: Expr, k: u64| Expr::Bin {
+        op: BinOp::Mul,
+        l: Box::new(e),
+        r: Box::new(Expr::Lit(Value::from_u64(32, k))),
+    };
+    let off_left = Expr::Bin {
+        op: BinOp::Sub,
+        l: Box::new(lo_idx),
+        r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
+    };
+    let off_right = Expr::Bin {
+        op: BinOp::Sub,
+        l: Box::new(hi_idx),
+        r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
+    };
+    if asc {
+        // slice (a to b) covers value bits [W-1-(a-lo)·ew … W-(b-lo+1)·ew]
+        (
+            Expr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(Expr::Bin {
+                    op: BinOp::Sub,
+                    l: Box::new(w.clone()),
+                    r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                }),
+                r: Box::new(scaled(off_left, ew)),
+            },
+            Expr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(w),
+                r: Box::new(scaled(
+                    Expr::Bin {
+                        op: BinOp::Add,
+                        l: Box::new(off_right),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    },
+                    ew,
+                )),
+            },
+        )
+    } else {
+        // slice (a downto b) covers value bits [(a-lo)·ew+ew-1 … (b-lo)·ew]
+        (
+            Expr::Bin {
+                op: BinOp::Add,
+                l: Box::new(scaled(off_right, ew)),
+                r: Box::new(Expr::Lit(Value::from_u64(32, ew - 1))),
+            },
+            scaled(off_left, ew),
+        )
     }
 }

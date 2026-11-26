@@ -131,49 +131,125 @@ impl<'a> Lower<'a> {
             .insert(hidden.to_string(), self.record_real_ranges(tn));
     }
 
-    /// `c(i)` where `c` is an array-typed constant (e.g. a function-local
-    /// constant, which cannot be a module signal because function bodies lower
-    /// in slot space): lower to a `$const_idx` system call over the literal
-    /// value — args are [flat value, flat index, element width].
+    /// `c(i)` / `c(i, j)` where `c` is an array- or vector-typed constant
+    /// (e.g. a function-local constant, which cannot be a module signal
+    /// because function bodies lower in slot space): lower to a `$const_idx`
+    /// system call over the literal value — args are [flat value, flat
+    /// index, element width]. The flat index is MSB-first (element 0 = most
+    /// significant element), the one mapping both the const-eval and the
+    /// runtime evaluate; a materialized hidden signal is invisible to the
+    /// const-eval, so constant initializers must take this route.
     pub(super) fn lower_const_array_index(&mut self, fname: &str, args: &[Expr]) -> Option<Expr> {
-        let tn = self.const_types.get(fname)?;
-        let TypeInfo::Array { elem, dims, .. } = self.types.get(tn)? else {
-            return None;
-        };
+        let tn = self.const_types.get(fname)?.clone();
         let val = self.consts.get(fname)?.clone();
-        let flat = if !dims.is_empty() && dims.len() == args.len() {
-            let mut flat: Option<Expr> = None;
-            for (arg, (lo, n)) in args.iter().zip(dims.iter()) {
-                let a = Expr::Bin {
-                    op: BinOp::Sub,
-                    l: Box::new(arg.clone()),
-                    r: Box::new(Expr::Lit(Value::from_u64(32, *lo as u64))),
-                };
-                flat = Some(match flat {
-                    None => a,
-                    Some(f) => Expr::Bin {
-                        op: BinOp::Add,
-                        l: Box::new(Expr::Bin {
-                            op: BinOp::Mul,
-                            l: Box::new(f),
-                            r: Box::new(Expr::Lit(Value::from_u64(32, *n as u64))),
-                        }),
-                        r: Box::new(a),
-                    },
-                });
-            }
-            flat?
-        } else {
-            args.first()?.clone()
-        };
+        let ew = self.const_elem_width(&tn)?;
+        let flat = self.flat_const_index(fname, &tn, args, val.width(), ew)?;
         Some(Expr::Call {
             name: "$const_idx".into(),
             args: vec![
                 Expr::Lit(val),
                 flat,
-                Expr::Lit(Value::from_u64(32, *elem as u64)),
+                Expr::Lit(Value::from_u64(32, ew as u64)),
             ],
         })
+    }
+
+    /// Element width in bits of constant `fname`'s array-like type:
+    /// `TypeInfo::Array` carries it, the vector type marks resolve through
+    /// `array_elem_width` (1-bit elements unless `string`).
+    pub(super) fn const_elem_width(&self, tn: &str) -> Option<usize> {
+        match self.types.get(tn)? {
+            TypeInfo::Array { elem, .. } => Some(*elem),
+            TypeInfo::Vector { .. } => Some(self.array_elem_width(tn).unwrap_or(1)),
+            _ => None,
+        }
+    }
+
+    /// Per-dim `(low, size, ascending)` of constant `fname`: the object
+    /// constraint's shape (`obj_dims`/`obj_asc`) when recorded, else the
+    /// type's dims (flat descending default), else the value's single dim.
+    fn const_dims_meta(
+        &self,
+        fname: &str,
+        tn: &str,
+        bits: usize,
+        ew: usize,
+    ) -> Vec<(i64, usize, bool)> {
+        let dirs = self.obj_asc.get(fname).cloned();
+        let dims = self
+            .obj_dims
+            .get(fname)
+            .cloned()
+            .or_else(|| match self.types.get(tn) {
+                Some(TypeInfo::Array { dims, .. }) => Some(dims.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| vec![(0, (bits / ew.max(1)).max(1))]);
+        dims.into_iter()
+            .enumerate()
+            .map(|(d, (lo, n))| {
+                // Unrecorded directions keep the flat direct mapping (the
+                // pre-dims behavior): only a recorded descending constraint
+                // flips the index.
+                let asc = dirs
+                    .as_ref()
+                    .and_then(|v| v.get(d))
+                    .copied()
+                    .unwrap_or(true);
+                (lo, n, asc)
+            })
+            .collect()
+    }
+
+    /// Flat MSB-first index over the constant's dims for the given index
+    /// args. An ascending dim addresses directly from its low bound; a
+    /// descending dim's flat position flips against its size. A shape/arg
+    /// mismatch falls back to the first arg (the pre-dims behavior).
+    fn flat_const_index(
+        &self,
+        fname: &str,
+        tn: &str,
+        args: &[Expr],
+        bits: usize,
+        ew: usize,
+    ) -> Option<Expr> {
+        let dims = self.const_dims_meta(fname, tn, bits, ew);
+        if dims.is_empty() || dims.len() != args.len() {
+            return args.first().cloned();
+        }
+        let mut flat: Option<Expr> = None;
+        for (arg, (lo, n, asc)) in args.iter().zip(dims.iter()) {
+            let off = Expr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(arg.clone()),
+                r: Box::new(Expr::Lit(Value::from_u64(32, (*lo).max(0) as u64))),
+            };
+            let e = if *asc {
+                off
+            } else {
+                Expr::Bin {
+                    op: BinOp::Sub,
+                    l: Box::new(Expr::Lit(Value::from_u64(
+                        32,
+                        (*n as i64 - 1).max(0) as u64,
+                    ))),
+                    r: Box::new(off),
+                }
+            };
+            flat = Some(match flat {
+                None => e,
+                Some(f) => Expr::Bin {
+                    op: BinOp::Add,
+                    l: Box::new(Expr::Bin {
+                        op: BinOp::Mul,
+                        l: Box::new(f),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, *n as u64))),
+                    }),
+                    r: Box::new(e),
+                },
+            });
+        }
+        flat
     }
 
     pub(super) fn sig_id(&self, name: &str) -> Option<SigId> {
