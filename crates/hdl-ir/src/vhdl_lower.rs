@@ -19,7 +19,8 @@
 //! architectures/concurrent in `arch`, object decls in `decls`,
 //! subprograms in `subprogram` (slot machinery in `slots`), processes in
 //! `process`, sequential statements in `seq` (loops/waits in `loops`),
-//! aggregates in `aggregate`, expressions/attributes in `expr`/`dims`/`dump`.
+//! selected-name chains in `chains`, aggregates in `aggregate`,
+//! expressions/attributes in `expr`/`dims`/`dump`.
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
@@ -49,6 +50,7 @@ use std::rc::Rc;
 
 mod aggregate;
 mod arch;
+mod chains;
 mod config;
 mod decls;
 mod dims;
@@ -735,15 +737,6 @@ pub struct ProtType {
     /// State-variable initializers (field name → lowered expr), written by
     /// the generated `t::new` constructor.
     pub inits: Vec<(String, Expr)>,
-}
-
-/// One step of a folded selected-name chain: a record field select (`.f`)
-/// or an index group (`(i)` / `(i, j)`). The parser folds `a.b(i).c` into
-/// nested Name/Call nodes; `flatten_selected_name` recovers the order.
-#[derive(Debug)]
-enum ChainSeg {
-    Field(String),
-    Index(Vec<SyntaxNode>),
 }
 
 struct Lower<'a> {
