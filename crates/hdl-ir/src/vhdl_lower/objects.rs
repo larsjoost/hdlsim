@@ -503,6 +503,50 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Apply a record-field select segment: narrow the current expression to
+    /// the field's bit range (fields packed first-declared = MSB) and step
+    /// the type to the field's. The effective index dims come from the
+    /// field's decl constraint, else the field type's own Array info.
+    /// Returns the updated (expression, type, dims).
+    fn chain_field_seg(
+        &self,
+        cur: Expr,
+        cur_ty: String,
+        f: &String,
+    ) -> Option<(Expr, String, Option<Vec<(i64, usize)>>)> {
+        let Some(TypeInfo::Record { fields }) = self.types.get(&cur_ty) else {
+            return None;
+        };
+        let total: usize = fields.iter().map(|fd| fd.1).sum();
+        let mut run = 0usize;
+        let mut hit: Option<(usize, usize)> = None;
+        for (fn_, w, _) in fields {
+            let lsb = total - run - w;
+            if *fn_ == *f {
+                hit = Some((lsb, *w));
+                break;
+            }
+            run += w;
+        }
+        let (lsb, w) = hit?;
+        let outer_ty = cur_ty.clone();
+        let field_ty = self.rec_field_ty.get(&(cur_ty.clone(), f.clone()))?.clone();
+        let cur_dims = self
+            .rec_field_dims
+            .get(&(outer_ty, f.clone()))
+            .cloned()
+            .or_else(|| match self.types.get(&field_ty) {
+                Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => Some(dims.clone()),
+                _ => None,
+            });
+        let cur = Expr::Sel {
+            msb: Box::new(Expr::Lit(Value::from_u64(32, (lsb + w - 1) as u64))),
+            lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
+            e: Box::new(cur),
+        };
+        Some((cur, field_ty, cur_dims))
+    }
+
     /// Walk a selected-name chain's segments from its resolved root,
     /// threading the current expression, type, array dims, and the
     /// array-of-records element type through each segment.
@@ -526,38 +570,7 @@ impl<'a> Lower<'a> {
         for seg in segs {
             match seg {
                 ChainSeg::Field(f) => {
-                    let Some(TypeInfo::Record { fields }) = self.types.get(&cur_ty) else {
-                        return None;
-                    };
-                    let total: usize = fields.iter().map(|fd| fd.1).sum();
-                    let mut run = 0usize;
-                    let mut hit: Option<(usize, usize)> = None;
-                    for (fn_, w, _) in fields {
-                        let lsb = total - run - w;
-                        if *fn_ == f {
-                            hit = Some((lsb, *w));
-                            break;
-                        }
-                        run += w;
-                    }
-                    let (lsb, w) = hit?;
-                    let outer_ty = cur_ty.clone();
-                    cur_ty = self.rec_field_ty.get(&(cur_ty.clone(), f.clone()))?.clone();
-                    cur_dims = self
-                        .rec_field_dims
-                        .get(&(outer_ty, f.clone()))
-                        .cloned()
-                        .or_else(|| match self.types.get(&cur_ty) {
-                            Some(TypeInfo::Array { dims, .. }) if !dims.is_empty() => {
-                                Some(dims.clone())
-                            }
-                            _ => None,
-                        });
-                    cur = Expr::Sel {
-                        msb: Box::new(Expr::Lit(Value::from_u64(32, (lsb + w - 1) as u64))),
-                        lsb: Box::new(Expr::Lit(Value::from_u64(32, lsb as u64))),
-                        e: Box::new(cur),
-                    };
+                    (cur, cur_ty, cur_dims) = self.chain_field_seg(cur, cur_ty, &f)?;
                 }
                 ChainSeg::Index(args) => {
                     // Array-of-records root: the element type is known from
