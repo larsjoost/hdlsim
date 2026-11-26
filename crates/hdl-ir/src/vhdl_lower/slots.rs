@@ -159,44 +159,20 @@ impl<'a> Lower<'a> {
             && constraint.is_none_or(|c| self.text(c).contains("<>"))
     }
 
-    /// Install a subprogram's slot space: push the enclosing `names` map
-    /// onto `names_stack`, build the slots (slot 0 = return value, then the
-    /// formals — installed first so function-local constants can reference
-    /// parameters: `constant pos : time := ifelse(T >= 0 ns, T, -T);`),
-    /// mark the formals in `fn_formals` (they are sized by the call's
-    /// actuals), allocate two hidden 32-bit shape slots per shape-bound
-    /// formal between the formals and the locals (the body's element/slice
-    /// addressing remaps through them; the frame carries them as init-less
-    /// locals entries so every SigId keeps one slot), drop stale per-slot
-    /// shape entries from a previously lowered subprogram (slot ids alias
-    /// across subprograms), and record this subprogram's object shapes and
-    /// record/protected mappings.
-    pub(super) fn install_fn_slots(
+    /// Allocate the hidden shape slots for a subprogram's shape-bound
+    /// formals: two 32-bit slots (low bound, direction) per formal, named
+    /// with a `$` prefix user identifiers cannot contain, appended to
+    /// `slots` (their ids follow the formals') and returned alongside the
+    /// per-formal shape records and the frame-local signal entries. The
+    /// fallback binding mirrors `record_obj_shape`'s convention: `string`
+    /// formals address (1, ascending) — the kernel's string convention —
+    /// everything else (0, descending), which is the raw bit addressing
+    /// the lowerer emitted before shape binding existed.
+    fn alloc_hidden_shape_slots(
         &mut self,
-        name: &str,
-        ret_width: usize,
-        args: &[(String, usize, String)],
-        arg_types: &[(String, String)],
+        slots: &mut Vec<(String, usize)>,
         arg_shapes: &[(String, Option<SyntaxNode>, Option<SyntaxNode>)],
-    ) -> FnSpace {
-        let saved_names = std::mem::take(&mut self.names);
-        self.names_stack.push(saved_names);
-        let mut slots: Vec<(String, usize)> = vec![(name.to_string(), ret_width.max(1))];
-        slots.extend(args.iter().map(|(n, w, _)| (n.clone(), *w)));
-        self.names = slots
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| (n.clone(), i as SigId))
-            .collect();
-        let saved_formals = std::mem::take(&mut self.fn_formals);
-        self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
-        let saved_formal_dyn = std::mem::take(&mut self.formal_dyn);
-        // Hidden shape slots: each shape-bound formal gets (lo, asc), named
-        // with a `$` prefix user identifiers cannot contain. The fallback
-        // binding mirrors `record_obj_shape`'s convention: `string` formals
-        // address (1, ascending) — the kernel's string convention —
-        // everything else (0, descending), which is the raw bit addressing
-        // the lowerer emitted before shape binding existed.
+    ) -> (Vec<FormalShape>, Vec<SignalIr>) {
         let mut hidden: Vec<FormalShape> = Vec::new();
         let mut hidden_sigs: Vec<SignalIr> = Vec::new();
         for (n, tmark, constraint) in arg_shapes {
@@ -244,6 +220,42 @@ impl<'a> Lower<'a> {
                 });
             }
         }
+        (hidden, hidden_sigs)
+    }
+
+    /// Install a subprogram's slot space: push the enclosing `names` map
+    /// onto `names_stack`, build the slots (slot 0 = return value, then the
+    /// formals — installed first so function-local constants can reference
+    /// parameters: `constant pos : time := ifelse(T >= 0 ns, T, -T);`),
+    /// mark the formals in `fn_formals` (they are sized by the call's
+    /// actuals), allocate two hidden 32-bit shape slots per shape-bound
+    /// formal between the formals and the locals (the body's element/slice
+    /// addressing remaps through them; the frame carries them as init-less
+    /// locals entries so every SigId keeps one slot), drop stale per-slot
+    /// shape entries from a previously lowered subprogram (slot ids alias
+    /// across subprograms), and record this subprogram's object shapes and
+    /// record/protected mappings.
+    pub(super) fn install_fn_slots(
+        &mut self,
+        name: &str,
+        ret_width: usize,
+        args: &[(String, usize, String)],
+        arg_types: &[(String, String)],
+        arg_shapes: &[(String, Option<SyntaxNode>, Option<SyntaxNode>)],
+    ) -> FnSpace {
+        let saved_names = std::mem::take(&mut self.names);
+        self.names_stack.push(saved_names);
+        let mut slots: Vec<(String, usize)> = vec![(name.to_string(), ret_width.max(1))];
+        slots.extend(args.iter().map(|(n, w, _)| (n.clone(), *w)));
+        self.names = slots
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i as SigId))
+            .collect();
+        let saved_formals = std::mem::take(&mut self.fn_formals);
+        self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
+        let saved_formal_dyn = std::mem::take(&mut self.formal_dyn);
+        let (hidden, hidden_sigs) = self.alloc_hidden_shape_slots(&mut slots, arg_shapes);
         // Capture the pre-call shape/record state and clear the shape
         // entries under this subprogram's slot ids — a stale entry would
         // mis-address this one's slices and fold its attributes from another

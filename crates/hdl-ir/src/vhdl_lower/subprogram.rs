@@ -737,6 +737,26 @@ impl<'a> Lower<'a> {
         } = hdr;
         // Registered before the body lowers (see `note_impure_marker`).
         self.note_impure_marker(f, &name);
+        let fp = self.lower_formal_params(&decl_nodes, &ret_mark, f);
+        Some(self.lower_fn_into_slots(name, &ret_mark, fp, &decl_nodes, &nested_fns, &stmt_nodes))
+    }
+
+    /// Lower a subprogram's body in its slot space (see
+    /// [`Lower::install_fn_slots`]): install the slots, lower the
+    /// declarative items and statements, fold the unconstrained-return
+    /// width while the function's own slot mappings are still installed,
+    /// then restore the enclosing scope. The hidden shape slots ride at the
+    /// front of `FuncIr.locals` so the flat slot list keeps one entry per
+    /// SigId.
+    fn lower_fn_into_slots(
+        &mut self,
+        name: String,
+        ret_mark: &Option<SyntaxNode>,
+        fp: FormalParams,
+        decl_nodes: &[SyntaxNode],
+        nested_fns: &[SyntaxNode],
+        stmt_nodes: &[SyntaxNode],
+    ) -> FuncIr {
         let FormalParams {
             args,
             arg_types,
@@ -745,11 +765,7 @@ impl<'a> Lower<'a> {
             modes,
             ret_width,
             ..
-        } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
-        // Lower the body in slot space (slot 0 = return value; the install
-        // also pushes the enclosing `names` map for the scope guard below).
-        // The hidden shape slots ride at the front of `fd.locals` so the
-        // flat slot list keeps one entry per SigId.
+        } = fp;
         let FnSpace {
             slots,
             hidden_sigs,
@@ -778,21 +794,21 @@ impl<'a> Lower<'a> {
         // Declarative items in textual order: each may reference the ones
         // before it (parameters, types, constants, locals). Nested function
         // declarations lower last, now that all outer slots are visible.
-        self.lower_fn_declarative_items(&decl_nodes, &nested_fns, &mut fd);
+        self.lower_fn_declarative_items(decl_nodes, nested_fns, &mut fd);
         let body = self.lower_fn_body(
-            &stmt_nodes,
+            stmt_nodes,
             &fd.slots,
             &mut fd.locals,
             fd.pending_const_inits,
         );
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
-        let ret_width = self.unconstrained_ret_width(&ret_mark, &body, ret_width);
+        let ret_width = self.unconstrained_ret_width(ret_mark, &body, ret_width);
         // Reset the slot-id record mappings to their entry state (see
         // `FnSlotScope`): this runs after the return-width fixup above,
         // which still reads the function's own slot mappings.
         guard.restore(self);
-        Some(FuncIr {
+        FuncIr {
             name,
             ret_width: ret_width.max(1),
             args,
@@ -802,7 +818,7 @@ impl<'a> Lower<'a> {
             dyn_locals: fd.dyn_locals,
             body,
             hidden,
-        })
+        }
     }
 }
 

@@ -41,37 +41,9 @@ pub(super) fn ce_call_procedure(
     if depth >= CE_MAX_DEPTH {
         return false;
     }
-    // Callee frame: slot 0 is the unused return slot, then one slot per
-    // actual (an actual wider than the declared formal keeps its width —
-    // unconstrained string parameters), then the body's locals.
-    let mut lvals: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
-    for (i, a) in args.iter().enumerate() {
-        let w = f.args.get(i).map(|(_, w, _)| *w).unwrap_or(1);
-        match ce_impl(a, env, funcs, extras, Some(&mut *slots)) {
-            Some(v) => lvals.push(v.resize(w.max(v.width()))),
-            None => return false,
-        }
-    }
-    // Trailing formals omitted at the call site take their interface
-    // defaults (`step : in integer := 2`) — `pick_procedure` checked that
-    // every omitted formal carries one.
-    for d in f.defaults.iter().skip(args.len()) {
-        match d {
-            Some(d) => lvals.push(d.clone()),
-            None => break,
-        }
-    }
-    lvals.extend(
-        f.locals
-            .iter()
-            .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
-    );
-    // The hidden shape slots are locals entries (32-bit, init-less) — the
-    // extend reserved their positions; overwrite from the call's binds.
-    fill_hidden_slots(&f.hidden, &binds, &mut lvals);
-    if !fold_dyn_locals(&f.dyn_locals, &mut lvals, env, funcs, extras) {
+    let Some(mut lvals) = build_proc_frame(f, args, &binds, env, funcs, extras, slots) else {
         return false;
-    }
+    };
     CE_DEPTH.with(|d| d.set(depth + 1));
     let mut sub = CeFlow::Continue;
     ce_stmt(&f.body, &mut lvals, env, funcs, extras, &mut sub);
@@ -93,6 +65,47 @@ pub(super) fn ce_call_procedure(
         }
     }
     true
+}
+
+/// Build a procedure callee's frame: slot 0 is the unused return slot, then
+/// one slot per actual (an actual wider than the declared formal keeps its
+/// width — unconstrained string parameters), then interface defaults for
+/// trailing omitted formals (`pick_procedure` checked that every omitted
+/// formal carries one), then the body's locals. The hidden shape slots are
+/// locals entries (32-bit, init-less) — the extend reserved their
+/// positions; overwrite from the call's binds. `None` = an actual or a
+/// formal-dependent local did not fold.
+fn build_proc_frame(
+    f: &FuncIr,
+    args: &[Expr],
+    binds: &[(usize, Value, Value)],
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<Rc<FuncIr>>>,
+    slots: &mut Vec<Value>,
+) -> Option<Vec<Value>> {
+    let mut lvals: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
+    for (i, a) in args.iter().enumerate() {
+        let w = f.args.get(i).map(|(_, w, _)| *w).unwrap_or(1);
+        let v = ce_impl(a, env, funcs, extras, Some(slots))?;
+        lvals.push(v.resize(w.max(v.width())));
+    }
+    for d in f.defaults.iter().skip(args.len()) {
+        match d {
+            Some(d) => lvals.push(d.clone()),
+            None => break,
+        }
+    }
+    lvals.extend(
+        f.locals
+            .iter()
+            .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
+    );
+    fill_hidden_slots(&f.hidden, binds, &mut lvals);
+    if !fold_dyn_locals(&f.dyn_locals, &mut lvals, env, funcs, extras) {
+        return None;
+    }
+    Some(lvals)
 }
 
 /// Fold a call's shape binds down to values, keeping only the picked

@@ -4394,6 +4394,33 @@ impl Simulator {
         }
     }
 
+    /// Count one runtime subprogram call against the runaway-call budget
+    /// (not const-eval/elaboration, which run with `cur_proc = None`). A
+    /// loop whose body only calls functions never returns to
+    /// `exec_frames`, so the interpreter-step budget there cannot see it —
+    /// see `report_fn_runaway`. Continuous assigns evaluate under the
+    /// fixpoint's `u32::MAX` sentinel; those calls are attributed to the
+    /// fixpoint itself. Shared by `run_func` and `run_procedure`.
+    fn count_runaway_call(&self, fname: &str) {
+        let Some(pid) = self.cur_proc else {
+            return;
+        };
+        let calls = self.fn_calls.get() + 1;
+        self.fn_calls.set(calls);
+        if calls > self.max_fn_calls && self.fn_runaway.borrow().is_none() {
+            let origin = if pid == u32::MAX {
+                "<continuous-assign fixpoint>".to_string()
+            } else {
+                self.flat.procs[pid as usize].origin.clone()
+            };
+            self.fn_runaway
+                .borrow_mut()
+                .get_or_insert((origin, fname.to_string()));
+            self.fn_runaway_hit.set(true);
+            self.capture_fn_chain();
+        }
+    }
+
     fn run_func(
         &self,
         fi: usize,
@@ -4409,22 +4436,7 @@ impl Simulator {
         // `report_fn_runaway`. Continuous assigns evaluate under the
         // fixpoint's u32::MAX sentinel; those calls are attributed to the
         // fixpoint itself.
-        if let Some(pid) = self.cur_proc {
-            let calls = self.fn_calls.get() + 1;
-            self.fn_calls.set(calls);
-            if calls > self.max_fn_calls && self.fn_runaway.borrow().is_none() {
-                let origin = if pid == u32::MAX {
-                    "<continuous-assign fixpoint>".to_string()
-                } else {
-                    self.flat.procs[pid as usize].origin.clone()
-                };
-                self.fn_runaway
-                    .borrow_mut()
-                    .get_or_insert((origin, f.name.clone()));
-                self.fn_runaway_hit.set(true);
-                self.capture_fn_chain();
-            }
-        }
+        self.count_runaway_call(&f.name);
         // Latched: unwind with X so the enclosing evaluation (fixpoint
         // sweep, process statement) reaches a latch check promptly instead
         // of grinding through the runaway computation.
@@ -4529,22 +4541,7 @@ impl Simulator {
             self.fn_recursion.borrow_mut().get_or_insert(f.name.clone());
             return;
         }
-        if let Some(pid) = self.cur_proc {
-            let calls = self.fn_calls.get() + 1;
-            self.fn_calls.set(calls);
-            if calls > self.max_fn_calls && self.fn_runaway.borrow().is_none() {
-                let origin = if pid == u32::MAX {
-                    "<continuous-assign fixpoint>".to_string()
-                } else {
-                    self.flat.procs[pid as usize].origin.clone()
-                };
-                self.fn_runaway
-                    .borrow_mut()
-                    .get_or_insert((origin, f.name.clone()));
-                self.fn_runaway_hit.set(true);
-                self.capture_fn_chain();
-            }
-        }
+        self.count_runaway_call(&f.name);
         if self.fn_runaway_hit.get() {
             return; // unwind (see run_func)
         }
