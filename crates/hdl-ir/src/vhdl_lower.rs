@@ -98,6 +98,11 @@ struct VariantSpec {
     overrides: HashMap<String, Value>,
 }
 
+/// Record field index dims: `(record, field) -> [(low bound, size)]` for
+/// fields of multi-bit-element array types. Shared by the lowerer's map and
+/// the package export that carries it across files.
+type RecFieldDims = Vec<(String, String, Vec<(i64, usize)>)>;
+
 /// A lowered package's declarative items, keyed by unit name on the `Design`,
 /// so `use lib.pkg.all;` in another file can merge them into scope.
 #[derive(Clone, Debug, Default)]
@@ -120,6 +125,11 @@ pub struct PackageIr {
     /// record selects (`r.outer.inner`) resolve in files that `use` the
     /// package (the lowerer's per-file `rec_field_ty` map doesn't cross files).
     pub rec_field_tys: Vec<(String, String, String)>,
+    /// Record field index dims `(record, field, [(low, size)])` for fields of
+    /// multi-bit-element array types with a decl constraint — lets slices of
+    /// such fields (`r.options(0 to n)`) remap in files that `use` the
+    /// package, mirroring [`Self::rec_field_tys`].
+    pub rec_field_dims: RecFieldDims,
     /// Protected types `(name, layout)` declared by this package — lets
     /// `obj.field` / `obj.m(...)` on a protected object resolve in files that
     /// `use` the package (the lowerer's per-file `prot_types` map doesn't cross
@@ -532,6 +542,7 @@ pub fn lower_file(
                         generics: Vec::new(),
                         type_actuals: Vec::new(),
                         rec_field_tys: Vec::new(),
+                        rec_field_dims: Vec::new(),
                         prot_tys: Vec::new(),
                         sig_types: Vec::new(),
                         sig_widths: Vec::new(),
@@ -1462,6 +1473,23 @@ struct Lower<'a> {
     /// constraint — ascending ranges (`0 to N-1`) address flat bits
     /// mirrored (element k = value bit W-1-k), so slices must remap.
     sig_asc: HashMap<SigId, (i64, bool)>,
+    /// Signal id → element width in bits for multi-bit-element vectors
+    /// (`string`: 8-bit characters) — index/slice bounds are element
+    /// positions, not bit positions, so addressing must scale by this.
+    /// Absent = 1-bit elements (plain vectors).
+    sig_elem: HashMap<SigId, usize>,
+    /// Signal id → bit-width expression for function locals whose
+    /// constraint hangs on a subprogram formal (`string(1 to size)`) —
+    /// index/slice remaps must use the per-call width, not the recorded
+    /// fallback (`FuncIr.dyn_locals` is the const-eval twin).
+    sig_dynw: HashMap<SigId, Expr>,
+    /// Total bits of the assignment/initializer target while its aggregate
+    /// expression lowers, when the target is a string (8-bit elements): an
+    /// `(others => ' ')` replicate must cover the whole target, and without
+    /// the target context it baked a fixed 32-bit count. `None` outside
+    /// string-target aggregate lowering keeps every other aggregate at its
+    /// previous behavior.
+    agg_target_w: Option<usize>,
     /// Access type name → designated type name, so `p.field` on an
     /// access-to-record lowers as an implicit `.all` dereference.
     access_inner: HashMap<String, String>,
@@ -1489,6 +1517,12 @@ struct Lower<'a> {
     /// — their width is only known after port connection, so static
     /// attributes on them lower to runtime `Expr::SigAttr`.
     uncon_ports: std::collections::HashSet<SigId>,
+    /// Slot ids of the subprogram formals being lowered — their sizes come
+    /// from the call's actuals, so `'length`/`'high` must fold symbolically
+    /// even when a previously lowered subprogram left a stale `sig_width`/
+    /// `sig_dims` entry for the same slot id (slot ids alias across
+    /// subprograms).
+    fn_formals: std::collections::HashSet<SigId>,
     /// `alias name is <expr>;` — name → lowered expression (slice/index
     /// aliases can't be a plain SigId). Whole-signal aliases are additionally
     /// inserted into `names`.
@@ -1596,6 +1630,10 @@ pub struct SigMaps {
     sig_width: HashMap<SigId, usize>,
     sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
     sig_asc: HashMap<SigId, (i64, bool)>,
+    /// Element width in bits for multi-bit-element vectors (`string`: 8) —
+    /// see [`Lower::sig_elem`]. Mirrored with the entity's other signal maps
+    /// so an architecture addresses entity-declared strings correctly.
+    sig_elem: HashMap<SigId, usize>,
     uncon_ports: std::collections::HashSet<SigId>,
     /// Constants and types declared in the entity's declarative part — an
     /// architecture sees them (the entity's declarative region encompasses
@@ -1657,6 +1695,9 @@ impl<'a> Lower<'a> {
             sig_dims: HashMap::new(),
             obj_dims: HashMap::new(),
             sig_asc: HashMap::new(),
+            sig_elem: HashMap::new(),
+            sig_dynw: HashMap::new(),
+            agg_target_w: None,
             rec_field_dims: HashMap::new(),
             access_inner: HashMap::new(),
             rec_field_ty: HashMap::new(),
@@ -1666,6 +1707,7 @@ impl<'a> Lower<'a> {
             extra_base: 0,
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
+            fn_formals: std::collections::HashSet::new(),
             aliases: HashMap::new(),
             alias_rec: HashMap::new(),
             suppress_err: 0,
@@ -1706,6 +1748,7 @@ impl<'a> Lower<'a> {
             sig_width: self.sig_width.clone(),
             sig_dims: self.sig_dims.clone(),
             sig_asc: self.sig_asc.clone(),
+            sig_elem: self.sig_elem.clone(),
             uncon_ports: self.uncon_ports.clone(),
             consts: self.entity_consts.clone(),
             types: self.entity_types.clone(),
@@ -1727,6 +1770,7 @@ impl<'a> Lower<'a> {
         self.sig_width.clear();
         self.sig_dims.clear();
         self.sig_asc.clear();
+        self.sig_elem.clear();
         self.uncon_ports.clear();
     }
 
@@ -1753,6 +1797,7 @@ impl<'a> Lower<'a> {
         self.sig_width = m.sig_width;
         self.sig_dims = m.sig_dims;
         self.sig_asc = m.sig_asc;
+        self.sig_elem = m.sig_elem;
         self.uncon_ports = m.uncon_ports;
         for (k, v) in m.consts {
             Rc::make_mut(&mut self.consts).entry(k).or_insert(v);
@@ -2359,6 +2404,54 @@ impl<'a> Lower<'a> {
             "downto" => Some(false),
             "to" => Some(true),
             _ => None,
+        }
+    }
+
+    /// Record an object's index-constraint direction (`sig_asc`) and element
+    /// width (`sig_elem`) from its type mark and constraint, so index/slice
+    /// addressing can remap ascending ranges and scale multi-bit elements
+    /// (`string` characters). Both maps are lower-side addressing aids only.
+    fn record_obj_shape(
+        &mut self,
+        id: SigId,
+        type_mark: Option<&SyntaxNode>,
+        constraint: Option<&SyntaxNode>,
+    ) {
+        if let Some(c) = constraint {
+            if let Some(asc) = self.constraint_ascending(c) {
+                // The low bound must fold on its own — a dynamic high bound
+                // (`string(1 to size)`) defeats a whole-constraint fold, and
+                // `constraint_dims` folds bounds with an empty env, missing
+                // formal-dependent ones. Fold the direction's low bound
+                // directly; fall back to the whole-constraint dims, then 0.
+                let lo = self
+                    .range_bound_low(c, asc)
+                    .or_else(|| self.constraint_dims(c).first().map(|&(l, _)| l))
+                    .unwrap_or(0);
+                self.sig_asc.insert(id, (lo, asc));
+            }
+        }
+        if let Some(tm) = type_mark {
+            let tn = self
+                .kw(tm)
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if let Some(ew) = self.array_elem_width(&tn) {
+                if ew > 1 {
+                    self.sig_elem.insert(id, ew);
+                }
+            }
+            if tn == "string" && !self.sig_asc.contains_key(&id) {
+                // Predefined `string` is positive-range ascending, and an
+                // unconstrained formal takes the actual's range — (1 to n)
+                // for the literal and constrained-object actuals this kernel
+                // produces. Without a recorded low bound the slice remap
+                // defaults to (0, descending) and reads a 1-based actual one
+                // element off (`arg(1 to 4)` yielding chars 2..5).
+                self.sig_asc.insert(id, (1, true));
+            }
         }
     }
 
@@ -3381,16 +3474,7 @@ impl<'a> Lower<'a> {
                 }
                 self.sig_signed.insert(id, signed);
                 self.sig_width.insert(id, width);
-                if let Some(c) = &constraint {
-                    if let Some(asc) = self.constraint_ascending(c) {
-                        let lo = self
-                            .constraint_dims(c)
-                            .first()
-                            .map(|&(l, _)| l)
-                            .unwrap_or(0);
-                        self.sig_asc.insert(id, (lo, asc));
-                    }
-                }
+                self.record_obj_shape(id, type_mark.as_ref(), constraint.as_ref());
                 // Block-header ports must be visible to the block body (entity
                 // ports get their names map rebuilt by lower_architecture, but
                 // a block header adds signals mid-body).
@@ -3472,7 +3556,18 @@ impl<'a> Lower<'a> {
         // w1) — they must coexist, or a type-conversion call inside one of
         // them (`round(signed(arg))` in the suv body) resolves back to the
         // executing function itself and recurses forever.
-        if is_stub(&f) && cands.iter().any(|c| sig(c) && !is_stub(c)) {
+        // Stub matching is by name + arity, not formal widths: the stub's
+        // widths are placeholders (`subprogram_stub` registers every formal
+        // at 32), so a width-equality match never fires for a body whose
+        // formal resolves differently (`string` → 8) — the placeholder stub
+        // stayed registered beside its own body and dispatch matched an
+        // actual to the placeholder width, const-evaluating the call to X
+        // (every `f("abc", n)`-shaped constant initializer).
+        if is_stub(&f)
+            && cands
+                .iter()
+                .any(|c| c.args.len() == f.args.len() && !is_stub(c))
+        {
             return;
         }
         if super::debug::TRACE_OVERLOAD.load(std::sync::atomic::Ordering::Relaxed)
@@ -3496,7 +3591,13 @@ impl<'a> Lower<'a> {
                     .collect::<Vec<_>>(),
             );
         }
-        match cands.iter().position(|c| sig(c) && is_stub(c)) {
+        // Same placeholder-width rule for the replacement: find the stub by
+        // name + arity so the body takes over the spec's slot even when the
+        // resolved formal widths differ from the stub's placeholders.
+        match cands
+            .iter()
+            .position(|c| c.args.len() == f.args.len() && is_stub(c))
+        {
             Some(i) => {
                 // The spec's interface carries the formals' defaults, the
                 // body's capture usually records none — keep them when the
@@ -3586,6 +3687,11 @@ impl<'a> Lower<'a> {
             self.rec_field_ty
                 .entry((r.clone(), f.clone()))
                 .or_insert_with(|| t.clone());
+        }
+        for (r, f, d) in &p.rec_field_dims {
+            self.rec_field_dims
+                .entry((r.clone(), f.clone()))
+                .or_insert_with(|| d.clone());
         }
         for (n, pt) in &p.prot_tys {
             if item.is_none_or(|i| i == n) {
@@ -3835,6 +3941,12 @@ impl<'a> Lower<'a> {
             .filter(|((r, _), _)| type_names.contains(r))
             .map(|((r, f), t)| (r.clone(), f.clone(), t.clone()))
             .collect();
+        let rec_field_dims = self
+            .rec_field_dims
+            .iter()
+            .filter(|((r, _), _)| type_names.contains(r))
+            .map(|((r, f), d)| (r.clone(), f.clone(), d.clone()))
+            .collect();
         let prot_tys = self
             .prot_types
             .iter()
@@ -3900,6 +4012,7 @@ impl<'a> Lower<'a> {
             generics,
             type_actuals: Vec::new(),
             rec_field_tys,
+            rec_field_dims,
             prot_tys,
             sig_types,
             sig_widths,
@@ -4069,6 +4182,7 @@ impl<'a> Lower<'a> {
             pkg.uses.extend(part.uses);
             pkg.attr_decls.extend(part.attr_decls);
             pkg.rec_field_tys.extend(part.rec_field_tys);
+            pkg.rec_field_dims.extend(part.rec_field_dims);
             pkg.prot_tys.extend(part.prot_tys);
             pkg.sig_types.extend(part.sig_types);
             pkg.type_widths.extend(part.type_widths);
@@ -4864,7 +4978,17 @@ impl<'a> Lower<'a> {
         let width = self.mem_row_width(type_mark, width);
         let kind = if real { SigKind::Real } else { SigKind::Wire };
         let init_v = init.and_then(|e| {
+            // A string target's `(others => ' ')` replicate must cover the
+            // whole object; without the target context it baked a fixed
+            // 32-bit count (see `agg_target_w`).
+            let saved_w = self.agg_target_w;
+            if e.kind() == SyntaxKind::Aggregate
+                && type_mark.is_some_and(|tm| self.string_typed(tm))
+            {
+                self.agg_target_w = Some(width);
+            }
             let ex = self.lower_expr(&e, &self.consts.clone());
+            self.agg_target_w = saved_w;
             self.ce(&ex)
         });
         for n in &names {
@@ -4892,16 +5016,7 @@ impl<'a> Lower<'a> {
             }
             self.sig_signed.insert(id, signed);
             self.sig_width.insert(id, width);
-            if let Some(c) = constraint {
-                if let Some(asc) = self.constraint_ascending(c) {
-                    let lo = self
-                        .constraint_dims(c)
-                        .first()
-                        .map(|&(l, _)| l)
-                        .unwrap_or(0);
-                    self.sig_asc.insert(id, (lo, asc));
-                }
-            }
+            self.record_obj_shape(id, type_mark, constraint);
             if let Some(tn) = &type_name {
                 if let Some(rn) = self.as_record(tn) {
                     self.sig_rec.insert(id, rn.clone());
@@ -5648,17 +5763,19 @@ impl<'a> Lower<'a> {
                             for n in names {
                                 self.rec_field_ty
                                     .insert((name.clone(), n.clone()), fty.clone());
-                                // Unconstrained array field with a decl
-                                // constraint: record the effective dims so
-                                // chain indexes flatten with the right low
-                                // bound (the bare type has none).
-                                if let (true, Some(c)) = (
+                                // Field of a multi-bit-element array type with
+                                // a decl constraint: record the effective dims
+                                // so chain indexes flatten and field slices
+                                // remap with the right low bound (an
+                                // unconstrained array type has none, and a
+                                // string subtype's range is lost when the
+                                // field resolves to the bare type).
+                                let multi_elem =
                                     matches!(
                                         self.types.get(&ftn),
                                         Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
-                                    ),
-                                    constraint,
-                                ) {
+                                    ) || self.array_elem_width(&ftn).is_some_and(|ew| ew > 1);
+                                if let (true, Some(c)) = (multi_elem, constraint) {
                                     let lo = self.range_low(c, &self.consts.clone()).unwrap_or(0);
                                     let cnt = self.constraint_width(c).max(1);
                                     self.rec_field_dims
@@ -6239,6 +6356,10 @@ impl<'a> Lower<'a> {
         let mut param_w: HashMap<String, usize> = HashMap::new();
         let mut args: Vec<(String, usize, String)> = Vec::new();
         let mut arg_types: Vec<(String, String)> = Vec::new();
+        // Per-formal type mark + constraint for `record_obj_shape` — the
+        // formal's element width (`string` → 8) and index direction must be
+        // known while the body lowers (`arg'length`, slices over locals).
+        let mut arg_shapes: Vec<(String, Option<SyntaxNode>, Option<SyntaxNode>)> = Vec::new();
         let mut defaults: Vec<Option<Value>> = Vec::new();
         for pd in decl_nodes
             .iter()
@@ -6310,6 +6431,7 @@ impl<'a> Lower<'a> {
                 if let Some(tm) = &tmark {
                     arg_types.push((n.clone(), self.kw(tm)));
                 }
+                arg_shapes.push((n.clone(), tmark.clone(), constraint.cloned()));
                 args.push((n, w, ty.clone()));
                 defaults.push(default_v.clone());
             }
@@ -6334,6 +6456,60 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Formals are sized by the call's actuals: mark their slot ids so
+        // `'length`/`'high` on them lower symbolically even when an earlier
+        // subprogram left a stale `sig_width`/`sig_dims` entry under the same
+        // aliased slot id. Saved/restored for nested subprograms below.
+        let saved_formals = std::mem::take(&mut self.fn_formals);
+        self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
+        // Formals' element widths and index directions: `arg'length` on a
+        // string formal must report an element count (the eval sides report
+        // the bound value's bit width), and slice remaps over a dynamic-width
+        // local read the direction. Captured/restored with the other
+        // slot-id maps below — slot ids alias module signal ids.
+        let saved_shape_elem: HashMap<SigId, Option<usize>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_elem.get(&id).copied())
+            })
+            .collect();
+        let saved_shape_asc: HashMap<SigId, Option<(i64, bool)>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_asc.get(&id).copied())
+            })
+            .collect();
+        let saved_shape_dynw: HashMap<SigId, Option<Expr>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_dynw.get(&id).cloned())
+            })
+            .collect();
+        let saved_shape_dims: HashMap<SigId, Option<Vec<(i64, usize)>>> = (0..slots.len())
+            .map(|i| {
+                let id = i as SigId;
+                (id, self.sig_dims.get(&id).cloned())
+            })
+            .collect();
+        // Slot ids alias across subprograms: a previously lowered
+        // subprogram's shape entries (`sig_asc`, `sig_elem`, `sig_dynw`,
+        // `sig_dims`) under the same id would mis-address this one's slices
+        // and fold its attributes from another function's object. Drop them
+        // for the slots about to be registered; the captures above restore
+        // the entry state at exit, and `record_obj_shape` re-adds what this
+        // subprogram's formals actually have.
+        for i in 0..slots.len() {
+            let id = i as SigId;
+            self.sig_asc.remove(&id);
+            self.sig_elem.remove(&id);
+            self.sig_dynw.remove(&id);
+            self.sig_dims.remove(&id);
+        }
+        for (n, tmark, constraint) in &arg_shapes {
+            if let Some(&id) = self.names.get(n) {
+                self.record_obj_shape(id, tmark.as_ref(), constraint.as_ref());
+            }
+        }
         // Formals/locals now in `names`: outer constants of the same name in
         // the lowering env must not shadow them (see `fn_scope`).
         self.fn_scope += 1;
@@ -6447,6 +6623,25 @@ impl<'a> Lower<'a> {
                         Some(tm) => self.resolve_type(tm, constraint, d.span()),
                         None => (32, false, None, false),
                     };
+                    // An unconstrained array mark with a static constraint
+                    // (`register_definition_array_t(0 to 63)`): resolve_type
+                    // returns the bare element width, but the local's flat
+                    // slot covers every element the constraint adds.
+                    // Subprogram locals are flat values, never mems. A
+                    // dynamic constraint keeps the fallback width and the
+                    // recorded `dyn_w` below.
+                    let w = match (tmark, constraint) {
+                        (Some(tm), Some(c))
+                            if matches!(
+                                self.types.get(&self.kw(tm)),
+                                Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
+                            ) && !self.text(c).contains("<>")
+                                && self.constraint_folds(c) =>
+                        {
+                            w.max(1) * self.constraint_width(c).max(1)
+                        }
+                        _ => w,
+                    };
                     // A constraint that references subprogram formals
                     // (`variable s : string(1 to size)`) can't fold at
                     // registration — formals have no values yet — so the
@@ -6481,9 +6676,20 @@ impl<'a> Lower<'a> {
                                 .find(|k| is_expr_node(k.kind()))
                                 .cloned()
                         });
-                    let mut init_ex = init_node
-                        .as_ref()
-                        .map(|node| self.lower_expr(node, &self.consts.clone()));
+                    let mut init_ex = init_node.as_ref().map(|node| {
+                        // A string target's `(others => ' ')` replicate must
+                        // cover the whole object (see `agg_target_w`); a
+                        // dynamic-width local re-derives the count below.
+                        let saved_w = self.agg_target_w;
+                        if node.kind() == SyntaxKind::Aggregate
+                            && tmark.is_some_and(|tm| self.string_typed(tm))
+                        {
+                            self.agg_target_w = Some(w);
+                        }
+                        let ex = self.lower_expr(node, &self.consts.clone());
+                        self.agg_target_w = saved_w;
+                        ex
+                    });
                     // A dynamic-width local with an OTHERS initializer must
                     // self-size: re-emit the replicate with the count derived
                     // from the dynamic width expression (the generic lowering
@@ -6500,8 +6706,14 @@ impl<'a> Lower<'a> {
                         }
                         slots.push((n.clone(), w));
                         self.names.insert(n.clone(), id);
+                        self.sig_signed.insert(id, signed);
+                        self.sig_width.insert(id, w);
+                        self.record_obj_shape(id, tmark, constraint);
                         if let Some(wexpr) = &dyn_w {
                             dyn_locals.push((id, wexpr.clone()));
+                            // The addressing remaps must size slices from the
+                            // per-call width, not the registration fallback.
+                            self.sig_dynw.insert(id, wexpr.clone());
                         }
                         if let Some(ex) = &init_ex {
                             pending_const_inits.push((id, ex.clone()));
@@ -6624,6 +6836,47 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        for (id, v) in saved_shape_elem {
+            match v {
+                Some(v) => {
+                    self.sig_elem.insert(id, v);
+                }
+                None => {
+                    self.sig_elem.remove(&id);
+                }
+            }
+        }
+        for (id, v) in saved_shape_asc {
+            match v {
+                Some(v) => {
+                    self.sig_asc.insert(id, v);
+                }
+                None => {
+                    self.sig_asc.remove(&id);
+                }
+            }
+        }
+        for (id, v) in saved_shape_dynw {
+            match v {
+                Some(v) => {
+                    self.sig_dynw.insert(id, v);
+                }
+                None => {
+                    self.sig_dynw.remove(&id);
+                }
+            }
+        }
+        for (id, v) in saved_shape_dims {
+            match v {
+                Some(v) => {
+                    self.sig_dims.insert(id, v);
+                }
+                None => {
+                    self.sig_dims.remove(&id);
+                }
+            }
+        }
+        self.fn_formals = saved_formals;
         Some(FuncIr {
             name,
             ret_width: ret_width.max(1),
@@ -6641,7 +6894,17 @@ impl<'a> Lower<'a> {
         match e {
             Expr::Lit(v) => v.width(),
             Expr::Real(_) => 64,
-            Expr::Sig(s) => self.sig_width.get(s).copied().unwrap_or(32).max(1),
+            Expr::Sig(s) => {
+                if self.sig_dynw.contains_key(s) {
+                    // A dynamic-width subprogram local's registration width
+                    // is a fallback, not a bound: the unconstrained-return
+                    // fixup must keep the historical 32-slot convention
+                    // (the real width is per-call, `FuncIr.dyn_locals`).
+                    32
+                } else {
+                    self.sig_width.get(s).copied().unwrap_or(32).max(1)
+                }
+            }
             Expr::Bin { l, r, .. } => self.expr_width_est(l).max(self.expr_width_est(r)),
             Expr::Un { e, .. } => self.expr_width_est(e),
             Expr::Cond { t, e, .. } => self.expr_width_est(t).max(self.expr_width_est(e)),
@@ -6811,7 +7074,17 @@ impl<'a> Lower<'a> {
             None => (32, false, None, false),
         };
         let init_v = init.and_then(|e| {
+            // A string target's `(others => ' ')` replicate must cover the
+            // whole object; without the target context it baked a fixed
+            // 32-bit count (see `agg_target_w`).
+            let saved_w = self.agg_target_w;
+            if e.kind() == SyntaxKind::Aggregate
+                && type_mark.is_some_and(|tm| self.string_typed(tm))
+            {
+                self.agg_target_w = Some(width);
+            }
             let ex = self.lower_expr(&e, &self.consts.clone());
+            self.agg_target_w = saved_w;
             self.ce(&ex)
         });
         for n in &names {
@@ -6826,6 +7099,7 @@ impl<'a> Lower<'a> {
             });
             self.sig_signed.insert(id, signed);
             self.sig_width.insert(id, width);
+            self.record_obj_shape(id, type_mark, constraint);
             if let Some(tn) = &type_name {
                 if let Some(rn) = self.as_record(tn) {
                     self.sig_rec.insert(id, rn.clone());
@@ -8497,7 +8771,22 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        self.lower_expr(rhs, env)
+        // A plain OTHERS aggregate into a string target replicates over the
+        // target's whole bit width (`(others => ' ')` filled only 4 of 5
+        // characters with the baked 32-bit fallback — see `agg_target_w`).
+        let saved_w = self.agg_target_w;
+        if rhs.kind() == SyntaxKind::Aggregate {
+            if let Some(id) = self.sig_id(&self.text(lhs)) {
+                if self.sig_elem.get(&id) == Some(&8) {
+                    if let Some(w) = self.sig_width.get(&id) {
+                        self.agg_target_w = Some(*w);
+                    }
+                }
+            }
+        }
+        let ex = self.lower_expr(rhs, env);
+        self.agg_target_w = saved_w;
+        ex
     }
 
     /// The signal id behind an assignment target whose type is an array

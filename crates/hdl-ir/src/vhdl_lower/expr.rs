@@ -644,35 +644,150 @@ impl<'a> Lower<'a> {
                         };
                     }
                 }
-                // Ascending vector (`0 to N-1`): element k addresses value
-                // bit W-1-(k-lo) — element 0 is the most significant bit,
-                // mirroring the memory-backed mapping above — so a slice
-                // (a to b) covers value bits [W-1-(b-lo) … W-1-(a-lo)].
-                // Descending ranges already address value bits directly.
+                // Element addressing on a plain (non-memory) vector: the
+                // bounds are element positions, so they must remap for an
+                // ascending range (element k = value bit W-1-(k-lo)·ew —
+                // element 0 is the most significant, mirroring the
+                // memory-backed mapping above) and scale by the element
+                // width (`string` characters are 8 bits). A descending
+                // 1-bit range from 0 addresses value bits directly and
+                // keeps the raw lowering.
                 if let Expr::Sig(sid) = &base_e {
                     if !self.mems.contains_key(sid) {
-                        if let Some(&(lo, true)) = self.sig_asc.get(sid) {
-                            let w = self.sig_width.get(sid).copied().unwrap_or(0).max(1) as u64;
+                        let (lo, asc) = self.sig_asc.get(sid).copied().unwrap_or((0, false));
+                        let ew = self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64;
+                        if asc || lo != 0 || ew > 1 {
+                            let w_lit = self.sig_width.get(sid).copied().unwrap_or(0).max(1) as u64;
+                            let w = self.sig_dynw.get(sid).cloned().unwrap_or_else(|| {
+                                if self.fn_formals.contains(sid) {
+                                    // An unconstrained formal's flat width is
+                                    // the actual's bit width, known only at
+                                    // evaluation (`SigAttr` yields it).
+                                    Expr::SigAttr {
+                                        sig: *sid,
+                                        attr: "length",
+                                    }
+                                } else {
+                                    Expr::Lit(Value::from_u64(32, w_lit))
+                                }
+                            });
                             let lo = lo.max(0) as u64;
-                            let a = self.lower_expr(msb, env);
-                            let b = self.lower_expr(lsb, env);
-                            // value bit = (w-1) - (element - lo)
-                            let off = |e: Expr| Expr::Bin {
+                            // `msb`/`lsb` hold the source range's high/low
+                            // bounds; for `to` the left (MSB-most) element is
+                            // `lsb`, for `downto` it is `msb`.
+                            let off_left = Expr::Bin {
                                 op: BinOp::Sub,
-                                l: Box::new(e),
+                                l: Box::new(self.lower_expr(lsb, env)),
                                 r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
                             };
-                            let bit = |e: Expr| Expr::Bin {
+                            let off_right = Expr::Bin {
                                 op: BinOp::Sub,
-                                l: Box::new(Expr::Lit(Value::from_u64(32, w - 1))),
-                                r: Box::new(e),
+                                l: Box::new(self.lower_expr(msb, env)),
+                                r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
+                            };
+                            let scaled = |e: Expr, k: u64| Expr::Bin {
+                                op: BinOp::Mul,
+                                l: Box::new(e),
+                                r: Box::new(Expr::Lit(Value::from_u64(32, k))),
+                            };
+                            let (msb_e, lsb_e) = if asc {
+                                // slice (a to b) covers value bits
+                                // [W-1-(a-lo)·ew … W-(b-lo+1)·ew]
+                                (
+                                    Expr::Bin {
+                                        op: BinOp::Sub,
+                                        l: Box::new(Expr::Bin {
+                                            op: BinOp::Sub,
+                                            l: Box::new(w.clone()),
+                                            r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                                        }),
+                                        r: Box::new(scaled(off_left, ew)),
+                                    },
+                                    Expr::Bin {
+                                        op: BinOp::Sub,
+                                        l: Box::new(w),
+                                        r: Box::new(scaled(
+                                            Expr::Bin {
+                                                op: BinOp::Add,
+                                                l: Box::new(off_right),
+                                                r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                                            },
+                                            ew,
+                                        )),
+                                    },
+                                )
+                            } else {
+                                // slice (a downto b) covers value bits
+                                // [(a-lo)·ew+ew-1 … (b-lo)·ew]
+                                (
+                                    Expr::Bin {
+                                        op: BinOp::Add,
+                                        l: Box::new(scaled(off_right, ew)),
+                                        r: Box::new(Expr::Lit(Value::from_u64(32, ew - 1))),
+                                    },
+                                    scaled(off_left, ew),
+                                )
                             };
                             return Expr::Sel {
                                 e: Box::new(base_e),
-                                msb: Box::new(bit(off(b))),
-                                lsb: Box::new(bit(off(a))),
+                                msb: Box::new(msb_e),
+                                lsb: Box::new(lsb_e),
                             };
                         }
+                    }
+                }
+                // Slice of a record field that is itself an array
+                // (`r.options(0 to n)`, `r.description(1 to len)`): the
+                // bounds are element positions inside the field's packed
+                // value. Field-array elements address MSB-first (element 0
+                // = most significant bits, matching `$const_idx` reads), so
+                // the bounds remap like an ascending signal slice over a
+                // carrier of the field's bit width.
+                if let Expr::Sel { .. } = &base_e {
+                    if let Some((flo, few, fw)) =
+                        base.and_then(|b| self.field_array_shape(&self.text(b)))
+                    {
+                        let w_e = Expr::Lit(Value::from_u64(32, fw));
+                        let lo_e = Expr::Lit(Value::from_u64(32, flo.max(0) as u64));
+                        let off_left = Expr::Bin {
+                            op: BinOp::Sub,
+                            l: Box::new(self.lower_expr(lsb, env)),
+                            r: Box::new(lo_e.clone()),
+                        };
+                        let off_right = Expr::Bin {
+                            op: BinOp::Sub,
+                            l: Box::new(self.lower_expr(msb, env)),
+                            r: Box::new(lo_e),
+                        };
+                        let scaled = |e: Expr, k: u64| Expr::Bin {
+                            op: BinOp::Mul,
+                            l: Box::new(e),
+                            r: Box::new(Expr::Lit(Value::from_u64(32, k))),
+                        };
+                        return Expr::Sel {
+                            e: Box::new(base_e),
+                            msb: Box::new(Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(Expr::Bin {
+                                    op: BinOp::Sub,
+                                    l: Box::new(w_e),
+                                    r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                                }),
+                                r: Box::new(scaled(off_left, few)),
+                            }),
+                            lsb: Box::new(Expr::Bin {
+                                op: BinOp::Sub,
+                                l: Box::new(Expr::Lit(Value::from_u64(32, fw))),
+                                r: Box::new(scaled(
+                                    Expr::Bin {
+                                        op: BinOp::Add,
+                                        l: Box::new(off_right),
+                                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                                    },
+                                    few,
+                                )),
+                            }),
+                        };
                     }
                 }
                 Expr::Sel {
@@ -727,15 +842,26 @@ impl<'a> Lower<'a> {
                             let dims = self.sig_dims.get(&id);
                             let mem_w = self.mems.get(&id).copied();
                             let sig_w = self.sig_width.get(&id).copied();
-                            if dims.is_none() && mem_w.is_none() && sig_w.is_none() {
+                            // Subprogram formals are sized by the call's
+                            // actuals; a stale `sig_width`/`sig_dims` entry
+                            // left by a previously lowered subprogram under
+                            // the same slot id must not bake a constant.
+                            if self.fn_formals.contains(&id)
+                                || (dims.is_none() && mem_w.is_none() && sig_w.is_none())
+                            {
                                 // Function formals and other not-yet-sized
                                 // signals: the width is only known from the
                                 // bound value at runtime (`arg'length` inside
                                 // an unconstrained-function body). A baked
                                 // constant truncated
                                 // `conv_unsigned(count, arg'length)` to a
-                                // 1-bit shift count.
-                                return Expr::SigAttr {
+                                // 1-bit shift count. `length` is an element
+                                // count, but the runtime and const-eval both
+                                // evaluate `SigAttr` as the bound value's bit
+                                // width — divide by the element width
+                                // (`string`: 8) right here, where the element
+                                // width is known.
+                                let sa = Expr::SigAttr {
                                     sig: id,
                                     attr: match attr.as_str() {
                                         "length" => "length",
@@ -745,6 +871,17 @@ impl<'a> Lower<'a> {
                                         _ => "right",
                                     },
                                 };
+                                if attr == "length" {
+                                    let ew = self.sig_elem.get(&id).copied().unwrap_or(1);
+                                    if ew > 1 {
+                                        return Expr::Bin {
+                                            op: BinOp::Div,
+                                            l: Box::new(sa),
+                                            r: Box::new(Expr::Lit(Value::from_u64(32, ew as u64))),
+                                        };
+                                    }
+                                }
+                                return sa;
                             }
                             // Arrays: element count = product of dimension sizes
                             // (sig_dims when present, else mem depth); vectors: bit
@@ -912,7 +1049,10 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            SyntaxKind::Aggregate => self.lower_aggregate(e, env, 32),
+            SyntaxKind::Aggregate => {
+                let w = self.agg_target_w.unwrap_or(32);
+                self.lower_aggregate(e, env, w)
+            }
             // VHDL-2008 external name in expression position
             // (`q <= << signal dut.s : std_logic >>;`): the hierarchical
             // target is not simulated — placeholder, no diagnostic.
@@ -922,6 +1062,82 @@ impl<'a> Lower<'a> {
                 Expr::Lit(Value::x(1))
             }
         }
+    }
+
+    /// Single-element addressing `v(k)` on a plain (non-memory) vector with a
+    /// recorded index direction or a multi-bit element width: ascending
+    /// ranges address mirrored (element k = value bit W-1-(k-lo)·ew) and
+    /// `string` characters are 8 bits, so the element must lower to a sized
+    /// `Sel`, not a raw 1-bit `Idx`. `None` keeps `Idx` — a 1-bit descending
+    /// range from 0, where raw bit addressing is already correct.
+    fn elem_sel(&self, sid: SigId, k: &Expr) -> Option<Expr> {
+        let (lo, asc) = self.sig_asc.get(&sid).copied().unwrap_or((0, false));
+        let ew = self.sig_elem.get(&sid).copied().unwrap_or(1).max(1) as u64;
+        if !asc && lo == 0 && ew == 1 {
+            return None;
+        }
+        let w_lit = self.sig_width.get(&sid).copied().unwrap_or(0).max(1) as u64;
+        let w = self.sig_dynw.get(&sid).cloned().unwrap_or_else(|| {
+            if self.fn_formals.contains(&sid) {
+                // An unconstrained formal's flat width is the actual's bit
+                // width, known only at evaluation (`SigAttr` yields it).
+                Expr::SigAttr {
+                    sig: sid,
+                    attr: "length",
+                }
+            } else {
+                Expr::Lit(Value::from_u64(32, w_lit))
+            }
+        });
+        let lo = lo.max(0) as u64;
+        let off = || Expr::Bin {
+            op: BinOp::Sub,
+            l: Box::new(k.clone()),
+            r: Box::new(Expr::Lit(Value::from_u64(32, lo))),
+        };
+        let scaled = |e: Expr| Expr::Bin {
+            op: BinOp::Mul,
+            l: Box::new(e),
+            r: Box::new(Expr::Lit(Value::from_u64(32, ew))),
+        };
+        // element k covers value bits [W-1-(k-lo)·ew … W-(k-lo+1)·ew]
+        // ascending, [(k-lo)·ew … (k-lo+1)·ew-1] descending.
+        let (msb, lsb) = if asc {
+            (
+                Expr::Bin {
+                    op: BinOp::Sub,
+                    l: Box::new(Expr::Bin {
+                        op: BinOp::Sub,
+                        l: Box::new(w.clone()),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    }),
+                    r: Box::new(scaled(off())),
+                },
+                Expr::Bin {
+                    op: BinOp::Sub,
+                    l: Box::new(w),
+                    r: Box::new(scaled(Expr::Bin {
+                        op: BinOp::Add,
+                        l: Box::new(off()),
+                        r: Box::new(Expr::Lit(Value::from_u64(32, 1))),
+                    })),
+                },
+            )
+        } else {
+            (
+                Expr::Bin {
+                    op: BinOp::Add,
+                    l: Box::new(scaled(off())),
+                    r: Box::new(Expr::Lit(Value::from_u64(32, ew - 1))),
+                },
+                scaled(off()),
+            )
+        };
+        Some(Expr::Sel {
+            e: Box::new(Expr::Sig(sid)),
+            msb: Box::new(msb),
+            lsb: Box::new(lsb),
+        })
     }
 
     fn lower_call(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
@@ -1248,13 +1464,22 @@ impl<'a> Lower<'a> {
                     }
                 }
                 if args.len() == 1 {
+                    let k = args
+                        .into_iter()
+                        .next()
+                        .expect("match guard requires exactly one argument");
+                    if let Some(sid) = base_id {
+                        if !self.mems.contains_key(&sid) {
+                            if let Some(se) = self.elem_sel(sid, &k) {
+                                return se;
+                            }
+                        }
+                    }
                     return Expr::Idx {
-                        e: Box::new(Expr::Sig(base)),
-                        i: Box::new(
-                            args.into_iter()
-                                .next()
-                                .expect("match guard requires exactly one argument"),
-                        ),
+                        e: Box::new(Expr::Sig(
+                            base_id.expect("arm guard checked base_id.is_some()"),
+                        )),
+                        i: Box::new(k),
                     };
                 }
                 Expr::Call { name: fname, args }
@@ -1858,9 +2083,12 @@ impl<'a> Lower<'a> {
                 return Expr::Lit(Value { bits, real: false });
             }
             // String literal: first char in the high byte (MSB-first), so
-            // `&`-concatenation and string_of read left to right.
+            // `&`-concatenation and string_of read left to right. An empty
+            // literal is zero-width — `'length` of the formal it feeds must
+            // be 0, or a guarded `result(1 to arg'length) := arg` runs with
+            // a phantom character and clobbers the first result char.
             let bytes = inner.as_bytes();
-            let n = bytes.len().max(1);
+            let n = bytes.len();
             let mut bits = vec![V0; n * 8];
             for (bi, &b) in bytes.iter().enumerate() {
                 for j in 0..8 {

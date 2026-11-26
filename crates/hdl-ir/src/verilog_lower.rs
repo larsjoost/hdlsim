@@ -3845,11 +3845,19 @@ fn ce_impl(
                 // overload stays ahead of a `(natural, string, string, …)`
                 // namesake when a record actual arrives, though neither
                 // matched exactly (a scalar actual folds to a width the
-                // formal does not declare).
+                // formal does not declare). A same-arity interface stub must
+                // never win this scored fit against a real body: its formals
+                // carry fallback widths and its body const-evals to X, so a
+                // real-body call whose actual is nearer the stub's fallback
+                // width would fold the constant to X (`expand("abc", 5)`
+                // scored the w32 stub over the w8 real `string` formal). When
+                // any real body is viable, stubs drop out of the pool; an
+                // unelaborated interface (stubs only) keeps the scored pick.
                 .or_else(|| {
+                    let has_real = cands.iter().any(|f| viable(f) && !is_stub_ir(f));
                     cands
                         .iter()
-                        .filter(|f| viable(f))
+                        .filter(|f| viable(f) && (has_real == !is_stub_ir(f)))
                         .filter_map(|f| ce_overload_fit(f, &argv).map(|c| (c, f)))
                         .min_by_key(|(c, _)| *c)
                         .map(|(_, f)| f)
