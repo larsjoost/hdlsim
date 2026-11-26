@@ -661,23 +661,29 @@ impl<'a> Lower<'a> {
                 // keeps the raw lowering.
                 if let Expr::Sig(sid) = &base_e {
                     if !self.mems.contains_key(sid) {
+                        // Dynamic first: a shape-bound formal addresses
+                        // through its hidden shape slots — the actual's low
+                        // bound and direction, bound per call — so the slice
+                        // lands at the actual's layout, whatever it is.
+                        if let Some(&(lo_id, asc_id)) = self.formal_dyn.get(sid) {
+                            let (msb_e, lsb_e) = super::width::dyn_remapped_sel_bounds(
+                                self.slot_width_expr(*sid),
+                                self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64,
+                                Expr::Sig(lo_id),
+                                Expr::Sig(asc_id),
+                                self.lower_expr(msb, env),
+                                self.lower_expr(lsb, env),
+                            );
+                            return Expr::Sel {
+                                e: Box::new(base_e),
+                                msb: Box::new(msb_e),
+                                lsb: Box::new(lsb_e),
+                            };
+                        }
                         let (lo, asc) = self.sig_asc.get(sid).copied().unwrap_or((0, false));
                         let ew = self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64;
                         if asc || lo != 0 || ew > 1 {
-                            let w_lit = self.sig_width.get(sid).copied().unwrap_or(0).max(1) as u64;
-                            let w = self.sig_dynw.get(sid).cloned().unwrap_or_else(|| {
-                                if self.fn_formals.contains(sid) {
-                                    // An unconstrained formal's flat width is
-                                    // the actual's bit width, known only at
-                                    // evaluation (`SigAttr` yields it).
-                                    Expr::SigAttr {
-                                        sig: *sid,
-                                        attr: "length",
-                                    }
-                                } else {
-                                    Expr::Lit(Value::from_u64(32, w_lit))
-                                }
-                            });
+                            let w = self.slot_width_expr(*sid);
                             let lo_u = lo.max(0) as u64;
                             // `msb`/`lsb` hold the source range's high/low
                             // bounds; for `to` the left (MSB-most) element is
@@ -1039,24 +1045,30 @@ impl<'a> Lower<'a> {
     /// `Sel`, not a raw 1-bit `Idx`. `None` keeps `Idx` — a 1-bit descending
     /// range from 0, where raw bit addressing is already correct.
     fn elem_sel(&self, sid: SigId, k: &Expr) -> Option<Expr> {
-        let (lo, asc) = self.sig_asc.get(&sid).copied().unwrap_or((0, false));
         let ew = self.sig_elem.get(&sid).copied().unwrap_or(1).max(1) as u64;
+        // A shape-bound formal addresses through its hidden shape slots —
+        // the actual's low bound and direction, bound per call — so element
+        // k lands at the actual's layout, whatever it is.
+        if let Some(&(lo_id, asc_id)) = self.formal_dyn.get(&sid) {
+            let (msb, lsb) = super::width::dyn_remapped_sel_bounds(
+                self.slot_width_expr(sid),
+                ew,
+                Expr::Sig(lo_id),
+                Expr::Sig(asc_id),
+                k.clone(),
+                k.clone(),
+            );
+            return Some(Expr::Sel {
+                e: Box::new(Expr::Sig(sid)),
+                msb: Box::new(msb),
+                lsb: Box::new(lsb),
+            });
+        }
+        let (lo, asc) = self.sig_asc.get(&sid).copied().unwrap_or((0, false));
         if !asc && lo == 0 && ew == 1 {
             return None;
         }
-        let w_lit = self.sig_width.get(&sid).copied().unwrap_or(0).max(1) as u64;
-        let w = self.sig_dynw.get(&sid).cloned().unwrap_or_else(|| {
-            if self.fn_formals.contains(&sid) {
-                // An unconstrained formal's flat width is the actual's bit
-                // width, known only at evaluation (`SigAttr` yields it).
-                Expr::SigAttr {
-                    sig: sid,
-                    attr: "length",
-                }
-            } else {
-                Expr::Lit(Value::from_u64(32, w_lit))
-            }
-        });
+        let w = self.slot_width_expr(sid);
         let lo = lo.max(0) as u64;
         let off = || Expr::Bin {
             op: BinOp::Sub,
@@ -1246,12 +1258,13 @@ impl<'a> Lower<'a> {
             .next()
             .unwrap_or(name.as_str())
             .to_ascii_lowercase();
-        let args: Vec<Expr> = kids
+        let arg_nodes: Vec<&SyntaxNode> = kids
             .iter()
             .enumerate()
             .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
-            .map(|(_, k)| self.lower_expr(k, env))
+            .map(|(_, k)| k)
             .collect();
+        let args: Vec<Expr> = arg_nodes.iter().map(|k| self.lower_expr(k, env)).collect();
         // `.all(i)` dereference of an access-to-array: `L.all(i)` -> L(i).
         if fname == "all"
             && name.len() > 4
@@ -1651,20 +1664,71 @@ impl<'a> Lower<'a> {
                     .get(&fname)
                     .expect("arm guard checked that this alias is a Call")
                 {
-                    Expr::Call { name: target, .. } => Expr::Call {
-                        name: target.clone(),
-                        args,
-                        shapes: Vec::new(),
-                    },
+                    Expr::Call { name: target, .. } => {
+                        let shapes = self.call_shape_binds(target, &args);
+                        Expr::Call {
+                            name: target.clone(),
+                            args,
+                            shapes,
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }
-            _ => Expr::Call {
-                name: fname,
-                args,
-                shapes: Vec::new(),
-            },
+            _ => {
+                let shapes = self.call_shape_binds(&fname, &args);
+                Expr::Call {
+                    name: fname,
+                    args,
+                    shapes,
+                }
+            }
         }
+    }
+
+    /// A call's shape binds: for every formal position that is shape-bound
+    /// in any same-name candidate, resolve the actual's index range in the
+    /// caller's context. The actual's shape, best-effort: an outer
+    /// shape-bound formal chains its own hidden slots; a recorded shape
+    /// (`sig_asc`) lowers to literals; a constrained formal actual keeps its
+    /// raw (0, descending) convention. Anything else omits the bind — the
+    /// callee falls back to its recorded convention, which is the
+    /// pre-shape-binding behavior bit for bit.
+    pub(super) fn call_shape_binds(&self, fname: &str, args: &[Expr]) -> Vec<ShapeBind> {
+        let Some(cands) = self.funcs.get(fname) else {
+            return Vec::new();
+        };
+        let mut positions: Vec<usize> = cands
+            .iter()
+            .flat_map(|f| f.hidden.iter().map(|h| h.formal))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let mut binds = Vec::new();
+        for p in positions {
+            let Some(Expr::Sig(s)) = args.get(p) else {
+                continue;
+            };
+            let (lo, asc) = if let Some(&(flo, fasc)) = self.formal_dyn.get(s) {
+                (Expr::Sig(flo), Expr::Sig(fasc))
+            } else if let Some(&(lo, asc)) = self.sig_asc.get(s) {
+                (
+                    Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
+                    Expr::Lit(Value::from_u64(32, asc as u64)),
+                )
+            } else if self.fn_formals.contains(s) {
+                // A constrained formal actual (subtype-typed, no constraint
+                // node): its addressing convention is the raw (0, descending).
+                (
+                    Expr::Lit(Value::from_u64(32, 0)),
+                    Expr::Lit(Value::from_u64(32, 0)),
+                )
+            } else {
+                continue;
+            };
+            binds.push(ShapeBind { formal: p, lo, asc });
+        }
+        binds
     }
 
     fn lower_aggregate(

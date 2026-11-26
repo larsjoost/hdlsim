@@ -401,11 +401,10 @@ impl<'a> Lower<'a> {
         } else {
             name
         };
-        Stmt::SysCall {
-            name,
-            args,
-            shapes: Vec::new(),
-        }
+        // A user procedure's shape-bound formals take the actuals' ranges:
+        // bind what the actual's shape resolves to, omit the rest.
+        let shapes = self.call_shape_binds(&name, &args);
+        Stmt::SysCall { name, args, shapes }
     }
 
     /// Protected-type method dispatch for call statements: `obj.m(args);`
