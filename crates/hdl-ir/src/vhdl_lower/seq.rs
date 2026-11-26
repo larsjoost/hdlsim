@@ -224,37 +224,41 @@ impl<'a> Lower<'a> {
         Stmt::Null
     }
 
+    /// Lower a sequential variable assignment `v := ...;`: blocking (nba =
+    /// false), either as a conditional expression or a plain assignment.
+    fn lower_var_assign(&mut self, s: &SyntaxNode) -> Stmt {
+        let kids = real_children(s);
+        let lhs = kids.iter().find(|k| {
+            k.kind() == SyntaxKind::Name
+                || k.kind() == SyntaxKind::Call
+                || k.kind() == SyntaxKind::PartSelect
+        });
+        // Conditional expression: `v := a when c else b;`
+        let has_when = kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
+        if has_when {
+            let colon_pos = kids
+                .iter()
+                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
+            if let (Some(l), Some(cp)) = (lhs, colon_pos) {
+                if let Some(a) = self.lower_cond_assign(&kids[cp + 2..], l, false) {
+                    return a;
+                }
+            }
+            return Stmt::Null;
+        }
+        let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
+        match (lhs, rhs) {
+            (Some(l), Some(r)) => self.finish_scalar_assign(l, r, false),
+            _ => Stmt::Null,
+        }
+    }
+
     pub(super) fn lower_seq_stmt_impl(&mut self, s: &SyntaxNode) -> Stmt {
         match s.kind() {
             SyntaxKind::SeqAssign => self.lower_seq_assign(s),
-            SyntaxKind::VarAssign => {
-                let kids = real_children(s);
-                let lhs = kids.iter().find(|k| {
-                    k.kind() == SyntaxKind::Name
-                        || k.kind() == SyntaxKind::Call
-                        || k.kind() == SyntaxKind::PartSelect
-                });
-                // Conditional expression: `v := a when c else b;`
-                let has_when = kids
-                    .iter()
-                    .any(|k| k.kind() == SyntaxKind::Ident && self.kw(k) == "when");
-                if has_when {
-                    let colon_pos = kids
-                        .iter()
-                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
-                    if let (Some(l), Some(cp)) = (lhs, colon_pos) {
-                        if let Some(a) = self.lower_cond_assign(&kids[cp + 2..], l, false) {
-                            return a;
-                        }
-                    }
-                    return Stmt::Null;
-                }
-                let rhs = kids.iter().rev().find(|k| is_expr_node(k.kind()));
-                match (lhs, rhs) {
-                    (Some(l), Some(r)) => self.finish_scalar_assign(l, r, false),
-                    _ => Stmt::Null,
-                }
-            }
+            SyntaxKind::VarAssign => self.lower_var_assign(s),
             SyntaxKind::If => self.lower_if(s),
             SyntaxKind::Case => self.lower_case(s),
             SyntaxKind::For => self.lower_for(s),
