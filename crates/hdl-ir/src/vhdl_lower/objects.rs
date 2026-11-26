@@ -92,27 +92,43 @@ impl<'a> Lower<'a> {
                 ti @ TypeInfo::Array { .. } => {
                     self.materialize_const_array(module, &hidden, val, ti);
                 }
-                TypeInfo::Record { fields } => {
-                    let width = fields.iter().map(|f| f.1).sum::<usize>().max(1);
-                    let id = module.signals.len() as SigId;
-                    module.signals.push(SignalIr {
-                        name: hidden.clone(),
-                        width,
-                        kind: SigKind::Wire,
-                        init: Some(val),
-                        mem: None,
-                        signed: false,
-                    });
-                    self.names.insert(hidden.clone(), id);
-                    self.sig_width.insert(id, width);
-                    self.sig_rec.insert(id, tn.clone());
-                    module
-                        .real_ranges
-                        .insert(hidden, self.record_real_ranges(&tn));
+                TypeInfo::Record { .. } => {
+                    self.materialize_const_record(module, &hidden, val, &tn);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Hidden signal for a record-typed constant: width is the summed
+    /// field width, the record type is remembered for field selects, and
+    /// the real-typed leaf ranges are registered for wave display.
+    fn materialize_const_record(
+        &mut self,
+        module: &mut ModuleIr,
+        hidden: &str,
+        val: Value,
+        tn: &str,
+    ) {
+        let Some(TypeInfo::Record { fields }) = self.types.get(tn) else {
+            return;
+        };
+        let width = fields.iter().map(|f| f.1).sum::<usize>().max(1);
+        let id = module.signals.len() as SigId;
+        module.signals.push(SignalIr {
+            name: hidden.to_string(),
+            width,
+            kind: SigKind::Wire,
+            init: Some(val),
+            mem: None,
+            signed: false,
+        });
+        self.names.insert(hidden.to_string(), id);
+        self.sig_width.insert(id, width);
+        self.sig_rec.insert(id, tn.to_string());
+        module
+            .real_ranges
+            .insert(hidden.to_string(), self.record_real_ranges(tn));
     }
 
     /// `c(i)` where `c` is an array-typed constant (e.g. a function-local
