@@ -944,7 +944,7 @@ fn extract_from_stmt(
 ) -> Result<(), String> {
     match s {
         Stmt::Spanned { inner, .. } => extract_from_stmt(inner, guards, delay, origin, out),
-        Stmt::SysCall { name, args } if name == "sva_assert" || name == "assert" => {
+        Stmt::SysCall { name, args, .. } if name == "sva_assert" || name == "assert" => {
             let Some(cond) = args.first() else {
                 return Err("prove: malformed assert (no condition)".to_string());
             };
@@ -1756,7 +1756,7 @@ impl<'e, 'a> Exec<'e, 'a> {
                     signed: tv.signed || ev.signed,
                 })
             }
-            Expr::Call { name, args } => self.eval_call(name, args),
+            Expr::Call { name, args, .. } => self.eval_call(name, args),
             Expr::Concat(parts) => {
                 let mut vals = Vec::new();
                 for p in parts {

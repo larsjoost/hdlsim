@@ -17,6 +17,7 @@
 use crate::events::{Observer, SimEvent};
 use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
+use hdl_ir::ShapeBind;
 use hdl_syntax::source::Span;
 
 mod ckpt;
@@ -1535,9 +1536,10 @@ impl Simulator {
 
     fn exec_frames(&mut self, pid: u32) -> Control {
         /// What to do next, decided by peeking at the top frame without holding
-        /// a borrow across `exec_stmt`.
+        /// a borrow across `exec_stmt`. The statement is boxed: `Stmt` is
+        /// large and this loop's stack slot should stay small.
         enum Act {
-            Exec(Stmt),
+            Exec(Box<Stmt>),
             ForStep,
             ForTest,
             RepeatTest,
@@ -1587,7 +1589,7 @@ impl Simulator {
                         }
                         let s = std::mem::replace(&mut block[*pc], Stmt::Null);
                         *pc += 1;
-                        Act::Exec(s)
+                        Act::Exec(Box::new(s))
                     }
                     Frame::ForIter { after_body, .. } => {
                         if *after_body {
@@ -1612,7 +1614,7 @@ impl Simulator {
                 }
             };
             match action {
-                Act::Exec(s) => match self.exec_stmt(pid, s) {
+                Act::Exec(s) => match self.exec_stmt(pid, *s) {
                     Control::Done => {
                         // `$finish`/`std.env.finish` stop the process here —
                         // statements after the call in this activation do not
@@ -1958,7 +1960,7 @@ impl Simulator {
                 self.eval_expr(&e, None);
                 Control::Done
             }
-            Stmt::SysCall { name, args } => {
+            Stmt::SysCall { name, args, .. } => {
                 // Process context: process variables are flat signals, no frame.
                 self.sys_call(&name, args, None);
                 Control::Done
@@ -2006,9 +2008,17 @@ impl Simulator {
                 t: Box::new(self.concretize_target(t)),
                 e: Box::new(self.concretize_target(e)),
             },
-            Expr::Call { name, args } => Expr::Call {
+            Expr::Call { name, args, shapes } => Expr::Call {
                 name: name.clone(),
                 args: args.iter().map(|a| self.concretize_target(a)).collect(),
+                shapes: shapes
+                    .iter()
+                    .map(|b| ShapeBind {
+                        formal: b.formal,
+                        lo: self.concretize_target(&b.lo),
+                        asc: self.concretize_target(&b.asc),
+                    })
+                    .collect(),
             },
             Expr::Concat(es) => {
                 Expr::Concat(es.iter().map(|e| self.concretize_target(e)).collect())
@@ -3434,7 +3444,7 @@ impl Simulator {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { .. } => 1,
-            Expr::Call { name, args } => self
+            Expr::Call { name, args, .. } => self
                 .func_match(name, args, locals)
                 .map(|i| self.flat.functions[i].ret_width)
                 .unwrap_or(1),
@@ -3875,7 +3885,7 @@ impl Simulator {
                     }
                 }
             }
-            Expr::Call { name, args } => self.eval_call(name, args, locals),
+            Expr::Call { name, args, .. } => self.eval_call(name, args, locals),
         }
     }
 
@@ -4763,7 +4773,7 @@ impl<'a> FnRunner<'a> {
                     }
                 }
             }
-            Stmt::SysCall { name, args }
+            Stmt::SysCall { name, args, .. }
                 // Class field writes / randomize are &self-capable: run them
                 // as calls. Other syscalls need &mut self — only reachable
                 // here via `ProcRunner`-dispatched nested expression calls.
@@ -4935,7 +4945,7 @@ impl<'a> ProcRunner<'a> {
                 }
                 Control::Done
             }
-            Stmt::SysCall { name, args } => {
+            Stmt::SysCall { name, args, .. } => {
                 self.sim
                     .sys_call(name, args.clone(), Some(&mut *self.locals));
                 Control::Done

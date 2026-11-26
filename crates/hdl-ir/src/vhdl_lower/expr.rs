@@ -103,6 +103,7 @@ impl<'a> Lower<'a> {
                                     return Expr::Call {
                                         name: format!("$method::{}::{}", t, last),
                                         args: vec![Expr::Sig(id)],
+                                        shapes: Vec::new(),
                                     };
                                 }
                                 if let Some((_, w, lsb, _)) =
@@ -111,6 +112,7 @@ impl<'a> Lower<'a> {
                                     return Expr::Call {
                                         name: format!("$getf::{}::{}@{},{}", t, last, lsb, w),
                                         args: vec![Expr::Sig(id)],
+                                        shapes: Vec::new(),
                                     };
                                 }
                                 // Unknown member on a known protected object.
@@ -370,6 +372,7 @@ impl<'a> Lower<'a> {
                     return Expr::Call {
                         name: f.name.clone(),
                         args: vec![Expr::Lit(Value::x(32)); n_actuals],
+                        shapes: Vec::new(),
                     };
                 }
                 // `open` (reserved word) in a port/generic map association:
@@ -386,6 +389,7 @@ impl<'a> Lower<'a> {
                     return Expr::Call {
                         name: "$now".into(),
                         args: Vec::new(),
+                        shapes: Vec::new(),
                     };
                 }
                 // Xilinx implicit globals (unisim references bare `GSR` etc.).
@@ -426,6 +430,7 @@ impl<'a> Lower<'a> {
                                 return Expr::Call {
                                     name: f.name.clone(),
                                     args: vec![Expr::Lit(Value::x(32)); f.args.len()],
+                                    shapes: Vec::new(),
                                 };
                             }
                             if p.types.iter().any(|(n, _)| *n == item) {
@@ -507,7 +512,9 @@ impl<'a> Lower<'a> {
                                 args: vec![Expr::Call {
                                     name: "$this".into(),
                                     args: vec![],
+                                    shapes: Vec::new(),
                                 }],
+                                shapes: Vec::new(),
                             };
                         }
                     }
@@ -1212,6 +1219,7 @@ impl<'a> Lower<'a> {
                     let inner = Expr::Call {
                         name: format!("${attr_name}"),
                         args: vec![self.lower_expr(arg, env)],
+                        shapes: Vec::new(),
                     };
                     if attr_name == "val" {
                         let prefix = ak.iter().find(|k| k.kind() == SyntaxKind::Name).cloned();
@@ -1311,6 +1319,7 @@ impl<'a> Lower<'a> {
                 return Expr::Call {
                     name: fname.clone(),
                     args,
+                    shapes: Vec::new(),
                 };
             }
         }
@@ -1346,6 +1355,7 @@ impl<'a> Lower<'a> {
                         return Expr::Call {
                             name: format!("$method::{}::{}", t, m),
                             args: args2,
+                            shapes: Vec::new(),
                         };
                     }
                     // Unknown member on a protected object — or any member of
@@ -1379,11 +1389,13 @@ impl<'a> Lower<'a> {
                 let mut args2 = vec![Expr::Call {
                     name: "$this".into(),
                     args: vec![],
+                    shapes: Vec::new(),
                 }];
                 args2.extend(args.iter().cloned());
                 return Expr::Call {
                     name: format!("$method::{}::{}", t, fname),
                     args: args2,
+                    shapes: Vec::new(),
                 };
             }
         }
@@ -1443,7 +1455,11 @@ impl<'a> Lower<'a> {
                         i: Box::new(k),
                     };
                 }
-                Expr::Call { name: fname, args }
+                Expr::Call {
+                    name: fname,
+                    args,
+                    shapes: Vec::new(),
+                }
             }
             // Shift/rotate function forms from std_logic_arith & co.
             "shift_left" | "sll" | "sla" if args.len() == 2 => Expr::Bin {
@@ -1488,7 +1504,11 @@ impl<'a> Lower<'a> {
                     _ => false,
                 };
                 if record {
-                    Expr::Call { name: fname, args }
+                    Expr::Call {
+                        name: fname,
+                        args,
+                        shapes: Vec::new(),
+                    }
                 } else {
                     Expr::Bin {
                         op: if fname == "shl" {
@@ -1634,11 +1654,16 @@ impl<'a> Lower<'a> {
                     Expr::Call { name: target, .. } => Expr::Call {
                         name: target.clone(),
                         args,
+                        shapes: Vec::new(),
                     },
                     _ => unreachable!(),
                 }
             }
-            _ => Expr::Call { name: fname, args },
+            _ => Expr::Call {
+                name: fname,
+                args,
+                shapes: Vec::new(),
+            },
         }
     }
 

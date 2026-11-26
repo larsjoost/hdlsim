@@ -116,7 +116,7 @@ impl<'a> Lower<'a> {
     /// case-insensitive.
     pub(super) fn refs_impure_call(&self, ex: &Expr) -> bool {
         match ex {
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 self.impure_fns.contains(&name.to_ascii_lowercase())
                     || args.iter().any(|a| self.refs_impure_call(a))
             }
@@ -363,7 +363,7 @@ impl<'a> Lower<'a> {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { e, .. } => self.expr_width_est(e),
-            Expr::Call { name, args } => self
+            Expr::Call { name, args, .. } => self
                 .funcs
                 .get(&name.to_ascii_lowercase())
                 .and_then(|c| {

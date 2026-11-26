@@ -11,11 +11,11 @@
 use super::{Ev, Frame, ProcRt, Simulator};
 use hdl_ir::elab::Flat;
 use hdl_ir::value::Value;
-use hdl_ir::{BinOp, Edge, EdgeKind, Expr, Stmt, UnOp};
+use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ShapeBind, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -283,12 +283,18 @@ fn w_expr(w: &mut W, e: &Expr) {
             w_expr(w, t);
             w_expr(w, e);
         }
-        Expr::Call { name, args } => {
+        Expr::Call { name, args, shapes } => {
             w.u8(5);
             w.str(name);
             w.u32(args.len() as u32);
             for a in args {
                 w_expr(w, a);
+            }
+            w.u32(shapes.len() as u32);
+            for b in shapes {
+                w.u32(b.formal as u32);
+                w_expr(w, &b.lo);
+                w_expr(w, &b.asc);
             }
         }
         Expr::Concat(parts) => {
@@ -384,7 +390,18 @@ fn r_expr(r: &mut R) -> Result<Expr, String> {
             for _ in 0..n {
                 args.push(r_expr(r)?);
             }
-            Expr::Call { name, args }
+            let ns = r.u32()? as usize;
+            if ns > (1 << 12) {
+                return Err("too many shape binds".to_string());
+            }
+            let mut shapes = Vec::with_capacity(ns);
+            for _ in 0..ns {
+                let formal = r.u32()? as usize;
+                let lo = r_expr(r)?;
+                let asc = r_expr(r)?;
+                shapes.push(ShapeBind { formal, lo, asc });
+            }
+            Expr::Call { name, args, shapes }
         }
         6 => {
             let n = r.u32()? as usize;
@@ -528,12 +545,18 @@ fn w_stmt(w: &mut W, s: &Stmt) {
                 None => w.bool(false),
             }
         }
-        Stmt::SysCall { name, args } => {
+        Stmt::SysCall { name, args, shapes } => {
             w.u8(6);
             w.str(name);
             w.u32(args.len() as u32);
             for a in args {
                 w_expr(w, a);
+            }
+            w.u32(shapes.len() as u32);
+            for b in shapes {
+                w.u32(b.formal as u32);
+                w_expr(w, &b.lo);
+                w_expr(w, &b.asc);
             }
         }
         Stmt::For {
@@ -680,7 +703,18 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             for _ in 0..n {
                 args.push(r_expr(r)?);
             }
-            Stmt::SysCall { name, args }
+            let ns = r.u32()? as usize;
+            if ns > (1 << 12) {
+                return Err("too many shape binds".to_string());
+            }
+            let mut shapes = Vec::with_capacity(ns);
+            for _ in 0..ns {
+                let formal = r.u32()? as usize;
+                let lo = r_expr(r)?;
+                let asc = r_expr(r)?;
+                shapes.push(ShapeBind { formal, lo, asc });
+            }
+            Stmt::SysCall { name, args, shapes }
         }
         7 => Stmt::For {
             init: Box::new(r_stmt(r)?),
@@ -1266,6 +1300,11 @@ mod tests {
             Expr::Call {
                 name: "to_integer".to_string(),
                 args: vec![sig(4)],
+                shapes: vec![ShapeBind {
+                    formal: 0,
+                    lo: sig(6),
+                    asc: sig(7),
+                }],
             },
             Expr::Concat(vec![sig(1), sig(2)]),
             Expr::Replicate {
@@ -1348,6 +1387,11 @@ mod tests {
             Stmt::SysCall {
                 name: "$display".to_string(),
                 args: vec![Expr::Sig(3)],
+                shapes: vec![ShapeBind {
+                    formal: 0,
+                    lo: Expr::Lit(Value::from_u64(32, 1)),
+                    asc: Expr::Lit(Value::from_u64(32, 0)),
+                }],
             },
             Stmt::For {
                 init: Box::new(a.clone()),

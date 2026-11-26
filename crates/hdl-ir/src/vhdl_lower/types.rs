@@ -178,6 +178,7 @@ impl<'a> Lower<'a> {
                 locals: Vec::new(),
                 dyn_locals: Vec::new(),
                 body: Stmt::Null,
+                hidden: Vec::new(),
             });
         }
         // std.standard delay_length and the VHDL-2019 vector types.
@@ -558,9 +559,11 @@ impl<'a> Lower<'a> {
                             Expr::Call {
                                 name: "$this".into(),
                                 args: vec![],
+                                shapes: Vec::new(),
                             },
                             ex.clone(),
                         ],
+                        shapes: Vec::new(),
                     });
                 }
             }
@@ -573,6 +576,7 @@ impl<'a> Lower<'a> {
                 locals: Vec::new(),
                 dyn_locals: Vec::new(),
                 body: Stmt::Block(ctor_stmts),
+                hidden: Vec::new(),
             };
             self.register_func(ctor.clone());
             self.pending_funcs.push(ctor);

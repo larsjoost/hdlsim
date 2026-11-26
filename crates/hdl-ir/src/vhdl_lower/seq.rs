@@ -104,9 +104,11 @@ impl<'a> Lower<'a> {
                     Expr::Call {
                         name: "$this".into(),
                         args: vec![],
+                        shapes: Vec::new(),
                     },
                     rv,
                 ],
+                shapes: Vec::new(),
             };
         }
         if self.prot_nested_lhs(l) {
@@ -320,6 +322,7 @@ impl<'a> Lower<'a> {
             }
             .to_string(),
             args: exprs,
+            shapes: Vec::new(),
         }
     }
 
@@ -398,7 +401,11 @@ impl<'a> Lower<'a> {
         } else {
             name
         };
-        Stmt::SysCall { name, args }
+        Stmt::SysCall {
+            name,
+            args,
+            shapes: Vec::new(),
+        }
     }
 
     /// Protected-type method dispatch for call statements: `obj.m(args);`
@@ -420,6 +427,7 @@ impl<'a> Lower<'a> {
                         return Some(Stmt::SysCall {
                             name: format!("$callmethod::{}::{}", t, m),
                             args: args2,
+                            shapes: Vec::new(),
                         });
                     }
                 }
@@ -434,11 +442,13 @@ impl<'a> Lower<'a> {
                 let mut args2 = vec![Expr::Call {
                     name: "$this".into(),
                     args: vec![],
+                    shapes: Vec::new(),
                 }];
                 args2.extend(args.iter().cloned());
                 return Some(Stmt::SysCall {
                     name: format!("$callmethod::{}::{}", t, name),
                     args: args2,
+                    shapes: Vec::new(),
                 });
             }
         }

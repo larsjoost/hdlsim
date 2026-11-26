@@ -78,6 +78,7 @@ impl<'a> Lower<'a> {
             locals: Vec::new(),
             dyn_locals: Vec::new(),
             body: Stmt::Null,
+            hidden: Vec::new(),
         })
     }
 
@@ -794,6 +795,7 @@ impl<'a> Lower<'a> {
             locals: fd.locals,
             dyn_locals: fd.dyn_locals,
             body,
+            hidden: Vec::new(),
         })
     }
 }

@@ -332,6 +332,7 @@ impl<'a> Lower<'a> {
                             idx,
                             Expr::Lit(Value::from_u64(32, ew as u64)),
                         ],
+                        shapes: Vec::new(),
                     },
                     root_ty.take(),
                 ));
@@ -397,6 +398,7 @@ impl<'a> Lower<'a> {
                 flat,
                 Expr::Lit(Value::from_u64(32, elem.max(1) as u64)),
             ],
+            shapes: Vec::new(),
         })
     }
 
