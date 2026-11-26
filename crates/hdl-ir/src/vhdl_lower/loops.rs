@@ -50,6 +50,28 @@ impl<'a> Lower<'a> {
         ))
     }
 
+    /// VHDL for-loop variables are implicitly declared by the loop: reuse
+    /// the slot if the name is already bound, else allocate a fresh 32-bit
+    /// wire named `__for_<var>`.
+    fn declare_for_var(&mut self, var: &str) -> SigId {
+        match self.sig_id(var) {
+            Some(id) => id,
+            None => {
+                let id = (self.extra_base + self.extra_signals.len()) as SigId;
+                self.extra_signals.push(SignalIr {
+                    name: format!("__for_{}", var),
+                    width: 32,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: None,
+                    signed: false,
+                });
+                self.names.insert(var.to_string(), id);
+                id
+            }
+        }
+    }
+
     pub(super) fn lower_for(&mut self, s: &SyntaxNode) -> Stmt {
         let kids = real_children(s);
         // for <var> in <range> loop <body> end loop
@@ -70,23 +92,7 @@ impl<'a> Lower<'a> {
             self.err(s.span(), "malformed for loop");
             return Stmt::Null;
         };
-        // VHDL for-loop variables are implicitly declared by the loop.
-        let var_id = match self.sig_id(&var) {
-            Some(id) => id,
-            None => {
-                let id = (self.extra_base + self.extra_signals.len()) as SigId;
-                self.extra_signals.push(SignalIr {
-                    name: format!("__for_{}", var),
-                    width: 32,
-                    kind: SigKind::Wire,
-                    init: None,
-                    mem: None,
-                    signed: false,
-                });
-                self.names.insert(var.clone(), id);
-                id
-            }
-        };
+        let var_id = self.declare_for_var(&var);
         // Range bounds.
         let (lo, hi, downto) = match range.map(|r| r.kind()) {
             Some(SyntaxKind::Range) => {
