@@ -47,10 +47,14 @@ pass/fail. This file is the map; follow it instead of rediscovering it.
   `///` on public items, no `unwrap()` on source-derived data, errors as
   `Result<T, Diagnostic>`, deterministic output, tests colocated in
   `#[cfg(test)]` plus end-to-end tests in `crates/hdlsim/tests/`.
+- Follow `docs/coding-principles.md` (style recommendations). They shape how
+  code is written and reviewed; the rules in this file and `REVIEWING.md`
+  stay the binding baseline. Mark a deliberate deviation at the site with a
+  one-line comment.
 - Docs map: `README.md` (features), `docs/project-context.md` (architecture,
   module table, commands), `docs/extensibility.md` (extension seams),
   `docs/plan.md` (change history), `REVIEWING.md` (review conventions),
-  `docs/worldclass.md`.
+  `docs/coding-principles.md` (style recommendations), `docs/worldclass.md`.
 
 ## The debug loop (edit → simulate → diagnose)
 

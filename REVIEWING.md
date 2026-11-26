@@ -23,6 +23,11 @@
   golden files in `tests/golden/`.
 - `cargo fmt --check` and `cargo test` must pass before a milestone is done.
 - One logical change per commit; milestones land as reviewable slices.
+- Style recommendations live in `docs/coding-principles.md` (small
+  single-purpose functions, no lazy cloning, comment ladder, "review
+  questions" list). They shape how code is written and what review asks;
+  the rules in this file are the gate. A deliberate deviation from a
+  recommendation is marked at the site with a one-line comment.
 
 ## Extensibility (closed core, open edges)
 - Core data structures (AST, IR, `SimEvent`) are closed enums: the compiler forces

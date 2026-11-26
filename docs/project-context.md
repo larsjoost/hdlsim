@@ -64,6 +64,14 @@ gains debt it does not have an entry for; improvements are committed by
 regenerating the file with `scripts/standards-baseline.sh` alongside the
 change that earned them.
 
+## Coding principles
+
+`docs/coding-principles.md` holds the style recommendations (small
+single-purpose functions, no lazy cloning, comment ladder, make illegal
+states unrepresentable). They are advisory — the rules in `AGENTS.md` and
+`REVIEWING.md` remain the binding baseline, and a deliberate deviation is
+marked at the site.
+
 ## Workflow
 
 - **Never commit directly to `main`.** Create a branch, push it, and open a
