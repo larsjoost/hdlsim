@@ -147,6 +147,46 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Index shape of a record field that is itself an array
+    /// (`r.options(0 to n)`): `(low bound, element width, field bit width)`.
+    /// The low bound comes from the field's decl constraint
+    /// (`rec_field_dims`) or the field type's own dims; the element width
+    /// from the field type. `None` when the dotted name does not resolve to
+    /// a record field of a multi-bit-element array type — the caller keeps
+    /// the raw bounds.
+    pub(super) fn field_array_shape(&self, name: &str) -> Option<(i64, u64, u64)> {
+        let (root, rest) = name.split_once('.')?;
+        let path: Vec<String> = rest.split('.').map(|s| s.to_ascii_lowercase()).collect();
+        let last = path.last()?.clone();
+        let id = self.sig_id(root)?;
+        let mut ty = self.sig_rec.get(&id)?.clone();
+        for seg in &path[..path.len() - 1] {
+            ty = self.rec_field_ty.get(&(ty.clone(), seg.clone()))?.clone();
+        }
+        let (_, w) = self.record_field_offset(&ty, &[last.as_str()])?;
+        let fty = self.rec_field_ty.get(&(ty.clone(), last.clone()))?.clone();
+        let lo = self
+            .rec_field_dims
+            .get(&(ty, last))
+            .and_then(|d| d.first().map(|&(l, _)| l))
+            .or_else(|| match self.types.get(&fty) {
+                Some(TypeInfo::Array { dims, .. }) => dims.first().map(|&(l, _)| l),
+                _ => None,
+            })
+            // A constrained Vector subtype (`string(1 to 10)`) keeps its
+            // range in `type_dims`.
+            .or_else(|| {
+                self.type_dims
+                    .get(&fty)
+                    .and_then(|d| d.first().map(|&(l, _)| l))
+            })?;
+        let ew = self.array_elem_width(&fty)? as u64;
+        if ew <= 1 {
+            return None;
+        }
+        Some((lo, ew, w as u64))
+    }
+
     /// Whether the type mark names a character-array type (`string` or a
     /// string subtype): string literals in such an object's initializer are
     /// ASCII text, not bit strings (`lower_literal` consults this).
@@ -241,6 +281,26 @@ impl<'a> Lower<'a> {
         self.ce_env(&ex, env)
             .and_then(|v| v.to_u64())
             .map(|v| v as i64)
+    }
+
+    /// Low bound of a constraint's first range, folding only that bound with
+    /// the registration env — a dynamic high bound (`string(1 to size)`)
+    /// defeats a whole-range fold, and the direction decides which
+    /// expression is the low bound (the left one for `to`, the right one for
+    /// `downto`; `range_low` always returns the left bound, which is the
+    /// HIGH bound of a descending range).
+    pub(super) fn range_bound_low(&mut self, c: &SyntaxNode, asc: bool) -> Option<i64> {
+        let sub = real_children(c)
+            .into_iter()
+            .find(|k| k.kind() == SyntaxKind::Range)?;
+        let exprs: Vec<SyntaxNode> = real_children(&sub)
+            .into_iter()
+            .filter(|k| is_expr_node(k.kind()))
+            .collect();
+        let node = if asc { exprs.first() } else { exprs.last() }?;
+        let ex = self.lower_expr(node, &self.consts.clone());
+        self.ce_env(&ex, &self.consts.clone())
+            .and_then(|v| v.to_i64())
     }
 
     /// Dims of a declaration constraint: one (low, size) per range, left to
