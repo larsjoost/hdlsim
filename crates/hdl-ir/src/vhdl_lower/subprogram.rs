@@ -714,6 +714,8 @@ impl<'a> Lower<'a> {
             nested_fns,
             stmt_nodes,
         } = hdr;
+        // Registered before the body lowers (see `note_impure_marker`).
+        self.note_impure_marker(f, &name);
         let FormalParams {
             args,
             arg_types,

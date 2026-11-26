@@ -45,6 +45,58 @@ impl<'a> Lower<'a> {
             })
     }
 
+    /// Record a subprogram's `impure` marker (the keyword precedes the
+    /// designator, so the scan stops at the `Name` node) under its lowercase
+    /// designator, before the body lowers: a constant initializer in the
+    /// same declarative region then sees it via `refs_impure_call`.
+    pub(super) fn note_impure_marker(&mut self, f: &SyntaxNode, name: &str) {
+        let marked = real_children(f)
+            .into_iter()
+            .take_while(|k| k.kind() != SyntaxKind::Name)
+            .any(|k| k.kind() == SyntaxKind::Ident && self.kw(&k) == "impure");
+        if marked {
+            self.impure_fns.insert(name.to_ascii_lowercase());
+        }
+    }
+
+    /// Whether the lowered initializer expression calls an impure function
+    /// declared in this file. An impure function's value is legal VHDL —
+    /// evaluated once, at elaboration — but it may read files or shared
+    /// state the const-eval cannot execute, so the X fallback there is by
+    /// design, not a fold gap, and the constant-initializer warning would
+    /// be misleading (same stance as `refs_unset_generic`). Both call forms
+    /// arrive as [`Expr::Call`] — a parameterless call lowers from a bare
+    /// name — so scanning the lowered expression covers `f(x)` and `f`
+    /// alike. Callees keep their source casing, so the lookup is
+    /// case-insensitive.
+    pub(super) fn refs_impure_call(&self, ex: &Expr) -> bool {
+        match ex {
+            Expr::Call { name, args } => {
+                self.impure_fns.contains(&name.to_ascii_lowercase())
+                    || args.iter().any(|a| self.refs_impure_call(a))
+            }
+            Expr::Lit(_) | Expr::Real(_) | Expr::Sig(_) | Expr::SigAttr { .. } => false,
+            Expr::Bin { l, r, .. } => self.refs_impure_call(l) || self.refs_impure_call(r),
+            Expr::Un { e, .. } | Expr::Signed(e) | Expr::ToInt(e) | Expr::ToString(e) => {
+                self.refs_impure_call(e)
+            }
+            Expr::Cond { c, t, e } => {
+                self.refs_impure_call(c) || self.refs_impure_call(t) || self.refs_impure_call(e)
+            }
+            Expr::Concat(v) => v.iter().any(|e| self.refs_impure_call(e)),
+            Expr::Replicate { count, e } => {
+                self.refs_impure_call(count) || self.refs_impure_call(e)
+            }
+            Expr::Sel { e, msb, lsb } => {
+                self.refs_impure_call(e) || self.refs_impure_call(msb) || self.refs_impure_call(lsb)
+            }
+            Expr::Idx { e, i } => self.refs_impure_call(e) || self.refs_impure_call(i),
+            Expr::Rising(e) | Expr::Falling(e) | Expr::Prev(e) | Expr::Resize { e, .. } => {
+                self.refs_impure_call(e)
+            }
+        }
+    }
+
     /// Width from a constraint: `(msb downto lsb)` / `(msb to lsb)` / `(n)`,
     /// or multi-dimensional `(r1, r2, ...)` → product of the dimension widths.
     pub(super) fn constraint_width(&mut self, c: &SyntaxNode) -> usize {
