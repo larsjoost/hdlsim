@@ -547,6 +547,111 @@ impl<'a> Lower<'a> {
         Some((cur, field_ty, cur_dims))
     }
 
+    /// Apply an array-index segment. Memory-backed signal arrays index by
+    /// element; flat value slots (function formals) read elements out of
+    /// the flat vector — record elements via `$const_idx` (scalar elements
+    /// keep the kernel's established bit read); non-signal bases index the
+    /// flat constant value. Consumes the array-of-records element type,
+    /// clears the dims context (a following Field seg re-derives it), and
+    /// steps the type to the element's. Returns the updated (expr, type).
+    fn chain_index_seg(
+        &mut self,
+        cur: Expr,
+        cur_ty: String,
+        root_elem: &mut Option<String>,
+        cur_dims: &mut Option<Vec<(i64, usize)>>,
+        args: &[SyntaxNode],
+        env: &HashMap<String, Value>,
+    ) -> Option<(Expr, String)> {
+        // Array-of-records root: the element type is known from the slot
+        // registration; other bases resolve it from the current type's
+        // Array info.
+        let root_ty = root_elem.take();
+        let elem_rec_w = root_ty.as_ref().and_then(|en| match self.types.get(en) {
+            Some(TypeInfo::Record { fields }) => {
+                Some(fields.iter().map(|f| f.1).sum::<usize>().max(1))
+            }
+            _ => None,
+        });
+        let cur = if let Expr::Sig(sid) = cur {
+            // Memory-backed signal arrays index by element; flat value
+            // slots (function formals) read elements out of the flat
+            // vector — record elements via `$const_idx` (scalar elements
+            // keep the kernel's established bit read).
+            let is_mem = self.mems.get(&sid).copied().is_some();
+            if !is_mem && args.len() == 1 {
+                if let Some(ew) = elem_rec_w {
+                    let idx = self.lower_expr(&args[0], env);
+                    *cur_dims = None;
+                    return Some((
+                        Expr::Call {
+                            name: "$const_idx".into(),
+                            args: vec![
+                                Expr::Sig(sid),
+                                idx,
+                                Expr::Lit(Value::from_u64(32, ew as u64)),
+                            ],
+                        },
+                        root_ty.unwrap_or(cur_ty),
+                    ));
+                }
+            }
+            if args.len() == 1 {
+                let idx = self.lower_expr(&args[0], env);
+                Expr::Idx {
+                    e: Box::new(Expr::Sig(sid)),
+                    i: Box::new(idx),
+                }
+            } else {
+                let sd = self.sig_dims.get(&sid).cloned()?;
+                if sd.len() != args.len() {
+                    return None;
+                }
+                let flat = flatten_dims(args, &sd, env, self);
+                Expr::Idx {
+                    e: Box::new(Expr::Sig(sid)),
+                    i: Box::new(flat),
+                }
+            }
+        } else {
+            let Some(TypeInfo::Array { elem, dims, .. }) = self.types.get(&cur_ty).cloned() else {
+                return None;
+            };
+            // A record field's decl constraint overrides the (empty) dims
+            // of an unconstrained array type; a single index with no dims
+            // at all keeps the raw value (0-based assumption beats
+            // dropping it).
+            let dims = cur_dims.take().unwrap_or(dims);
+            let flat = if args.len() == 1 && dims.is_empty() {
+                self.lower_expr(&args[0], env)
+            } else {
+                flatten_dims(args, &dims, env, self)
+            };
+            Expr::Call {
+                name: "$const_idx".into(),
+                args: vec![
+                    cur,
+                    flat,
+                    Expr::Lit(Value::from_u64(32, elem.max(1) as u64)),
+                ],
+            }
+        };
+        let cur_ty = match root_ty {
+            Some(en) => en,
+            None => match self.types.get(&cur_ty).cloned() {
+                Some(TypeInfo::Array {
+                    elem_name: Some(en),
+                    ..
+                }) => en,
+                _ => return None,
+            },
+        };
+        // The element itself is not the constrained field array anymore;
+        // a following Field seg re-derives the dims.
+        *cur_dims = None;
+        Some((cur, cur_ty))
+    }
+
     /// Walk a selected-name chain's segments from its resolved root,
     /// threading the current expression, type, array dims, and the
     /// array-of-records element type through each segment.
@@ -573,97 +678,14 @@ impl<'a> Lower<'a> {
                     (cur, cur_ty, cur_dims) = self.chain_field_seg(cur, cur_ty, &f)?;
                 }
                 ChainSeg::Index(args) => {
-                    // Array-of-records root: the element type is known from
-                    // the slot registration; other bases resolve it from the
-                    // current type's Array info.
-                    let root_ty = root_elem.take();
-                    let elem_rec_w = root_ty.as_ref().and_then(|en| match self.types.get(en) {
-                        Some(TypeInfo::Record { fields }) => {
-                            Some(fields.iter().map(|f| f.1).sum::<usize>().max(1))
-                        }
-                        _ => None,
-                    });
-                    if let Expr::Sig(sid) = cur {
-                        // Memory-backed signal arrays index by element;
-                        // flat value slots (function formals) read elements
-                        // out of the flat vector — record elements via
-                        // `$const_idx` (scalar elements keep the kernel's
-                        // established bit read).
-                        let is_mem = self.mems.get(&sid).copied().is_some();
-                        if !is_mem && args.len() == 1 {
-                            if let Some(ew) = elem_rec_w {
-                                let idx = self.lower_expr(&args[0], env);
-                                cur = Expr::Call {
-                                    name: "$const_idx".into(),
-                                    args: vec![
-                                        Expr::Sig(sid),
-                                        idx,
-                                        Expr::Lit(Value::from_u64(32, ew as u64)),
-                                    ],
-                                };
-                                cur_ty = root_ty.unwrap_or(cur_ty);
-                                // The element itself is not the constrained
-                                // field array anymore; a following Field seg
-                                // re-derives the dims.
-                                cur_dims = None;
-                                continue;
-                            }
-                        }
-                        if args.len() == 1 {
-                            let idx = self.lower_expr(&args[0], env);
-                            cur = Expr::Idx {
-                                e: Box::new(Expr::Sig(sid)),
-                                i: Box::new(idx),
-                            };
-                        } else {
-                            let sd = self.sig_dims.get(&sid).cloned()?;
-                            if sd.len() != args.len() {
-                                return None;
-                            }
-                            let flat = flatten_dims(&args, &sd, env, self);
-                            cur = Expr::Idx {
-                                e: Box::new(Expr::Sig(sid)),
-                                i: Box::new(flat),
-                            };
-                        }
-                    } else {
-                        let Some(TypeInfo::Array { elem, dims, .. }) =
-                            self.types.get(&cur_ty).cloned()
-                        else {
-                            return None;
-                        };
-                        // A record field's decl constraint overrides the
-                        // (empty) dims of an unconstrained array type; a
-                        // single index with no dims at all keeps the raw
-                        // value (0-based assumption beats dropping it).
-                        let dims = cur_dims.take().unwrap_or(dims);
-                        let flat = if args.len() == 1 && dims.is_empty() {
-                            self.lower_expr(&args[0], env)
-                        } else {
-                            flatten_dims(&args, &dims, env, self)
-                        };
-                        cur = Expr::Call {
-                            name: "$const_idx".into(),
-                            args: vec![
-                                cur,
-                                flat,
-                                Expr::Lit(Value::from_u64(32, elem.max(1) as u64)),
-                            ],
-                        };
-                    }
-                    cur_ty = match root_ty {
-                        Some(en) => en,
-                        None => match self.types.get(&cur_ty).cloned() {
-                            Some(TypeInfo::Array {
-                                elem_name: Some(en),
-                                ..
-                            }) => en,
-                            _ => return None,
-                        },
-                    };
-                    // The element itself is not the constrained field array
-                    // anymore; a following Field seg re-derives the dims.
-                    cur_dims = None;
+                    (cur, cur_ty) = self.chain_index_seg(
+                        cur,
+                        cur_ty,
+                        &mut root_elem,
+                        &mut cur_dims,
+                        &args,
+                        env,
+                    )?;
                 }
             }
         }
