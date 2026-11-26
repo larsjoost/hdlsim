@@ -424,6 +424,147 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Lower one `variable` declarative item of a subprogram: slot its
+    /// names, resolve the width (with static array-constraint expansion and
+    /// dynamic-constraint fallback), register shapes/dyn mappings, and queue
+    /// the per-call initializer. Subprogram locals are flat values, never
+    /// mems. Malformed decls (no `:`) are skipped.
+    fn lower_fn_local_variable(
+        &mut self,
+        d: &SyntaxNode,
+        slots: &mut Vec<(String, usize)>,
+        locals: &mut Vec<SignalIr>,
+        local_types: &mut Vec<(String, String)>,
+        dyn_locals: &mut Vec<(SigId, Expr)>,
+        pending_const_inits: &mut Vec<(SigId, Expr)>,
+    ) {
+        let dk = real_children(d);
+        let Some(colon) = dk
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
+        else {
+            return;
+        };
+        let names: Vec<String> = dk[..colon]
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))
+            .collect();
+        let tmark = dk[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name);
+        let constraint = dk[colon + 1..]
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Range);
+        let (w, signed, _, real) = match tmark {
+            Some(tm) => self.resolve_type(tm, constraint, d.span()),
+            None => (32, false, None, false),
+        };
+        // An unconstrained array mark with a static constraint
+        // (`register_definition_array_t(0 to 63)`): resolve_type
+        // returns the bare element width, but the local's flat
+        // slot covers every element the constraint adds.
+        // Subprogram locals are flat values, never mems. A
+        // dynamic constraint keeps the fallback width and the
+        // recorded `dyn_w` below.
+        let w = match (tmark, constraint) {
+            (Some(tm), Some(c))
+                if matches!(
+                    self.types.get(&self.kw(tm)),
+                    Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
+                ) && !self.text(c).contains("<>")
+                    && self.constraint_folds(c) =>
+            {
+                w.max(1) * self.constraint_width(c).max(1)
+            }
+            _ => w,
+        };
+        // A constraint that references subprogram formals
+        // (`variable s : string(1 to size)`) can't fold at
+        // registration — formals have no values yet — so the
+        // recorded width is a fallback. Record a bit-width
+        // expression for const-eval to fold per call, and size
+        // an OTHERS initializer from it too. Only array-like
+        // types qualify: a record's flat width is the sum of
+        // its fields, and a record-element constraint
+        // (`t_node(name(1 to n))`) selects field ranges —
+        // lowering its element name as an identifier would
+        // misfire E0401.
+        let dyn_w = match (tmark, constraint) {
+            (Some(tm), Some(c))
+                if self.constraint_shapes_width(tm)
+                    && !self.text(c).contains("<>")
+                    && !self.constraint_folds(c) =>
+            {
+                Some(self.dyn_width_expr(tm, c))
+            }
+            _ => None,
+        };
+        // `variable v : integer := 0;` — the initializer runs on
+        // every call (VHDL subprogram variables are re-initialized
+        // per call), so lower it and prepend `v := init;` to the
+        // body like a dynamic local constant.
+        let init_node = dk[colon + 1..]
+            .iter()
+            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
+            .and_then(|e| {
+                dk[colon + 1 + e + 1..]
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .cloned()
+            });
+        let mut init_ex = init_node.as_ref().map(|node| {
+            // A string target's `(others => ' ')` replicate must
+            // cover the whole object (see `agg_target_w`); a
+            // dynamic-width local re-derives the count below.
+            let saved_w = self.agg_target_w;
+            if node.kind() == SyntaxKind::Aggregate && tmark.is_some_and(|tm| self.string_typed(tm))
+            {
+                self.agg_target_w = Some(w);
+            }
+            let ex = self.lower_expr(node, &self.consts.clone());
+            self.agg_target_w = saved_w;
+            ex
+        });
+        // A dynamic-width local with an OTHERS initializer must
+        // self-size: re-emit the replicate with the count derived
+        // from the dynamic width expression (the generic lowering
+        // baked the fallback width).
+        if let (Some(wexpr), Some(node)) = (&dyn_w, &init_node) {
+            if let Some(ex) = self.dyn_others_init(node, wexpr) {
+                init_ex = Some(ex);
+            }
+        }
+        for n in names {
+            let id = slots.len() as SigId;
+            if let Some(tm) = &tmark {
+                local_types.push((n.clone(), self.kw(tm)));
+            }
+            slots.push((n.clone(), w));
+            self.names.insert(n.clone(), id);
+            self.sig_signed.insert(id, signed);
+            self.sig_width.insert(id, w);
+            self.record_obj_shape(id, tmark, constraint);
+            if let Some(wexpr) = &dyn_w {
+                dyn_locals.push((id, wexpr.clone()));
+                // The addressing remaps must size slices from the
+                // per-call width, not the registration fallback.
+                self.sig_dynw.insert(id, wexpr.clone());
+            }
+            if let Some(ex) = &init_ex {
+                pending_const_inits.push((id, ex.clone()));
+            }
+            locals.push(SignalIr {
+                name: n,
+                width: w,
+                kind: if real { SigKind::Real } else { SigKind::Wire },
+                init: None,
+                mem: None,
+                signed,
+            });
+        }
+    }
+
     pub(super) fn lower_function_node(&mut self, f: &SyntaxNode) -> Option<FuncIr> {
         let hdr = self.split_subprogram_header(f)?;
         let SubprogramHeader {
@@ -523,134 +664,14 @@ impl<'a> Lower<'a> {
                     self.register_attr_decl(d);
                 }
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
-                SyntaxKind::VariableDecl => {
-                    let dk = real_children(d);
-                    let Some(colon) = dk
-                        .iter()
-                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
-                    else {
-                        continue;
-                    };
-                    let names: Vec<String> = dk[..colon]
-                        .iter()
-                        .filter(|k| k.kind() == SyntaxKind::Name)
-                        .map(|k| self.text(k))
-                        .collect();
-                    let tmark = dk[colon + 1..]
-                        .iter()
-                        .find(|k| k.kind() == SyntaxKind::Name);
-                    let constraint = dk[colon + 1..]
-                        .iter()
-                        .find(|k| k.kind() == SyntaxKind::Range);
-                    let (w, signed, _, real) = match tmark {
-                        Some(tm) => self.resolve_type(tm, constraint, d.span()),
-                        None => (32, false, None, false),
-                    };
-                    // An unconstrained array mark with a static constraint
-                    // (`register_definition_array_t(0 to 63)`): resolve_type
-                    // returns the bare element width, but the local's flat
-                    // slot covers every element the constraint adds.
-                    // Subprogram locals are flat values, never mems. A
-                    // dynamic constraint keeps the fallback width and the
-                    // recorded `dyn_w` below.
-                    let w = match (tmark, constraint) {
-                        (Some(tm), Some(c))
-                            if matches!(
-                                self.types.get(&self.kw(tm)),
-                                Some(TypeInfo::Array { dims, .. }) if dims.is_empty()
-                            ) && !self.text(c).contains("<>")
-                                && self.constraint_folds(c) =>
-                        {
-                            w.max(1) * self.constraint_width(c).max(1)
-                        }
-                        _ => w,
-                    };
-                    // A constraint that references subprogram formals
-                    // (`variable s : string(1 to size)`) can't fold at
-                    // registration — formals have no values yet — so the
-                    // recorded width is a fallback. Record a bit-width
-                    // expression for const-eval to fold per call, and size
-                    // an OTHERS initializer from it too. Only array-like
-                    // types qualify: a record's flat width is the sum of
-                    // its fields, and a record-element constraint
-                    // (`t_node(name(1 to n))`) selects field ranges —
-                    // lowering its element name as an identifier would
-                    // misfire E0401.
-                    let dyn_w = match (tmark, constraint) {
-                        (Some(tm), Some(c))
-                            if self.constraint_shapes_width(tm)
-                                && !self.text(c).contains("<>")
-                                && !self.constraint_folds(c) =>
-                        {
-                            Some(self.dyn_width_expr(tm, c))
-                        }
-                        _ => None,
-                    };
-                    // `variable v : integer := 0;` — the initializer runs on
-                    // every call (VHDL subprogram variables are re-initialized
-                    // per call), so lower it and prepend `v := init;` to the
-                    // body like a dynamic local constant.
-                    let init_node = dk[colon + 1..]
-                        .iter()
-                        .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
-                        .and_then(|e| {
-                            dk[colon + 1 + e + 1..]
-                                .iter()
-                                .find(|k| is_expr_node(k.kind()))
-                                .cloned()
-                        });
-                    let mut init_ex = init_node.as_ref().map(|node| {
-                        // A string target's `(others => ' ')` replicate must
-                        // cover the whole object (see `agg_target_w`); a
-                        // dynamic-width local re-derives the count below.
-                        let saved_w = self.agg_target_w;
-                        if node.kind() == SyntaxKind::Aggregate
-                            && tmark.is_some_and(|tm| self.string_typed(tm))
-                        {
-                            self.agg_target_w = Some(w);
-                        }
-                        let ex = self.lower_expr(node, &self.consts.clone());
-                        self.agg_target_w = saved_w;
-                        ex
-                    });
-                    // A dynamic-width local with an OTHERS initializer must
-                    // self-size: re-emit the replicate with the count derived
-                    // from the dynamic width expression (the generic lowering
-                    // baked the fallback width).
-                    if let (Some(wexpr), Some(node)) = (&dyn_w, &init_node) {
-                        if let Some(ex) = self.dyn_others_init(node, wexpr) {
-                            init_ex = Some(ex);
-                        }
-                    }
-                    for n in names {
-                        let id = slots.len() as SigId;
-                        if let Some(tm) = &tmark {
-                            local_types.push((n.clone(), self.kw(tm)));
-                        }
-                        slots.push((n.clone(), w));
-                        self.names.insert(n.clone(), id);
-                        self.sig_signed.insert(id, signed);
-                        self.sig_width.insert(id, w);
-                        self.record_obj_shape(id, tmark, constraint);
-                        if let Some(wexpr) = &dyn_w {
-                            dyn_locals.push((id, wexpr.clone()));
-                            // The addressing remaps must size slices from the
-                            // per-call width, not the registration fallback.
-                            self.sig_dynw.insert(id, wexpr.clone());
-                        }
-                        if let Some(ex) = &init_ex {
-                            pending_const_inits.push((id, ex.clone()));
-                        }
-                        locals.push(SignalIr {
-                            name: n,
-                            width: w,
-                            kind: if real { SigKind::Real } else { SigKind::Wire },
-                            init: None,
-                            mem: None,
-                            signed,
-                        });
-                    }
-                }
+                SyntaxKind::VariableDecl => self.lower_fn_local_variable(
+                    d,
+                    &mut slots,
+                    &mut locals,
+                    &mut local_types,
+                    &mut dyn_locals,
+                    &mut pending_const_inits,
+                ),
                 _ => {}
             }
         }
