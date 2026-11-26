@@ -97,6 +97,10 @@ pub struct FlatFunc {
     /// copies `inout`/`out` procedure formals' final values back to the
     /// caller's variable actual on return.
     pub modes: Vec<ArgMode>,
+    /// Shape-bound (unconstrained 1-D) formals, carried from
+    /// [`FuncIr::hidden`] — the hidden slots their bodies address through
+    /// and the fallback binding when a call node carries none.
+    pub hidden: Vec<FormalShape>,
     /// Locals whose constraint reads formals (`string(1 to size)`): the
     /// recorded bit-width expressions, re-folded per call by the kernel and
     /// by const-eval (see [`FuncIr::dyn_locals`], which this carries).
@@ -401,6 +405,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
                 formal_types: func.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: func.defaults.clone(),
                 modes: func.modes.clone(),
+                hidden: func.hidden.clone(),
                 dyn_locals: func.dyn_locals.clone(),
                 body: Arc::new(func.body.clone()),
             });
@@ -679,6 +684,7 @@ impl Flat {
                 formal_types: f.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: f.defaults.clone(),
                 modes: f.modes.clone(),
+                hidden: f.hidden.clone(),
                 dyn_locals: f.dyn_locals.clone(),
                 body,
             });
@@ -855,9 +861,17 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
             t: Box::new(remap_expr(t, map)),
             e: Box::new(remap_expr(e, map)),
         },
-        Expr::Call { name, args } => Expr::Call {
+        Expr::Call { name, args, shapes } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(|a| remap_expr(a, map)).collect(),
+            shapes: shapes
+                .iter()
+                .map(|b| ShapeBind {
+                    formal: b.formal,
+                    lo: remap_expr(&b.lo, map),
+                    asc: remap_expr(&b.asc, map),
+                })
+                .collect(),
         },
         Expr::Concat(parts) => Expr::Concat(parts.iter().map(|p| remap_expr(p, map)).collect()),
         Expr::Replicate { count, e } => Expr::Replicate {
@@ -962,9 +976,17 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
                 .collect(),
             timeout: timeout.as_ref().map(|t| remap_expr(t, map)),
         },
-        Stmt::SysCall { name, args } => Stmt::SysCall {
+        Stmt::SysCall { name, args, shapes } => Stmt::SysCall {
             name: name.clone(),
             args: args.iter().map(|a| remap_expr(a, map)).collect(),
+            shapes: shapes
+                .iter()
+                .map(|b| ShapeBind {
+                    formal: b.formal,
+                    lo: remap_expr(&b.lo, map),
+                    asc: remap_expr(&b.asc, map),
+                })
+                .collect(),
         },
         Stmt::For {
             init,

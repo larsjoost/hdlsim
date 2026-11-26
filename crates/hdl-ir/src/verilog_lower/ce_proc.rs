@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ir::{ArgMode, Expr, FuncIr, SigId, Stmt};
+use crate::ir::{ArgMode, Expr, FormalShape, FuncIr, ShapeBind, SigId, Stmt};
 use crate::value::{Value, VX};
 
 use super::{ce_impl, ce_stmt, CeFlow, CE_DEPTH, CE_MAX_DEPTH};
@@ -20,6 +20,7 @@ use super::{ce_impl, ce_stmt, CeFlow, CE_DEPTH, CE_MAX_DEPTH};
 pub(super) fn ce_call_procedure(
     name: &str,
     args: &[Expr],
+    shapes: &[ShapeBind],
     slots: &mut Vec<Value>,
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
@@ -28,40 +29,21 @@ pub(super) fn ce_call_procedure(
     let Some(f) = pick_procedure(name, args.len(), funcs, extras) else {
         return false;
     };
+    // Hidden shape binds fold against the caller's frame (an unfoldable bind
+    // leaves nothing constant to address the formal with — abort).
+    let Some(binds) = eval_hidden_binds(&f.hidden, shapes, env, funcs, extras, Some(&mut *slots))
+    else {
+        return false;
+    };
     // Same shared budget as the function dispatch: a self-recursive or
     // mutually recursive procedure aborts the fold instead of overflowing.
     let depth = CE_DEPTH.with(|d| d.get());
     if depth >= CE_MAX_DEPTH {
         return false;
     }
-    // Callee frame: slot 0 is the unused return slot, then one slot per
-    // actual (an actual wider than the declared formal keeps its width —
-    // unconstrained string parameters), then the body's locals.
-    let mut lvals: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
-    for (i, a) in args.iter().enumerate() {
-        let w = f.args.get(i).map(|(_, w, _)| *w).unwrap_or(1);
-        match ce_impl(a, env, funcs, extras, Some(&mut *slots)) {
-            Some(v) => lvals.push(v.resize(w.max(v.width()))),
-            None => return false,
-        }
-    }
-    // Trailing formals omitted at the call site take their interface
-    // defaults (`step : in integer := 2`) — `pick_procedure` checked that
-    // every omitted formal carries one.
-    for d in f.defaults.iter().skip(args.len()) {
-        match d {
-            Some(d) => lvals.push(d.clone()),
-            None => break,
-        }
-    }
-    lvals.extend(
-        f.locals
-            .iter()
-            .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
-    );
-    if !fold_dyn_locals(&f.dyn_locals, &mut lvals, env, funcs, extras) {
+    let Some(mut lvals) = build_proc_frame(f, args, &binds, env, funcs, extras, slots) else {
         return false;
-    }
+    };
     CE_DEPTH.with(|d| d.set(depth + 1));
     let mut sub = CeFlow::Continue;
     ce_stmt(&f.body, &mut lvals, env, funcs, extras, &mut sub);
@@ -83,6 +65,99 @@ pub(super) fn ce_call_procedure(
         }
     }
     true
+}
+
+/// Build a procedure callee's frame: slot 0 is the unused return slot, then
+/// one slot per actual (an actual wider than the declared formal keeps its
+/// width — unconstrained string parameters), then interface defaults for
+/// trailing omitted formals (`pick_procedure` checked that every omitted
+/// formal carries one), then the body's locals. The hidden shape slots are
+/// locals entries (32-bit, init-less) — the extend reserved their
+/// positions; overwrite from the call's binds. `None` = an actual or a
+/// formal-dependent local did not fold.
+fn build_proc_frame(
+    f: &FuncIr,
+    args: &[Expr],
+    binds: &[(usize, Value, Value)],
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<Rc<FuncIr>>>,
+    slots: &mut Vec<Value>,
+) -> Option<Vec<Value>> {
+    let mut lvals: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
+    for (i, a) in args.iter().enumerate() {
+        let w = f.args.get(i).map(|(_, w, _)| *w).unwrap_or(1);
+        let v = ce_impl(a, env, funcs, extras, Some(slots))?;
+        lvals.push(v.resize(w.max(v.width())));
+    }
+    for d in f.defaults.iter().skip(args.len()) {
+        match d {
+            Some(d) => lvals.push(d.clone()),
+            None => break,
+        }
+    }
+    lvals.extend(
+        f.locals
+            .iter()
+            .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
+    );
+    fill_hidden_slots(&f.hidden, binds, &mut lvals);
+    if !fold_dyn_locals(&f.dyn_locals, &mut lvals, env, funcs, extras) {
+        return None;
+    }
+    Some(lvals)
+}
+
+/// Fold a call's shape binds down to values, keeping only the picked
+/// candidate's shape-bound formals — a bind for a position the callee does
+/// not address dynamically is dead. `None` = a needed bind did not fold.
+pub(super) fn eval_hidden_binds(
+    hidden: &[FormalShape],
+    shapes: &[ShapeBind],
+    env: &HashMap<String, Value>,
+    funcs: &HashMap<String, Vec<FuncIr>>,
+    extras: &HashMap<String, Vec<Rc<FuncIr>>>,
+    mut slots: Option<&mut Vec<Value>>,
+) -> Option<Vec<(usize, Value, Value)>> {
+    let mut binds = Vec::new();
+    for b in shapes {
+        if !hidden.iter().any(|h| h.formal == b.formal) {
+            continue;
+        }
+        let lo = ce_impl(&b.lo, env, funcs, extras, slots.as_deref_mut())?;
+        let asc = ce_impl(&b.asc, env, funcs, extras, slots.as_deref_mut())?;
+        binds.push((b.formal, lo, asc));
+    }
+    Some(binds)
+}
+
+/// Fill a callee frame's hidden shape slots from the call's binds
+/// (pre-evaluated in the caller's frame, keyed by formal position). A
+/// shape-bound formal with no bind takes its recorded fallback — the kernel
+/// convention its addressing falls back to. Positions are reserved as they
+/// are set when the frame does not already carry them.
+pub(super) fn fill_hidden_slots(
+    hidden: &[FormalShape],
+    binds: &[(usize, Value, Value)],
+    lvals: &mut Vec<Value>,
+) {
+    for h in hidden {
+        let (lo, asc) = match binds.iter().find(|(f, _, _)| *f == h.formal) {
+            Some((_, lo, asc)) => (lo.clone(), asc.clone()),
+            None => (
+                Value::from_u64(32, h.fb_lo.max(0) as u64),
+                Value::from_u64(32, h.fb_asc as u64),
+            ),
+        };
+        while lvals.len() <= h.lo as usize {
+            lvals.push(Value::x(32));
+        }
+        lvals[h.lo as usize] = lo.resize(32);
+        while lvals.len() <= h.asc as usize {
+            lvals.push(Value::x(32));
+        }
+        lvals[h.asc as usize] = asc.resize(32);
+    }
 }
 
 /// Re-fold a local's formal-dependent constraint (`string(1 to size)`)

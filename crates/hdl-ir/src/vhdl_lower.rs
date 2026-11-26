@@ -868,6 +868,12 @@ struct Lower<'a> {
     /// `sig_dims` entry for the same slot id (slot ids alias across
     /// subprograms).
     fn_formals: std::collections::HashSet<SigId>,
+    /// Shape-bound (unconstrained 1-D vector) formal slot id → its hidden
+    /// (lo, asc) shape slot ids. The body's element/slice addressing remaps
+    /// through them (the formal takes the actual's index range, LRM 1076
+    /// §5.2.1); taken and restored with the slot scope — ids alias across
+    /// subprograms.
+    formal_dyn: HashMap<SigId, (SigId, SigId)>,
     /// `alias name is <expr>;` — name → lowered expression (slice/index
     /// aliases can't be a plain SigId). Whole-signal aliases are additionally
     /// inserted into `names`.
@@ -1061,6 +1067,7 @@ impl<'a> Lower<'a> {
             inst_count: 0,
             uncon_ports: std::collections::HashSet::new(),
             fn_formals: std::collections::HashSet::new(),
+            formal_dyn: HashMap::new(),
             aliases: HashMap::new(),
             alias_rec: HashMap::new(),
             suppress_err: 0,

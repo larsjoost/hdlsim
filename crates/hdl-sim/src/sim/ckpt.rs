@@ -11,11 +11,11 @@
 use super::{Ev, Frame, ProcRt, Simulator};
 use hdl_ir::elab::Flat;
 use hdl_ir::value::Value;
-use hdl_ir::{BinOp, Edge, EdgeKind, Expr, Stmt, UnOp};
+use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ShapeBind, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -256,6 +256,22 @@ fn r_span(r: &mut R) -> Result<Span, String> {
 
 // ---- Expr / Stmt / Frame --------------------------------------------------------
 
+/// Write a call node's payload — name, args, then the shape binds. Shared by
+/// `Expr::Call` and `Stmt::SysCall`, which differ only in their tag byte.
+fn w_call(w: &mut W, name: &str, args: &[Expr], shapes: &[ShapeBind]) {
+    w.str(name);
+    w.u32(args.len() as u32);
+    for a in args {
+        w_expr(w, a);
+    }
+    w.u32(shapes.len() as u32);
+    for b in shapes {
+        w.u32(b.formal as u32);
+        w_expr(w, &b.lo);
+        w_expr(w, &b.asc);
+    }
+}
+
 fn w_expr(w: &mut W, e: &Expr) {
     match e {
         Expr::Lit(v) => {
@@ -283,13 +299,9 @@ fn w_expr(w: &mut W, e: &Expr) {
             w_expr(w, t);
             w_expr(w, e);
         }
-        Expr::Call { name, args } => {
+        Expr::Call { name, args, shapes } => {
             w.u8(5);
-            w.str(name);
-            w.u32(args.len() as u32);
-            for a in args {
-                w_expr(w, a);
-            }
+            w_call(w, name, args, shapes);
         }
         Expr::Concat(parts) => {
             w.u8(6);
@@ -356,6 +368,33 @@ fn w_expr(w: &mut W, e: &Expr) {
     }
 }
 
+/// Read a [`w_call`] payload back: name, args, shape binds.
+fn r_call(r: &mut R) -> Result<(String, Vec<Expr>, Vec<ShapeBind>), String> {
+    let name = r.str()?;
+    let n = r.u32()? as usize;
+    if n > (1 << 20) {
+        return Err("too many args".to_string());
+    }
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(r_expr(r)?);
+    }
+    let ns = r.u32()? as usize;
+    if ns > (1 << 12) {
+        return Err("too many shape binds".to_string());
+    }
+    let mut shapes = Vec::with_capacity(ns);
+    for _ in 0..ns {
+        let formal = r.u32()? as usize;
+        shapes.push(ShapeBind {
+            formal,
+            lo: r_expr(r)?,
+            asc: r_expr(r)?,
+        });
+    }
+    Ok((name, args, shapes))
+}
+
 fn r_expr(r: &mut R) -> Result<Expr, String> {
     Ok(match r.u8()? {
         0 => Expr::Lit(r.value()?),
@@ -375,16 +414,8 @@ fn r_expr(r: &mut R) -> Result<Expr, String> {
             e: Box::new(r_expr(r)?),
         },
         5 => {
-            let name = r.str()?;
-            let n = r.u32()? as usize;
-            if n > (1 << 20) {
-                return Err("too many args".to_string());
-            }
-            let mut args = Vec::with_capacity(n);
-            for _ in 0..n {
-                args.push(r_expr(r)?);
-            }
-            Expr::Call { name, args }
+            let (name, args, shapes) = r_call(r)?;
+            Expr::Call { name, args, shapes }
         }
         6 => {
             let n = r.u32()? as usize;
@@ -528,13 +559,9 @@ fn w_stmt(w: &mut W, s: &Stmt) {
                 None => w.bool(false),
             }
         }
-        Stmt::SysCall { name, args } => {
+        Stmt::SysCall { name, args, shapes } => {
             w.u8(6);
-            w.str(name);
-            w.u32(args.len() as u32);
-            for a in args {
-                w_expr(w, a);
-            }
+            w_call(w, name, args, shapes);
         }
         Stmt::For {
             init,
@@ -671,16 +698,8 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
             }
         }
         6 => {
-            let name = r.str()?;
-            let n = r.u32()? as usize;
-            if n > (1 << 20) {
-                return Err("too many args".to_string());
-            }
-            let mut args = Vec::with_capacity(n);
-            for _ in 0..n {
-                args.push(r_expr(r)?);
-            }
-            Stmt::SysCall { name, args }
+            let (name, args, shapes) = r_call(r)?;
+            Stmt::SysCall { name, args, shapes }
         }
         7 => Stmt::For {
             init: Box::new(r_stmt(r)?),
@@ -1266,6 +1285,11 @@ mod tests {
             Expr::Call {
                 name: "to_integer".to_string(),
                 args: vec![sig(4)],
+                shapes: vec![ShapeBind {
+                    formal: 0,
+                    lo: sig(6),
+                    asc: sig(7),
+                }],
             },
             Expr::Concat(vec![sig(1), sig(2)]),
             Expr::Replicate {
@@ -1348,6 +1372,11 @@ mod tests {
             Stmt::SysCall {
                 name: "$display".to_string(),
                 args: vec![Expr::Sig(3)],
+                shapes: vec![ShapeBind {
+                    formal: 0,
+                    lo: Expr::Lit(Value::from_u64(32, 1)),
+                    asc: Expr::Lit(Value::from_u64(32, 0)),
+                }],
             },
             Stmt::For {
                 init: Box::new(a.clone()),

@@ -209,6 +209,39 @@ pub enum ArgMode {
     Out,
 }
 
+/// A shape-bound (unconstrained 1-D) formal's call-time index shape. The
+/// formal's body is lowered once, but element/slice addressing depends on the
+/// actual's range direction and low bound — each call binds them through two
+/// hidden frame slots the body's addressing reads (LRM 1076 §5.2: an
+/// unconstrained formal takes the actual's index range).
+#[derive(Clone, Debug, Serialize)]
+pub struct FormalShape {
+    /// Position of the formal in [`FuncIr::args`].
+    pub formal: usize,
+    /// Hidden 32-bit slots: the actual's low bound, and 1 for an ascending
+    /// (`to`) actual / 0 for descending (`downto`).
+    pub lo: SigId,
+    pub asc: SigId,
+    /// Binding used when a call node carries no [`ShapeBind`] for this
+    /// formal (the call was lowered against an interface-only stub, or the
+    /// actual's shape is not statically known): the kernel convention the
+    /// formal would otherwise address with — (1, ascending) for `string`,
+    /// else (0, descending), matching the pre-shape lowerings bit for bit.
+    pub fb_lo: i64,
+    pub fb_asc: bool,
+}
+
+/// One formal's shape binding on a call node: the actual's low bound and
+/// direction as expressions evaluated in the caller's context. Keyed by
+/// formal position, not carried in `args`, so overload candidates that need
+/// no shape ignore it and every arity/width dispatch check stays untouched.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShapeBind {
+    pub formal: usize,
+    pub lo: Expr,
+    pub asc: Expr,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FuncIr {
     pub name: String,
@@ -223,6 +256,10 @@ pub struct FuncIr {
     /// Per-formal mode, parallel to `args`. Functions are always `In`;
     /// Verilog tasks record no directions today and stay `In`.
     pub modes: Vec<ArgMode>,
+    /// Shape-bound (unconstrained 1-D) formals: the hidden shape slots their
+    /// bodies address through, in slot order. Empty when every formal is
+    /// scalar or statically constrained (all Verilog subprograms, e.g.).
+    pub hidden: Vec<FormalShape>,
     /// Const-evaluated default value per formal (same order as `args`),
     /// `None` where the formal has no default. A call may omit trailing
     /// actuals whose formals carry `Some`. Empty when no formal has one.
@@ -312,6 +349,9 @@ pub enum Stmt {
     SysCall {
         name: String,
         args: Vec<Expr>,
+        /// Per-formal shape bindings for the callee's unconstrained 1-D
+        /// formals (see [`ShapeBind`]); empty when none apply.
+        shapes: Vec<ShapeBind>,
     },
     For {
         init: Box<Stmt>,
@@ -366,6 +406,9 @@ pub enum Expr {
     Call {
         name: String,
         args: Vec<Expr>,
+        /// Per-formal shape bindings for the callee's unconstrained 1-D
+        /// formals (see [`ShapeBind`]); empty when none apply.
+        shapes: Vec<ShapeBind>,
     },
     /// `{a, b, ...}` — parts[0] is most significant.
     Concat(Vec<Expr>),
@@ -431,9 +474,13 @@ impl Expr {
                 t.collect_sigs(out);
                 e.collect_sigs(out);
             }
-            Expr::Call { args, .. } => {
+            Expr::Call { args, shapes, .. } => {
                 for a in args {
                     a.collect_sigs(out);
+                }
+                for b in shapes {
+                    b.lo.collect_sigs(out);
+                    b.asc.collect_sigs(out);
                 }
             }
             Expr::Concat(parts) => {

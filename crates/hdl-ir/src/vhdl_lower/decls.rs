@@ -59,6 +59,7 @@ impl<'a> Lower<'a> {
                             Expr::Call {
                                 name: item.to_string(),
                                 args: Vec::new(),
+                                shapes: Vec::new(),
                             },
                         );
                         return;
@@ -254,6 +255,7 @@ impl<'a> Lower<'a> {
                         body: Stmt::SysCall {
                             name: format!("$new::{}", tn),
                             args: vec![Expr::Sig(id)],
+                            shapes: Vec::new(),
                         },
                         origin: format!("init protected object {n}"),
                         initial: false,
@@ -668,6 +670,7 @@ impl<'a> Lower<'a> {
             locals: Vec::new(),
             dyn_locals: Vec::new(),
             body: Stmt::Null,
+            hidden: Vec::new(),
         });
     }
 }

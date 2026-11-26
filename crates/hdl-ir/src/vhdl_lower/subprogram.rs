@@ -2,7 +2,7 @@
 //!
 //! Extracted verbatim from vhdl_lower.rs (pure move, no logic changes).
 
-use super::slots::FnLocalDecls;
+use super::slots::{FnLocalDecls, FnSpace};
 use super::*;
 
 impl<'a> Lower<'a> {
@@ -78,6 +78,7 @@ impl<'a> Lower<'a> {
             locals: Vec::new(),
             dyn_locals: Vec::new(),
             body: Stmt::Null,
+            hidden: Vec::new(),
         })
     }
 
@@ -736,6 +737,26 @@ impl<'a> Lower<'a> {
         } = hdr;
         // Registered before the body lowers (see `note_impure_marker`).
         self.note_impure_marker(f, &name);
+        let fp = self.lower_formal_params(&decl_nodes, &ret_mark, f);
+        Some(self.lower_fn_into_slots(name, &ret_mark, fp, &decl_nodes, &nested_fns, &stmt_nodes))
+    }
+
+    /// Lower a subprogram's body in its slot space (see
+    /// [`Lower::install_fn_slots`]): install the slots, lower the
+    /// declarative items and statements, fold the unconstrained-return
+    /// width while the function's own slot mappings are still installed,
+    /// then restore the enclosing scope. The hidden shape slots ride at the
+    /// front of `FuncIr.locals` so the flat slot list keeps one entry per
+    /// SigId.
+    fn lower_fn_into_slots(
+        &mut self,
+        name: String,
+        ret_mark: &Option<SyntaxNode>,
+        fp: FormalParams,
+        decl_nodes: &[SyntaxNode],
+        nested_fns: &[SyntaxNode],
+        stmt_nodes: &[SyntaxNode],
+    ) -> FuncIr {
         let FormalParams {
             args,
             arg_types,
@@ -744,11 +765,13 @@ impl<'a> Lower<'a> {
             modes,
             ret_width,
             ..
-        } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
-        // Lower the body in slot space (slot 0 = return value; the install
-        // also pushes the enclosing `names` map for the scope guard below).
-        let (slots, fn_slots) =
-            self.install_fn_slots(&name, ret_width, &args, &arg_types, &arg_shapes);
+        } = fp;
+        let FnSpace {
+            slots,
+            hidden_sigs,
+            hidden,
+            guard,
+        } = self.install_fn_slots(&name, ret_width, &args, &arg_types, &arg_shapes);
         // Formals/locals now in `names`: outer constants of the same name in
         // the lowering env must not shadow them (see `fn_scope`).
         self.fn_scope += 1;
@@ -760,7 +783,7 @@ impl<'a> Lower<'a> {
         // re-folds their widths per call (see `FuncIr.dyn_locals`).
         let mut fd = FnLocalDecls {
             slots,
-            locals: Vec::new(),
+            locals: hidden_sigs,
             local_types: Vec::new(),
             pending_const_inits: Vec::new(),
             dyn_locals: Vec::new(),
@@ -771,21 +794,21 @@ impl<'a> Lower<'a> {
         // Declarative items in textual order: each may reference the ones
         // before it (parameters, types, constants, locals). Nested function
         // declarations lower last, now that all outer slots are visible.
-        self.lower_fn_declarative_items(&decl_nodes, &nested_fns, &mut fd);
+        self.lower_fn_declarative_items(decl_nodes, nested_fns, &mut fd);
         let body = self.lower_fn_body(
-            &stmt_nodes,
+            stmt_nodes,
             &fd.slots,
             &mut fd.locals,
             fd.pending_const_inits,
         );
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
-        let ret_width = self.unconstrained_ret_width(&ret_mark, &body, ret_width);
+        let ret_width = self.unconstrained_ret_width(ret_mark, &body, ret_width);
         // Reset the slot-id record mappings to their entry state (see
         // `FnSlotScope`): this runs after the return-width fixup above,
         // which still reads the function's own slot mappings.
-        fn_slots.restore(self);
-        Some(FuncIr {
+        guard.restore(self);
+        FuncIr {
             name,
             ret_width: ret_width.max(1),
             args,
@@ -794,7 +817,8 @@ impl<'a> Lower<'a> {
             locals: fd.locals,
             dyn_locals: fd.dyn_locals,
             body,
-        })
+            hidden,
+        }
     }
 }
 

@@ -562,6 +562,7 @@ impl<'a> Lower<'a> {
                     locals: m.locals.clone(),
                     dyn_locals: Vec::new(),
                     body: m.body.clone(),
+                    hidden: Vec::new(),
                 })
             })
             .collect();
@@ -984,6 +985,7 @@ impl<'a> Lower<'a> {
                 .getf_name(&cn, field)
                 .unwrap_or_else(|| format!("$getf::{}::{}", cn, field)),
             args: vec![Expr::Sig(root_id)],
+            shapes: Vec::new(),
         })
     }
 
@@ -993,6 +995,7 @@ impl<'a> Lower<'a> {
         Expr::Call {
             name: "$this".to_string(),
             args: vec![],
+            shapes: Vec::new(),
         }
     }
 
@@ -1285,6 +1288,7 @@ impl<'a> Lower<'a> {
         let check = |cons: Expr| Stmt::SysCall {
             name: "sva_assert".to_string(),
             args: vec![cons],
+            shapes: Vec::new(),
         };
         let body = match exprs.len() {
             1 => check(self.lower_expr(exprs[0], env)),
@@ -1482,6 +1486,7 @@ impl<'a> Lower<'a> {
                                     body: Stmt::SysCall {
                                         name: format!("$new::{}", cn),
                                         args,
+                                        shapes: Vec::new(),
                                     },
                                     origin: format!("{} = new(...)", name),
                                     initial: true,
@@ -1785,6 +1790,7 @@ impl<'a> Lower<'a> {
                             None => Stmt::SysCall {
                                 name: "sva_assert".to_string(),
                                 args: vec![e],
+                                shapes: Vec::new(),
                             },
                         }
                     }
@@ -1860,6 +1866,7 @@ impl<'a> Lower<'a> {
                                             .setf_name(&cn, &field)
                                             .unwrap_or_else(|| format!("$setf::{}::{}", cn, field)),
                                         args: vec![obj, self.lower_expr(r, env)],
+                                        shapes: Vec::new(),
                                     });
                                 }
                                 // `c = new C(args)` → $new syscall (alloc + ctor).
@@ -1906,6 +1913,7 @@ impl<'a> Lower<'a> {
                                             return Stmt::SysCall {
                                                 name: format!("$new::{}", cn),
                                                 args,
+                                                shapes: Vec::new(),
                                             };
                                         }
                                     }
@@ -1924,6 +1932,7 @@ impl<'a> Lower<'a> {
                                     return Stmt::SysCall {
                                         name: "$array_new".to_string(),
                                         args: vec![self.lower_expr(l, env), size],
+                                        shapes: Vec::new(),
                                     };
                                 }
                                 // `p = '{a: x, b: y}` — struct assignment pattern.
@@ -1974,6 +1983,7 @@ impl<'a> Lower<'a> {
                                                         return Stmt::ExprStmt(Expr::Call {
                                                             name: self.randomize_name(cn),
                                                             args,
+                                                            shapes: Vec::new(),
                                                         });
                                                     }
                                                     return Stmt::SysCall {
@@ -1982,6 +1992,7 @@ impl<'a> Lower<'a> {
                                                             cn, method
                                                         ),
                                                         args,
+                                                        shapes: Vec::new(),
                                                     };
                                                 }
                                             }
@@ -2011,6 +2022,7 @@ impl<'a> Lower<'a> {
                                             return Stmt::SysCall {
                                                 name: format!("$array_{}", method),
                                                 args,
+                                                shapes: Vec::new(),
                                             };
                                         }
                                     }
@@ -2027,6 +2039,7 @@ impl<'a> Lower<'a> {
                                     return Stmt::ExprStmt(Expr::Call {
                                         name: n,
                                         args: Vec::new(),
+                                        shapes: Vec::new(),
                                     });
                                 }
                             }
@@ -2145,6 +2158,7 @@ impl<'a> Lower<'a> {
                         r: Box::new(Expr::Call {
                             name: "$array_size".to_string(),
                             args: vec![arr],
+                            shapes: Vec::new(),
                         }),
                     },
                     step: Box::new(Stmt::Assign {
@@ -2311,7 +2325,11 @@ impl<'a> Lower<'a> {
                     .filter(|k| is_expr_node(k.kind()))
                     .map(|k| self.lower_expr(k, env))
                     .collect();
-                Stmt::SysCall { name, args }
+                Stmt::SysCall {
+                    name,
+                    args,
+                    shapes: Vec::new(),
+                }
             }
             _ => Stmt::Null,
         }
@@ -2708,6 +2726,7 @@ impl<'a> Lower<'a> {
             locals,
             dyn_locals: Vec::new(),
             body,
+            hidden: Vec::new(),
         }
     }
 
@@ -2960,6 +2979,7 @@ impl<'a> Lower<'a> {
                                     .getf_name(&cn, base)
                                     .unwrap_or_else(|| format!("$getf::{}::{}", cn, base)),
                                 args: vec![self.this_expr()],
+                                shapes: Vec::new(),
                             };
                         }
                         // A bare typedef name used as a value (passing a type to a
@@ -3148,11 +3168,13 @@ impl<'a> Lower<'a> {
                                         return Expr::Call {
                                             name: self.randomize_name(cn),
                                             args,
+                                            shapes: Vec::new(),
                                         };
                                     }
                                     return Expr::Call {
                                         name: format!("$method::{}::{}", cn, method),
                                         args,
+                                        shapes: Vec::new(),
                                     };
                                 }
                             }
@@ -3168,6 +3190,7 @@ impl<'a> Lower<'a> {
                                 return Expr::Call {
                                     name: "$array_size".to_string(),
                                     args: vec![Expr::Sig(id)],
+                                    shapes: Vec::new(),
                                 };
                             }
                         }
@@ -3178,7 +3201,11 @@ impl<'a> Lower<'a> {
                     .filter(|k| is_expr_node(k.kind()))
                     .map(|k| self.lower_expr(k, env))
                     .collect();
-                Expr::Call { name, args }
+                Expr::Call {
+                    name,
+                    args,
+                    shapes: Vec::new(),
+                }
             }
             SyntaxKind::Concat => Expr::Concat(
                 real_children(e)
@@ -3744,7 +3771,7 @@ fn ce_impl(
             };
             Some(Value::from_u64(32, v as u64))
         }
-        Expr::Call { name, args } => {
+        Expr::Call { name, args, shapes } => {
             // System functions usable in constant expressions.
             // lower_expr strips the `$` from system tasks, so both spellings.
             if (name == "$clog2" || name == "clog2") && args.len() == 1 {
@@ -3885,7 +3912,10 @@ fn ce_impl(
                 return None; // recursive const-eval: not constant
             }
             CE_DEPTH.with(|d| d.set(depth + 1));
-            let r = const_eval_func(f, &argv, env, funcs, extras);
+            // Hidden shape binds fold against the caller's frame, filtered to
+            // the picked candidate's shape-bound formals.
+            let binds = ce_proc::eval_hidden_binds(&f.hidden, shapes, env, funcs, extras, slots)?;
+            let r = const_eval_func(f, &argv, &binds, env, funcs, extras);
             CE_DEPTH.with(|d| d.set(depth));
             if super::debug::TRACE_CE.load(std::sync::atomic::Ordering::Relaxed)
                 && (name.starts_with("get_")
@@ -3957,17 +3987,22 @@ fn ce_overload_fit(f: &FuncIr, argv: &[Value]) -> Option<u64> {
 fn const_eval_func(
     f: &FuncIr,
     argv: &[Value],
+    binds: &[(usize, Value, Value)],
     env: &HashMap<String, Value>,
     funcs: &HashMap<String, Vec<FuncIr>>,
     extras: &HashMap<String, Vec<std::rc::Rc<FuncIr>>>,
 ) -> Option<Value> {
     let mut slots: Vec<Value> = vec![Value::x(f.ret_width.max(1))];
     slots.extend(argv.iter().cloned());
+    // Locals ride in slot order; the hidden shape slots are locals entries
+    // (32-bit, init-less), so extend first and then overwrite the two slots
+    // of each shape-bound formal from the call's binds.
     slots.extend(
         f.locals
             .iter()
             .map(|l| l.init.clone().unwrap_or_else(|| Value::x(l.width.max(1)))),
     );
+    ce_proc::fill_hidden_slots(&f.hidden, binds, &mut slots);
     // Locals with formal-dependent constraints (`string(1 to size)`)
     // registered with a fallback width: re-fold the recorded bit-width
     // expression now that the actuals are in the slots (shared with the
@@ -4189,7 +4224,7 @@ fn ce_stmt(
                 ce_stmt(d, slots, env, funcs, extras, flow);
             }
         }
-        Stmt::SysCall { name, args } => {
+        Stmt::SysCall { name, args, shapes } => {
             // VHDL `report`/`assert` inside a constant initializer: a note or
             // warning only annotates elaboration, so const-eval continues past
             // it (a `log2` that warns on non-power-of-2 input must still
@@ -4240,7 +4275,7 @@ fn ce_stmt(
                     // on a fresh frame and copy inout/out formals back (see
                     // `ce_proc`). Builtin syscalls and unresolvable names
                     // have no constant meaning and abort the fold.
-                    if !ce_proc::ce_call_procedure(name, args, slots, env, funcs, extras) {
+                    if !ce_proc::ce_call_procedure(name, args, shapes, slots, env, funcs, extras) {
                         *flow = CeFlow::Abort;
                     }
                 }

@@ -151,6 +151,7 @@ impl<'a> Lower<'a> {
                 flat,
                 Expr::Lit(Value::from_u64(32, ew as u64)),
             ],
+            shapes: Vec::new(),
         })
     }
 

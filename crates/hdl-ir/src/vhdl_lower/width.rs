@@ -116,7 +116,7 @@ impl<'a> Lower<'a> {
     /// case-insensitive.
     pub(super) fn refs_impure_call(&self, ex: &Expr) -> bool {
         match ex {
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 self.impure_fns.contains(&name.to_ascii_lowercase())
                     || args.iter().any(|a| self.refs_impure_call(a))
             }
@@ -332,6 +332,24 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The flat-width expression of a slot: a dynamic-width local's recorded
+    /// per-call expression, else a formal's `SigAttr` (the actual's bit
+    /// width, known only at evaluation), else the registered width. Shared
+    /// by the element and slice addressing remaps.
+    pub(super) fn slot_width_expr(&self, sid: SigId) -> Expr {
+        if let Some(w) = self.sig_dynw.get(&sid) {
+            return w.clone();
+        }
+        if self.fn_formals.contains(&sid) {
+            return Expr::SigAttr {
+                sig: sid,
+                attr: "length",
+            };
+        }
+        let w = self.sig_width.get(&sid).copied().unwrap_or(0).max(1) as u64;
+        Expr::Lit(Value::from_u64(32, w))
+    }
+
     /// Estimated bit width of a lowered expression (lowerer-side; used to give
     /// unconstrained return types the width of what is actually returned).
     pub(super) fn expr_width_est(&self, e: &Expr) -> usize {
@@ -363,7 +381,7 @@ impl<'a> Lower<'a> {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { e, .. } => self.expr_width_est(e),
-            Expr::Call { name, args } => self
+            Expr::Call { name, args, .. } => self
                 .funcs
                 .get(&name.to_ascii_lowercase())
                 .and_then(|c| {
@@ -454,4 +472,71 @@ pub(super) fn remapped_sel_bounds(
             scaled(off_left, ew),
         )
     }
+}
+
+/// Value-bit `(msb, lsb)` slice bounds for element addressing whose low
+/// bound and direction are only known at run time — a shape-bound formal's
+/// hidden shape slots carry the actual's binding per call (LRM 1076 §5.2.1).
+/// The static [`remapped_sel_bounds`] folds the direction into the formula;
+/// here `asc` is an expression, so the two layouts merge under a `Cond` on
+/// it: ascending element k covers value bits [W-1-(k-lo)·ew … W-(k-lo+1)·ew],
+/// descending element k covers [(k-lo)·ew … (k-lo+1)·ew-1]. `hi_idx`/`lo_idx`
+/// are the already-lowered index bounds in the source range's own high/low
+/// roles (a single element passes the same expression for both).
+pub(super) fn dyn_remapped_sel_bounds(
+    w: Expr,
+    ew: u64,
+    lo: Expr,
+    asc: Expr,
+    hi_idx: Expr,
+    lo_idx: Expr,
+) -> (Expr, Expr) {
+    let scaled = |e: Expr, k: u64| Expr::Bin {
+        op: BinOp::Mul,
+        l: Box::new(e),
+        r: Box::new(Expr::Lit(Value::from_u64(32, k))),
+    };
+    let off = |idx: Expr| Expr::Bin {
+        op: BinOp::Sub,
+        l: Box::new(idx),
+        r: Box::new(lo.clone()),
+    };
+    let off_left = off(lo_idx);
+    let off_right = off(hi_idx);
+    let w1 = || Expr::Lit(Value::from_u64(32, 1));
+    // Ascending: msb = W-1-off_left·ew, lsb = W-(off_right+1)·ew.
+    let msb_asc = Expr::Bin {
+        op: BinOp::Sub,
+        l: Box::new(Expr::Bin {
+            op: BinOp::Sub,
+            l: Box::new(w.clone()),
+            r: Box::new(w1()),
+        }),
+        r: Box::new(scaled(off_left.clone(), ew)),
+    };
+    let lsb_asc = Expr::Bin {
+        op: BinOp::Sub,
+        l: Box::new(w),
+        r: Box::new(scaled(
+            Expr::Bin {
+                op: BinOp::Add,
+                l: Box::new(off_right.clone()),
+                r: Box::new(w1()),
+            },
+            ew,
+        )),
+    };
+    // Descending: msb = off_right·ew+ew-1, lsb = off_left·ew.
+    let msb_desc = Expr::Bin {
+        op: BinOp::Add,
+        l: Box::new(scaled(off_right, ew)),
+        r: Box::new(Expr::Lit(Value::from_u64(32, ew - 1))),
+    };
+    let lsb_desc = scaled(off_left, ew);
+    let pick = |t: Expr, e: Expr| Expr::Cond {
+        c: Box::new(asc.clone()),
+        t: Box::new(t),
+        e: Box::new(e),
+    };
+    (pick(msb_asc, msb_desc), pick(lsb_asc, lsb_desc))
 }

@@ -103,6 +103,7 @@ impl<'a> Lower<'a> {
                                     return Expr::Call {
                                         name: format!("$method::{}::{}", t, last),
                                         args: vec![Expr::Sig(id)],
+                                        shapes: Vec::new(),
                                     };
                                 }
                                 if let Some((_, w, lsb, _)) =
@@ -111,6 +112,7 @@ impl<'a> Lower<'a> {
                                     return Expr::Call {
                                         name: format!("$getf::{}::{}@{},{}", t, last, lsb, w),
                                         args: vec![Expr::Sig(id)],
+                                        shapes: Vec::new(),
                                     };
                                 }
                                 // Unknown member on a known protected object.
@@ -370,6 +372,7 @@ impl<'a> Lower<'a> {
                     return Expr::Call {
                         name: f.name.clone(),
                         args: vec![Expr::Lit(Value::x(32)); n_actuals],
+                        shapes: Vec::new(),
                     };
                 }
                 // `open` (reserved word) in a port/generic map association:
@@ -386,6 +389,7 @@ impl<'a> Lower<'a> {
                     return Expr::Call {
                         name: "$now".into(),
                         args: Vec::new(),
+                        shapes: Vec::new(),
                     };
                 }
                 // Xilinx implicit globals (unisim references bare `GSR` etc.).
@@ -426,6 +430,7 @@ impl<'a> Lower<'a> {
                                 return Expr::Call {
                                     name: f.name.clone(),
                                     args: vec![Expr::Lit(Value::x(32)); f.args.len()],
+                                    shapes: Vec::new(),
                                 };
                             }
                             if p.types.iter().any(|(n, _)| *n == item) {
@@ -507,7 +512,9 @@ impl<'a> Lower<'a> {
                                 args: vec![Expr::Call {
                                     name: "$this".into(),
                                     args: vec![],
+                                    shapes: Vec::new(),
                                 }],
+                                shapes: Vec::new(),
                             };
                         }
                     }
@@ -654,23 +661,29 @@ impl<'a> Lower<'a> {
                 // keeps the raw lowering.
                 if let Expr::Sig(sid) = &base_e {
                     if !self.mems.contains_key(sid) {
+                        // Dynamic first: a shape-bound formal addresses
+                        // through its hidden shape slots — the actual's low
+                        // bound and direction, bound per call — so the slice
+                        // lands at the actual's layout, whatever it is.
+                        if let Some(&(lo_id, asc_id)) = self.formal_dyn.get(sid) {
+                            let (msb_e, lsb_e) = super::width::dyn_remapped_sel_bounds(
+                                self.slot_width_expr(*sid),
+                                self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64,
+                                Expr::Sig(lo_id),
+                                Expr::Sig(asc_id),
+                                self.lower_expr(msb, env),
+                                self.lower_expr(lsb, env),
+                            );
+                            return Expr::Sel {
+                                e: Box::new(base_e),
+                                msb: Box::new(msb_e),
+                                lsb: Box::new(lsb_e),
+                            };
+                        }
                         let (lo, asc) = self.sig_asc.get(sid).copied().unwrap_or((0, false));
                         let ew = self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64;
                         if asc || lo != 0 || ew > 1 {
-                            let w_lit = self.sig_width.get(sid).copied().unwrap_or(0).max(1) as u64;
-                            let w = self.sig_dynw.get(sid).cloned().unwrap_or_else(|| {
-                                if self.fn_formals.contains(sid) {
-                                    // An unconstrained formal's flat width is
-                                    // the actual's bit width, known only at
-                                    // evaluation (`SigAttr` yields it).
-                                    Expr::SigAttr {
-                                        sig: *sid,
-                                        attr: "length",
-                                    }
-                                } else {
-                                    Expr::Lit(Value::from_u64(32, w_lit))
-                                }
-                            });
+                            let w = self.slot_width_expr(*sid);
                             let lo_u = lo.max(0) as u64;
                             // `msb`/`lsb` hold the source range's high/low
                             // bounds; for `to` the left (MSB-most) element is
@@ -1032,24 +1045,30 @@ impl<'a> Lower<'a> {
     /// `Sel`, not a raw 1-bit `Idx`. `None` keeps `Idx` — a 1-bit descending
     /// range from 0, where raw bit addressing is already correct.
     fn elem_sel(&self, sid: SigId, k: &Expr) -> Option<Expr> {
-        let (lo, asc) = self.sig_asc.get(&sid).copied().unwrap_or((0, false));
         let ew = self.sig_elem.get(&sid).copied().unwrap_or(1).max(1) as u64;
+        // A shape-bound formal addresses through its hidden shape slots —
+        // the actual's low bound and direction, bound per call — so element
+        // k lands at the actual's layout, whatever it is.
+        if let Some(&(lo_id, asc_id)) = self.formal_dyn.get(&sid) {
+            let (msb, lsb) = super::width::dyn_remapped_sel_bounds(
+                self.slot_width_expr(sid),
+                ew,
+                Expr::Sig(lo_id),
+                Expr::Sig(asc_id),
+                k.clone(),
+                k.clone(),
+            );
+            return Some(Expr::Sel {
+                e: Box::new(Expr::Sig(sid)),
+                msb: Box::new(msb),
+                lsb: Box::new(lsb),
+            });
+        }
+        let (lo, asc) = self.sig_asc.get(&sid).copied().unwrap_or((0, false));
         if !asc && lo == 0 && ew == 1 {
             return None;
         }
-        let w_lit = self.sig_width.get(&sid).copied().unwrap_or(0).max(1) as u64;
-        let w = self.sig_dynw.get(&sid).cloned().unwrap_or_else(|| {
-            if self.fn_formals.contains(&sid) {
-                // An unconstrained formal's flat width is the actual's bit
-                // width, known only at evaluation (`SigAttr` yields it).
-                Expr::SigAttr {
-                    sig: sid,
-                    attr: "length",
-                }
-            } else {
-                Expr::Lit(Value::from_u64(32, w_lit))
-            }
-        });
+        let w = self.slot_width_expr(sid);
         let lo = lo.max(0) as u64;
         let off = || Expr::Bin {
             op: BinOp::Sub,
@@ -1212,6 +1231,7 @@ impl<'a> Lower<'a> {
                     let inner = Expr::Call {
                         name: format!("${attr_name}"),
                         args: vec![self.lower_expr(arg, env)],
+                        shapes: Vec::new(),
                     };
                     if attr_name == "val" {
                         let prefix = ak.iter().find(|k| k.kind() == SyntaxKind::Name).cloned();
@@ -1238,12 +1258,13 @@ impl<'a> Lower<'a> {
             .next()
             .unwrap_or(name.as_str())
             .to_ascii_lowercase();
-        let args: Vec<Expr> = kids
+        let arg_nodes: Vec<SyntaxNode> = kids
             .iter()
             .enumerate()
             .filter(|(i, k)| Some(*i) != name_pos && Some(*i) != attr_pos && is_expr_node(k.kind()))
-            .map(|(_, k)| self.lower_expr(k, env))
+            .map(|(_, k)| k.clone())
             .collect();
+        let args: Vec<Expr> = arg_nodes.iter().map(|k| self.lower_expr(k, env)).collect();
         // `.all(i)` dereference of an access-to-array: `L.all(i)` -> L(i).
         if fname == "all"
             && name.len() > 4
@@ -1311,6 +1332,7 @@ impl<'a> Lower<'a> {
                 return Expr::Call {
                     name: fname.clone(),
                     args,
+                    shapes: Vec::new(),
                 };
             }
         }
@@ -1346,6 +1368,7 @@ impl<'a> Lower<'a> {
                         return Expr::Call {
                             name: format!("$method::{}::{}", t, m),
                             args: args2,
+                            shapes: Vec::new(),
                         };
                     }
                     // Unknown member on a protected object — or any member of
@@ -1379,11 +1402,13 @@ impl<'a> Lower<'a> {
                 let mut args2 = vec![Expr::Call {
                     name: "$this".into(),
                     args: vec![],
+                    shapes: Vec::new(),
                 }];
                 args2.extend(args.iter().cloned());
                 return Expr::Call {
                     name: format!("$method::{}::{}", t, fname),
                     args: args2,
+                    shapes: Vec::new(),
                 };
             }
         }
@@ -1443,7 +1468,11 @@ impl<'a> Lower<'a> {
                         i: Box::new(k),
                     };
                 }
-                Expr::Call { name: fname, args }
+                Expr::Call {
+                    name: fname,
+                    args,
+                    shapes: Vec::new(),
+                }
             }
             // Shift/rotate function forms from std_logic_arith & co.
             "shift_left" | "sll" | "sla" if args.len() == 2 => Expr::Bin {
@@ -1488,7 +1517,11 @@ impl<'a> Lower<'a> {
                     _ => false,
                 };
                 if record {
-                    Expr::Call { name: fname, args }
+                    Expr::Call {
+                        name: fname,
+                        args,
+                        shapes: Vec::new(),
+                    }
                 } else {
                     Expr::Bin {
                         op: if fname == "shl" {
@@ -1631,14 +1664,118 @@ impl<'a> Lower<'a> {
                     .get(&fname)
                     .expect("arm guard checked that this alias is a Call")
                 {
-                    Expr::Call { name: target, .. } => Expr::Call {
-                        name: target.clone(),
-                        args,
-                    },
+                    Expr::Call { name: target, .. } => {
+                        let shapes = self.call_shape_binds(target, &args, &arg_nodes);
+                        Expr::Call {
+                            name: target.clone(),
+                            args,
+                            shapes,
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }
-            _ => Expr::Call { name: fname, args },
+            _ => {
+                let shapes = self.call_shape_binds(&fname, &args, &arg_nodes);
+                Expr::Call {
+                    name: fname,
+                    args,
+                    shapes,
+                }
+            }
+        }
+    }
+
+    /// A call's shape binds: for every formal position that is shape-bound
+    /// in any same-name candidate, resolve the actual's index range in the
+    /// caller's context (see `actual_shape` for the per-actual cases).
+    /// Positions with an unresolvable actual omit the bind.
+    pub(super) fn call_shape_binds(
+        &self,
+        fname: &str,
+        args: &[Expr],
+        nodes: &[SyntaxNode],
+    ) -> Vec<ShapeBind> {
+        let Some(cands) = self.funcs.get(fname) else {
+            return Vec::new();
+        };
+        let mut positions: Vec<usize> = cands
+            .iter()
+            .flat_map(|f| f.hidden.iter().map(|h| h.formal))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let mut binds = Vec::new();
+        for p in positions {
+            let Some(a) = args.get(p) else {
+                continue;
+            };
+            let Some((lo, asc)) = self.actual_shape(a, nodes.get(p)) else {
+                continue;
+            };
+            binds.push(ShapeBind { formal: p, lo, asc });
+        }
+        binds
+    }
+
+    /// One actual's index range in the caller's context, best-effort: an
+    /// outer shape-bound formal chains its own hidden slots; a recorded
+    /// shape (`sig_asc`) lowers to literals; a folded constant actual
+    /// carries no id, so its declared range comes from the recorded object
+    /// shape (`obj_dims`/`obj_asc`) under the actual's name; a constrained
+    /// formal actual keeps its raw (0, descending) convention. `None` omits
+    /// the bind — the callee falls back to its recorded convention, which
+    /// is the pre-shape-binding behavior bit for bit.
+    fn actual_shape(&self, a: &Expr, node: Option<&SyntaxNode>) -> Option<(Expr, Expr)> {
+        match a {
+            Expr::Sig(s) => {
+                if let Some(&(flo, fasc)) = self.formal_dyn.get(s) {
+                    return Some((Expr::Sig(flo), Expr::Sig(fasc)));
+                }
+                if let Some(&(lo, asc)) = self.sig_asc.get(s) {
+                    return Some((
+                        Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
+                        Expr::Lit(Value::from_u64(32, asc as u64)),
+                    ));
+                }
+                // A constrained formal actual (subtype-typed, no constraint
+                // node): its addressing convention is the raw (0, descending).
+                self.fn_formals.contains(s).then(|| {
+                    (
+                        Expr::Lit(Value::from_u64(32, 0)),
+                        Expr::Lit(Value::from_u64(32, 0)),
+                    )
+                })
+            }
+            // Folded constant: the recorded object shape under the actual's
+            // name.
+            _ => {
+                let key = self.obj_name(node);
+                let &(lo, _) = self.obj_dims.get(&key).and_then(|d| d.first())?;
+                let asc = self
+                    .obj_asc
+                    .get(&key)
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or(false);
+                Some((
+                    Expr::Lit(Value::from_u64(32, lo.max(0) as u64)),
+                    Expr::Lit(Value::from_u64(32, asc as u64)),
+                ))
+            }
+        }
+    }
+
+    /// The recorded-shape lookup key of an actual node: the node's full
+    /// (lowercased) text, falling back to its last dotted segment —
+    /// `obj_dims`/`obj_asc` are keyed by bare object name.
+    fn obj_name(&self, n: Option<&SyntaxNode>) -> String {
+        let Some(n) = n else {
+            return String::new();
+        };
+        let t = self.text(n).to_ascii_lowercase();
+        match t.rsplit_once('.') {
+            Some((_, last)) => last.to_string(),
+            None => t,
         }
     }
 
