@@ -8,6 +8,18 @@
 //! assignment `:=` is blocking. The well-known `ieee.std_logic_1164` /
 //! `numeric_std` functions (`rising_edge`, `to_integer`, `resize`, …) are
 //! built in: recognized by name here and lowered to dedicated `Expr` nodes.
+//!
+//! Layout: this file holds the public IR types, the `Lower` context struct
+//! (its fields are the module's real interface — each submodule's `//!`
+//! header states which fields it owns), `lower_file`, and the tests. The
+//! lowering itself lives in per-responsibility submodules: `context`-free
+//! helpers in `scalar`, config/binding in `config`, architecture selection
+//! in `variant`, object/record naming in `objects`, type decls in `types`,
+//! widths in `width`, entities in `entity`, packages in `package`,
+//! architectures/concurrent in `arch`, object decls in `decls`,
+//! subprograms in `subprogram`, processes in `process`, sequential
+//! statements in `seq`, aggregates in `aggregate`, and expressions/
+//! attributes in `expr` + `dims` + `dump`.
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
@@ -46,15 +58,15 @@ mod expr;
 mod objects;
 mod package;
 mod process;
+mod scalar;
 mod seq;
 mod subprogram;
 mod types;
+mod variant;
 mod width;
+pub(crate) use scalar::*;
 use variant::{apply_default_archs, arch_entity};
 pub use variant::{lower_entity_variant, lower_pending_architectures, stem_key};
-mod variant;
-pub(crate) use scalar::*;
-mod scalar;
 
 /// Lower one parsed VHDL file into modules (entities with their architectures
 /// attached). `time_unit_fs` is the fallback for physical literals; VHDL
