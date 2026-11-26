@@ -18,9 +18,8 @@
 //! widths in `width`, entities in `entity`, packages in `package`,
 //! architectures/concurrent in `arch`, object decls in `decls`,
 //! subprograms in `subprogram` (slot machinery in `slots`), processes in
-//! `process`, sequential statements in `seq` (loops and waits in `loops`),
-//! aggregates in `aggregate`, and expressions/attributes in `expr` +
-//! `dims` + `dump`.
+//! `process`, sequential statements in `seq` (loops/waits in `loops`),
+//! aggregates in `aggregate`, expressions/attributes in `expr`/`dims`/`dump`.
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
