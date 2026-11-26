@@ -7,6 +7,57 @@
 use super::*;
 
 impl<'a> Lower<'a> {
+    /// Hidden signal for an array-typed constant: a memory of per-element
+    /// width holding the flat value.
+    fn materialize_const_array(
+        &mut self,
+        module: &mut ModuleIr,
+        hidden: &str,
+        val: Value,
+        ti: TypeInfo,
+    ) {
+        let TypeInfo::Array {
+            elem,
+            depth,
+            dims,
+            elem_name,
+        } = ti
+        else {
+            return;
+        };
+        // An unconstrained array type carries its declaration
+        // depth (1 for `array (natural range <>)`); the folded
+        // VALUE knows the real element count — derive the depth
+        // from the value so `c(i)` for every folded element
+        // resolves (a 1-word memory X-fills the rest).
+        let elem = elem.max(1);
+        let depth = if dims.is_empty() && depth <= 1 {
+            (val.width() / elem).max(1)
+        } else {
+            depth.max(1)
+        };
+        let id = module.signals.len() as SigId;
+        module.signals.push(SignalIr {
+            name: hidden.to_string(),
+            width: elem,
+            kind: SigKind::Wire,
+            init: Some(val),
+            mem: Some(depth),
+            signed: false,
+        });
+        self.names.insert(hidden.to_string(), id);
+        self.mems.insert(id, depth);
+        self.sig_width.insert(id, elem);
+        if !dims.is_empty() {
+            self.sig_dims.insert(id, dims);
+        }
+        if let Some(en) = elem_name {
+            if matches!(self.types.get(&en), Some(TypeInfo::Record { .. })) {
+                self.sig_elem_rec.insert(id, en);
+            }
+        }
+    }
+
     /// Materialize a record/array-typed constant as a hidden signal holding
     /// its value, so runtime selection works: `c(i)`, `c(i).field`, `c.field`
     /// on a constant lower to Idx/Sel over `__const_<name>`.
@@ -38,65 +89,46 @@ impl<'a> Lower<'a> {
                 continue;
             };
             match ti {
-                TypeInfo::Array {
-                    elem,
-                    depth,
-                    dims,
-                    elem_name,
-                } => {
-                    // An unconstrained array type carries its declaration
-                    // depth (1 for `array (natural range <>)`); the folded
-                    // VALUE knows the real element count — derive the depth
-                    // from the value so `c(i)` for every folded element
-                    // resolves (a 1-word memory X-fills the rest).
-                    let elem = elem.max(1);
-                    let depth = if dims.is_empty() && depth <= 1 {
-                        (val.width() / elem).max(1)
-                    } else {
-                        depth.max(1)
-                    };
-                    let id = module.signals.len() as SigId;
-                    module.signals.push(SignalIr {
-                        name: hidden.clone(),
-                        width: elem,
-                        kind: SigKind::Wire,
-                        init: Some(val),
-                        mem: Some(depth),
-                        signed: false,
-                    });
-                    self.names.insert(hidden, id);
-                    self.mems.insert(id, depth);
-                    self.sig_width.insert(id, elem);
-                    if !dims.is_empty() {
-                        self.sig_dims.insert(id, dims);
-                    }
-                    if let Some(en) = elem_name {
-                        if matches!(self.types.get(&en), Some(TypeInfo::Record { .. })) {
-                            self.sig_elem_rec.insert(id, en);
-                        }
-                    }
+                ti @ TypeInfo::Array { .. } => {
+                    self.materialize_const_array(module, &hidden, val, ti);
                 }
-                TypeInfo::Record { fields } => {
-                    let width = fields.iter().map(|f| f.1).sum::<usize>().max(1);
-                    let id = module.signals.len() as SigId;
-                    module.signals.push(SignalIr {
-                        name: hidden.clone(),
-                        width,
-                        kind: SigKind::Wire,
-                        init: Some(val),
-                        mem: None,
-                        signed: false,
-                    });
-                    self.names.insert(hidden.clone(), id);
-                    self.sig_width.insert(id, width);
-                    self.sig_rec.insert(id, tn.clone());
-                    module
-                        .real_ranges
-                        .insert(hidden, self.record_real_ranges(&tn));
+                TypeInfo::Record { .. } => {
+                    self.materialize_const_record(module, &hidden, val, &tn);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Hidden signal for a record-typed constant: width is the summed
+    /// field width, the record type is remembered for field selects, and
+    /// the real-typed leaf ranges are registered for wave display.
+    fn materialize_const_record(
+        &mut self,
+        module: &mut ModuleIr,
+        hidden: &str,
+        val: Value,
+        tn: &str,
+    ) {
+        let Some(TypeInfo::Record { fields }) = self.types.get(tn) else {
+            return;
+        };
+        let width = fields.iter().map(|f| f.1).sum::<usize>().max(1);
+        let id = module.signals.len() as SigId;
+        module.signals.push(SignalIr {
+            name: hidden.to_string(),
+            width,
+            kind: SigKind::Wire,
+            init: Some(val),
+            mem: None,
+            signed: false,
+        });
+        self.names.insert(hidden.to_string(), id);
+        self.sig_width.insert(id, width);
+        self.sig_rec.insert(id, tn.to_string());
+        module
+            .real_ranges
+            .insert(hidden.to_string(), self.record_real_ranges(tn));
     }
 
     /// `c(i)` where `c` is an array-typed constant (e.g. a function-local
