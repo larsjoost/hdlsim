@@ -664,6 +664,7 @@ impl<'a> Lower<'a> {
             ret_width: ret_width.max(1),
             args,
             defaults: Vec::new(),
+            modes: Vec::new(),
             locals: Vec::new(),
             dyn_locals: Vec::new(),
             body: Stmt::Null,

@@ -93,6 +93,10 @@ pub struct FlatFunc {
     /// has none). A call may omit trailing actuals whose entries are `Some`;
     /// empty means no formal carries a default.
     pub defaults: Vec<Option<Value>>,
+    /// Per-formal mode (LRM 1076 §4.3), parallel to the formals. The kernel
+    /// copies `inout`/`out` procedure formals' final values back to the
+    /// caller's variable actual on return.
+    pub modes: Vec<ArgMode>,
     /// Locals whose constraint reads formals (`string(1 to size)`): the
     /// recorded bit-width expressions, re-folded per call by the kernel and
     /// by const-eval (see [`FuncIr::dyn_locals`], which this carries).
@@ -396,6 +400,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
                 slots,
                 formal_types: func.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: func.defaults.clone(),
+                modes: func.modes.clone(),
                 dyn_locals: func.dyn_locals.clone(),
                 body: Arc::new(func.body.clone()),
             });
@@ -673,6 +678,7 @@ impl Flat {
                 slots,
                 formal_types: f.args.iter().map(|(_, _, t)| t.clone()).collect(),
                 defaults: f.defaults.clone(),
+                modes: f.modes.clone(),
                 dyn_locals: f.dyn_locals.clone(),
                 body,
             });

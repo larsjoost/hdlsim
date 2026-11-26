@@ -20,6 +20,7 @@ use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_syntax::source::Span;
 
 mod ckpt;
+mod proc_copyback;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
@@ -2553,7 +2554,7 @@ impl Simulator {
                 // registered: run with full side effects (syscalls, signal
                 // assignment) — not the pure function path.
                 if let Some(fi) = self.func_match(name, &args, locals.as_deref()) {
-                    self.run_procedure(fi, &args, locals.as_deref());
+                    self.run_procedure(fi, &args, locals);
                 } else {
                     self.emit(SimEvent::Message {
                         text: format!(
@@ -4452,7 +4453,7 @@ impl Simulator {
     /// (expression position, pure), the body executes with `&mut self`, so
     /// syscalls (report/assert/finish/textio) and signal assignment take
     /// effect instead of being silently dropped.
-    fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&Vec<Value>>) {
+    fn run_procedure(&mut self, fi: usize, args: &[Expr], caller: Option<&mut Vec<Value>>) {
         let f = self.flat.functions[fi].clone();
         // Same recursion guard as `run_func` (shared `fn_depth`, so function
         // ↔ procedure call chains count together). Procedure calls from a
@@ -4487,7 +4488,7 @@ impl Simulator {
         lvals.push(Value::x(f.ret_width.max(1))); // slot 0 = return slot (unused)
         for (i, a) in args.iter().enumerate() {
             let w = f.slots.get(i + 1).copied().unwrap_or(1);
-            let v = self.eval_expr(a, caller);
+            let v = self.eval_expr(a, caller.as_deref());
             // An actual wider than the declared slot (unconstrained string
             // parameters) keeps its full width — the slot is a lower bound,
             // never a truncation.
@@ -4507,6 +4508,7 @@ impl Simulator {
         self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
         self.fn_stack.borrow_mut().pop();
+        self.copy_back_formals(&f.modes, args, &lvals, caller); // §4.3 inout/out copy-back
     }
 
     /// Read field bits `[lsb..lsb+w)` of the object word for `handle` in
