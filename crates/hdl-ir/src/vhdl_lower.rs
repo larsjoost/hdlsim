@@ -17,9 +17,9 @@
 //! in `variant`, object/record naming in `objects`, type decls in `types`,
 //! widths in `width`, entities in `entity`, packages in `package`,
 //! architectures/concurrent in `arch`, object decls in `decls`,
-//! subprograms in `subprogram`, processes in `process`, sequential
-//! statements in `seq`, aggregates in `aggregate`, and expressions/
-//! attributes in `expr` + `dims` + `dump`.
+//! subprograms in `subprogram` (slot machinery in `slots`), processes in
+//! `process`, sequential statements in `seq`, aggregates in `aggregate`,
+//! and expressions/attributes in `expr` + `dims` + `dump`.
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
@@ -60,6 +60,7 @@ mod package;
 mod process;
 mod scalar;
 mod seq;
+mod slots;
 mod subprogram;
 mod types;
 mod variant;

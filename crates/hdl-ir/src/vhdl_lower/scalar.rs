@@ -75,6 +75,22 @@ pub(super) fn is_stmt_node(k: SyntaxKind) -> bool {
     )
 }
 
+/// Kinds collected as a subprogram's declarative items, in textual order
+/// (each may reference the ones before it: params, types, constants, locals).
+pub(super) fn is_decl_item(k: SyntaxKind) -> bool {
+    matches!(
+        k,
+        SyntaxKind::PortDecl
+            | SyntaxKind::VariableDecl
+            | SyntaxKind::ConstantDecl
+            | SyntaxKind::AliasDecl
+            | SyntaxKind::AttrDecl
+            | SyntaxKind::TypeDecl
+            | SyntaxKind::SubtypeDecl
+            | SyntaxKind::FileDecl
+    )
+}
+
 pub(super) fn bits_for(n: usize) -> usize {
     (usize::BITS - (n.max(1) - 1).leading_zeros()).max(1) as usize
 }
