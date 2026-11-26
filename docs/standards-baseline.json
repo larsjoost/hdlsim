@@ -22,7 +22,7 @@
     "crates/hdl-ir/src/vhdl_lower/objects.rs": 629,
     "crates/hdl-ir/src/vhdl_lower/package.rs": 698,
     "crates/hdl-ir/src/vhdl_lower/seq.rs": 937,
-    "crates/hdl-ir/src/vhdl_lower/subprogram.rs": 949,
+    "crates/hdl-ir/src/vhdl_lower/subprogram.rs": 962,
     "crates/hdl-ir/src/vhdl_lower/types.rs": 946,
     "crates/hdl-lib/src/lib.rs": 1959,
     "crates/hdl-sim/src/bmc.rs": 2405,

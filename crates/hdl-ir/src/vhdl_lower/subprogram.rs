@@ -589,11 +589,7 @@ impl<'a> Lower<'a> {
         &mut self,
         decl_nodes: &[SyntaxNode],
         nested_fns: &[SyntaxNode],
-        slots: &mut Vec<(String, usize)>,
-        locals: &mut Vec<SignalIr>,
-        local_types: &mut Vec<(String, String)>,
-        dyn_locals: &mut Vec<(SigId, Expr)>,
-        pending_const_inits: &mut Vec<(SigId, Expr)>,
+        fd: &mut FnLocalDecls,
     ) {
         for k in nested_fns {
             if let Some(stub) = self.subprogram_stub(k) {
@@ -606,9 +602,13 @@ impl<'a> Lower<'a> {
                 SyntaxKind::TypeDecl => self.lower_type_decl(d),
                 SyntaxKind::SubtypeDecl => self.lower_subtype_decl(d),
                 SyntaxKind::ViewDecl => self.lower_view_decl(d),
-                SyntaxKind::ConstantDecl => {
-                    self.lower_fn_local_constant(d, slots, locals, local_types, pending_const_inits)
-                }
+                SyntaxKind::ConstantDecl => self.lower_fn_local_constant(
+                    d,
+                    &mut fd.slots,
+                    &mut fd.locals,
+                    &mut fd.local_types,
+                    &mut fd.pending_const_inits,
+                ),
                 SyntaxKind::AliasDecl => self.lower_alias_decl(d),
                 SyntaxKind::AttrDecl => {
                     self.register_attr_decl(d);
@@ -616,17 +616,17 @@ impl<'a> Lower<'a> {
                 SyntaxKind::FileDecl => self.lower_file_decl(d),
                 SyntaxKind::VariableDecl => self.lower_fn_local_variable(
                     d,
-                    slots,
-                    locals,
-                    local_types,
-                    dyn_locals,
-                    pending_const_inits,
+                    &mut fd.slots,
+                    &mut fd.locals,
+                    &mut fd.local_types,
+                    &mut fd.dyn_locals,
+                    &mut fd.pending_const_inits,
                 ),
                 _ => {}
             }
         }
         // Record-typed locals (declared in the loop above): same treatment.
-        self.map_slot_records(slots, local_types);
+        self.map_slot_records(&fd.slots, &fd.local_types);
         for k in nested_fns {
             if let Some(fi) = self.lower_function_node(k) {
                 self.register_func(fi);
@@ -769,12 +769,12 @@ impl<'a> Lower<'a> {
             arg_types,
             arg_shapes,
             defaults,
-            mut ret_width,
+            ret_width,
             ..
         } = self.lower_formal_params(&decl_nodes, &ret_mark, f);
         // Lower the body in slot space (slot 0 = return value; the install
         // also pushes the enclosing `names` map for the scope guard below).
-        let (mut slots, fn_slots) =
+        let (slots, fn_slots) =
             self.install_fn_slots(&name, ret_width, &args, &arg_types, &arg_shapes);
         // Formals/locals now in `names`: outer constants of the same name in
         // the lowering env must not shadow them (see `fn_scope`).
@@ -785,26 +785,26 @@ impl<'a> Lower<'a> {
         // evaluated on every call, prepended to the body as an assignment.
         // Locals whose constraint depends on subprogram formals — const-eval
         // re-folds their widths per call (see `FuncIr.dyn_locals`).
-        let mut locals: Vec<SignalIr> = Vec::new();
-        let mut local_types: Vec<(String, String)> = Vec::new();
-        let mut pending_const_inits: Vec<(SigId, Expr)> = Vec::new();
-        let mut dyn_locals: Vec<(SigId, Expr)> = Vec::new();
+        let mut fd = FnLocalDecls {
+            slots,
+            locals: Vec::new(),
+            local_types: Vec::new(),
+            pending_const_inits: Vec::new(),
+            dyn_locals: Vec::new(),
+        };
         // Pre-register nested subprograms so constant initializers in the
         // declarative part can reference them (`constant r : string := f;`);
         // real bodies are lowered after the loop and overwrite the stubs.
         // Declarative items in textual order: each may reference the ones
         // before it (parameters, types, constants, locals). Nested function
         // declarations lower last, now that all outer slots are visible.
-        self.lower_fn_declarative_items(
-            &decl_nodes,
-            &nested_fns,
-            &mut slots,
-            &mut locals,
-            &mut local_types,
-            &mut dyn_locals,
-            &mut pending_const_inits,
+        self.lower_fn_declarative_items(&decl_nodes, &nested_fns, &mut fd);
+        let body = self.lower_fn_body(
+            &stmt_nodes,
+            &fd.slots,
+            &mut fd.locals,
+            fd.pending_const_inits,
         );
-        let body = self.lower_fn_body(&stmt_nodes, &slots, &mut locals, pending_const_inits);
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
         let ret_width = self.unconstrained_ret_width(&ret_mark, &body, ret_width);
@@ -817,11 +817,24 @@ impl<'a> Lower<'a> {
             ret_width: ret_width.max(1),
             args,
             defaults,
-            locals,
-            dyn_locals,
+            locals: fd.locals,
+            dyn_locals: fd.dyn_locals,
             body,
         })
     }
+}
+
+/// Per-call mutable collections threaded through a subprogram's
+/// declarative-item and body lowering: the slot list (name, width), the
+/// lowered locals, their declared type marks, and the two per-call queues
+/// (dynamic-width locals re-folded by const-eval; constant initializers
+/// prepended to the body).
+struct FnLocalDecls {
+    slots: Vec<(String, usize)>,
+    locals: Vec<SignalIr>,
+    local_types: Vec<(String, String)>,
+    dyn_locals: Vec<(SigId, Expr)>,
+    pending_const_inits: Vec<(SigId, Expr)>,
 }
 
 /// Saved outer-scope state from installing a subprogram's slot space:
