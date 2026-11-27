@@ -300,12 +300,7 @@ impl<'a> Lower<'a> {
             .find(|k| k.kind() == SyntaxKind::Ident)
             .map(|k| self.kw(k))
             .unwrap_or_default();
-        let severity = kids
-            .iter()
-            .filter(|k| k.kind() == SyntaxKind::Ident)
-            .map(|k| self.kw(k))
-            .find(|w| matches!(w.as_str(), "note" | "warning" | "error" | "failure"))
-            .unwrap_or_default();
+        let severity = self.assert_severity(&kids, &first_kw);
         let mut exprs: Vec<Expr> = kids
             .iter()
             .filter(|k| is_expr_node(k.kind()))
@@ -324,6 +319,52 @@ impl<'a> Lower<'a> {
             args: exprs,
             shapes: Vec::new(),
         }
+    }
+
+    /// Resolve an assert/report severity to its LRM name ("note" /
+    /// "warning" / "error" / "failure") — empty when it cannot be known at
+    /// lower time. A written keyword wins. A `severity C` named constant is
+    /// const-folded: the parser keeps a non-keyword severity as a bare
+    /// identifier (not an expression), enum constants carry their
+    /// declaration-order position as the value (see types.rs), and
+    /// severity_level is (note, warning, error, failure). Nothing written
+    /// defaults per LRM 10.2 to error for assert (report's note default is
+    /// applied by the kernel). A written non-constant (variable) severity
+    /// stays empty rather than guessing a level.
+    fn assert_severity(&self, kids: &[SyntaxNode], first_kw: &str) -> String {
+        let keyword = kids
+            .iter()
+            .filter(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .find(|w| matches!(w.as_str(), "note" | "warning" | "error" | "failure"));
+        if let Some(w) = keyword {
+            return w;
+        }
+        let written = kids
+            .iter()
+            .skip_while(|k| !(k.kind() == SyntaxKind::Ident && self.kw(k) == "severity"))
+            .skip(1)
+            .find(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k));
+        let Some(name) = written else {
+            return if first_kw == "report" {
+                String::new()
+            } else {
+                "error".to_string()
+            };
+        };
+        let folded = self
+            .consts
+            .get(&name)
+            .to_owned()
+            .and_then(|v| match v.to_u64() {
+                Some(0) => Some("note".to_string()),
+                Some(1) => Some("warning".to_string()),
+                Some(2) => Some("error".to_string()),
+                Some(3) => Some("failure".to_string()),
+                _ => None,
+            });
+        folded.unwrap_or_default()
     }
 
     /// Lower an `exit`/`next` statement. The parser folds both into one
@@ -357,10 +398,18 @@ impl<'a> Lower<'a> {
     fn lower_return_stmt(&mut self, s: &SyntaxNode) -> Stmt {
         let kids = real_children(s);
         let e = kids.iter().find(|k| is_expr_node(k.kind()));
-        Stmt::Return(Box::new(
-            e.map(|e| self.lower_expr(e, &self.consts.clone()))
-                .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0))),
-        ))
+        // A string-returning function's `RETURN "0"` (or any alphabet
+        // literal) is text — lower the return expression in the string
+        // context. `string'(...)` qualifiers set their own context.
+        let saved = self.str_ctx;
+        if self.fn_ret_str {
+            self.str_ctx = true;
+        }
+        let ex = e
+            .map(|e| self.lower_expr(e, &self.consts.clone()))
+            .unwrap_or_else(|| Expr::Lit(Value::from_u64(1, 0)));
+        self.str_ctx = saved;
+        Stmt::Return(Box::new(ex))
     }
 
     /// Lower a procedure call statement `foo(a, b);` (or bare `foo;`):

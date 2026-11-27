@@ -211,6 +211,16 @@ code — truncated to the OS range 0..=255, and with test failures still taking
 precedence (a failing run always exits 1). Verilog `$finish(n)` is unaffected:
 its argument is a diagnostic level, not an exit status.
 
+### Transcript output
+
+`report`/`assert` lines carry the emitting statement's location and severity
+color: `file:line: message`, red for `error`/`failure`, yellow for `warning`,
+plain for `note`. A severity written as a named `severity_level` constant is
+const-folded (`severity C_SEV` behaves like the keyword it evaluates to).
+Colors are on by default — even piped, so agent-consumed transcripts keep the
+signal; `NO_COLOR` or `--no-color` disables, `--color auto` colors only on a
+terminal.
+
 ## Reporting bugs — reproducer bundles
 
 Whenever hdlsim exits non-zero, it prints a short `note:` hint on stderr with

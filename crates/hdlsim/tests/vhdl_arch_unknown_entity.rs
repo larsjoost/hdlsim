@@ -23,6 +23,9 @@ fn unknown_entity_error_points_at_name_and_ends_with_newline() {
     let rtl = fixture("arch_unknown/edge_detector_rtl.vhd");
     let out = hdlsim()
         .arg("check")
+        // --no-color: the test measures caret columns in the rendered text;
+        // colors are on by default now (see tests/color.rs).
+        .arg("--no-color")
         .arg(&entity)
         .arg(&rtl)
         .output()

@@ -119,32 +119,48 @@ impl Transcript {
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {
         let color = hdl_syntax::diagnostic::color_enabled();
-        if let SimEvent::Message { text, span, .. } = ev {
-            // Colorize severity-ish message lines ($error/$fatal/assert
-            // failures, warnings); plain $display output stays uncolored.
-            // Those same lines get a `file:line:` prefix when the kernel
-            // attached the emitting statement's span.
+        if let SimEvent::Message {
+            text,
+            span,
+            severity,
+            ..
+        } = ev
+        {
+            // Legacy text sniff for lines without an explicit severity —
+            // kernel guards predate the field, and replayed .hwf transcripts
+            // lose it (like the span). Their level is in the text.
             let t = text.trim_start();
-            let failureish = t.starts_with("error")
-                || t.starts_with("fatal")
-                || t.contains("assertion failed")
-                || t.starts_with("warning");
-            let text = if failureish {
-                format!("{}{}", Self::loc(&self.db, *span), text)
-            } else {
-                text.clone()
-            };
-            let painted = if t.starts_with("error")
+            let sniffed = if t.starts_with("error")
                 || t.starts_with("fatal")
                 || t.contains("assertion failed")
             {
-                hdl_syntax::diagnostic::paint(color, "1;31", &text)
+                Some(hdl_sim::MessageSeverity::Error)
             } else if t.starts_with("warning") {
-                hdl_syntax::diagnostic::paint(color, "1;33", &text)
+                Some(hdl_sim::MessageSeverity::Warning)
             } else {
-                text
+                None
             };
-            print!("{}", painted);
+            match severity.or(sniffed) {
+                // A diagnostic line: `file:line: ` prefix (jump-to location)
+                // plus severity color. The kernel marks note/warning report
+                // text with a leading ": " — drop it under the location.
+                Some(sev) => {
+                    let body = text.strip_prefix(": ").unwrap_or(text);
+                    let located = format!("{}{}", Self::loc(&self.db, *span), body);
+                    let painted = match sev {
+                        hdl_sim::MessageSeverity::Error | hdl_sim::MessageSeverity::Failure => {
+                            hdl_syntax::diagnostic::paint(color, "1;31", &located)
+                        }
+                        hdl_sim::MessageSeverity::Warning => {
+                            hdl_syntax::diagnostic::paint(color, "1;33", &located)
+                        }
+                        hdl_sim::MessageSeverity::Note => located,
+                    };
+                    print!("{}", painted);
+                }
+                // Plain transcript text ($display, textio echo) stays raw.
+                None => print!("{}", text),
+            }
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }

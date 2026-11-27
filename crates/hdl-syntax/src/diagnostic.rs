@@ -29,13 +29,13 @@ impl Severity {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorMode {
     /// Color when stderr is a terminal; disabled by the standard
-    /// `NO_COLOR` variable.
+    /// `NO_COLOR` variable. Selected with `--color auto`.
     Auto,
     Always,
     Never,
 }
 
-static COLOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static COLOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
 
 /// Set the global color mode (from the `--color`/`--no-color` CLI flags).
 /// An explicitly set mode wins over `NO_COLOR` and tty auto-detection.
@@ -57,17 +57,23 @@ pub fn color_mode() -> ColorMode {
 }
 
 /// Should diagnostics be colorized right now?
+///
+/// Colors are on by default — piped/agent-consumed transcripts keep the
+/// severity signal too. The default still honors the standard `NO_COLOR`
+/// variable; an explicit `--color always` overrides it, `--color never` /
+/// `--no-color` turn colors off, and `--color auto` restores tty detection.
 pub fn color_enabled() -> bool {
-    match color_mode() {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => {
+    match COLOR_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true, // explicit --color always wins over NO_COLOR
+        2 => false,
+        0 => {
             use std::io::IsTerminal;
             if std::env::var_os("NO_COLOR").is_some() {
                 return false;
             }
             std::io::stderr().is_terminal()
         }
+        _ => std::env::var_os("NO_COLOR").is_none(), // default: on unless NO_COLOR
     }
 }
 
@@ -599,7 +605,7 @@ mod tests {
             "missing semicolon",
         )
         .with_help("add `;` here");
-        let out = d.render(&db);
+        let out = d.render_with(&db, false);
         // Exact rustc layout: header, --> line, gutter, source, carets, help.
         let expected = "error[E0001]: missing semicolon\n  --> t.v:2:4\n   |\n 2 |   wire x\n   |    ^^^\n   |\n   = help: add `;` here";
         assert_eq!(out, expected);
