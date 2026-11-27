@@ -186,6 +186,15 @@ impl Simulator {
                             }
                             let old = self.mems[sig][a as usize].clone();
                             let mut cur = old.clone();
+                            // A well-formed slice entirely beyond the word's
+                            // width has no storage to write: drop it instead
+                            // of clamping onto the top bit (same rule as the
+                            // signal arm below — two clamped half-writes with
+                            // different sources would fight every fixpoint
+                            // sweep and trip the combinational-loop guard).
+                            if msb >= lsb && lsb >= cur.bits.len() {
+                                return false;
+                            }
                             // Same clamp as the signal arm: dynamic slice
                             // bounds must not wrap the bit loop.
                             let msb = msb.min(cur.bits.len().saturating_sub(1));
@@ -214,7 +223,18 @@ impl Simulator {
                 // underflowed to usize::MAX here and the bit loop spun
                 // forever inside one call — unreachable by any pump-level
                 // interrupt check.
-                let msb = msb.min(self.vals[sig as usize].bits.len().saturating_sub(1));
+                let len = self.vals[sig as usize].bits.len();
+                // A well-formed slice entirely beyond the signal's width has
+                // no storage to change: drop the write instead of clamping
+                // it onto the top bit — two clamped half-writes with
+                // different sources would otherwise fight every fixpoint
+                // sweep and trip the combinational-loop guard on an acyclic
+                // assign graph (a top signal left narrow by an unbound
+                // generic, connected to a default-width child port).
+                if msb >= lsb && lsb >= len {
+                    return false;
+                }
+                let msb = msb.min(len.saturating_sub(1));
                 let lsb = lsb.min(msb);
                 let mut cur = self.vals[sig as usize].clone();
                 let v = v.resize(msb - lsb + 1);
