@@ -568,6 +568,7 @@ mod tests {
                 time_fs: 2_000_000,
                 span: None,
                 severity: None,
+                scope: None,
             },
             &flat,
         );

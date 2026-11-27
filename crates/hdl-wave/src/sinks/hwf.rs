@@ -202,6 +202,7 @@ pub fn read_hwf(bytes: &[u8]) -> Result<(Flat, Vec<SimEvent>), String> {
                     time_fs: t,
                     span: None,
                     severity: None,
+                    scope: None,
                 });
             }
             3 => {
@@ -293,6 +294,7 @@ mod tests {
                 time_fs: 15,
                 span: None,
                 severity: None,
+                scope: None,
             },
             &f,
         );
