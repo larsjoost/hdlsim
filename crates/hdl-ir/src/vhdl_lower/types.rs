@@ -374,7 +374,20 @@ impl<'a> Lower<'a> {
                 // then compare equal every sweep and the object freezes).
                 let depth = if dims.is_empty() {
                     constraint
-                        .map(|c| self.constraint_width(c))
+                        .map(|c| {
+                            // Best-effort depth estimate: `resolve_type`
+                            // re-runs in contexts where the constraint's
+                            // bound names are not in scope (protected-body
+                            // shared variables re-resolved outside their
+                            // body context), and the estimate must not
+                            // report spurious E0401s there — unresolvable
+                            // bounds fall back to the declared depth, like
+                            // the width estimator.
+                            self.suppress_err += 1;
+                            let n = self.constraint_width(c);
+                            self.suppress_err -= 1;
+                            n
+                        })
                         .filter(|n| *n > 1)
                         .unwrap_or(depth)
                 } else {
