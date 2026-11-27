@@ -1,4 +1,4 @@
-//! Regression tests for the Questa-style `--when` and `--examine` flags.
+//! Regression tests for the `--when` and `--examine` flags.
 //! `--when` echoes one line per change of a named signal that matches the
 //! spec's value filter and time window (`name[=value][@T|@T0-T1]`);
 //! `--examine` prints one settled value at a time point (or the end-of-run

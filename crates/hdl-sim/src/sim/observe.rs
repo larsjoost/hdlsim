@@ -1,4 +1,4 @@
-//! The `--watch` signal-change watch. The Questa-style `--when` /
+//! The `--watch` signal-change watch. The `--when` /
 //! `--examine` probes live in the sibling `probe.rs`.
 //!
 //! Child module of `sim` so it can read the kernel's private fields, the

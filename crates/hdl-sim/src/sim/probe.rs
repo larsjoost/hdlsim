@@ -1,4 +1,4 @@
-//! The Questa-style observation probes: `--when` echoes a line when a
+//! The observation probes: `--when` echoes a line when a
 //! signal changes into a matching value inside an optional time window, and
 //! `--examine` prints one settled value at a time point (or end of run).
 //!
