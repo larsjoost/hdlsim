@@ -352,6 +352,7 @@ impl Simulator {
             .iter()
             .map(|a| assign_target_sig(&a.lhs))
             .collect();
+        let mut skipped: Vec<String> = Vec::new();
         for spec in specs {
             let hits = self.resolve_signal_pattern(spec.trim());
             if hits.is_empty() {
@@ -360,14 +361,27 @@ impl Simulator {
             }
             for (sig, name) in hits {
                 if !targets.contains(&Some(sig)) {
-                    self.trace_assigns.clear();
-                    return Err(format!(
-                        "--trace-assign: no continuous assignment drives {name} \
-                         (process-driven signals: use --watch or --when)"
-                    ));
+                    // A name may match several instances (dot-suffix rule);
+                    // arm the assign-driven ones and note the rest.
+                    skipped.push(name);
+                    continue;
                 }
                 self.trace_assigns.push(TraceAssign { target: sig, name });
             }
+        }
+        if self.trace_assigns.is_empty() {
+            return Err(format!(
+                "--trace-assign: no continuous assignment drives {} \
+                 (process-driven signals: use --watch or --when)",
+                skipped.join(", ")
+            ));
+        }
+        if !skipped.is_empty() {
+            eprintln!(
+                "trace-assign: note: no continuous assignment drives {} \
+                 (skipped; process-driven signals: use --watch or --when)",
+                skipped.join(", ")
+            );
         }
         eprintln!("trace-assign: {} rule(s) armed", self.trace_assigns.len());
         Ok(())
