@@ -130,6 +130,11 @@ pub fn lower_pending_architectures(
     // same-named entities, and stem matching is the only signal that pins
     // an architecture file to ITS entity.
     entity_by_stem: &HashMap<(String, String, String), usize>,
+    // Out: (module index, architecture source file) for every module this
+    // call appended, so callers can stamp source provenance — variant
+    // re-lowering and wave/origin attribution must find the file the user
+    // actually compiled, not a same-named twin from a library scan.
+    bound_sources: &mut Vec<(usize, std::path::PathBuf)>,
 ) -> Vec<PendingArch> {
     if pending.is_empty() {
         return Vec::new();
@@ -231,8 +236,13 @@ pub fn lower_pending_architectures(
                 None => HashMap::new(),
             }
         };
+        let first_new = modules.len();
         match lx.lower_architecture(&p.arch, modules, &ents) {
             Some((ent, arch)) => {
+                let arch_file = db.file(p.root.span().file).name().to_string();
+                for i in first_new..modules.len() {
+                    bound_sources.push((i, std::path::PathBuf::from(&arch_file)));
+                }
                 last_arch.insert(ent.clone(), arch);
                 if let Some(&base) = ents.get(&ent) {
                     arch_bases.insert(ent, base);
