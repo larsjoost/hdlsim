@@ -108,8 +108,10 @@ impl Default for ModuleIr {
 pub struct ParamIr {
     pub name: String,
     pub default: Value,
-    /// Record type name of a record-typed generic — restored into the
-    /// architecture scope so `G_PARAM.field` selects resolve when the
+    /// Type-mark name of the generic (records: the registered record name;
+    /// scalars: the bare mark, e.g. `integer`) — restored into the
+    /// architecture scope's `const_types` so a use of the generic recovers
+    /// its signedness and record field selects resolve when the
     /// architecture is lowered in a fresh scope (separate file).
     pub ty: Option<String>,
 }
@@ -294,6 +296,20 @@ pub struct InstIr {
 pub enum Conn {
     Named(String, Expr),
     Positional(Expr),
+}
+
+/// Is this statement the empty body of an interface-only subprogram stub?
+/// Declarations without a body (spec-only packages like ieee_proposed's
+/// to_* family, forward declarations whose body never landed) lower to
+/// `Null` or an empty `Block`; the kernel must not execute them — dispatch
+/// treats them as last-resort candidates and built-in names fall through to
+/// their kernel implementation.
+pub fn is_bodiless(body: &Stmt) -> bool {
+    match body {
+        Stmt::Null => true,
+        Stmt::Block(ss) => ss.is_empty(),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -15,7 +15,7 @@ use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ShapeBind, Stmt, UnOp};
 use hdl_syntax::source::Span;
 
 const MAGIC: &[u8; 8] = b"HDLCKPT1";
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 
 // ---- little-endian writer/reader ----------------------------------------------
 
@@ -929,6 +929,11 @@ pub(crate) fn save(sim: &Simulator, out: &mut Vec<u8>) {
     for v in &sim.prev {
         w.value(v);
     }
+    w.u64(sim.delta_epoch);
+    w.u32(sim.sig_evt.len() as u32);
+    for e in &sim.sig_evt {
+        w.u64(*e);
+    }
     w.u32(sim.mems.len() as u32);
     for m in &sim.mems {
         w.u32(m.len() as u32);
@@ -1074,6 +1079,15 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     sim.prev.clear();
     for _ in 0..n {
         sim.prev.push(r.value()?);
+    }
+    sim.delta_epoch = r.u64()?;
+    let n = r.u32()? as usize;
+    if n != sim.sig_evt.len() {
+        return Err("sig_evt count mismatch".to_string());
+    }
+    sim.sig_evt.clear();
+    for _ in 0..n {
+        sim.sig_evt.push(r.u64()?);
     }
     let n = r.u32()? as usize;
     if n != sim.mems.len() {

@@ -14,7 +14,7 @@
 //! - Deterministic: fixed RNG seed, FIFO active queue, BTreeMap time queue.
 //! - Never panics on design content; runtime errors are Message events.
 
-use crate::events::{Observer, SimEvent};
+use crate::events::{MessageSeverity, Observer, SimEvent};
 use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::{FormalShape, ShapeBind};
@@ -185,6 +185,18 @@ pub struct Simulator {
     flat: Flat,
     vals: Vec<Value>,
     prev: Vec<Value>,
+    /// Per-signal stamp of the pump iteration ("delta epoch") in which the
+    /// signal last changed, and the never-reset epoch counter. Edge tests
+    /// (`rising_edge`/`falling_edge`/`'event`) are true only while the change
+    /// is current: the kernel applies updates in one iteration and runs the
+    /// woken processes in the next (or the same one for same-iteration
+    /// wakes), so a stamp of `epoch` or `epoch - 1` counts as this delta.
+    /// `prev` alone holds the value before the signal's last change of ANY
+    /// delta — a clock's pre-edge value persists across the whole high
+    /// phase, which made `wait until rising_edge(clk) and ready` fire
+    /// mid-phase, one cycle before the handshake it guards.
+    delta_epoch: u64,
+    sig_evt: Vec<u64>,
     mems: Vec<Vec<Value>>, // per memory signal: mems[sig] if is_mem
     is_mem: Vec<bool>,
     active: VecDeque<u32>,
@@ -462,6 +474,8 @@ impl Simulator {
                 .map(|s| s.init.clone().unwrap_or_else(|| Value::x(s.width.max(1))))
                 .collect(),
             prev: vec![Value::x(1); n],
+            delta_epoch: 0,
+            sig_evt: vec![0; n],
             mems: flat
                 .signals
                 .iter()
@@ -951,6 +965,7 @@ impl Simulator {
                 ),
                 time_fs: self.time,
                 span: self.cur_span,
+                severity: Some(MessageSeverity::Error),
                 });
             self.stopped = true;
             self.error_stopped = true;
@@ -992,6 +1007,7 @@ impl Simulator {
                 ),
                 time_fs: self.time,
                 span: self.cur_span,
+                severity: Some(MessageSeverity::Error),
                 });
             self.stopped = true;
             self.error_stopped = true;
@@ -1023,6 +1039,7 @@ impl Simulator {
             text: crate::meminfo::limit_message("simulate", peak_kb, limit_kb),
             time_fs: self.time,
             span: self.cur_span,
+            severity: Some(MessageSeverity::Error),
         });
         self.stopped = true;
         self.error_stopped = true;
@@ -1163,6 +1180,7 @@ impl Simulator {
             ),
             time_fs: self.time,
             span: self.cur_span,
+            severity: Some(MessageSeverity::Error),
         });
         self.interrupt_info = Some((reason.to_string(), rc));
         self.stopped = true;
@@ -1227,6 +1245,11 @@ impl Simulator {
             }
             delta_count += 1;
             self.delta_no = delta_count;
+            // One pump iteration ≈ half a VHDL delta: updates are applied in
+            // this iteration, woken processes run in the next. The epoch
+            // never resets (unlike `delta_count`), so edge currency stamps
+            // stay comparable across time advances.
+            self.delta_epoch += 1;
             if delta_count > 10_000 {
                 self.emit(SimEvent::Message {
                     text: format!(
@@ -1235,6 +1258,7 @@ impl Simulator {
                     ),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: Some(MessageSeverity::Error),
                     });
                 self.stopped = true;
                 self.error_stopped = true;
@@ -1280,6 +1304,7 @@ impl Simulator {
                         ),
                         time_fs: self.time,
                         span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
                         });
                     self.stopped = true;
                     self.error_stopped = true;
@@ -1570,6 +1595,7 @@ impl Simulator {
                     ),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: Some(MessageSeverity::Error),
                     });
                 self.stopped = true;
                 self.error_stopped = true;
@@ -2168,6 +2194,7 @@ impl Simulator {
                     text,
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: None,
                 });
             }
             "monitor" => {
@@ -2181,6 +2208,7 @@ impl Simulator {
                     text: format!("{}\n", text),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: None,
                 });
             }
             "assert" => {
@@ -2193,20 +2221,35 @@ impl Simulator {
                         .get(1)
                         .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                         .unwrap_or_default();
-                    let severity = args
-                        .get(2)
-                        .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    self.emit(SimEvent::Message {
-                        text: format!("assertion failed at t={}: {}\n", self.time, msg),
-                        time_fs: self.time,
-                        span: self.cur_span,
+                    let severity = args.get(2).and_then(|a| {
+                        MessageSeverity::from_name(
+                            &string_of(&self.eval_expr(a, locals.as_deref())).to_ascii_lowercase(),
+                        )
                     });
-                    if matches!(severity.as_str(), "error" | "failure") {
+                    if matches!(
+                        severity,
+                        Some(MessageSeverity::Error | MessageSeverity::Failure)
+                    ) {
+                        self.emit(SimEvent::Message {
+                            text: format!("assertion failed at t={}: {}\n", self.time, msg),
+                            time_fs: self.time,
+                            span: self.cur_span,
+                            severity,
+                        });
                         self.fail(format!("assertion failed at t={}: {}", self.time, msg));
+                    } else {
+                        // Note/warning severity reports the message without
+                        // failing (LRM 10.2 severity levels) — `assert false
+                        // report "done" severity note` is a common
+                        // end-of-test marker.
+                        self.emit(SimEvent::Message {
+                            text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
+                            time_fs: self.time,
+                            span: self.cur_span,
+                            severity: Some(severity.unwrap_or(MessageSeverity::Note)),
+                        });
                     }
-                    if severity == "failure" {
+                    if severity == Some(MessageSeverity::Failure) {
                         self.emit(SimEvent::Message {
                             text: format!(
                                 "error: severity failure at t={}; simulation aborted\n",
@@ -2214,6 +2257,7 @@ impl Simulator {
                             ),
                             time_fs: self.time,
                             span: self.cur_span,
+                            severity: Some(MessageSeverity::Error),
                         });
                         self.stopped = true;
                     }
@@ -2224,20 +2268,28 @@ impl Simulator {
                     .first()
                     .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
                     .unwrap_or_default();
-                let severity = args
-                    .get(1)
-                    .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+                let severity = args.get(1).and_then(|a| {
+                    MessageSeverity::from_name(
+                        &string_of(&self.eval_expr(a, locals.as_deref())).to_ascii_lowercase(),
+                    )
+                });
                 self.emit(SimEvent::Message {
                     text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: Some(severity.unwrap_or(MessageSeverity::Note)),
                 });
-                if matches!(severity.as_str(), "error" | "failure") {
-                    self.fail(format!("report severity {}: {}", severity, msg));
+                if matches!(
+                    severity,
+                    Some(MessageSeverity::Error | MessageSeverity::Failure)
+                ) {
+                    self.fail(format!(
+                        "report severity {}: {}",
+                        severity.expect("matched Some above").name(),
+                        msg
+                    ));
                 }
-                if severity == "failure" {
+                if severity == Some(MessageSeverity::Failure) {
                     self.emit(SimEvent::Message {
                         text: format!(
                             "error: severity failure at t={}; simulation aborted\n",
@@ -2245,6 +2297,7 @@ impl Simulator {
                         ),
                         time_fs: self.time,
                         span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
                     });
                     self.stopped = true;
                 }
@@ -2265,6 +2318,7 @@ impl Simulator {
                         text: format!("assertion failed at t={}: {}\n", self.time, text),
                         time_fs: self.time,
                         span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
                     });
                     self.fail(format!("sva assertion failed at t={}: {}", self.time, text));
                 }
@@ -2276,6 +2330,7 @@ impl Simulator {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: Some(MessageSeverity::Error),
                 });
                 self.fail(format!("${} at t={}: {}", name, self.time, text));
                 if name == "fatal" {
@@ -2288,6 +2343,11 @@ impl Simulator {
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: Some(if name == "warning" {
+                        MessageSeverity::Warning
+                    } else {
+                        MessageSeverity::Note
+                    }),
                 });
             }
             "finish" => {
@@ -2342,6 +2402,7 @@ impl Simulator {
                                     ),
                                     time_fs: self.time,
                                     span: self.cur_span,
+                                    severity: Some(MessageSeverity::Warning),
                                 }),
                             }
                             i += 2;
@@ -2354,6 +2415,7 @@ impl Simulator {
                                 ),
                                 time_fs: self.time,
                                 span: self.cur_span,
+                                severity: Some(MessageSeverity::Warning),
                             });
                         }
                     }
@@ -2362,6 +2424,7 @@ impl Simulator {
                             text: format!("warning: $rand_solve at t={}: {}\n", self.time, msg),
                             time_fs: self.time,
                             span: self.cur_span,
+                            severity: Some(MessageSeverity::Warning),
                         });
                     }
                 }
@@ -2437,6 +2500,7 @@ impl Simulator {
                         text: format!("{}\n", text),
                         time_fs: self.time,
                         span: self.cur_span,
+                        severity: None,
                     });
                 } else {
                     use std::io::Write;
@@ -2455,8 +2519,23 @@ impl Simulator {
                             ),
                             time_fs: self.time,
                             span: self.cur_span,
+                            severity: Some(MessageSeverity::Error),
                         }),
                     }
+                }
+                // WRITELINE leaves the line null (std.textio: `L: inout
+                // LINE` is consumed by the write). Without the reset the
+                // next `write(l, …)` appends to the printed content and a
+                // `l.all /= to_string(x)` guard sees the whole history.
+                if let Some(e) = args.get(1) {
+                    self.store_value(
+                        e,
+                        Value {
+                            bits: Vec::new(),
+                            real: false,
+                        },
+                        locals.as_deref_mut(),
+                    );
                 }
             }
             // `file_open([status,] f, path, mode)` — bind the path to the
@@ -2565,6 +2644,20 @@ impl Simulator {
                     }
                 }
             }
+            // `deallocate(l)` — TEXTIO line: set the accessed buffer empty
+            // (null access). Subsequent writes append from scratch.
+            "deallocate" => {
+                if let Some(target) = args.first() {
+                    self.store_value(
+                        target,
+                        Value {
+                            bits: Vec::new(),
+                            real: false,
+                        },
+                        locals.as_deref_mut(),
+                    );
+                }
+            }
             _ => {
                 // User procedure / SV task called as a statement, if
                 // registered: run with full side effects (syscalls, signal
@@ -2579,6 +2672,7 @@ impl Simulator {
                         ),
                         time_fs: self.time,
                         span: self.cur_span,
+                        severity: Some(MessageSeverity::Warning),
                     });
                 }
             }
@@ -2665,14 +2759,23 @@ impl Simulator {
                     b
                 })
                 .collect();
-            if bytes
-                .iter()
-                .all(|&b| b != 0 && (b.is_ascii_graphic() || b == b' '))
-            {
-                return String::from_utf8_lossy(&bytes).into_owned();
+            // Oversized return slots zero-pad on the MSB side: strip the
+            // leading NUL bytes so a padded string renders as its text
+            // (`to_string(v)` landing in a 64-bit slot prints "1234", not
+            // hex of 0x31323334). All-NUL stays non-text so integer 0
+            // still prints "0".
+            let payload = match bytes.iter().position(|&b| b != 0) {
+                Some(i) => &bytes[i..],
+                None => &bytes[bytes.len()..],
+            };
+            if !payload.is_empty() && payload.iter().all(|&b| b.is_ascii_graphic() || b == b' ') {
+                return String::from_utf8_lossy(payload).into_owned();
             }
         }
+        // VHDL integers are 32-bit two's complement: TEXTIO `write(l, -122)`
+        // spells "-122", not the unsigned bit pattern.
         match v.to_u64() {
+            Some(n) if w == 32 && n > i32::MAX as u64 => (n as u32 as i32).to_string(),
             Some(n) if w <= 32 => n.to_string(),
             Some(n) => format!("0x{:x}", n),
             None => "X".to_string(),
@@ -2684,7 +2787,8 @@ impl Simulator {
             self.emit(SimEvent::Message {
                 text: format!("error: cannot read memory file '{}'", fname),
                 time_fs: self.time,
-                span: self.cur_span,
+                span: None,
+                severity: Some(MessageSeverity::Error),
             });
             return;
         };
@@ -2794,6 +2898,7 @@ impl Simulator {
                     text: format!("{}\n", text),
                     time_fs: self.time,
                     span: self.cur_span,
+                    severity: None,
                 });
             }
         }
@@ -2851,21 +2956,26 @@ impl Simulator {
                 return any;
             }
         }
+        self.fail_comb_loop();
+        any
+    }
+
+    /// Report unconverged continuous assigns: the combinational-loop guard.
+    /// An unbounded failure would otherwise spin the delta loop forever
+    /// without time ever advancing (so --max-time could not stop it).
+    fn fail_comb_loop(&mut self) {
         self.cur_proc = None;
         self.emit(SimEvent::Message {
             text: format!(
-                "error: combinational loop detected at t={} — continuous assignments never settle (a signal's value feeds back into its own RHS with no clock in between); simulation stopped\\n",
+                "error: combinational loop detected at t={} — continuous assignments never settle (a signal's value feeds back into its own RHS with no clock in between); simulation stopped\n",
                 fmt_time(self.time)
             ),
             time_fs: self.time,
             span: self.cur_span,
-            });
-        // Unconverged continuous assigns will oscillate every delta — an
-        // unbounded failure would otherwise spin the delta loop forever
-        // without time ever advancing (so --max-time could not stop it).
+            severity: Some(MessageSeverity::Error),
+        });
         self.stopped = true;
         self.error_stopped = true;
-        any
     }
 
     // ---- signal update + scheduling ---------------------------------------------------
@@ -3085,6 +3195,23 @@ impl Simulator {
         );
     }
 
+    /// True while the signal's most recent change is current: LRM 8.1
+    /// `'event` is only true in the simulation cycle the change took effect.
+    /// The kernel applies an update in one pump iteration and runs the woken
+    /// process in the next — both are the same VHDL delta — so a stamp within
+    /// one epoch of now counts; anything older is a previous delta and the
+    /// edge test must be false (`prev` alone keeps a clock's pre-edge value
+    /// across the whole high phase, which made `wait until rising_edge(clk)
+    /// and ready` fire mid-phase, one cycle before the guarded handshake).
+    fn edge_current(&self, i: usize) -> bool {
+        let evt = if i < self.sig_evt.len() {
+            self.sig_evt[i]
+        } else {
+            0
+        };
+        self.delta_epoch.saturating_sub(evt) <= 1
+    }
+
     /// Returns true if the signal actually changed.
     fn set_sig(&mut self, sig: FlatSigId, v: Value) -> bool {
         let old = self.vals[sig as usize].clone();
@@ -3094,6 +3221,10 @@ impl Simulator {
         }
         self.prev[sig as usize] = old.clone();
         self.vals[sig as usize] = new.clone();
+        // Stamp the delta epoch of this change — edge tests (`rising_edge`,
+        // `falling_edge`, `'event`) consult it to stay true only while the
+        // change is current (see the field docs).
+        self.sig_evt[sig as usize] = self.delta_epoch;
         if !self.watch.is_empty() {
             self.watch_change(sig, &old, &new);
         }
@@ -3274,6 +3405,7 @@ impl Simulator {
                 ),
                 time_fs: self.time,
                 span: self.cur_span,
+                severity: Some(MessageSeverity::Error),
             });
         }
         self.stopped = true;
@@ -3297,17 +3429,28 @@ impl Simulator {
                     Expr::Sig(s) if self.is_mem[*s as usize] => {
                         let sig = *s as usize;
                         let w = self.flat.signals[sig].width.max(1);
+                        // A word write must report a real change so the
+                        // continuous-assign fixpoint re-sweeps: assigns are
+                        // evaluated in order, and without a reported change a
+                        // whole-memory compare scheduled before this write
+                        // (`arr = (OTHERS => '1')`) would never re-run — the
+                        // fixpoint stops on the first change-free sweep.
+                        let mut changed = false;
                         if (a as usize) < self.mems[sig].len() {
                             let old = self.mems[sig][a as usize].clone();
-                            self.mems[sig][a as usize] = v.resize(w);
+                            let new = v.resize(w);
+                            changed = old != new;
+                            self.mems[sig][a as usize] = new;
                             self.wake_mem_watchers(sig, a as usize, old);
                         } else if self.mem_grow_ok(sig, a as usize) {
                             let old = Value::x(w);
                             self.mems[sig].resize(a as usize + 1, Value::x(w));
-                            self.mems[sig][a as usize] = v.resize(w);
+                            let new = v.resize(w);
+                            changed = old != new;
+                            self.mems[sig][a as usize] = new;
                             self.wake_mem_watchers(sig, a as usize, old);
                         }
-                        false // memory element: no scalar event phase 1
+                        changed
                     }
                     _ => {
                         // Bit write.
@@ -3351,9 +3494,12 @@ impl Simulator {
                             for j in 0..=(msb - lsb) {
                                 cur.set_bit(lsb + j, v.bit(j));
                             }
+                            // Report the change for the same fixpoint reason
+                            // as the whole-word write above.
+                            let changed = old != cur;
                             self.mems[sig][a as usize] = cur;
                             self.wake_mem_watchers(sig, a as usize, old);
-                            return false; // memory element: no scalar event phase 1
+                            return changed;
                         }
                     }
                     return false;
@@ -3450,10 +3596,23 @@ impl Simulator {
                 a.abs_diff(b) + 1
             }
             Expr::Idx { .. } => 1,
-            Expr::Call { name, args, .. } => self
-                .func_match(name, args, locals)
-                .map(|i| self.flat.functions[i].ret_width)
-                .unwrap_or(1),
+            Expr::Call { name, args, .. } => {
+                // `$const_idx(val, idx, w)` — element `w` of a flat constant
+                // array: the element width is the third argument (a literal
+                // at every lowering site). Without it the call's width reads
+                // the 1-wide fallback, and an unconstrained-array overload
+                // (a width-1 formal) then absorbs a call an exact-width
+                // overload should take — `to_string(integer_expr)` bound the
+                // `std_ulogic_vector` overload and rendered bit characters.
+                if name == "$const_idx" {
+                    if let Some(w) = args.get(2) {
+                        return self.eval_expr(w, locals).to_u64().unwrap_or(1).max(1) as usize;
+                    }
+                }
+                self.func_match(name, args, locals)
+                    .map(|i| self.flat.functions[i].ret_width)
+                    .unwrap_or(1)
+            }
             Expr::Replicate { e, .. } => self.expr_width(e, locals),
             Expr::Rising(_) | Expr::Falling(_) => 1,
             Expr::Prev(e) => self.expr_width(e, locals),
@@ -3628,10 +3787,13 @@ impl Simulator {
                 // signal.
                 if let Some(l) = locals {
                     if sig < l.len() {
-                        let w = l[sig].width().max(1);
+                        // A null-range actual keeps its zero width at the
+                        // call boundary, so `'length` reports 0 (LRM 1076
+                        // §16.2: 'length of a null range is 0).
+                        let w = l[sig].width();
                         let v = match *attr {
                             "length" => w as u64,
-                            "high" | "left" => (w as u64).saturating_sub(1),
+                            "high" | "left" => w.saturating_sub(1) as u64,
                             _ => 0, // low | right
                         };
                         return Value::from_u64(32, v);
@@ -3750,7 +3912,7 @@ impl Simulator {
                 } else {
                     VX
                 };
-                Value::from_u64(1, (cur == V1 && prev == V0) as u64)
+                Value::from_u64(1, (self.edge_current(i) && cur == V1 && prev == V0) as u64)
             }
             Expr::Falling(e) => {
                 let v = self.eval_expr(e, locals);
@@ -3764,7 +3926,7 @@ impl Simulator {
                 } else {
                     VX
                 };
-                Value::from_u64(1, (cur == V0 && prev == V1) as u64)
+                Value::from_u64(1, (self.edge_current(i) && cur == V0 && prev == V1) as u64)
             }
             Expr::Prev(e) => {
                 // `sig'last_value`: the value before the current delta.
@@ -3816,6 +3978,13 @@ impl Simulator {
                 let s = if self.expr_real(e, locals) {
                     match v.to_f64() {
                         Some(f) => format!("{}", f),
+                        None => "x".to_string(),
+                    }
+                } else if self.expr_signed(e, locals) {
+                    // Signed integer image: sign-extend from the value's own
+                    // width (`integer'image(-1)` is "-1", not 4294967295).
+                    match v.to_i64() {
+                        Some(n) => n.to_string(),
                         None => "x".to_string(),
                     }
                 } else {
@@ -3946,6 +4115,18 @@ impl Simulator {
             // radix digits (uppercase, 'X' for unknown nibbles); to_string of a
             // 1-bit value is its char, of a byte-multiple value its bytes.
             "to_hstring" | "to_ostring" | "to_bstring" | "to_string" if !args.is_empty() => {
+                // A user-declared overload shadows the built-in for calls it
+                // can bind (LRM 1076 §11.3 — a locally declared homograph
+                // hides the implicitly declared one): a design's own
+                // `to_string(integer)` must reach the user body, not the
+                // per-bit built-in rendering. Strict binding rejects the
+                // steals that would break this — bodiless spec stubs (e.g.
+                // ieee_proposed's decl-only to_* family) and
+                // width-incompatible candidates fall through to the
+                // built-in.
+                if let Some(fi) = self.func_match_strict(name, args, locals) {
+                    return self.run_func(fi, args, shapes, locals);
+                }
                 let v = self.eval_expr(&args[0], locals);
                 let s = match name {
                     "to_hstring" => vhdl_radix_string(&v, 16),
@@ -4130,26 +4311,62 @@ impl Simulator {
     /// first-registered one — a width-mismatched argument reads X rather
     /// than failing.
     fn func_match(&self, name: &str, args: &[Expr], locals: Option<&Vec<Value>>) -> Option<usize> {
+        self.func_match_impl(name, args, locals, true)
+    }
+
+    /// Strict overload binding for built-in shadowing decisions (the to_*
+    /// family): only a bodied candidate whose formals take the actuals by
+    /// width wins. The arity-only last-resort tiers exist so user dispatch
+    /// always has something to run; when deciding whether a user homograph
+    /// shadows a built-in, a width-incompatible or bodiless candidate must
+    /// not steal the call — `to_string(2.5)` with only a user
+    /// `to_string(integer)` declared is the built-in's real rendering, not
+    /// the user body (LRM 1076 §11.3 hides only the implicit declaration
+    /// with the same signature).
+    fn func_match_strict(
+        &self,
+        name: &str,
+        args: &[Expr],
+        locals: Option<&Vec<Value>>,
+    ) -> Option<usize> {
+        self.func_match_impl(name, args, locals, false)
+    }
+
+    fn func_match_impl(
+        &self,
+        name: &str,
+        args: &[Expr],
+        locals: Option<&Vec<Value>>,
+        last_resort: bool,
+    ) -> Option<usize> {
         let nargs = args.len();
         // VHDL identifiers are case-insensitive (LRM 1076 §15.2); the table
         // is keyed lowercase so a `ROUND(signed)` body answers a `round(...)`
         // call site. The lowerer's table is keyed the same way.
-        let cands = self.funcs.get(&name.to_ascii_lowercase())?;
-        if cands.len() == 1 {
-            return Some(cands[0]);
+        let cands_map = self.funcs.get(&name.to_ascii_lowercase())?;
+        if last_resort && cands_map.len() == 1 {
+            return Some(cands_map[0]);
         }
         // Interface-only stubs (spec declarations whose body never landed —
         // e.g. the built-in ieee.math_real spec) must never win a width tie
         // against a real body: they execute as empty bodies returning X,
         // which callers loop on forever. Try real bodies first; stubs are a
         // last resort.
-        let is_stub_fn = |i: usize| match &*self.flat.functions[i].body {
-            Stmt::Null => true,
-            Stmt::Block(ss) => ss.is_empty(),
-            _ => false,
-        };
-        let mut ordered: Vec<usize> = cands.iter().copied().filter(|&i| !is_stub_fn(i)).collect();
-        ordered.extend(cands.iter().copied().filter(|&i| is_stub_fn(i)));
+        let is_stub_fn = |i: usize| hdl_ir::is_bodiless(&self.flat.functions[i].body);
+        let mut ordered: Vec<usize> = cands_map
+            .iter()
+            .copied()
+            .filter(|&i| !is_stub_fn(i))
+            .collect();
+        ordered.extend(cands_map.iter().copied().filter(|&i| is_stub_fn(i)));
+        // Strict binding never executes a bodiless spec stub — drop it from
+        // the candidate pool entirely (the built-in serves the call).
+        if !last_resort {
+            ordered.retain(|&i| !is_stub_fn(i));
+            if ordered.is_empty() {
+                return None;
+            }
+        }
         let cands = &ordered;
         let fits = |&i: &usize| {
             let f = &self.flat.functions[i];
@@ -4211,14 +4428,25 @@ impl Simulator {
             let f = &self.flat.functions[i];
             args.iter().enumerate().all(|(j, a)| match arg_hint(a) {
                 None => true,
-                Some(h) => f.formal_types.get(j).is_none_or(|t| t.is_empty() || t == h),
+                // A `signed` hint covers the integer family too: an
+                // integer-typed actual lowers `Signed`-marked (bit-identical)
+                // and must prefer the `integer` formal over a same-width
+                // `std_ulogic_vector` formal, which no integer actual can
+                // bind implicitly (LRM 1076 §9.3.5 — no implicit conversion).
+                Some(h) => f
+                    .formal_types
+                    .get(j)
+                    .is_none_or(|t| t.is_empty() || t == h || (h == "signed" && t == "integer")),
             })
         };
-        let pick_in = |pool: &[usize]| -> Option<usize> {
+        let pick_width_in = |pool: &[usize]| -> Option<usize> {
             pool.iter()
                 .copied()
                 .find(|i| width_exact(i))
                 .or_else(|| pool.iter().copied().find(|i| width_wild(i)))
+        };
+        let pick_in = |pool: &[usize]| -> Option<usize> {
+            pick_width_in(pool)
                 .or_else(|| {
                     pool.iter()
                         .copied()
@@ -4228,16 +4456,21 @@ impl Simulator {
         };
         let fitting: Vec<usize> = cands.iter().copied().filter(|i| fits(i)).collect();
         let typed: Vec<usize> = fitting.iter().copied().filter(|i| type_ok(i)).collect();
-        let picked = pick_in(&typed)
-            .or_else(|| pick_in(&fitting))
-            .or_else(|| {
-                cands
-                    .iter()
-                    .copied()
-                    .find(|&i| self.flat.functions[i].arity == nargs)
-            })
-            .or_else(|| cands.iter().copied().find(fits))
-            .unwrap_or(cands[0]);
+        let picked = if last_resort {
+            pick_in(&typed)
+                .or_else(|| pick_in(&fitting))
+                .or_else(|| {
+                    cands
+                        .iter()
+                        .copied()
+                        .find(|&i| self.flat.functions[i].arity == nargs)
+                })
+                .or_else(|| cands.iter().copied().find(fits))
+                .unwrap_or(cands[0])
+        } else {
+            // Strict: a width-compatible bodied candidate or nothing.
+            pick_width_in(&typed).or_else(|| pick_width_in(&fitting))?
+        };
         // A self-call that passes a formal through UNCHANGED — the body
         // lowered `f(unsigned(x))` to `f(Sig(x))` (bit-identical type
         // conversion) or `f(signed(x))` to `f(Signed(Sig(x)))` — receives
@@ -4246,7 +4479,9 @@ impl Simulator {
         // unconstrained formals (`conv_float(signed)` vs
         // `conv_float(unsigned)`, both w1) hit exactly this. Dispatch to
         // the next fitting candidate instead of the executing function.
-        let picked = if Some(picked) == self.cur_fn.get() {
+        // (Strict binding skips this: it never picks the arity-tier
+        // delegating bodies the rule exists for.)
+        let picked = if last_resort && Some(picked) == self.cur_fn.get() {
             // A formal passed through a bare `Sig` or through the
             // bit-identical `Signed` marker reaches this function with the
             // same value every time — unwrap both to the slot id.
@@ -4486,8 +4721,15 @@ impl Simulator {
             let v = self.eval_expr(a, locals);
             // Same rule as `run_procedure`: an actual wider than the declared
             // slot (unconstrained array-of-record formals) keeps its full
-            // width — the slot is a lower bound, never a truncation.
-            lvals.push(v.resize(w.max(v.width())));
+            // width — the slot is a lower bound, never a truncation. A
+            // null-range actual (`""`) keeps its zero width: padding it to
+            // the slot width would report `'length = 1` and defeat
+            // null-range guards (`if number'length = 0`).
+            lvals.push(if v.width() == 0 {
+                v
+            } else {
+                v.resize(w.max(v.width()))
+            });
         }
         // Omitted trailing actuals take the formals' recorded interface
         // defaults (`w : natural := 8`); anything after the formals (locals)
@@ -4554,8 +4796,13 @@ impl Simulator {
             let v = self.eval_expr(a, caller.as_deref());
             // An actual wider than the declared slot (unconstrained string
             // parameters) keeps its full width — the slot is a lower bound,
-            // never a truncation.
-            lvals.push(v.resize(w.max(v.width())));
+            // never a truncation. A null-range actual keeps its zero width
+            // (see run_func: `'length` of the formal must stay 0).
+            lvals.push(if v.width() == 0 {
+                v
+            } else {
+                v.resize(w.max(v.width()))
+            });
         }
         while lvals.len() < f.slots.len() {
             lvals.push(Value::x(f.slots[lvals.len()]));
@@ -5019,6 +5266,7 @@ impl<'a> ProcRunner<'a> {
                     ),
                     time_fs: self.sim.time,
                     span: self.sim.cur_span,
+                    severity: Some(MessageSeverity::Warning),
                     });
                 Control::Done
             }

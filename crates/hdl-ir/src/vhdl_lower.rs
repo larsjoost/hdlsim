@@ -24,7 +24,7 @@
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
-use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VX, VZ};
+use crate::value::{BinOp, UnOp, Value, V0, V1, VDASH, VH, VL, VU, VW, VX, VZ};
 use crate::verilog_lower::const_eval_f_with_pkgs;
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
@@ -961,6 +961,11 @@ struct Lower<'a> {
     /// `x` characters X-poison the value and kill `'length` downstream. Set
     /// around initializer lowering only (see `string_typed`).
     str_ctx: bool,
+    /// Enclosing function's return type is string-typed: `RETURN "0"` in a
+    /// string-returning function is text, so the return expression lowers in
+    /// the string context (set in `lower_fn_into_slots`, consulted by
+    /// `lower_return_stmt`).
+    fn_ret_str: bool,
     /// Names currently bound to no value whose X roots in an unbound formal
     /// generic (a required formal with no default, and constants derived from
     /// one): expressions referencing them are constant per instance, so their
@@ -1071,6 +1076,7 @@ impl<'a> Lower<'a> {
             aliases: HashMap::new(),
             alias_rec: HashMap::new(),
             suppress_err: 0,
+            fn_ret_str: false,
             fn_scope: 0,
             pkgs: HashMap::new(),
             cfgs: HashMap::new(),
@@ -1198,7 +1204,11 @@ impl<'a> Lower<'a> {
         for n in real_children(u) {
             if n.kind() == SyntaxKind::Name {
                 let text = self.db.span_text(n.span()).trim();
-                let parts: Vec<&str> = text.split('.').collect();
+                // Whitespace is free between tokens (`pkg . item` equals
+                // `pkg.item`), so every dotted part is trimmed — the raw
+                // span text keeps interior spacing (`pkg. item`) that would
+                // otherwise miss the item key.
+                let parts: Vec<&str> = text.split('.').map(|p| p.trim()).collect();
                 // Two-part names are ambiguous: `lib.unit` (e.g.
                 // `context vunit_lib.com_context;`) vs `unit.item` / `unit.all`.
                 // If the second part names a known package, it is the unit.

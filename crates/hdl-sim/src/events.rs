@@ -10,6 +10,42 @@
 use hdl_ir::Value;
 use hdl_syntax::source::Span;
 
+/// Severity of a report/assert message (LRM 1076 §10.2 `severity_level`),
+/// resolved by the lowerer/kernel so a transcript renderer can color the line
+/// and prefix the emitting statement's location without sniffing the text.
+/// `None` marks output with no VHDL severity — plain `$display`/`$write` and
+/// textio echoes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MessageSeverity {
+    Note,
+    Warning,
+    Error,
+    Failure,
+}
+
+impl MessageSeverity {
+    /// LRM severity_level name, lowercase.
+    pub fn name(self) -> &'static str {
+        match self {
+            MessageSeverity::Note => "note",
+            MessageSeverity::Warning => "warning",
+            MessageSeverity::Error => "error",
+            MessageSeverity::Failure => "failure",
+        }
+    }
+
+    /// Parse a lowercase LRM severity name; `None` for anything else.
+    pub fn from_name(name: &str) -> Option<MessageSeverity> {
+        match name {
+            "note" => Some(MessageSeverity::Note),
+            "warning" => Some(MessageSeverity::Warning),
+            "error" => Some(MessageSeverity::Error),
+            "failure" => Some(MessageSeverity::Failure),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum SimEvent {
     /// A statement executed (carries its source span) — drives line/branch
@@ -36,11 +72,14 @@ pub enum SimEvent {
     },
     /// A `$display`/`$write`/`report` line of text. `span` is the source
     /// statement that produced it when known, so a transcript reader (human
-    /// or agent) can jump straight to the source line.
+    /// or agent) can jump straight to the source line. `severity` is the
+    /// VHDL severity level for report/assert output (`None` for plain
+    /// `$display` text) — see [`MessageSeverity`].
     Message {
         text: String,
         time_fs: u64,
         span: Option<Span>,
+        severity: Option<MessageSeverity>,
     },
     /// A test failed: `assert`/`report` with severity `error`/`failure`, or a
     /// Verilog `$error`/`$fatal`. CLI runners exit non-zero when this fires.

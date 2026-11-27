@@ -3611,6 +3611,46 @@ fn ce_f64(v: &Value) -> Option<f64> {
     v.to_f64().or_else(|| v.to_u64().map(|n| n as f64))
 }
 
+/// Whether a const-evaluated expression is signed (mirrors the simulator's
+/// `expr_signed`): `Signed`/`Resize{signed}` markers carry it; literal and
+/// env operands are unsigned.
+fn ce_signed(e: &Expr) -> bool {
+    match e {
+        Expr::Signed(_) => true,
+        Expr::Resize { signed, .. } => *signed,
+        Expr::Bin { op, l, r } => {
+            if matches!(
+                op,
+                BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
+            ) {
+                ce_signed(l)
+            } else {
+                ce_signed(l) && ce_signed(r)
+            }
+        }
+        Expr::Un { e, .. } => ce_signed(e),
+        _ => false,
+    }
+}
+
+/// Sign-extended integer value for ordered comparisons, or `None` when the
+/// value holds metavariables. Mirrors the kernel's signed comparison.
+fn ce_to_i(v: &Value, w: usize) -> Option<i128> {
+    if !v.is_known() {
+        return None;
+    }
+    let mut x: i128 = 0;
+    for (i, &b) in v.bits.iter().enumerate() {
+        if b == V1 {
+            x |= 1 << i;
+        }
+    }
+    if w < 128 && v.bit(w - 1) == V1 {
+        x |= -1i128 << w; // sign bit
+    }
+    Some(x)
+}
+
 /// `Some(slots)` while interpreting a function body: `Expr::Sig(i)` then
 /// reads slot `i` (slot 0 = return value, then args, then locals) instead of
 /// failing.
@@ -3642,6 +3682,10 @@ fn ce_impl(
             let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             let s = if ce_real(e) || v.real {
                 ce_f64(&v).map(|f| format!("{}", f))?
+            } else if ce_signed(e) {
+                // Signed integer image: sign-extend from the value's own
+                // width (`integer'image(-1)` is "-1", not 4294967295).
+                v.to_i64().map(|n| n.to_string())?
             } else {
                 v.to_u64().map(|n| n.to_string())?
             };
@@ -3691,6 +3735,26 @@ fn ce_impl(
                 // `width=0` still folds instead of failing the range check.
                 if matches!(op, BinOp::Div | BinOp::Mod) && rv.to_u64() == Some(0) {
                     return Some(Value::from_u64(1, 0));
+                }
+                // Ordered comparison with a signed operand: sign-extend both
+                // to the wider width first (`C_NEG >= 0` with `C_NEG = -1`
+                // must fold to false, not 4294967295 >= 0).
+                if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+                    && (ce_signed(l) || ce_signed(r))
+                {
+                    let w = lv.width().max(rv.width()).max(1);
+                    return match (ce_to_i(&lv, w), ce_to_i(&rv, w)) {
+                        (Some(a), Some(b)) => Some(Value::from_u64(
+                            1,
+                            match op {
+                                BinOp::Lt => a < b,
+                                BinOp::Le => a <= b,
+                                BinOp::Gt => a > b,
+                                _ => a >= b,
+                            } as u64,
+                        )),
+                        _ => None,
+                    };
                 }
                 Some(lv.binop(*op, &rv))
             }

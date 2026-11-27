@@ -24,7 +24,9 @@ fn analyze_flags_dead_signals_with_explanations() {
         "module m (\n    input  wire clk,\n    input  wire en,\n    output reg  [7:0] q\n);\n    wire [7:0] dead_wire;\n    always @(posedge clk) begin\n        if (en)\n            q <= q + 8'd1;\n    end\nendmodule\n",
     );
     let out = hdlsim()
-        .args(["analyze", f.to_str().unwrap()])
+        // --no-color: this test pins the finding text; colors are on by
+        // default now (see tests/color.rs).
+        .args(["analyze", "--no-color", f.to_str().unwrap()])
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));
@@ -59,7 +61,7 @@ fn analyze_vhdl_entity() {
         "library ieee;\nuse ieee.std_logic_1164.all;\n\nentity m is\n    port (clk : in std_logic; q : out std_logic_vector(7 downto 0));\nend entity;\n\narchitecture rtl of m is\n    signal dead_s : std_logic_vector(7 downto 0);\nbegin\n    q <= dead_s;\nend architecture;\n",
     );
     let out = hdlsim()
-        .args(["analyze", f.to_str().unwrap()])
+        .args(["analyze", "--no-color", f.to_str().unwrap()])
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));

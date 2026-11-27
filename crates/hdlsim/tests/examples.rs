@@ -46,9 +46,13 @@ fn every_feature_example_prints_pass() {
             .expect("runs hdlsim");
         let text = String::from_utf8_lossy(&out.stdout).to_string()
             + &String::from_utf8_lossy(&out.stderr);
-        let pass = text
-            .lines()
-            .any(|l| l.trim() == "PASS" || l.trim() == ": PASS");
+        let pass = text.lines().any(|l| {
+            let l = l.trim();
+            // Note-severity report lines carry the emitting statement's
+            // location (`file:line: PASS`); older transcripts and bare
+            // $display keep the plain/`: `-prefixed shapes.
+            l == "PASS" || l == ": PASS" || l.ends_with(": PASS")
+        });
         if !pass || !out.status.success() {
             failed.push(format!(
                 "{}: status={:?} pass={}\n{}",

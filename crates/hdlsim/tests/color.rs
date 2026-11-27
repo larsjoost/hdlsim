@@ -1,6 +1,6 @@
 //! Colorized diagnostics: `--color always|never|auto`, `--no-color`, and the
-//! standard `NO_COLOR` variable. Tests run the binary with piped output, so
-//! auto mode (default) must produce no ANSI escapes.
+//! standard `NO_COLOR` variable. Colors are on by default — even for piped
+//! output (agent-consumed transcripts) — and the default honors `NO_COLOR`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -101,12 +101,25 @@ fn hdls_sim_color_flag_forces_and_disables() {
 }
 
 #[test]
-fn piped_default_is_plain() {
-    // Test harness pipes output (not a tty), so auto mode must not colorize.
-    let f = write_tmp("auto", BAD_SRC);
+fn piped_default_is_colored() {
+    // The default is always-on: piped output still carries the severity
+    // color (agent-consumed transcripts). `--no-color` / NO_COLOR turn it
+    // off, `--color auto` restores tty detection.
+    let f = write_tmp("default", BAD_SRC);
     let (_o, err, _c) = run_color(&[], &f, &[]);
+    assert!(err.contains("\x1b[1;31m"), "{}", err);
+    let _ = std::fs::remove_file(&f);
+
+    // NO_COLOR disables the default mode.
+    let f = write_tmp("default_nc", BAD_SRC);
+    let (_o, err, _c) = run_color(&[], &f, &[("NO_COLOR", "1")]);
     assert!(!err.contains("\x1b["), "{}", err);
-    assert!(err.contains("error[E0301]:"), "{}", err);
+    let _ = std::fs::remove_file(&f);
+
+    // An explicit --color always overrides NO_COLOR.
+    let f = write_tmp("always_nc", BAD_SRC);
+    let (_o, err, _c) = run_color(&["--color", "always"], &f, &[("NO_COLOR", "1")]);
+    assert!(err.contains("\x1b[1;31m"), "{}", err);
     let _ = std::fs::remove_file(&f);
 }
 
@@ -129,11 +142,13 @@ fn sim_failures_are_red_when_color_forced() {
 }
 
 #[test]
-fn no_color_env_disables_even_when_forced_by_tty() {
-    // NO_COLOR only applies in auto mode; with an explicit flag the flag wins,
-    // but in the piped test harness auto+NO_COLOR must be plain.
+fn no_color_env_disables_the_default() {
+    // NO_COLOR applies to the default (always-on) mode; an explicit
+    // `--color never` is plain everywhere regardless.
     let f = write_tmp("nocolor", BAD_SRC);
     let (_o, err, _c) = run_color(&[], &f, &[("NO_COLOR", "1")]);
+    assert!(!err.contains("\x1b["), "{}", err);
+    let (_o, err, _c) = run_color(&["--color", "never"], &f, &[("NO_COLOR", "1")]);
     assert!(!err.contains("\x1b["), "{}", err);
     let _ = std::fs::remove_file(&f);
 }

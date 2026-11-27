@@ -79,7 +79,12 @@ impl<'a> Lower<'a> {
                     kind: SigKind::Wire,
                     init: None,
                     mem: None,
-                    signed: false,
+                    // VHDL loop variables are integers: a signed slot keeps
+                    // null ranges null (`for i in 0 to -1` / `-1 downto 0`
+                    // must run zero iterations — unsigned, the -1 bound
+                    // reads 4294967295 and the loop guard stays true for
+                    // ~2^31 iterations).
+                    signed: true,
                 });
                 self.names.insert(var.to_string(), id);
                 id
@@ -173,8 +178,12 @@ impl<'a> Lower<'a> {
             .map(|k| self.lower_expr(k, &self.consts.clone()));
         match (a, b) {
             (Some(a), Some(b)) => {
+                // (start, end, downto) — `make_for`'s convention: the loop
+                // starts at the left bound and, for `downto`, counts down
+                // while `i >= end` (`for_range_attr_bounds` returns the
+                // same shape for `reverse_range`).
                 if dir == "downto" {
-                    (b, a, true)
+                    (a, b, true)
                 } else {
                     (a, b, false)
                 }
@@ -187,7 +196,11 @@ impl<'a> Lower<'a> {
     /// range: flat-slot runtime bounds, else the object's/type's dims,
     /// else the memory depth of a materialized array constant. `None`
     /// falls through to the discrete-range expression form.
-    fn for_range_attr_bounds(&self, bn: &str, reverse: bool) -> Option<(Expr, Expr, bool)> {
+    pub(super) fn for_range_attr_bounds(
+        &self,
+        bn: &str,
+        reverse: bool,
+    ) -> Option<(Expr, Expr, bool)> {
         // Flat slot (function formal, unsized signal): runtime bounds
         // from the bound value's width.
         if let Some((lo, hi)) = self.object_id(bn).and_then(|id| self.flat_slot_range(id)) {
@@ -270,8 +283,13 @@ impl<'a> Lower<'a> {
         };
         let cond = Expr::Bin {
             op: if downto { BinOp::Ge } else { BinOp::Le },
-            l: Box::new(v()),
-            r: Box::new(hi),
+            // The loop variable is an integer (LRM 1076 §8.9): mark the
+            // comparison operands so the guard sign-extends — an unsigned
+            // slot read would turn a null range (`0 to -1`, `-1 downto 0`)
+            // into ~2^31 iterations against the raw 0xFFFFFFFF bound. The
+            // init/step targets stay raw `Sig` writes.
+            l: Box::new(Expr::Signed(Box::new(v()))),
+            r: Box::new(Expr::Signed(Box::new(hi))),
         };
         let step = Stmt::Assign {
             lhs: v(),

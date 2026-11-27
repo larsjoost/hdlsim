@@ -55,8 +55,9 @@ impl<'a> Lower<'a> {
         self.install_entity_maps(&entity_name);
         // Entity generics are constants in the architecture (also when the
         // architecture was deferred to a pending pass with a fresh scope).
-        // A record-typed generic's type name is restored into `const_types`
-        // so `G_PARAM.field` selects resolve out-of-file too (the record's
+        // A generic's type name is restored into `const_types` so
+        // `G_PARAM.field` selects resolve out-of-file and a signed-integer
+        // generic keeps its signedness at use sites (the record's
         // `TypeInfo` arrives via the entity's context clauses above).
         for prm in &modules[midx].params {
             let key = prm.name.to_ascii_lowercase();
@@ -370,18 +371,39 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|k| self.lower_expr(k, &env))
             .collect();
-        if exprs.len() < 2 {
-            return;
-        }
         let ev = |e: &Expr| self.ce_env(e, &env).and_then(|v| v.to_u64());
-        let (Some(lo), Some(hi)) = (ev(&exprs[0]), ev(&exprs[1])) else {
-            // A range hanging on an unbound formal generic is constant per
-            // instance (the generic map rebinds it) — same reasoning as the
-            // constant-initializer suppression.
-            if !range_nodes.iter().any(|k| self.refs_unset_generic(k)) {
-                self.warn(s.span(), "generate range is not constant; skipped");
+        // `for i in x'range generate` — a single attribute expression, not
+        // two discrete bounds. Resolve the bounds exactly as the sequential
+        // for-loop does (constant's initializer dims, then the shared
+        // signal/type/memory rules), so generate loops over array constants
+        // unroll instead of being silently skipped.
+        let attr_bounds = kids.iter().take(gen_pos).find_map(|k| match k.kind() {
+            SyntaxKind::Attr => self.gen_range_attr_bounds(k),
+            SyntaxKind::Range => real_children(k)
+                .iter()
+                .find(|c| c.kind() == SyntaxKind::Attr)
+                .and_then(|at| self.gen_range_attr_bounds(at)),
+            _ => None,
+        });
+        let (lo, hi, downto) = if let Some((a, b, dt)) = attr_bounds {
+            match (ev(&a), ev(&b)) {
+                (Some(a), Some(b)) => (a, b, dt),
+                _ => return,
             }
-            return;
+        } else {
+            if exprs.len() < 2 {
+                return;
+            }
+            let (Some(lo), Some(hi)) = (ev(&exprs[0]), ev(&exprs[1])) else {
+                // A range hanging on an unbound formal generic is constant per
+                // instance (the generic map rebinds it) — same reasoning as the
+                // constant-initializer suppression.
+                if !range_nodes.iter().any(|k| self.refs_unset_generic(k)) {
+                    self.warn(s.span(), "generate range is not constant; skipped");
+                }
+                return;
+            };
+            (lo, hi, downto)
         };
         let (decls, body) = self.gen_body(&kids[gen_pos + 1..]);
         // Generate-local declarations and the loop parameter are scoped to
@@ -390,23 +412,48 @@ impl<'a> Lower<'a> {
         // lowered after it.
         let saved_consts = self.consts.clone();
         // Bounds may be real-typed (invalid VHDL) whose f64 bit pattern reads
-        // as a huge u64; check the iteration count before allocating.
-        let n = if downto {
-            lo.checked_sub(hi)
+        // as a huge u64; check the iteration count before allocating. Bounds
+        // fold in 32-bit arithmetic, so a negative bound (`0 TO C_N - 2` with
+        // C_N = 1) arrives wrapped — interpret a 32-bit pair as signed, which
+        // makes the comparison exact. A null discrete range is legal VHDL
+        // (the generate produces nothing) and must be skipped silently; only
+        // a range over the iteration cap stays a warning.
+        let both32 = lo <= u64::from(u32::MAX) && hi <= u64::from(u32::MAX);
+        let (a, b) = if both32 {
+            (i64::from(lo as u32 as i32), i64::from(hi as u32 as i32))
         } else {
-            hi.checked_sub(lo)
-        }
-        .and_then(|d| d.checked_add(1));
-        let Some(n) = n.filter(|&n| n <= 1 << 20) else {
-            self.warn(
-                s.span(),
-                "generate loop range is not a constant discrete range (or too large); skipped",
-            );
+            (lo as i64, hi as i64)
+        };
+        let n = (if downto {
+            a.checked_sub(b)
+        } else {
+            b.checked_sub(a)
+        })
+        .and_then(|d| d.checked_add(1))
+        .filter(|&n| n > 0 && n <= 1 << 20)
+        .map(|n| n as u64);
+        let Some(n) = n else {
+            let null_range = if downto { a < b } else { b < a };
+            if !null_range {
+                self.warn(
+                    s.span(),
+                    "generate loop range is not a constant discrete range (or too large); skipped",
+                );
+            }
             return;
         };
         if crate::debug::TRACE_GENRANGE.load(std::sync::atomic::Ordering::Relaxed) && n > 64 {
             let sf = self.db.file(s.span().file);
             let (line, _col) = sf.line_col(s.span().start);
+            // An attribute range (`x'range`) has no discrete bound
+            // expressions — print the resolved literals instead.
+            let (lo_expr, hi_expr) = match (exprs.first(), exprs.get(1)) {
+                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                _ => (
+                    Expr::Lit(Value::from_u64(32, lo)),
+                    Expr::Lit(Value::from_u64(32, hi)),
+                ),
+            };
             eprintln!(
                 "genrange lo={} hi={} downto={} n={} {}:{} lo_expr {:.80?} hi_expr {:.80?}",
                 lo,
@@ -415,8 +462,8 @@ impl<'a> Lower<'a> {
                 n,
                 sf.name(),
                 line,
-                exprs[0],
-                exprs[1],
+                lo_expr,
+                hi_expr,
             );
         }
         let vals: Vec<u64> = if downto {
@@ -434,6 +481,52 @@ impl<'a> Lower<'a> {
             }
         }
         self.consts = saved_consts;
+    }
+
+    /// Bounds of an `x'range` / `x'reverse_range` attribute in a generate
+    /// loop header. The generate unrolls at lower time, so a constant's
+    /// initializer-recorded `obj_dims` resolves first; objects without it
+    /// fall through to the sequential for-loop's shared resolution
+    /// (signal dims, type dims, flat slots, materialized memories).
+    fn gen_range_attr_bounds(&self, at: &SyntaxNode) -> Option<(Expr, Expr, bool)> {
+        let ak = real_children(at);
+        let attr = ak
+            .iter()
+            .rfind(|k| k.kind() == SyntaxKind::Ident)
+            .map(|k| self.kw(k))
+            .unwrap_or_default();
+        if attr != "range" && attr != "reverse_range" {
+            return None;
+        }
+        let bn = ak
+            .iter()
+            .find(|k| k.kind() == SyntaxKind::Name)
+            .map(|k| self.text(k))?;
+        let reverse = attr == "reverse_range";
+        // Constant with initializer-derived dims: first dim, honoring the
+        // recorded direction (`obj_asc`, ascending for value-shaped dims).
+        let key = bn.to_ascii_lowercase();
+        if let Some(&(lo, sz)) = self.obj_dims.get(&key).and_then(|d| d.first()) {
+            let asc = self
+                .obj_asc
+                .get(&key)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(true);
+            let hi = lo + sz as i64 - 1;
+            // (start, end, downto) — `make_for`/`lower_gen_for` convention:
+            // the loop starts at the left bound, counting down for `downto`.
+            let (a, b, dt) = match (asc, reverse) {
+                (true, false) | (false, true) => (lo, hi, false),
+                (true, true) | (false, false) => (hi, lo, true),
+            };
+            return Some((
+                Expr::Lit(Value::from_u64(32, a as u64)),
+                Expr::Lit(Value::from_u64(32, b as u64)),
+                dt,
+            ));
+        }
+        self.for_range_attr_bounds(&bn, reverse)
     }
 
     /// `if cond generate … [elsif …] [else …] end if generate;` — the first

@@ -395,6 +395,29 @@ impl<'a> Lower<'a> {
                             _ => self.lower_expr(&init, &env),
                         }
                     }
+                    Some(TypeInfo::Vector { .. }) => {
+                        // Builtin 1-D vectors (std_ulogic_vector, bit_vector,
+                        // string, unsigned): named/others aggregates place
+                        // elements over the decl constraint like user array
+                        // types; without this the aggregate hits the generic
+                        // fallback and folds to a mis-sized X (an
+                        // `(OTHERS => 'U')` don't-care byte poisoned every
+                        // later record field in the fold).
+                        let elem = self.array_elem_width(&tn).unwrap_or(1);
+                        let (n, lo) = match &constraint {
+                            Some(c) => (
+                                Some(self.constraint_width(c)),
+                                self.range_low(c, &env).unwrap_or(0),
+                            ),
+                            None => (None, 0),
+                        };
+                        match n {
+                            Some(n) if n > 0 => self
+                                .lower_array_aggregate_specs(&init, n, lo, elem, None, &env)
+                                .unwrap_or_else(|| self.lower_expr(&init, &env)),
+                            _ => self.lower_expr(&init, &env),
+                        }
+                    }
                     _ => self.lower_expr(&init, &env),
                 }
             }
@@ -563,6 +586,29 @@ impl<'a> Lower<'a> {
                         match n {
                             Some(n) if n > 0 => self
                                 .lower_array_aggregate(&init, &tn, n, lo, &env)
+                                .unwrap_or_else(|| self.lower_expr(&init, &env)),
+                            _ => self.lower_expr(&init, &env),
+                        }
+                    }
+                    Some(TypeInfo::Vector { .. }) => {
+                        // Builtin 1-D vectors (std_ulogic_vector, bit_vector,
+                        // string, unsigned): named/others aggregates place
+                        // elements over the decl constraint like user array
+                        // types; without this the aggregate hits the generic
+                        // fallback and folds to a mis-sized X (an
+                        // `(OTHERS => 'U')` don't-care byte poisoned every
+                        // later record field in the fold).
+                        let elem = self.array_elem_width(&tn).unwrap_or(1);
+                        let (n, lo) = match &constraint {
+                            Some(c) => (
+                                Some(self.constraint_width(c)),
+                                self.range_low(c, &env).unwrap_or(0),
+                            ),
+                            None => (None, 0),
+                        };
+                        match n {
+                            Some(n) if n > 0 => self
+                                .lower_array_aggregate_specs(&init, n, lo, elem, None, &env)
                                 .unwrap_or_else(|| self.lower_expr(&init, &env)),
                             _ => self.lower_expr(&init, &env),
                         }

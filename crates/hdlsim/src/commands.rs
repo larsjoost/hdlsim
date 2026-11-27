@@ -123,9 +123,9 @@ impl Command for Help {
         println!("              --bundle FILE  read the whole project from a reproducer .tar");
         println!();
         println!("  Global flags (before or after the command):");
-        println!("    --color auto|always|never   colorize errors/warnings (default: auto =");
-        println!("                                 color when stderr is a terminal; NO_COLOR");
-        println!("                                 also applies)");
+        println!("    --color auto|always|never   colorize errors/warnings (default: always =");
+        println!("                                 color even when piped; NO_COLOR or --no-color");
+        println!("                                 disables; auto = color only on a terminal)");
         println!("    --no-color                   disable color output");
         println!(
             "    --error-format human|json    diagnostics on stderr as rustc-style text (default)"
@@ -163,7 +163,8 @@ impl Command for Help {
         println!("                                (also XILINX_VIVADO, XILINX_HLS)");
         println!("    HDLSIM_ISSUE_REPO=owner/repo  where --report files issues (default larsjoost/hdlsim)");
         println!("    HDLSIM_REPORT_GIST=public   opt in to public gist upload for --report");
-        println!("                                (NO_COLOR is honored for diagnostics)");
+        println!("                                (NO_COLOR disables the default colors; an");
+        println!("                                explicit --color always overrides it)");
         println!("  Debug and limit options are CLI flags on the commands that use them");
         println!(
             "  (--trace*, --max-*, --progress-sec, --no-cache, --cache-dir, --dump-maps, \
@@ -899,7 +900,8 @@ pub const COMMANDS: &[&dyn Command] = &[
 ///   `--no-cache`, `--cache-dir`) — armed once, before any command runs
 ///   (see [`RunOptions`]).
 ///
-/// Returns the remaining args. `NO_COLOR` disables color entirely.
+/// Returns the remaining args. The default color mode is always-on (NO_COLOR
+/// disables); `NO_COLOR` does not override an explicit `--color always`.
 /// Flags may appear before or after the subcommand and in `--flag value`
 /// or `--flag=value` form; a bad value is an error (exit code 2).
 pub fn apply_global_args(

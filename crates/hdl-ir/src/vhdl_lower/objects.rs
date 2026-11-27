@@ -144,7 +144,21 @@ impl<'a> Lower<'a> {
         let val = self.consts.get(fname)?.clone();
         let ew = self.const_elem_width(&tn)?;
         let flat = self.flat_const_index(fname, &tn, args, val.width(), ew)?;
-        Some(Expr::Call {
+        // An element of an array-of-integers constant IS an integer: mark it
+        // so the runtime overload picker can type-match the actual
+        // (`arg_hint` reads the `Signed` marker, bit-identical in eval).
+        // Without it, same-width overloads from other packages — an
+        // unconstrained `std_ulogic_vector` formal also resolves to 32 —
+        // absorb the call by registration order and `to_string(int_elem)`
+        // binds the bit-rendering overload.
+        let int_elem = match self.types.get(&tn) {
+            Some(TypeInfo::Array {
+                elem_name: Some(en),
+                ..
+            }) => matches!(self.types.get(en), Some(TypeInfo::Integer { .. })),
+            _ => false,
+        };
+        let elem = Expr::Call {
             name: "$const_idx".into(),
             args: vec![
                 Expr::Lit(val),
@@ -152,6 +166,11 @@ impl<'a> Lower<'a> {
                 Expr::Lit(Value::from_u64(32, ew as u64)),
             ],
             shapes: Vec::new(),
+        };
+        Some(if int_elem {
+            Expr::Signed(Box::new(elem))
+        } else {
+            elem
         })
     }
 
@@ -185,7 +204,14 @@ impl<'a> Lower<'a> {
                 Some(TypeInfo::Array { dims, .. }) => Some(dims.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| vec![(0, (bits / ew.max(1)).max(1))]);
+            .unwrap_or_else(|| {
+                // Unrecorded shape: the element count comes from the packed
+                // width; a `string` (8-bit elements) defaults to the LRM
+                // `1 TO n` range, everything else to the flat 0-based
+                // mapping.
+                let lo = if ew == 8 { 1 } else { 0 };
+                vec![(lo, (bits / ew.max(1)).max(1))]
+            });
         dims.into_iter()
             .enumerate()
             .map(|(d, (lo, n))| {

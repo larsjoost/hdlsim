@@ -30,10 +30,13 @@ pub fn is_xz(b: u8) -> bool {
     matches!(b, VX | VZ | VW | VU)
 }
 
-/// Loose equality between a narrow bit vector and a wide byte-packed string of
-/// '0'/'1' characters (chars MSB-first, first char in the high byte — the
-/// string-literal packing): true when the wide value is exactly 8x the narrow
-/// one and each byte is the char of the corresponding bit.
+/// Loose equality between a narrow bit vector and a wide byte-packed string
+/// (chars MSB-first, first char in the high byte — the string-literal
+/// packing). Two shapes compare loosely:
+/// - both sides are byte-packed char strings and the wide side carries whole
+///   leading NUL chars (zero-extended return slot padding);
+/// - the wide side is exactly 8× the narrow one and each byte is the char of
+///   the corresponding bit (`to_bstring(v) = "1010"`).
 fn eq_string_loose(a: &Value, b: &Value) -> bool {
     let (narrow, wide) = if a.width() <= b.width() {
         (a, b)
@@ -41,21 +44,37 @@ fn eq_string_loose(a: &Value, b: &Value) -> bool {
         (b, a)
     };
     let nb = narrow.width();
-    if nb == 0 || wide.width() != nb * 8 || !wide.is_known() || !narrow.is_known() {
+    let ww = wide.width();
+    if nb == 0 || ww == 0 || ww % 8 != 0 || !wide.is_known() || !narrow.is_known() {
         return false;
     }
-    let nbytes = wide.width() / 8;
-    (0..nb).all(|i| {
-        // String chars are MSB-first (char 0 = high byte), so bit i is char
-        // `nb - 1 - i`, which sits in byte `nbytes - 1 - (nb - 1 - i)`.
-        let byte_idx = nbytes - nb + i;
-        let byte_bits = &wide.bits[byte_idx * 8..byte_idx * 8 + 8];
-        let byte = byte_bits
+    let byte = |v: &Value, bi: usize| -> u8 {
+        v.bits[bi * 8..bi * 8 + 8]
             .iter()
             .enumerate()
-            .fold(0u8, |acc, (j, &b)| acc | (((b == V1) as u8) << j));
-        byte == if narrow.bits[i] == V1 { b'1' } else { b'0' }
-    })
+            .fold(0u8, |acc, (j, &x)| acc | (((x == V1) as u8) << j))
+    };
+    let nbytes = ww / 8;
+    // Padded char strings: `resize` zero-pads on the MSB side, which is the
+    // FIRST-char end of the packing (char `c` lives at byte index
+    // `nbytes - 1 - c`), so the padding occupies the high byte indices and
+    // the narrow's bytes overlay the low ones in the same order.
+    if nb % 8 == 0 {
+        let nch = nb / 8;
+        if nbytes > nch
+            && (nch..nbytes).all(|bi| byte(wide, bi) == 0)
+            && (0..nch).all(|bi| byte(wide, bi) == byte(narrow, bi))
+        {
+            return true;
+        }
+    }
+    // Char-per-bit spelling of a bit vector.
+    if ww == nb * 8 {
+        return (0..nb).all(|i| {
+            byte(wide, nbytes - nb + i) == if narrow.bits[i] == V1 { b'1' } else { b'0' }
+        });
+    }
+    false
 }
 
 #[derive(Clone, Debug)]

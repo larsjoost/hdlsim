@@ -567,6 +567,7 @@ mod tests {
                 text: "hi\n".into(),
                 time_fs: 2_000_000,
                 span: None,
+                severity: None,
             },
             &flat,
         );

@@ -23,11 +23,7 @@ impl<'a> Lower<'a> {
             c.args.len() == f.args.len()
                 && c.args.iter().map(|a| a.1).eq(f.args.iter().map(|a| a.1))
         };
-        let is_stub = |c: &FuncIr| match &c.body {
-            Stmt::Null => true,
-            Stmt::Block(ss) => ss.is_empty(),
-            _ => false,
-        };
+        let is_stub = |c: &FuncIr| crate::ir::is_bodiless(&c.body);
         // A spec stub followed by its body: the body replaces the stub and
         // inherits the spec's interface defaults (`w : natural := 8`); a
         // stub never displaces a real body. Two REAL bodies with the same
@@ -135,6 +131,48 @@ impl<'a> Lower<'a> {
                     self.types
                         .entry(tname.clone())
                         .or_insert_with(|| tinfo.clone());
+                }
+            }
+        }
+        // A selected type is visible with its structure (LRM 10.4): walking
+        // `r.f.g` needs the nested record's layout, and `a(i).f` the element
+        // record's, even though only the outer type mark was use'd. Merge the
+        // type infos reachable through field and element links from the same
+        // package alongside the selected one.
+        if let Some(i) = item {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut queue: Vec<String> = vec![i.to_ascii_lowercase()];
+            while let Some(cur) = queue.pop() {
+                if !seen.insert(cur.clone()) {
+                    continue;
+                }
+                let Some((_, t)) = p.types.iter().find(|(n, _)| n.eq_ignore_ascii_case(&cur))
+                else {
+                    continue;
+                };
+                let linked: Vec<String> = match t {
+                    TypeInfo::Record { .. } => p
+                        .rec_field_tys
+                        .iter()
+                        .filter(|(r, _, _)| r.eq_ignore_ascii_case(&cur))
+                        .map(|(_, _, ft)| ft.clone())
+                        .collect(),
+                    TypeInfo::Array {
+                        elem_name: Some(en),
+                        ..
+                    } => vec![en.clone()],
+                    _ => Vec::new(),
+                };
+                for n in linked {
+                    let nl = n.to_ascii_lowercase();
+                    if !seen.contains(&nl) {
+                        if let Some((_, ti)) =
+                            p.types.iter().find(|(tn, _)| tn.eq_ignore_ascii_case(&nl))
+                        {
+                            self.types.entry(nl.clone()).or_insert_with(|| ti.clone());
+                            queue.push(nl);
+                        }
+                    }
                 }
             }
         }

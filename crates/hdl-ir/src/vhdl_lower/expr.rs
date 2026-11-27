@@ -6,6 +6,66 @@
 use super::*;
 
 impl<'a> Lower<'a> {
+    /// A folded constant/generic value at a use site: a bare literal loses
+    /// the object's type, so a signed integer is wrapped in `Signed` to keep
+    /// ordered comparisons signed (`G_LEN >= 0` with `G_LEN = -1` would
+    /// otherwise read as 4294967295 >= 0).
+    fn const_use(&self, key: &str, v: Value) -> Expr {
+        let e = Expr::Lit(v);
+        if let Some(tn) = self.const_types.get(key) {
+            if matches!(self.types.get(tn), Some(TypeInfo::Integer { signed: true })) {
+                return Expr::Signed(Box::new(e));
+            }
+        }
+        e
+    }
+
+    /// Whether a lowered expression is signed by its declared type: the
+    /// `Signed`/`Resize` markers, or a signal/slot whose declaration recorded
+    /// signedness (integer objects). Mirrors the kernel's `expr_signed`.
+    fn expr_is_signed(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Signed(_) => true,
+            Expr::Resize { signed, .. } => *signed,
+            Expr::Sig(i) => self.sig_signed.get(i).copied().unwrap_or(false),
+            Expr::Bin { op, l, r } => {
+                if matches!(
+                    op,
+                    BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
+                ) {
+                    self.expr_is_signed(l)
+                } else {
+                    self.expr_is_signed(l) && self.expr_is_signed(r)
+                }
+            }
+            Expr::Un { e, .. } => self.expr_is_signed(e),
+            _ => false,
+        }
+    }
+
+    /// Build an ordered comparison (`<`, `<=`, `>`, `>=`): when either
+    /// operand is signed by its declared type, mark both so the comparison
+    /// sign-extends. Kernel slot reads (subprogram variables) default to
+    /// unsigned, and the 1076.2 UNIFORM seed fix-up (`if TSEED2 < 0`) must
+    /// see a negative seed, not 4294967295. Other operators keep their
+    /// operands untouched (two's-complement arithmetic is bit-identical).
+    fn mark_signed_compare(&self, op: BinOp, l: Expr, r: Expr) -> Expr {
+        if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+            && (self.expr_is_signed(&l) || self.expr_is_signed(&r))
+        {
+            return Expr::Bin {
+                op,
+                l: Box::new(Expr::Signed(Box::new(l))),
+                r: Box::new(Expr::Signed(Box::new(r))),
+            };
+        }
+        Expr::Bin {
+            op,
+            l: Box::new(l),
+            r: Box::new(r),
+        }
+    }
+
     pub(super) fn lower_expr(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         match e.kind() {
             SyntaxKind::Literal => self.lower_literal(e, env),
@@ -25,17 +85,61 @@ impl<'a> Lower<'a> {
                 let kids = real_children(e);
                 let rest = &kids[1..];
                 // A qualified *aggregate* (`T'(field => v, others => x)`) is a
-                // construction, not a conversion — placeholder.
-                let is_aggregate = rest.iter().any(|k| k.kind() == SyntaxKind::Others)
-                    || kids
-                        .iter()
-                        .any(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
-                    || kids.iter().any(|k| k.kind() == SyntaxKind::Range);
+                // construction, not a conversion. The parser folds the
+                // parenthesized element list directly into this node (no inner
+                // Aggregate), so the detection is an element-association arrow
+                // (`=` immediately followed by `>`) — a lone `=` (comparison
+                // inside `boolean'(a = b)`) is not an aggregate.
+                let is_aggregate = kids.windows(3).any(|w| {
+                    w[1].kind() == SyntaxKind::Punct
+                        && self.text(&w[1]) == "="
+                        && w[2].kind() == SyntaxKind::Punct
+                        && self.text(&w[2]) == ">"
+                }) || rest.iter().any(|k| k.kind() == SyntaxKind::Others);
                 if is_aggregate {
+                    // A qualified record aggregate folds like a typed record
+                    // constant: resolve the type mark, skip the type mark and
+                    // the paren puncts, and run the shared field scan. Array-
+                    // qualified aggregates (`T'(1, 2)`, `s'(1 to N => ' ')`)
+                    // keep the placeholder — unconstrained array length needs
+                    // the decl constraint this node does not carry.
+                    let tn = kids.first().map(|k| self.kw(k)).unwrap_or_default();
+                    if let Some(TypeInfo::Record { .. }) = self.types.get(&tn).cloned() {
+                        let fields = self.record_fields_of_type(&tn);
+                        let start = kids
+                            .iter()
+                            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "(")
+                            .map(|p| p + 1)
+                            .unwrap_or(1);
+                        let end = kids
+                            .last()
+                            .filter(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ")")
+                            .map(|_| kids.len() - 1)
+                            .unwrap_or(kids.len());
+                        if !fields.is_empty() && start < end {
+                            return self.lower_record_agg_kids(
+                                &kids[start..end],
+                                &tn,
+                                &fields,
+                                env,
+                            );
+                        }
+                    }
                     return Expr::Lit(Value::x(32));
                 }
                 match rest.iter().find(|k| is_expr_node(k.kind())) {
-                    Some(k) => self.lower_expr(k, env),
+                    Some(k) => {
+                        // `string'("-")` — the qualifier forces the operand's
+                        // type: string-typed marks lower alphabet characters
+                        // as ASCII text, not 1-bit std_logic values.
+                        let saved = self.str_ctx;
+                        if kids.first().is_some_and(|tm| self.string_typed(tm)) {
+                            self.str_ctx = true;
+                        }
+                        let ex = self.lower_expr(k, env);
+                        self.str_ctx = saved;
+                        ex
+                    }
                     None => Expr::Lit(Value::x(32)),
                 }
             }
@@ -343,14 +447,14 @@ impl<'a> Lower<'a> {
                     // override a formal `C_DATA` in the body. `sig_id` is
                     // case-insensitive; `names` keys keep the source case.
                     if self.fn_scope == 0 || self.sig_id(base).is_none() {
-                        return Expr::Lit(v.clone());
+                        return self.const_use(&key, v.clone());
                     }
                 }
                 if let Some(id) = self.sig_id(base) {
                     return Expr::Sig(id);
                 }
                 if let Some(v) = self.consts.get(&key) {
-                    return Expr::Lit(v.clone());
+                    return self.const_use(&key, v.clone());
                 }
                 if let Some(a) = self.aliases.get(&key) {
                     return a.clone();
@@ -555,11 +659,9 @@ impl<'a> Lower<'a> {
                     return Expr::Lit(Value::x(1));
                 };
                 if exprs.len() == 2 {
-                    Expr::Bin {
-                        op,
-                        l: Box::new(self.lower_expr(exprs[0], env)),
-                        r: Box::new(self.lower_expr(exprs[1], env)),
-                    }
+                    let le = self.lower_expr(exprs[0], env);
+                    let re = self.lower_expr(exprs[1], env);
+                    self.mark_signed_compare(op, le, re)
                 } else {
                     Expr::Lit(Value::x(1))
                 }
@@ -580,26 +682,61 @@ impl<'a> Lower<'a> {
                     return Expr::Lit(Value::x(1));
                 };
                 match operand {
-                    Some(o) => Expr::Un {
-                        op,
-                        e: Box::new(self.lower_expr(o, env)),
-                    },
+                    Some(o) => {
+                        let oe = self.lower_expr(o, env);
+                        // `-literal` is a signed universal integer: fold to a
+                        // signed-marked literal so ordered comparisons are
+                        // signed (`-1 >= 0` is false, not 4294967295 >= 0).
+                        if op == UnOp::Neg {
+                            if let Expr::Lit(v) = &oe {
+                                if let Some(n) = v.to_u64() {
+                                    let w = v.width().max(1);
+                                    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                                    let neg = (!(n & mask)).wrapping_add(1) & mask;
+                                    return Expr::Signed(Box::new(Expr::Lit(Value::from_u64(
+                                        w, neg,
+                                    ))));
+                                }
+                            }
+                        }
+                        Expr::Un {
+                            op,
+                            e: Box::new(oe),
+                        }
+                    }
                     None => Expr::Lit(Value::x(1)),
                 }
             }
             SyntaxKind::Call => self.lower_call(e, env),
             SyntaxKind::PartSelect => {
                 // name ( msb dir lsb ) — the base name is not a bound expr.
+                // A selected-chain base (`c_arr(0).f(0)(0 TO 15)`) arrives as
+                // a Call child instead of a bare Name: the first expression
+                // child is then the base and the remaining ones the bounds.
                 let kids = real_children(e);
-                let base_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
-                let base = base_pos.map(|i| &kids[i]);
-                let exprs: Vec<&SyntaxNode> = kids
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, k)| Some(*i) != base_pos && is_expr_node(k.kind()))
-                    .map(|(_, k)| k)
-                    .collect();
-                if exprs.len() < 2 {
+                let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
+                let (base, bound_nodes): (Option<SyntaxNode>, Vec<SyntaxNode>) = match name_pos {
+                    Some(np) => (
+                        Some(kids[np].clone()),
+                        kids.iter()
+                            .enumerate()
+                            .filter(|(i, k)| Some(*i) != Some(np) && is_expr_node(k.kind()))
+                            .map(|(_, k)| k.clone())
+                            .collect(),
+                    ),
+                    None => {
+                        let exprs: Vec<SyntaxNode> = kids
+                            .iter()
+                            .filter(|k| is_expr_node(k.kind()))
+                            .cloned()
+                            .collect();
+                        match exprs.len() {
+                            n if n >= 3 => (Some(exprs[0].clone()), exprs[1..].to_vec()),
+                            _ => (None, exprs),
+                        }
+                    }
+                };
+                if bound_nodes.len() < 2 {
                     return Expr::Lit(Value::x(1));
                 }
                 let dir = kids
@@ -608,11 +745,11 @@ impl<'a> Lower<'a> {
                     .map(|k| self.kw(k))
                     .unwrap_or_else(|| "downto".to_string());
                 let (msb, lsb) = if dir == "downto" {
-                    (exprs[0], exprs[1])
+                    (bound_nodes[0].clone(), bound_nodes[1].clone())
                 } else {
-                    (exprs[1], exprs[0])
+                    (bound_nodes[1].clone(), bound_nodes[0].clone())
                 };
-                let base_e = match base {
+                let base_e = match &base {
                     Some(b) => self.lower_expr(b, env),
                     None => Expr::Lit(Value::x(1)),
                 };
@@ -627,14 +764,16 @@ impl<'a> Lower<'a> {
                 if let Expr::Sig(sid) = &base_e {
                     if let (Some(&depth), Some(&ew)) = (self.mems.get(sid), self.sig_width.get(sid))
                     {
-                        let (e_lo, e_hi) = if dir == "downto" {
-                            (lsb, msb)
-                        } else {
-                            (msb, lsb)
-                        };
+                        // `lsb`/`msb` hold the source range's low/high bounds
+                        // in both directions (normalized above), and the word
+                        // formulas below want (low element, high element):
+                        // element e occupies bits [total-1-e·w … total-(e+1)·w],
+                        // so the slice spans element `lo`'s top bit down to
+                        // element `hi`'s bottom bit regardless of direction.
+                        let (e_lo, e_hi) = (lsb.clone(), msb.clone());
                         let total = depth.saturating_mul(ew).max(1);
-                        let e_lo = self.lower_expr(e_lo, env);
-                        let e_hi = self.lower_expr(e_hi, env);
+                        let e_lo = self.lower_expr(&e_lo, env);
+                        let e_hi = self.lower_expr(&e_hi, env);
                         let word = |base: u64, e: Expr| Expr::Bin {
                             op: BinOp::Sub,
                             l: Box::new(Expr::Lit(Value::from_u64(32, base))),
@@ -671,8 +810,8 @@ impl<'a> Lower<'a> {
                                 self.sig_elem.get(sid).copied().unwrap_or(1).max(1) as u64,
                                 Expr::Sig(lo_id),
                                 Expr::Sig(asc_id),
-                                self.lower_expr(msb, env),
-                                self.lower_expr(lsb, env),
+                                self.lower_expr(&msb, env),
+                                self.lower_expr(&lsb, env),
                             );
                             return Expr::Sel {
                                 e: Box::new(base_e),
@@ -693,8 +832,8 @@ impl<'a> Lower<'a> {
                                 ew,
                                 lo_u,
                                 asc,
-                                self.lower_expr(msb, env),
-                                self.lower_expr(lsb, env),
+                                self.lower_expr(&msb, env),
+                                self.lower_expr(&lsb, env),
                             );
                             return Expr::Sel {
                                 e: Box::new(base_e),
@@ -707,7 +846,7 @@ impl<'a> Lower<'a> {
                 // Slice of a constant (`ASC_DATA(0 to 3)`): remap the index
                 // bounds to value-bit positions from the recorded decl
                 // direction, like the signal path above.
-                if let Some(sel) = self.const_slice_sel(base, &base_e, msb, lsb, env) {
+                if let Some(sel) = self.const_slice_sel(base.as_ref(), &base_e, &msb, &lsb, env) {
                     return sel;
                 }
                 // Slice of a record field that is itself an array
@@ -718,19 +857,20 @@ impl<'a> Lower<'a> {
                 // the bounds remap like an ascending signal slice over a
                 // carrier of the field's bit width.
                 if let Expr::Sel { .. } = &base_e {
-                    if let Some((flo, few, fw)) =
-                        base.and_then(|b| self.field_array_shape(&self.text(b)))
+                    if let Some((flo, few, fw)) = base
+                        .as_ref()
+                        .and_then(|b| self.field_array_shape(&self.text(b)))
                     {
                         let w_e = Expr::Lit(Value::from_u64(32, fw));
                         let lo_e = Expr::Lit(Value::from_u64(32, flo.max(0) as u64));
                         let off_left = Expr::Bin {
                             op: BinOp::Sub,
-                            l: Box::new(self.lower_expr(lsb, env)),
+                            l: Box::new(self.lower_expr(&lsb, env)),
                             r: Box::new(lo_e.clone()),
                         };
                         let off_right = Expr::Bin {
                             op: BinOp::Sub,
-                            l: Box::new(self.lower_expr(msb, env)),
+                            l: Box::new(self.lower_expr(&msb, env)),
                             r: Box::new(lo_e),
                         };
                         let scaled = |e: Expr, k: u64| Expr::Bin {
@@ -764,10 +904,37 @@ impl<'a> Lower<'a> {
                         };
                     }
                 }
+                // Slice of a constant-element read (`C_PKT(0)(0 TO 15)` —
+                // the base lowers to `$const_idx` over the constant's flat
+                // value). Element k packs MSB-first (element 0 = most
+                // significant bits, the same rule `$const_idx` applies), so
+                // an ascending slice's bounds remap to value-bit positions
+                // over a carrier of the element width. Descending slices
+                // keep the raw bounds (the flat default mapping).
+                if let Expr::Call { name, args, .. } = &base_e {
+                    if name == "$const_idx" && dir == "to" {
+                        if let Some(Expr::Lit(ewv)) = args.get(2) {
+                            let ew = ewv.to_u64().unwrap_or(1).max(1);
+                            let (msb_e, lsb_e) = super::width::remapped_sel_bounds(
+                                Expr::Lit(Value::from_u64(32, ew)),
+                                1,
+                                0,
+                                true,
+                                self.lower_expr(&msb, env),
+                                self.lower_expr(&lsb, env),
+                            );
+                            return Expr::Sel {
+                                e: Box::new(base_e.clone()),
+                                msb: Box::new(msb_e),
+                                lsb: Box::new(lsb_e),
+                            };
+                        }
+                    }
+                }
                 Expr::Sel {
                     e: Box::new(base_e),
-                    msb: Box::new(self.lower_expr(msb, env)),
-                    lsb: Box::new(self.lower_expr(lsb, env)),
+                    msb: Box::new(self.lower_expr(&msb, env)),
+                    lsb: Box::new(self.lower_expr(&lsb, env)),
                 }
             }
             SyntaxKind::Attr => {
@@ -1201,6 +1368,17 @@ impl<'a> Lower<'a> {
                             return Expr::Lit(string_value(s));
                         }
                     }
+                    // A signed-integer image renders two's complement
+                    // (`integer'image(-1)` is "-1"): mark the operand so the
+                    // evaluator sign-extends instead of printing raw bits.
+                    let e = if matches!(
+                        self.types.get(&prefix.to_ascii_lowercase()),
+                        Some(TypeInfo::Integer { signed: true })
+                    ) {
+                        Expr::Signed(Box::new(e))
+                    } else {
+                        e
+                    };
                     return Expr::ToString(Box::new(e));
                 }
             }
@@ -1265,6 +1443,28 @@ impl<'a> Lower<'a> {
             .map(|(_, k)| k.clone())
             .collect();
         let args: Vec<Expr> = arg_nodes.iter().map(|k| self.lower_expr(k, env)).collect();
+        // `c_vec(0).f(0)` — a selected-name chain as the callee: the parser
+        // folds the prefix into one dotted Name, so only the call path sees
+        // it. Route const-rooted chains through the chain walker (it rejects
+        // function roots), which interleaves field and index segments over
+        // the constant's flat value — the same expression the runtime and
+        // const-eval already fold. Signal/alias roots keep their existing
+        // per-shape handling below.
+        if name.contains('.') {
+            let root = name
+                .split(['.', '('])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !root.is_empty()
+                && self.consts.contains_key(&root)
+                && !self.funcs.contains_key(&root)
+            {
+                if let Some(ex) = self.lower_selected_chain(e, env) {
+                    return ex;
+                }
+            }
+        }
         // `.all(i)` dereference of an access-to-array: `L.all(i)` -> L(i).
         if fname == "all"
             && name.len() > 4
@@ -1648,11 +1848,7 @@ impl<'a> Lower<'a> {
             _ if args.len() == 2 && vhdl_binop(fname.trim_matches('"')).is_some() => {
                 let op = vhdl_binop(fname.trim_matches('"'))
                     .expect("arm guard checked vhdl_binop(...).is_some()");
-                Expr::Bin {
-                    op,
-                    l: Box::new(args[0].clone()),
-                    r: Box::new(args[1].clone()),
-                }
+                self.mark_signed_compare(op, args[0].clone(), args[1].clone())
             }
             _ if self
                 .aliases
@@ -1842,6 +2038,21 @@ impl<'a> Lower<'a> {
         env: &HashMap<String, Value>,
     ) -> Expr {
         let kids = real_children(e);
+        self.lower_record_agg_kids(&kids, tn, fields, env)
+    }
+
+    /// Record-aggregate fold over an explicit element-child list — shared by
+    /// [`Self::lower_typed_record_aggregate`] (an `Aggregate` node whose
+    /// children are the elements) and the qualified-record path (the parser
+    /// folds `T'(field => v, …)` directly into the `Qualified` node, so the
+    /// element children must be pre-extracted).
+    fn lower_record_agg_kids(
+        &mut self,
+        kids: &[SyntaxNode],
+        tn: &str,
+        fields: &[(String, usize, usize)],
+        env: &HashMap<String, Value>,
+    ) -> Expr {
         let mut named: Vec<(String, usize)> = Vec::new();
         let mut positional: Vec<usize> = Vec::new();
         let mut i = 0;
@@ -2139,7 +2350,8 @@ impl<'a> Lower<'a> {
                 b'0' => V0,
                 b'1' => V1,
                 b'z' => VZ,
-                b'-' | b'l' | b'h' | b'u' | b'w' | b'x' => VX,
+                b'u' => VU,
+                b'-' | b'l' | b'h' | b'w' | b'x' => VX,
                 _ => {
                     return Expr::Lit(Value {
                         bits: (0..8)
@@ -2164,9 +2376,23 @@ impl<'a> Lower<'a> {
             // `'length` downstream.
             if !self.str_ctx
                 && !inner.is_empty()
-                && inner
-                    .bytes()
-                    .all(|c| matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'-' | b'?'))
+                && inner.bytes().all(|c| {
+                    matches!(
+                        c,
+                        b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'u' | b'U' | b'w' | b'W'
+                            | b'l' | b'L' | b'h' | b'H' | b'-' | b'?'
+                    )
+                })
+                // A lone letter ("h") is far more often the one-character
+                // STRING "h" than a 1-bit weak value — u/w/l/h spell words in
+                // report text and filenames. Only a multi-character literal
+                // ("UWH-") reads as std_ulogic metavalues; a single one is
+                // written 'h' (char literal, handled above).
+                && !(inner.len() == 1
+                    && inner
+                        .bytes()
+                        .next()
+                        .is_some_and(|c| matches!(c.to_ascii_lowercase(), b'u' | b'w' | b'l' | b'h')))
             {
                 let mut bits = vec![VX; inner.len()];
                 for (i, c) in inner.bytes().enumerate() {
@@ -2174,6 +2400,10 @@ impl<'a> Lower<'a> {
                         b'0' => V0,
                         b'1' => V1,
                         b'z' => VZ,
+                        b'u' => VU,
+                        b'w' => VW,
+                        b'l' => VL,
+                        b'h' => VH,
                         b'-' | b'?' => VDASH, // don't-care, matched by `case?`
                         _ => VX,
                     };

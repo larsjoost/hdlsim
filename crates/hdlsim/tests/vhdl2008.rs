@@ -191,6 +191,64 @@ end;
 }
 
 #[test]
+fn single_char_string_literal_is_text() {
+    // "h"/"u"/"w"/"l" spell words: a one-character string literal is the
+    // STRING "h", not a 1-bit weak metavalue — concat and compare must see
+    // text (report messages, prefixes like "h" & to_hstring(v), filenames).
+    assert_pass(
+        "single_char_string",
+        r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity tb is end;
+architecture rtl of tb is
+  signal v : std_logic_vector(7 downto 0) := x"A5";
+begin
+  process
+  begin
+    if ("h" & to_hstring(v)) = "hA5" and ("h" & "i") = "hi" then
+      report "PASS";
+    else
+      report "FAIL cat=" & ("h" & to_hstring(v));
+    end if;
+    wait;
+  end process;
+end;
+"#,
+    );
+}
+
+#[test]
+fn user_to_string_overload_shadows_builtin() {
+    // A user-declared `to_string(integer)` with a body shadows the built-in
+    // for calls it can bind (LRM 1076 §11.3), but must not steal calls it
+    // cannot bind: `to_string(2.5)` has no fitting user overload and takes
+    // the built-in real rendering.
+    assert_pass(
+        "user_to_string",
+        r#"
+entity tb is end;
+architecture rtl of tb is
+  function to_string(value : integer) return string is
+  begin
+    return "user:" & integer'image(value);
+  end function;
+begin
+  process
+  begin
+    if to_string(5) = "user:5" and to_string(2.5) = "2.5" then
+      report "PASS";
+    else
+      report "FAIL int=" & to_string(5) & " real=" & to_string(2.5);
+    end if;
+    wait;
+  end process;
+end;
+"#,
+    );
+}
+
+#[test]
 fn delayed_concurrent_assign_waveform() {
     // Waveform delays are each relative to the assignment time.
     assert_pass(

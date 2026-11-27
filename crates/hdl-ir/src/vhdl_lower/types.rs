@@ -366,6 +366,33 @@ impl<'a> Lower<'a> {
                 } else {
                     elem.max(1) * dims.iter().map(|(_, n)| (*n).max(1)).product::<usize>()
                 };
+                // An unconstrained array type mark with an object index
+                // constraint (`arr : rem_n_array_t(0 to 7)` of 1-bit
+                // vectors) sizes the memory depth from that constraint —
+                // the declared depth is the placeholder 1, and leaving it
+                // collapses every element onto row 0 (whole-array assigns
+                // then compare equal every sweep and the object freezes).
+                let depth = if dims.is_empty() {
+                    constraint
+                        .map(|c| {
+                            // Best-effort depth estimate: `resolve_type`
+                            // re-runs in contexts where the constraint's
+                            // bound names are not in scope (protected-body
+                            // shared variables re-resolved outside their
+                            // body context), and the estimate must not
+                            // report spurious E0401s there — unresolvable
+                            // bounds fall back to the declared depth, like
+                            // the width estimator.
+                            self.suppress_err += 1;
+                            let n = self.constraint_width(c);
+                            self.suppress_err -= 1;
+                            n
+                        })
+                        .filter(|n| *n > 1)
+                        .unwrap_or(depth)
+                } else {
+                    depth
+                };
                 (w, false, Some(depth), false)
             }
             TypeInfo::Record { fields } => (
