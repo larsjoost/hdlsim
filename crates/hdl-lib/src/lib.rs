@@ -26,6 +26,7 @@ pub mod bundle;
 pub mod cache;
 pub mod doctor;
 pub mod providers;
+mod variant;
 
 use hdl_ir::elab::UnitResolver;
 use hdl_ir::verilog_lower;
@@ -924,6 +925,7 @@ impl LibraryManager {
         }
         let pending = std::mem::take(&mut self.pending_archs);
         let mut lower_diags = Vec::new();
+        let mut bound_sources: Vec<(usize, PathBuf)> = Vec::new();
         let still = hdl_ir::vhdl_lower::lower_pending_architectures(
             &self.db,
             &mut lower_diags,
@@ -943,8 +945,16 @@ impl LibraryManager {
             &self.entity_module_of,
             &self.entity_module_by_dir,
             &self.entity_module_by_stem,
+            &mut bound_sources,
         );
         self.diags.extend(lower_diags);
+        // Stamp provenance for the bound-architecture modules. Variant
+        // re-lowering resolves its source files from these entries; without
+        // one, a same-named unit from a library scan can win by walk order
+        // and an explicitly-passed file is silently overridden.
+        for (i, path) in bound_sources {
+            self.module_source.insert(i, path);
+        }
         self.pending_archs = still;
     }
 
@@ -989,182 +999,7 @@ impl UnitResolver for LibraryManager {
         params: &HashMap<String, hdl_ir::Value>,
         bound: usize,
     ) -> Result<Option<String>, String> {
-        let (ent, arch) = match unit.split_once('/') {
-            Some((e, a)) => (e.to_string(), Some(a.to_ascii_lowercase())),
-            None => (unit.to_string(), None),
-        };
-        let lname = ent.to_ascii_lowercase();
-        let mut items: Vec<(String, u64)> = params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_u64().unwrap_or(0)))
-            .collect();
-        items.sort();
-        let suffix = format!(
-            "#{}",
-            items
-                .iter()
-                .map(|(k, v)| format!("{k}={v:x}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let vbase = format!("{lname}{suffix}");
-        let want = match &arch {
-            Some(a) => format!("{vbase}/{a}"),
-            None => vbase.clone(),
-        };
-        if design.modules.iter().any(|m| m.name == want) {
-            return Ok(Some(want));
-        }
-        self.ensure_stem_index();
-        let mut cands: Vec<PathBuf> = self
-            .stem_index
-            .get(&lname)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
-        if cands.is_empty() {
-            self.ensure_index();
-            cands = self
-                .index
-                .get(&lname)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, p)| p)
-                .collect();
-        }
-        if cands.is_empty() {
-            cands = self.search_project(&lname);
-        } else {
-            // The stem index keys raw file stems: a sibling architecture file
-            // (`foo_rtl.vhd` for `foo_entity.vhd`) never matches the unit name,
-            // so a stem-index hit alone would re-lower the variant entity
-            // without its architectures (an empty module). Merge the unit-name
-            // search index — extra candidates are skipped by the unit check
-            // below, and the entity file itself comes from `module_source`.
-            for p in self.search_project(&lname) {
-                if !cands.contains(&p) {
-                    cands.push(p);
-                }
-            }
-        }
-        // Classify the candidates: the entity's declaration file plus the
-        // sibling files holding its architectures (this codebase splits
-        // `*_entity.vhd` / `*_behavior.vhd` into separate files).
-        //
-        // The entity file is the source file of the module the instantiation
-        // actually bound to (`bound`) when known: whole-tree libraries hold
-        // same-named entities from several files, and stem order would pick
-        // an unrelated twin (whose ports/generics differ). The stem-index
-        // scan remains the fallback for modules without provenance (e.g.
-        // previously created variants).
-        let mut ent_file: Option<(PathBuf, String)> = None;
-        let mut arch_files: Vec<(PathBuf, String)> = Vec::new();
-        if let Some(bpath) = self.module_source.get(&bound) {
-            if let Ok(text) = std::fs::read_to_string(bpath) {
-                let units = crate::providers::vhdl_units_in_file(bpath, &text);
-                if units
-                    .iter()
-                    .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && !*b)
-                {
-                    ent_file = Some((bpath.clone(), text));
-                }
-            }
-        }
-        for path in cands {
-            // VHDL variants only — a Verilog `#(...)` override keeps the
-            // default-parameter behavior.
-            if !matches!(
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .as_deref(),
-                Some("vhd") | Some("vhdl")
-            ) {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let units = crate::providers::vhdl_units_in_file(&path, &text);
-            if !units.iter().any(|(n, _)| n.eq_ignore_ascii_case(&lname)) {
-                continue;
-            }
-            // `(name, false)` = entity declaration, `(name, true)` = an
-            // architecture of it (see vhdl_units_in_file).
-            let has_ent = units
-                .iter()
-                .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && !*b);
-            let has_arch = units
-                .iter()
-                .any(|(n, b)| n.eq_ignore_ascii_case(&lname) && *b);
-            if has_ent {
-                if ent_file.is_none() {
-                    ent_file = Some((path, text));
-                }
-            } else if has_arch {
-                arch_files.push((path, text));
-            }
-        }
-        let Some((epath, etext)) = ent_file else {
-            return Ok(None);
-        };
-        let Ok(eid) = self.db.add_file(epath.display().to_string(), etext) else {
-            return Ok(None);
-        };
-        let eparsed = hdl_syntax::vhdl::parser::parse_file(eid, self.db.file(eid));
-        let mut arch_roots: Vec<hdl_syntax::cst::SyntaxNode> = Vec::new();
-        let edir = epath.parent();
-        // Canonicalized directory of the entity file: CLI paths ("tb.vhd") and
-        // search results ("./tb.vhd") yield different raw parents ("" vs "."),
-        // which would wrongly fail the sibling check below.
-        let edir_c = std::fs::canonicalize(&epath)
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .or_else(|| edir.map(|d| d.to_path_buf()));
-        for (apath, atext) in arch_files {
-            // Sibling files only: a same-named entity in another directory
-            // must not bind its architectures to this one.
-            let adir = std::fs::canonicalize(&apath)
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .or_else(|| apath.parent().map(|d| d.to_path_buf()));
-            if adir != edir_c {
-                continue;
-            }
-            let Ok(aid) = self.db.add_file(apath.display().to_string(), atext) else {
-                continue;
-            };
-            let aparsed = hdl_syntax::vhdl::parser::parse_file(aid, self.db.file(aid));
-            arch_roots.push(aparsed.root);
-        }
-        let mut lower_diags = Vec::new();
-        let modules = hdl_ir::vhdl_lower::lower_entity_variant(
-            &self.db,
-            &mut lower_diags,
-            &design.packages,
-            &design.pkg_funcs,
-            &design.configurations,
-            &eparsed.root,
-            &arch_roots,
-            &lname,
-            params,
-            &suffix,
-        );
-        self.diags.extend(lower_diags);
-        if modules.is_empty() {
-            return Ok(None);
-        }
-        design.modules.extend(modules);
-        if design.modules.iter().any(|m| m.name == want) {
-            return Ok(Some(want));
-        }
-        if arch.is_none() && design.modules.iter().any(|m| m.name == vbase) {
-            return Ok(Some(vbase));
-        }
-        Ok(None)
+        variant::resolve_variant(self, design, unit, params, bound)
     }
 
     fn resolve(&mut self, design: &mut Design, name: &str) -> Result<bool, String> {
