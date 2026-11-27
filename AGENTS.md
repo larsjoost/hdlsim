@@ -77,7 +77,10 @@ path from "something is wrong" to "here is the line":
    `hdlsim: FAILED — N test failure(s) (first at tb.vhd:42)` — jump there.
 5. To see why a signal is wrong: `hdlsim run --top tb --list-signals=PATTERN`
    to get exact hierarchical names, then `--watch sig --watch-x` (first
-   x/z source) or `hdlsim debug --top tb --driver sig --dump`. `--trace`,
+   x/z source), `--when 'sig=value@t0-t1'` / `--examine 'sig@T'` (filtered
+   transitions and settled value-at-time), `--trace-assign sig` (every
+   continuous-assign evaluation with the values its RHS read), or
+   `hdlsim debug --top tb --driver sig --dump`. `--trace`,
    `--trace-dispatch`, `--trace-picked`, `--trace-calls` print the scheduler
    trace on stderr.
 6. Waves: `--vcd w.vcd` / `--hwf` / `--fst` / `--wave out.html` on `run`;
