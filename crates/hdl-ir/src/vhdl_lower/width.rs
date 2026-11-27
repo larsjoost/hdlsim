@@ -267,9 +267,12 @@ impl<'a> Lower<'a> {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if let Some(ew) = self.array_elem_width(&tn) {
-                if ew > 1 {
-                    self.sig_elem.insert(id, ew);
-                }
+                // Overwrite even for 1-bit elements: slot ids are reused
+                // across subprogram bodies, and a stale multi-bit element
+                // width (`string` characters) from a previously lowered
+                // function's same-numbered slot would scale this object's
+                // slice remaps. An explicit 1 equals the consumers' default.
+                self.sig_elem.insert(id, ew);
             }
             if tn == "string" && !self.sig_asc.contains_key(&id) {
                 // Predefined `string` is positive-range ascending, and an

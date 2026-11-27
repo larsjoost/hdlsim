@@ -28,5 +28,5 @@ pub mod rand;
 pub mod sat;
 pub mod sim;
 
-pub use events::{NullObserver, Observer, SimEvent};
+pub use events::{MessageSeverity, NullObserver, Observer, SimEvent};
 pub use sim::{set_progress_interval, Simulator};

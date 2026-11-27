@@ -155,6 +155,23 @@ impl<'a> Lower<'a> {
     ) -> Option<(ChainRoot, Vec<ChainSeg>)> {
         let mut segs: Vec<ChainSeg> = Vec::new();
         let root = self.flatten_selected_name(e, &mut segs);
+        // A chain rooted AT the call node itself (`c_arr(0).f(0)` as a call
+        // callee): `flatten_selected_name` collects the index arguments of
+        // nested Call children only, so the top Call's own trailing index
+        // group must be appended here.
+        if e.kind() == SyntaxKind::Call {
+            let ck: Vec<SyntaxNode> = real_children(e);
+            let base_pos = ck.iter().position(|c| c.kind() == SyntaxKind::Name);
+            let args: Vec<SyntaxNode> = ck
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| Some(*i) != base_pos && is_expr_node(c.kind()))
+                .map(|(_, c)| c.clone())
+                .collect();
+            if !args.is_empty() {
+                segs.push(ChainSeg::Index(args));
+            }
+        }
         if root.is_empty() || segs.is_empty() {
             return None;
         }

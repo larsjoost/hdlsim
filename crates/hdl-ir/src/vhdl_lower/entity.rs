@@ -245,6 +245,22 @@ impl<'a> Lower<'a> {
             let rec_ty = type_mark
                 .as_ref()
                 .and_then(|tm| self.as_record(&self.kw(tm)));
+            // Type mark of any generic (qualified marks reduce to the bare
+            // name): recorded into `const_types`/`ParamIr.ty` so a use of the
+            // generic can recover its signedness — a folded literal alone
+            // would compare unsigned (`G_LEN >= 0` with `G_LEN = -1`).
+            let gen_ty = rec_ty.clone().or_else(|| {
+                type_mark
+                    .as_ref()
+                    .map(|tm| {
+                        self.kw(tm)
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                    })
+                    .filter(|tn| !tn.is_empty())
+            });
             // Array dims of a multidimensional generic: from its own decl
             // constraint, from a constrained constant named as the default,
             // or from the shape of an aggregate default (`'length(d)` on the
@@ -309,7 +325,7 @@ impl<'a> Lower<'a> {
                 }
                 let status = if val.is_known() { "ok" } else { "unset" };
                 self.dump_const(n, "generic", d.span(), status, &val);
-                if let Some(tn) = &rec_ty {
+                if let Some(tn) = &gen_ty {
                     self.const_types.insert(key.clone(), tn.clone());
                 }
                 if let Some(gd) = &gen_dims {
@@ -344,7 +360,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                out.push((n.clone(), val, rec_ty.clone()));
+                out.push((n.clone(), val, gen_ty.clone()));
             }
         }
         out
@@ -392,15 +408,20 @@ impl<'a> Lower<'a> {
             }
             // Port default (`:= expr` after the type mark): const-eval it into
             // the port signal's init, so an unconnected (`open`) in-port still
-            // gets its default value at elaboration.
+            // gets its default value at elaboration. The parser keeps `:=` as
+            // two single-char puncts (":" then "="), and the default after it
+            // may itself be a bare name (`:= G_FROM`) — anchor on the punct
+            // pair and take the first expression node after it; the type mark
+            // precedes the pair and cannot shadow it.
             let init_v = dk
-                .iter()
-                .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":")
-                .and_then(|pos| {
-                    dk[pos + 1..]
-                        .iter()
-                        .find(|k| is_expr_node(k.kind()) && k.kind() != SyntaxKind::Name)
+                .windows(2)
+                .position(|w| {
+                    w[0].kind() == SyntaxKind::Punct
+                        && self.text(&w[0]) == ":"
+                        && w[1].kind() == SyntaxKind::Punct
+                        && self.text(&w[1]) == "="
                 })
+                .and_then(|pos| dk[pos + 2..].iter().find(|k| is_expr_node(k.kind())))
                 .and_then(|e| {
                     let ex = self.lower_expr(e, &self.consts.clone());
                     self.ce(&ex)

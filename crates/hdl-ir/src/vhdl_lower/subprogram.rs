@@ -713,7 +713,7 @@ impl<'a> Lower<'a> {
             .as_ref()
             .map(|tm| self.kw(tm))
             .and_then(|tn| self.types.get(&tn))
-            .is_some_and(|ti| matches!(ti, TypeInfo::Vector { .. }));
+            .is_some_and(|ti| matches!(ti, TypeInfo::Vector { .. } | TypeInfo::Array { .. }));
         if !is_uncon {
             return ret_width;
         }
@@ -795,12 +795,17 @@ impl<'a> Lower<'a> {
         // before it (parameters, types, constants, locals). Nested function
         // declarations lower last, now that all outer slots are visible.
         self.lower_fn_declarative_items(decl_nodes, nested_fns, &mut fd);
+        // The return expression of a string-returning function lowers in the
+        // string context (`RETURN "0"` is text, not a 1-bit std_logic value).
+        let saved_ret_str = self.fn_ret_str;
+        self.fn_ret_str = ret_mark.as_ref().is_some_and(|tm| self.string_typed(tm));
         let body = self.lower_fn_body(
             stmt_nodes,
             &fd.slots,
             &mut fd.locals,
             fd.pending_const_inits,
         );
+        self.fn_ret_str = saved_ret_str;
         self.names = self.names_stack.pop().unwrap_or_default();
         self.fn_scope -= 1;
         let ret_width = self.unconstrained_ret_width(ret_mark, &body, ret_width);

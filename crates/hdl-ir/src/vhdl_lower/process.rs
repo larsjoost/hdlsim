@@ -1,6 +1,4 @@
 //! Process and concurrent-assignment lowering: processes and their variables, sensitivity lists, concurrent asserts, waveform elements, and selected/conditional assignment.
-//!
-//! Extracted verbatim from vhdl_lower.rs (pure move, no logic changes).
 
 use super::*;
 
@@ -271,8 +269,19 @@ impl<'a> Lower<'a> {
                 a.collect_sigs(&mut sigs);
             }
         }
+        // A condition without signals gives an empty sensitivity set: the
+        // equivalent passive process runs once at initialization and never
+        // re-fires. Lowering it as `Always` would make the kernel treat it
+        // like a bare Verilog `always` and re-activate it every delta cycle
+        // (generic-check asserts such as
+        // `ASSERT (is_power_of_two(G_SIZE)) ...` would loop).
+        let kind = if sigs.is_empty() {
+            ProcKind::Initial
+        } else {
+            ProcKind::Always
+        };
         ProcessIr {
-            kind: ProcKind::Always,
+            kind,
             sens: Sens::List(
                 sigs.into_iter()
                     .map(|sig| Edge {

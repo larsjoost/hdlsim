@@ -235,11 +235,22 @@ pub fn elaborate_with_opts(
 /// may carry their own instances with overrides).
 /// Bind positional generic-map actuals (`generic map (v1, v2, …)`) by name:
 /// the k-th positional actual maps to the target module's k-th parameter in
-/// declaration order. Runs before variant binding — generic values select
-/// the re-lowered variant, so overrides must carry names by then. Instances
-/// whose target unit is not compiled yet keep their positionals until the
 /// next pass round; config bindings applied during instantiation resolve in
 /// `instantiate`, which has the final child module at hand.
+/// Resolve an instantiation's target module by name. VHDL identifiers are
+/// case-insensitive (LRM 1076 §13.2): an entity declared in one file as
+/// `foo_dut` may be instantiated from another as `FOO_DUT`, so an exact miss
+/// falls back to a case-insensitive match. Exact matches win so same-named
+/// entities from different files keep their existing (first-slot) binding.
+fn find_instance_target(modules: &[ModuleIr], name: &str) -> Option<usize> {
+    if let Some(pos) = modules.iter().position(|m| m.name == name) {
+        return Some(pos);
+    }
+    modules
+        .iter()
+        .position(|m| m.name.eq_ignore_ascii_case(name))
+}
+
 fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
     for mi in 0..design.modules.len() {
         for ii in 0..design.modules[mi].instances.len() {
@@ -252,7 +263,7 @@ fn resolve_positional_params(design: &mut Design) -> Result<(), ElabError> {
             }
             let unit = design.modules[mi].instances[ii].module.clone();
             let where_ = design.modules[mi].instances[ii].name.clone();
-            let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+            let Some(tid) = find_instance_target(&design.modules, &unit) else {
                 continue;
             };
             if !design.modules[tid].is_vhdl {
@@ -300,7 +311,7 @@ fn bind_param_variants(design: &mut Design, resolver: &mut dyn UnitResolver) -> 
                     continue;
                 }
                 let unit = design.modules[mi].instances[ii].module.clone();
-                let Some(tid) = design.modules.iter().position(|m| m.name == unit) else {
+                let Some(tid) = find_instance_target(&design.modules, &unit) else {
                     continue;
                 };
                 // Only VHDL entities can be re-lowered as generic-map variants.
@@ -692,13 +703,12 @@ impl Flat {
 
         // Child instances, recursively.
         for inst in &child_instances {
-            let child_id = design
-                .modules
-                .iter()
-                .position(|mm| mm.name == inst.module)
-                .ok_or_else(|| ElabError::UnknownUnit {
-                    name: inst.module.clone(),
-                    where_: where_.clone(),
+            let child_id =
+                find_instance_target(&design.modules, &inst.module).ok_or_else(|| {
+                    ElabError::UnknownUnit {
+                        name: inst.module.clone(),
+                        where_: where_.clone(),
+                    }
                 })?;
             let child_prefix = if prefix.is_empty() {
                 inst.name.clone()

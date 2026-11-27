@@ -21,16 +21,37 @@ pub(super) fn apply_default_archs(
     arch_bases: Option<&HashMap<String, usize>>,
 ) {
     for (ent, &base_from_entities) in entities {
-        let Some(ch) = config_defaults.get(ent).or_else(|| last_arch.get(ent)) else {
-            continue;
+        // Entity and architecture files may spell the entity name with
+        // different letter case (VHDL names are case-insensitive: an
+        // `tb_X_entity.vhd` may pair with a `tb_x_behavior.vhd`), so match
+        // the default-arch records either way.
+        let ent_lc = ent.to_ascii_lowercase();
+        let ch = match config_defaults
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == ent_lc)
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                last_arch
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase() == ent_lc)
+                    .map(|(_, v)| v.clone())
+            }) {
+            Some(ch) => ch,
+            None => continue,
         };
         let vname = format!("{ent}/{ch}");
-        if let Some(vpos) = modules.iter().position(|m| m.name == vname) {
+        if let Some(vpos) = modules
+            .iter()
+            .position(|m| m.name.eq_ignore_ascii_case(&vname))
+        {
             let mut v = modules[vpos].clone();
             v.name = ent.clone();
             let base = arch_bases
-                .and_then(|b| b.get(ent))
-                .copied()
+                .and_then(|b| {
+                    b.iter()
+                        .find(|(k, _)| k.to_ascii_lowercase() == ent_lc)
+                        .map(|(_, &v)| v)
+                })
                 .unwrap_or(base_from_entities);
             modules[base] = v;
         }

@@ -453,6 +453,7 @@ mod tests {
                 text: "PASS\n".into(),
                 time_fs: 9_000_000,
                 span: None,
+                severity: None,
             },
             &flat,
         );

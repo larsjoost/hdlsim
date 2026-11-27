@@ -72,6 +72,8 @@ struct SlotShapeSave {
     rec: HashMap<SigId, Option<String>>,
     elem_rec: HashMap<SigId, Option<String>>,
     prot: HashMap<SigId, Option<String>>,
+    signed: HashMap<SigId, Option<bool>>,
+    width: HashMap<SigId, Option<usize>>,
 }
 
 fn capture_map<T: Clone>(map: &HashMap<SigId, T>, len: usize) -> HashMap<SigId, Option<T>> {
@@ -107,6 +109,8 @@ impl SlotShapeSave {
             rec: capture_map(&lx.sig_rec, len),
             elem_rec: capture_map(&lx.sig_elem_rec, len),
             prot: capture_map(&lx.sig_prot, len),
+            signed: capture_map(&lx.sig_signed, len),
+            width: capture_map(&lx.sig_width, len),
         }
     }
 
@@ -132,12 +136,15 @@ impl SlotShapeSave {
         restore_map(&mut lx.sig_rec, self.rec);
         restore_map(&mut lx.sig_elem_rec, self.elem_rec);
         restore_map(&mut lx.sig_prot, self.prot);
+        restore_map(&mut lx.sig_signed, self.signed);
+        restore_map(&mut lx.sig_width, self.width);
     }
 }
 
 impl<'a> Lower<'a> {
     /// Whether a formal is shape-bound: its type mark resolves to a 1-D
-    /// vector type (`string`, `std_logic_vector`, …) and its constraint is
+    /// vector type (`string`, `std_logic_vector`, …) or an unconstrained
+    /// array-of-vector type (`rem_n_array_t`, …) and its constraint is
     /// absent or a box (`<>`) — the formal takes the actual's index range
     /// (LRM 1076 §5.2.1) and addresses through hidden shape slots. A
     /// constrained formal keeps its declared range (static remap).
@@ -155,8 +162,10 @@ impl<'a> Lower<'a> {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        matches!(self.types.get(&tn), Some(TypeInfo::Vector { .. }))
-            && constraint.is_none_or(|c| self.text(c).contains("<>"))
+        matches!(
+            self.types.get(&tn),
+            Some(TypeInfo::Vector { .. }) | Some(TypeInfo::Array { .. })
+        ) && constraint.is_none_or(|c| self.text(c).contains("<>"))
     }
 
     /// Allocate the hidden shape slots for a subprogram's shape-bound
@@ -252,6 +261,14 @@ impl<'a> Lower<'a> {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as SigId))
             .collect();
+        // Slot widths must be visible to the width estimator
+        // (`expr_width_est` reads `sig_width`): without an entry an
+        // unconstrained formal falls back to 32, and a `pre & acc` return
+        // estimate sums two fallbacks into an oversized return slot whose
+        // zero padding then leaks into string comparisons.
+        for (i, (_, w)) in slots.iter().enumerate() {
+            self.sig_width.insert(i as SigId, *w);
+        }
         let saved_formals = std::mem::take(&mut self.fn_formals);
         self.fn_formals = (1..slots.len()).map(|i| i as SigId).collect();
         let saved_formal_dyn = std::mem::take(&mut self.formal_dyn);
@@ -266,6 +283,15 @@ impl<'a> Lower<'a> {
         for (n, tmark, constraint) in arg_shapes {
             if let Some(&id) = self.names.get(n) {
                 self.record_obj_shape(id, tmark.as_ref(), constraint.as_ref());
+                // An integer formal holds two's-complement values: record
+                // its declared signedness so ordered compares in the body
+                // mark both operands (`if arg < 0` must see -1, not
+                // 4294967295) — `expr_is_signed` consults this map, the
+                // same rule declared objects follow.
+                if let Some(tm) = tmark {
+                    let (_, signed, _, _) = self.resolve_type(tm, constraint.as_ref(), tm.span());
+                    self.sig_signed.insert(id, signed);
+                }
             }
         }
         // Record-typed parameters: remember the record type so `arg.field`

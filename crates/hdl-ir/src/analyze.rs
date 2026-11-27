@@ -416,6 +416,25 @@ mod tests {
         assert!(!fs.iter().any(|f| f.signal == "mem"), "{:?}", fs);
     }
 
+    /// Strip ANSI SGR sequences: colors are on by default now, so a rendered
+    /// finding may carry them — the test pins the lint-style text itself.
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s.chars();
+        while let Some(c) = rest.next() {
+            if c == '\u{1b}' {
+                for c2 in rest.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn render_is_lint_style() {
         let f = Finding {
@@ -426,7 +445,7 @@ mod tests {
             message: "signal is never driven (constant X)".to_string(),
         };
         assert_eq!(
-            f.render(),
+            strip_sgr(&f.render()),
             "warning[W0501] m.dead: signal is never driven (constant X)"
         );
     }

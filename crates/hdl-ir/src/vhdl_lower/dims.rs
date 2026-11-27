@@ -224,8 +224,15 @@ impl<'a> Lower<'a> {
         }
         // An X value has no shape: `'length` must fold to X, not a number.
         v.to_u64()?;
-        let (n, lo) = self.array_agg_len(v.width(), elem);
-        n.map(|n| vec![(lo, n)])
+        let (n, _lo) = self.array_agg_len(v.width(), elem);
+        let n = n?;
+        // A string-typed object initialized from a literal takes the
+        // literal's range, `1 TO n` (LRM 7.3.1 string literal index
+        // subtype) — element addressing `s(k)` is 1-based off this low
+        // bound. Non-string array types keep the element-count shape:
+        // their declared range (possibly descending) is unknown here.
+        let lo = if elem == 8 { 1 } else { 0 };
+        Some(vec![(lo, n)])
     }
 
     /// Register `obj_dims` for a constant from its initializer (see
