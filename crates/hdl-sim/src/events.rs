@@ -74,12 +74,16 @@ pub enum SimEvent {
     /// statement that produced it when known, so a transcript reader (human
     /// or agent) can jump straight to the source line. `severity` is the
     /// VHDL severity level for report/assert output (`None` for plain
-    /// `$display` text) — see [`MessageSeverity`].
+    /// `$display` text) — see [`MessageSeverity`]. `scope` is the instance
+    /// path the message was emitted from (dotted instance labels,
+    /// top-relative, matching signal names) — `None` when unavailable:
+    /// kernel guards, concurrent assigns, replayed `.hwf` transcripts.
     Message {
         text: String,
         time_fs: u64,
         span: Option<Span>,
         severity: Option<MessageSeverity>,
+        scope: Option<String>,
     },
     /// A test failed: `assert`/`report` with severity `error`/`failure`, or a
     /// Verilog `$error`/`$fatal`. CLI runners exit non-zero when this fires.

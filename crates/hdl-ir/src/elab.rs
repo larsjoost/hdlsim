@@ -63,6 +63,9 @@ pub struct FlatProc {
     pub sens: Sens,
     pub body: Stmt,
     pub origin: String,
+    /// Instance path of the enclosing scope (dotted instance labels,
+    /// top-relative, exactly the signal-name prefix; empty at the top).
+    pub scope: String,
     /// Run once at t=0 before waiting on `sens` (VHDL processes).
     pub initial: bool,
 }
@@ -665,6 +668,7 @@ impl Flat {
                 sens,
                 body,
                 origin: p.origin.clone(),
+                scope: prefix.to_string(),
                 initial: p.initial,
             });
         }

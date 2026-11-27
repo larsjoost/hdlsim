@@ -88,7 +88,7 @@ fn vhdl_assert_failure_carries_source_location() {
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("tb_fail_fatal.vhd:7: assertion failed"),
+        stdout.contains("tb_fail_fatal.vhd:7: [failure] assertion failed"),
         "{stdout}"
     );
     assert!(
@@ -112,7 +112,10 @@ fn verilog_error_carries_source_location() {
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("tb_fail_error.v:3: error:"), "{stdout}");
+    assert!(
+        stdout.contains("tb_fail_error.v:3: [error] error:"),
+        "{stdout}"
+    );
     assert!(stdout.contains("tb_fail_error.v:3)"), "{stdout}");
 }
 

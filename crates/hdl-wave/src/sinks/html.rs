@@ -454,6 +454,7 @@ mod tests {
                 time_fs: 9_000_000,
                 span: None,
                 severity: None,
+                scope: None,
             },
             &flat,
         );

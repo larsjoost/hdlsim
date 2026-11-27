@@ -1,8 +1,10 @@
 //! VHDL report/assert severity in the transcript: every severity-carrying
-//! message is prefixed with the emitting statement's `file:line:` location
-//! and color-coded (warning yellow, error/failure red, note plain), and a
-//! severity written as a named `severity_level` constant takes effect — it
-//! must not be silently dropped to note.
+//! message is prefixed with the emitting statement's `file:line:` location,
+//! tagged with its severity level (`[note]` … `[failure]`), color-coded
+//! (warning yellow, error/failure red, note plain), and suffixed with the
+//! emitting instance's hierarchy path `(at inst.sub)` when the kernel knows
+//! it. A severity written as a named `severity_level` constant takes
+//! effect — it must not be silently dropped to note.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,7 +62,7 @@ fn note_report_is_located_and_plain() {
     let f = sev_src("sev_note", "report \"hello\";");
     let (out, code) = run("sev_tb", &["--color", "always"], &f);
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("sev_note.vhd:6: hello"), "{out}");
+    assert!(out.contains("sev_note.vhd:6: [note] hello"), "{out}");
     // Note severity adds no color even with --color always, and a passing
     // run paints nothing else.
     assert!(!out.contains('\x1b'), "{out}");
@@ -72,12 +74,12 @@ fn warning_report_is_located_and_yellow() {
     let f = sev_src("sev_warn", "report \"careful\" severity warning;");
     let (out, code) = run("sev_tb", &["--color", "always"], &f);
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("sev_warn.vhd:6: careful"), "{out}");
+    assert!(out.contains("sev_warn.vhd:6: [warning] careful"), "{out}");
     assert!(out.contains("\x1b[1;33m"), "{out}");
     // Plain mode keeps the location, drops the escape.
     let (out, code) = run("sev_tb", &["--no-color"], &f);
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("sev_warn.vhd:6: careful"), "{out}");
+    assert!(out.contains("sev_warn.vhd:6: [warning] careful"), "{out}");
     assert!(!out.contains('\x1b'), "{out}");
     let _ = std::fs::remove_file(&f);
 }
@@ -87,7 +89,7 @@ fn error_report_fails_run_in_red() {
     let f = sev_src("sev_err", "report \"boom\" severity error;");
     let (out, code) = run("sev_tb", &["--color", "always"], &f);
     assert_eq!(code, Some(1), "{out}");
-    assert!(out.contains("sev_err.vhd:6: boom"), "{out}");
+    assert!(out.contains("sev_err.vhd:6: [error] boom"), "{out}");
     assert!(out.contains("\x1b[1;31m"), "{out}");
     let _ = std::fs::remove_file(&f);
 }
@@ -97,7 +99,7 @@ fn failure_severity_aborts_simulation() {
     let f = sev_src("sev_fail", "report \"dead\" severity failure;");
     let (out, code) = run("sev_tb", &["--no-color"], &f);
     assert_eq!(code, Some(1), "{out}");
-    assert!(out.contains("sev_fail.vhd:6: dead"), "{out}");
+    assert!(out.contains("sev_fail.vhd:6: [failure] dead"), "{out}");
     assert!(out.contains("severity failure"), "{out}");
     let _ = std::fs::remove_file(&f);
 }
@@ -110,7 +112,7 @@ fn named_constant_severity_takes_effect() {
     let f = write_src("sev_const", src);
     let (out, code) = run("sev_const_tb", &["--no-color"], &f);
     assert_eq!(code, Some(1), "{out}");
-    assert!(out.contains("sev_const.vhd:7: dyn boom"), "{out}");
+    assert!(out.contains("sev_const.vhd:7: [error] dyn boom"), "{out}");
     let _ = std::fs::remove_file(&f);
 }
 
@@ -123,7 +125,7 @@ fn assert_severity_follows_the_same_rules() {
     );
     let (out, code) = run("sev_tb", &["--color", "always"], &f);
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("sev_awarn.vhd:6: soft"), "{out}");
+    assert!(out.contains("sev_awarn.vhd:6: [warning] soft"), "{out}");
     assert!(out.contains("\x1b[1;33m"), "{out}");
     let _ = std::fs::remove_file(&f);
 
@@ -134,5 +136,65 @@ fn assert_severity_follows_the_same_rules() {
     assert!(out.contains("sev_aerr.vhd:6: "), "{out}");
     assert!(out.contains("assertion failed"), "{out}");
     assert!(out.contains("\x1b[1;31m"), "{out}");
+    let _ = std::fs::remove_file(&f);
+}
+
+#[test]
+fn report_lines_carry_the_emitting_scope_path() {
+    // A report from a nested instance is suffixed with the instance path —
+    // the same dotted names `--list-signals` prints — so an agent can tell
+    // WHICH instance fired when a component is instantiated more than once.
+    // A top-level report has no path suffix. (Leaf report: line 8, top
+    // report: line 34.)
+    const SRC: &str = "\
+entity scope_leaf is
+  port (done : out bit);
+end entity;
+architecture rtl of scope_leaf is
+begin
+  process is
+  begin
+    report \"leaf report\" severity warning;
+    done <= '1';
+    wait;
+  end process;
+end architecture;
+
+entity scope_mid is
+  port (done : out bit);
+end entity;
+architecture rtl of scope_mid is
+  signal d : bit;
+begin
+  u_leaf : entity work.scope_leaf port map (done => d);
+  done <= d;
+end architecture;
+
+entity scope_tb is
+  port (ok : out bit);
+end entity;
+architecture a of scope_tb is
+  signal m : bit;
+begin
+  u_mid : entity work.scope_mid port map (done => m);
+  ok <= m;
+  process is
+  begin
+    report \"top report\";
+    wait;
+  end process;
+end architecture;
+";
+    let f = write_src("sev_scope", SRC);
+    let (out, code) = run("scope_tb", &["--no-color"], &f);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("sev_scope.vhd:8: [warning] leaf report (at u_mid.u_leaf)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sev_scope.vhd:34: [note] top report\n"),
+        "{out}"
+    );
     let _ = std::fs::remove_file(&f);
 }

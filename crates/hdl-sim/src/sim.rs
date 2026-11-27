@@ -957,6 +957,7 @@ impl Simulator {
                 .cloned()
                 .collect();
             self.emit(SimEvent::Message {
+                scope: self.cur_scope(),
                 text: format!(
                     "error: function call depth exceeded ({} nested calls) at t={} — probable infinite recursion in function '{name}' (call tree rooted at '{root}', chain tail: {}); simulation stopped\n",
                     self.max_func_depth,
@@ -999,6 +1000,7 @@ impl Simulator {
             // Show the tail of the chain; a repeating suffix is the cycle.
             let tail: Vec<String> = chain.iter().rev().take(14).rev().cloned().collect();
             self.emit(SimEvent::Message {
+                scope: self.cur_scope(),
                 text: format!(
                     "error: function call limit exceeded ({} calls in one process activation) at t={} — process '{origin}' loops while calling function '{name}' (call tree rooted at '{root}', chain tail: {}); simulation stopped\n",
                     self.max_fn_calls,
@@ -1036,6 +1038,7 @@ impl Simulator {
             return true;
         }
         self.emit(SimEvent::Message {
+            scope: self.cur_scope(),
             text: crate::meminfo::limit_message("simulate", peak_kb, limit_kb),
             time_fs: self.time,
             span: self.cur_span,
@@ -1125,13 +1128,46 @@ impl Simulator {
         self.eval_assigns_fixpoint();
     }
 
+    /// Instance path of the active process's enclosing scope — `None` at
+    /// the top level, under the concurrent-assign sentinel, or between
+    /// events. Matches the signal-name prefix of the same scope.
+    fn cur_scope(&self) -> Option<String> {
+        let proc = self
+            .cur_proc
+            .and_then(|p| self.flat.procs.get(p as usize))?;
+        (!proc.scope.is_empty()).then(|| proc.scope.clone())
+    }
+
+    /// Emit a severity-carrying report/assert message, tagged with the
+    /// active process's instance scope (transcript renders `(at path)`).
+    fn emit_severity_message(
+        &mut self,
+        text: String,
+        span: Option<Span>,
+        severity: MessageSeverity,
+    ) {
+        self.emit(SimEvent::Message {
+            text,
+            time_fs: self.time,
+            span,
+            severity: Some(severity),
+            scope: self.cur_scope(),
+        });
+    }
+
     /// Human-readable "where is the simulator right now": current time, the
     /// active process origin (file:line), and the live function call chain.
     /// Shared by the interrupt dump and the progress heartbeat.
     fn where_am_i(&self) -> String {
         let proc_desc = match self.cur_proc {
             Some(p) if (p as usize) < self.flat.procs.len() => {
-                format!("in {}", self.flat.procs[p as usize].origin)
+                let proc = &self.flat.procs[p as usize];
+                let scope = if proc.scope.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", proc.scope)
+                };
+                format!("in {scope}{}", proc.origin)
             }
             // eval_assigns_fixpoint runs assigns under a sentinel proc id.
             Some(_) if self.fix_sweep > 0 => format!(
@@ -1173,6 +1209,7 @@ impl Simulator {
     /// location dump as a transcript message and record the exit code.
     fn stop_for_interrupt(&mut self, reason: &str, rc: i32) {
         self.emit(SimEvent::Message {
+            scope: self.cur_scope(),
             text: format!(
                 "error: simulation {} at {} — simulation stopped\n",
                 reason,
@@ -1252,6 +1289,7 @@ impl Simulator {
             self.delta_epoch += 1;
             if delta_count > 10_000 {
                 self.emit(SimEvent::Message {
+                    scope: self.cur_scope(),
                     text: format!(
                         "error: delta-cycle limit exceeded ({} iterations without time advance) at t={} — the design keeps producing zero-delay events (e.g. `wait for 0 ns` in a loop, or processes re-triggering each other with no delay); simulation stopped\n",
                         delta_count, fmt_time(self.time)
@@ -1298,6 +1336,7 @@ impl Simulator {
                 drain_guard += 1;
                 if drain_guard > 1_000_000 {
                     self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
                         text: format!(
                             "error: zero-delay process loop detected at t={} — the design keeps re-running a process with no time passing; rerun with --trace to see the activation cycle; simulation stopped\n",
                             fmt_time(self.time)
@@ -1588,6 +1627,7 @@ impl Simulator {
                     format!("{}", self.max_proc_steps)
                 };
                 self.emit(SimEvent::Message {
+                    scope: self.cur_scope(),
                     text: format!(
                         "error: process step limit exceeded ({} interpreter steps in one activation) at t={} — process '{origin}' loops without waiting (e.g. `loop`/`while` with no `wait`); simulation stopped\n",
                         budget,
@@ -2191,6 +2231,7 @@ impl Simulator {
                     text
                 };
                 self.emit(SimEvent::Message {
+                    scope: None,
                     text,
                     time_fs: self.time,
                     span: self.cur_span,
@@ -2205,6 +2246,7 @@ impl Simulator {
                     locals.as_deref(),
                 );
                 self.emit(SimEvent::Message {
+                    scope: None,
                     text: format!("{}\n", text),
                     time_fs: self.time,
                     span: self.cur_span,
@@ -2230,35 +2272,32 @@ impl Simulator {
                         severity,
                         Some(MessageSeverity::Error | MessageSeverity::Failure)
                     ) {
-                        self.emit(SimEvent::Message {
-                            text: format!("assertion failed at t={}: {}\n", self.time, msg),
-                            time_fs: self.time,
-                            span: self.cur_span,
-                            severity,
-                        });
+                        self.emit_severity_message(
+                            format!("assertion failed at t={}: {}\n", self.time, msg),
+                            self.cur_span,
+                            severity.expect("matched Error/Failure above"),
+                        );
                         self.fail(format!("assertion failed at t={}: {}", self.time, msg));
                     } else {
                         // Note/warning severity reports the message without
                         // failing (LRM 10.2 severity levels) — `assert false
                         // report "done" severity note` is a common
                         // end-of-test marker.
-                        self.emit(SimEvent::Message {
-                            text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
-                            time_fs: self.time,
-                            span: self.cur_span,
-                            severity: Some(severity.unwrap_or(MessageSeverity::Note)),
-                        });
+                        self.emit_severity_message(
+                            format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
+                            self.cur_span,
+                            severity.unwrap_or(MessageSeverity::Note),
+                        );
                     }
                     if severity == Some(MessageSeverity::Failure) {
-                        self.emit(SimEvent::Message {
-                            text: format!(
+                        self.emit_severity_message(
+                            format!(
                                 "error: severity failure at t={}; simulation aborted\n",
                                 self.time
                             ),
-                            time_fs: self.time,
-                            span: self.cur_span,
-                            severity: Some(MessageSeverity::Error),
-                        });
+                            self.cur_span,
+                            MessageSeverity::Error,
+                        );
                         self.stopped = true;
                     }
                 }
@@ -2273,12 +2312,11 @@ impl Simulator {
                         &string_of(&self.eval_expr(a, locals.as_deref())).to_ascii_lowercase(),
                     )
                 });
-                self.emit(SimEvent::Message {
-                    text: format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
-                    time_fs: self.time,
-                    span: self.cur_span,
-                    severity: Some(severity.unwrap_or(MessageSeverity::Note)),
-                });
+                self.emit_severity_message(
+                    format!("{}{}\n", if msg.is_empty() { "" } else { ": " }, msg),
+                    self.cur_span,
+                    severity.unwrap_or(MessageSeverity::Note),
+                );
                 if matches!(
                     severity,
                     Some(MessageSeverity::Error | MessageSeverity::Failure)
@@ -2290,15 +2328,14 @@ impl Simulator {
                     ));
                 }
                 if severity == Some(MessageSeverity::Failure) {
-                    self.emit(SimEvent::Message {
-                        text: format!(
+                    self.emit_severity_message(
+                        format!(
                             "error: severity failure at t={}; simulation aborted\n",
                             self.time
                         ),
-                        time_fs: self.time,
-                        span: self.cur_span,
-                        severity: Some(MessageSeverity::Error),
-                    });
+                        self.cur_span,
+                        MessageSeverity::Error,
+                    );
                     self.stopped = true;
                 }
             }
@@ -2315,6 +2352,7 @@ impl Simulator {
                         None => String::new(),
                     };
                     self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
                         text: format!("assertion failed at t={}: {}\n", self.time, text),
                         time_fs: self.time,
                         span: self.cur_span,
@@ -2327,6 +2365,7 @@ impl Simulator {
                 // Verilog $error / $fatal — a failed test.
                 let text = self.fmt_args(&args, locals.as_deref());
                 self.emit(SimEvent::Message {
+                    scope: self.cur_scope(),
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
                     span: self.cur_span,
@@ -2340,6 +2379,7 @@ impl Simulator {
             "warning" | "info" => {
                 let text = self.fmt_args(&args, locals.as_deref());
                 self.emit(SimEvent::Message {
+                    scope: self.cur_scope(),
                     text: format!("{}: {}\n", name, text),
                     time_fs: self.time,
                     span: self.cur_span,
@@ -2396,6 +2436,7 @@ impl Simulator {
                                     );
                                 }
                                 None => self.emit(SimEvent::Message {
+                                    scope: self.cur_scope(),
                                     text: format!(
                                         "warning: $rand_solve: '{}' is not in the spec at t={}\n",
                                         name, self.time
@@ -2409,6 +2450,7 @@ impl Simulator {
                         }
                         if (args.len().saturating_sub(1)) % 2 != 0 {
                             self.emit(SimEvent::Message {
+                                scope: self.cur_scope(),
                                 text: format!(
                                     "warning: $rand_solve: dangling argument at t={}\n",
                                     self.time
@@ -2421,6 +2463,7 @@ impl Simulator {
                     }
                     Err(msg) => {
                         self.emit(SimEvent::Message {
+                            scope: self.cur_scope(),
                             text: format!("warning: $rand_solve at t={}: {}\n", self.time, msg),
                             time_fs: self.time,
                             span: self.cur_span,
@@ -2497,6 +2540,7 @@ impl Simulator {
                 };
                 if path == "stdout" || path.is_empty() {
                     self.emit(SimEvent::Message {
+                        scope: None,
                         text: format!("{}\n", text),
                         time_fs: self.time,
                         span: self.cur_span,
@@ -2513,6 +2557,7 @@ impl Simulator {
                             let _ = f.write_all(format!("{}\n", text).as_bytes());
                         }
                         Err(_) => self.emit(SimEvent::Message {
+                            scope: self.cur_scope(),
                             text: format!(
                                 "error: cannot write textio file '{}' at t={}\n",
                                 path, self.time
@@ -2666,6 +2711,7 @@ impl Simulator {
                     self.run_procedure(fi, &args, shapes, locals);
                 } else {
                     self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
                         text: format!(
                             "warning: unsupported system task ${} at t={}",
                             name, self.time
@@ -2785,6 +2831,7 @@ impl Simulator {
     fn read_mem_file(&mut self, mem: &SigId, fname: &str, binary: bool) {
         let Ok(text) = std::fs::read_to_string(fname) else {
             self.emit(SimEvent::Message {
+                scope: self.cur_scope(),
                 text: format!("error: cannot read memory file '{}'", fname),
                 time_fs: self.time,
                 span: None,
@@ -2895,6 +2942,7 @@ impl Simulator {
                 self.monitor_last[i] = Some(vals);
                 let text = self.fmt_args(&args, None);
                 self.emit(SimEvent::Message {
+                    scope: None,
                     text: format!("{}\n", text),
                     time_fs: self.time,
                     span: self.cur_span,
@@ -2966,6 +3014,7 @@ impl Simulator {
     fn fail_comb_loop(&mut self) {
         self.cur_proc = None;
         self.emit(SimEvent::Message {
+            scope: self.cur_scope(),
             text: format!(
                 "error: combinational loop detected at t={} — continuous assignments never settle (a signal's value feeds back into its own RHS with no clock in between); simulation stopped\n",
                 fmt_time(self.time)
@@ -3393,6 +3442,7 @@ impl Simulator {
         // sentence.
         if !self.error_stopped {
             self.emit(SimEvent::Message {
+                scope: self.cur_scope(),
                 text: format!(
                     "error: memory write to '{}' at index {} would grow it past \
                      --max-signal-mb (declared depth {} words) — the index is \
@@ -5260,6 +5310,7 @@ impl<'a> ProcRunner<'a> {
                 // cannot return to the caller with its position saved. Warn
                 // instead of silently ignoring the statement.
                 self.sim.emit(SimEvent::Message {
+                    scope: self.sim.cur_scope(),
                     text: format!(
                         "warning: wait/delay inside a procedure is not supported; continuing without suspending at t={}\n",
                         self.sim.time

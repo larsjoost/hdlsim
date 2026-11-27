@@ -49,9 +49,10 @@ fn every_feature_example_prints_pass() {
         let pass = text.lines().any(|l| {
             let l = l.trim();
             // Note-severity report lines carry the emitting statement's
-            // location (`file:line: PASS`); older transcripts and bare
-            // $display keep the plain/`: `-prefixed shapes.
-            l == "PASS" || l == ": PASS" || l.ends_with(": PASS")
+            // location and severity tag (`file:line: [note] PASS`); older
+            // transcripts and bare $display keep the plain/`: `-prefixed
+            // shapes.
+            l == "PASS" || l == ": PASS" || l.ends_with(": PASS") || l.ends_with(": [note] PASS")
         });
         if !pass || !out.status.success() {
             failed.push(format!(

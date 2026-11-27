@@ -7,6 +7,7 @@ use clap::Parser;
 use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_sim::{Observer, SimEvent, Simulator};
+use hdl_syntax::source::Span;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -116,6 +117,44 @@ impl Transcript {
     }
 }
 
+impl Transcript {
+    /// One located message line — `file:line: [severity] body (at scope)` —
+    /// painted by severity level. The explicit tag keeps the level legible
+    /// without color; the scope suffix names the emitting instance path
+    /// (matches signal names) so a duplicated component is attributable.
+    fn located_message(
+        &self,
+        color: bool,
+        span: Option<Span>,
+        sev: hdl_sim::MessageSeverity,
+        text: &str,
+        scope: Option<&String>,
+    ) -> String {
+        // The kernel marks note/warning report text with a leading ": " —
+        // drop it under the location.
+        let body = text.strip_prefix(": ").unwrap_or(text);
+        let (line, nl) = body.strip_suffix('\n').map_or((body, ""), |l| (l, "\n"));
+        let at = scope.map(|s| format!(" (at {s})")).unwrap_or_default();
+        let located = format!(
+            "{}[{}] {}{}{}",
+            Self::loc(&self.db, span),
+            sev.name(),
+            line,
+            at,
+            nl
+        );
+        match sev {
+            hdl_sim::MessageSeverity::Error | hdl_sim::MessageSeverity::Failure => {
+                hdl_syntax::diagnostic::paint(color, "1;31", &located)
+            }
+            hdl_sim::MessageSeverity::Warning => {
+                hdl_syntax::diagnostic::paint(color, "1;33", &located)
+            }
+            hdl_sim::MessageSeverity::Note => located,
+        }
+    }
+}
+
 impl Observer for Transcript {
     fn on_event(&mut self, ev: &SimEvent) {
         let color = hdl_syntax::diagnostic::color_enabled();
@@ -123,6 +162,7 @@ impl Observer for Transcript {
             text,
             span,
             severity,
+            scope,
             ..
         } = ev
         {
@@ -141,21 +181,8 @@ impl Observer for Transcript {
                 None
             };
             match severity.or(sniffed) {
-                // A diagnostic line: `file:line: ` prefix (jump-to location)
-                // plus severity color. The kernel marks note/warning report
-                // text with a leading ": " — drop it under the location.
                 Some(sev) => {
-                    let body = text.strip_prefix(": ").unwrap_or(text);
-                    let located = format!("{}{}", Self::loc(&self.db, *span), body);
-                    let painted = match sev {
-                        hdl_sim::MessageSeverity::Error | hdl_sim::MessageSeverity::Failure => {
-                            hdl_syntax::diagnostic::paint(color, "1;31", &located)
-                        }
-                        hdl_sim::MessageSeverity::Warning => {
-                            hdl_syntax::diagnostic::paint(color, "1;33", &located)
-                        }
-                        hdl_sim::MessageSeverity::Note => located,
-                    };
+                    let painted = self.located_message(color, *span, sev, text, scope.as_ref());
                     print!("{}", painted);
                 }
                 // Plain transcript text ($display, textio echo) stays raw.

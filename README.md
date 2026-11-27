@@ -213,13 +213,16 @@ its argument is a diagnostic level, not an exit status.
 
 ### Transcript output
 
-`report`/`assert` lines carry the emitting statement's location and severity
-color: `file:line: message`, red for `error`/`failure`, yellow for `warning`,
-plain for `note`. A severity written as a named `severity_level` constant is
-const-folded (`severity C_SEV` behaves like the keyword it evaluates to).
-Colors are on by default — even piped, so agent-consumed transcripts keep the
-signal; `NO_COLOR` or `--no-color` disables, `--color auto` colors only on a
-terminal.
+`report`/`assert` lines carry the emitting statement's location, an explicit
+severity tag, and the instance path of the scope that emitted them:
+`file:line: [warning] message (at u_core.u_fifo)`. The tag keeps the level
+legible without color; the path matches the names `--list-signals` prints, so
+a check instantiated more than once is attributable to the exact instance
+(top-level statements have no path suffix). Colors stay on by default — even
+piped, so agent-consumed transcripts keep the signal; `NO_COLOR` or
+`--no-color` disables, `--color auto` colors only on a terminal. A severity
+written as a named `severity_level` constant is const-folded
+(`severity C_SEV` behaves like the keyword it evaluates to).
 
 ## Reporting bugs — reproducer bundles
 
