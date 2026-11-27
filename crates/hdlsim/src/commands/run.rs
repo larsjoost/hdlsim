@@ -78,6 +78,14 @@ struct RunArgs {
     /// value. Repeatable.
     #[arg(long, value_name = "SPEC")]
     examine: Vec<String>,
+    /// Log every evaluation of the continuous assignments driving the named
+    /// signals, with the values the RHS read:
+    /// `trace-assign t=15ns d3 sweep1 assign#4 ->tb.dut.y = 0b0011 (was 0b0011) reads{tb.dut.a=0b0001}`.
+    /// Re-evaluations that do not change the value print too — the silence
+    /// around a sensitivity bug is itself the evidence. Repeatable;
+    /// dot-suffix match like --watch.
+    #[arg(long, value_name = "NAMES")]
+    trace_assign: Vec<String>,
     /// List signal names (hierarchical) after elaboration and exit, no
     /// simulation — use it to find the exact name for --watch. Optional
     /// `=PATTERN` (case-insensitive substring) filters, e.g.
@@ -441,6 +449,8 @@ impl Command for Run {
         }
         sim.set_when_rules(&a.when).map_err(anyhow::Error::msg)?;
         sim.set_examine_rules(&a.examine)
+            .map_err(anyhow::Error::msg)?;
+        sim.set_trace_assigns(&a.trace_assign)
             .map_err(anyhow::Error::msg)?;
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);

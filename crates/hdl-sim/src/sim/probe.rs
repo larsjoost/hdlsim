@@ -9,6 +9,7 @@ use super::Simulator;
 use hdl_ir::elab::FlatSigId;
 use hdl_ir::fmt_time;
 use hdl_ir::value::{Value, V0, V1, VDASH, VH, VL, VU, VW, VX, VZ};
+use hdl_ir::Expr;
 
 // ---- --when / --examine -----------------------------------------------------------
 
@@ -313,6 +314,102 @@ fn match_state_letter(s: &str) -> Option<u8> {
         "-" => Some(VDASH),
         "U" => Some(VU),
         _ => None,
+    }
+}
+
+// ---- --trace-assign ---------------------------------------------------------------
+
+/// One resolved `--trace-assign` rule: log every evaluation of the
+/// continuous assignments driving `target`, with the values the RHS read.
+pub(super) struct TraceAssign {
+    target: FlatSigId,
+    name: String,
+}
+
+/// The simple signal an assignment drives: `Expr::Sig` for plain targets;
+/// None for bit-selects and the like, which the per-evaluation trace cannot
+/// attribute.
+fn assign_target_sig(lhs: &Expr) -> Option<FlatSigId> {
+    match lhs {
+        Expr::Sig(s) => Some(*s),
+        _ => None,
+    }
+}
+
+impl Simulator {
+    /// Arm `--trace-assign` rules from raw signal-name specs (dot-suffix
+    /// match like --watch). Unmatched names, and names no continuous
+    /// assignment drives, are hard errors before the run starts — a typo'd
+    /// knob must not fail silently.
+    pub fn set_trace_assigns(&mut self, specs: &[String]) -> Result<(), String> {
+        self.trace_assigns.clear();
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let targets: Vec<Option<FlatSigId>> = self
+            .flat
+            .assigns
+            .iter()
+            .map(|a| assign_target_sig(&a.lhs))
+            .collect();
+        for spec in specs {
+            let hits = self.resolve_signal_pattern(spec.trim());
+            if hits.is_empty() {
+                self.trace_assigns.clear();
+                return Err(self.unmatched_error("--trace-assign", spec.trim()));
+            }
+            for (sig, name) in hits {
+                if !targets.contains(&Some(sig)) {
+                    self.trace_assigns.clear();
+                    return Err(format!(
+                        "--trace-assign: no continuous assignment drives {name} \
+                         (process-driven signals: use --watch or --when)"
+                    ));
+                }
+                self.trace_assigns.push(TraceAssign { target: sig, name });
+            }
+        }
+        eprintln!("trace-assign: {} rule(s) armed", self.trace_assigns.len());
+        Ok(())
+    }
+
+    /// One `trace-assign:` line per evaluation of a traced continuous
+    /// assignment — including re-evaluations whose result equals the
+    /// current value, because the silence around a sensitivity bug is
+    /// itself the evidence. Called from the fixpoint sweep after the RHS
+    /// is evaluated and converted, before the result is applied, so the
+    /// `reads{}` values are exactly what the evaluation saw.
+    pub(super) fn assign_trace_eval(&self, ai: usize, lhs: &Expr, rhs: &Expr, result: &Value) {
+        let Some(sig) = assign_target_sig(lhs) else {
+            return;
+        };
+        let Some(rule) = self.trace_assigns.iter().find(|r| r.target == sig) else {
+            return;
+        };
+        let mut sigs = Vec::new();
+        rhs.collect_sigs(&mut sigs);
+        sigs.sort_unstable();
+        sigs.dedup();
+        let reads: Vec<String> = sigs
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}={}",
+                    self.flat.signals[*s as usize].name,
+                    self.vals[*s as usize].fmt_value()
+                )
+            })
+            .collect();
+        eprintln!(
+            "trace-assign t={} d{} sweep{} assign#{ai} ->{} = {} (was {}) reads{{{}}}",
+            fmt_time(self.time),
+            self.delta_no,
+            self.fix_sweep,
+            rule.name,
+            result.fmt_value(),
+            self.vals[sig as usize].fmt_value(),
+            reads.join(", ")
+        );
     }
 }
 

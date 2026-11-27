@@ -52,6 +52,11 @@ struct DebugArgs {
     /// 2us; bare `--examine sig` at end of run. Repeatable.
     #[arg(long, value_name = "SPEC")]
     examine: Vec<String>,
+    /// Log every evaluation of the continuous assignments driving the named
+    /// signals, with the values the RHS read (same output as
+    /// `run --trace-assign`). Repeatable.
+    #[arg(long, value_name = "NAMES")]
+    trace_assign: Vec<String>,
     /// RNG seed.
     #[arg(long)]
     seed: Option<u64>,
@@ -122,6 +127,8 @@ impl Command for Debug {
         }
         sim.set_when_rules(&when).map_err(anyhow::Error::msg)?;
         sim.set_examine_rules(&examine)
+            .map_err(anyhow::Error::msg)?;
+        sim.set_trace_assigns(&a.trace_assign)
             .map_err(anyhow::Error::msg)?;
         init_phase.done("state initialized");
         if dump {

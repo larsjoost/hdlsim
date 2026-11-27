@@ -371,6 +371,11 @@ pub struct Simulator {
     /// `--examine` rules: one settled-value print per rule at its time point
     /// (or the end-of-run value), deduped via `printed`.
     examine_rules: Vec<probe::ExamineRule>,
+    /// `--trace-assign` rules: every evaluation of the continuous
+    /// assignments driving the named signals is logged with the values its
+    /// RHS read — see `probe.rs`. Empty by default — the hot-path check in
+    /// the fixpoint sweep is a bare `is_empty()`.
+    trace_assigns: Vec<probe::TraceAssign>,
     /// Delta cycle number within the current timestamp (pump's
     /// `delta_count`), shown in watch lines so the settling sequence of a
     /// single timestamp is readable.
@@ -557,6 +562,7 @@ impl Simulator {
             watch_lines: 0,
             when_rules: Vec::new(),
             examine_rules: Vec::new(),
+            trace_assigns: Vec::new(),
             delta_no: 0,
             fn_steps: std::cell::Cell::new(0),
             monitor: Vec::new(),
@@ -2987,6 +2993,9 @@ impl Simulator {
                 let a = self.flat.assigns[ai].clone();
                 let rhs = self.eval_expr(&a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
+                if !self.trace_assigns.is_empty() {
+                    self.assign_trace_eval(ai, &a.lhs, &a.rhs, &rhs);
+                }
                 if self.assign_to(&a.lhs, rhs, None) {
                     changed = true;
                     n_changed += 1;
