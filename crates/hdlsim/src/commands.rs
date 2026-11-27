@@ -528,24 +528,11 @@ pub fn pick_default_top(design: &hdl_ir::Design) -> anyhow::Result<String> {
 }
 
 /// Parse a time like `100ns`, `10us`, `1ms`, `500` (bare = ns) into femtoseconds.
+/// Thin anyhow-flavored wrapper over [`hdl_ir::parse_time`], which owns the
+/// implementation (the simulation kernel parses `--when`/`--examine` time
+/// windows too).
 pub fn parse_time(s: &str) -> anyhow::Result<u64> {
-    let (num, unit) = s
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map(|i| (&s[..i], &s[i..]))
-        .unwrap_or((s, ""));
-    let v: f64 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad time value '{}'", s))?;
-    let mult: f64 = match unit {
-        "" | "ns" => 1e6,
-        "fs" => 1.0,
-        "ps" => 1e3,
-        "us" | "µs" => 1e9,
-        "ms" => 1e12,
-        "s" => 1e15,
-        _ => return Err(anyhow::anyhow!("unknown time unit '{}'", unit)),
-    };
-    Ok((v * mult) as u64)
+    hdl_ir::parse_time(s).map_err(anyhow::Error::msg)
 }
 
 /// Parse a wall-clock duration like `30` (bare = seconds), `30s`, `1.5m`,

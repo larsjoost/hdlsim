@@ -43,6 +43,15 @@ struct DebugArgs {
     /// Stop time (e.g. 10us).
     #[arg(long)]
     max_time: Option<String>,
+    /// Echo a line when a signal changes and the rule matches:
+    /// `--when 'sig=value@T0-T1'` (same spec grammar as `run --when`).
+    /// Repeatable.
+    #[arg(long, value_name = "SPEC")]
+    when: Vec<String>,
+    /// Print a signal's settled value once: `--examine 'sig@2us'` at exactly
+    /// 2us; bare `--examine sig` at end of run. Repeatable.
+    #[arg(long, value_name = "SPEC")]
+    examine: Vec<String>,
     /// RNG seed.
     #[arg(long)]
     seed: Option<u64>,
@@ -78,6 +87,8 @@ impl Command for Debug {
             None => u64::MAX,
         };
         let seed = a.seed;
+        let when = a.when;
+        let examine = a.examine;
         let files: Vec<PathBuf> = a.files;
         let (mut mgr, root) = build_manager(&opts)?;
         let files: Vec<PathBuf> = files.iter().map(|f| remap_into_bundle(f, &root)).collect();
@@ -109,6 +120,9 @@ impl Command for Debug {
         if let Some(s) = seed {
             sim.set_seed(s);
         }
+        sim.set_when_rules(&when).map_err(anyhow::Error::msg)?;
+        sim.set_examine_rules(&examine)
+            .map_err(anyhow::Error::msg)?;
         init_phase.done("state initialized");
         if dump {
             print!("{}", sim.dump_design());
@@ -124,6 +138,7 @@ impl Command for Debug {
         sim.add_observer(Box::new(Transcript::new(mgr.db().clone())));
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
+        sim.examine_flush_final();
         sim_phase.done(format!("t={}", fmt_time(sim.time())));
         println!("hdlsim debug: stopped at t={}", fmt_time(sim.time()));
         if sim.failures() > 0 {

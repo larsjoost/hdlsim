@@ -1,4 +1,5 @@
-//! Signal-observation knobs on the simulator — the `--watch` machinery.
+//! The `--watch` signal-change watch. The Questa-style `--when` /
+//! `--examine` probes live in the sibling `probe.rs`.
 //!
 //! Child module of `sim` so it can read the kernel's private fields, the
 //! same pattern as `sim/ckpt.rs`.
@@ -23,19 +24,11 @@ impl Simulator {
     ) -> Result<(), String> {
         let mut unmatched: Vec<String> = Vec::new();
         for cand in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let key = cand.to_ascii_lowercase();
-            let suffix = format!(".{}", key);
-            let mut matched = 0;
-            for (i, s) in self.flat.signals.iter().enumerate() {
-                let n = s.name.to_ascii_lowercase();
-                if n == key || n.ends_with(&suffix) {
-                    self.watch.push((i as u32, s.name.clone()));
-                    matched += 1;
-                }
-            }
-            if matched == 0 {
+            let hits = self.resolve_signal_pattern(cand);
+            if hits.is_empty() {
                 unmatched.push(cand.to_string());
             }
+            self.watch.extend(hits);
         }
         if !unmatched.is_empty() {
             self.watch.clear();
@@ -67,6 +60,37 @@ impl Simulator {
         Ok(())
     }
 
+    /// Resolve one name pattern against the flat signal list: exact match or
+    /// dot-suffix match (`dut.q` matches `tb.dut.q`), case-insensitive —
+    /// the same rule as `--watch`. Empty when nothing matches.
+    pub(super) fn resolve_signal_pattern(&self, name: &str) -> Vec<(FlatSigId, String)> {
+        let key = name.to_ascii_lowercase();
+        let suffix = format!(".{key}");
+        self.flat
+            .signals
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                let n = s.name.to_ascii_lowercase();
+                n == key || n.ends_with(&suffix)
+            })
+            .map(|(i, s)| (i as FlatSigId, s.name.clone()))
+            .collect()
+    }
+
+    /// ` driver=<origin>` for whoever is producing the current change: the
+    /// running process, `assign` inside the continuous-assign sweep, empty
+    /// outside evaluation (t=0 init).
+    pub(super) fn driver_suffix(&self) -> String {
+        match self.cur_proc {
+            Some(p) if (p as usize) < self.flat.procs.len() => {
+                format!(" driver={}", self.flat.procs[p as usize].origin)
+            }
+            Some(_) => " driver=assign".to_string(),
+            None => String::new(),
+        }
+    }
+
     /// All signal names (hierarchical, exactly as `set_watch` matches
     /// them), sorted with duplicates removed (duplicate instance names
     /// produce duplicate signal names). Backs `run --list-signals`.
@@ -77,18 +101,13 @@ impl Simulator {
         names
     }
 
-    /// rustc-style help for an unmatched `--watch` name: up to three
-    /// similarly named signals, ranked by tier then distance —
-    /// 0: same trailing name component (the signal exists, the instance
-    ///    path is off — with real instance names any two hierarchy paths
-    ///    are farther apart than an edit-distance budget),
-    /// 1: trailing component within the edit budget (a typo'd component,
-    ///    `cmt` → `dut.cnt` — the full names are too far apart for tier 2),
-    /// 2: full name within the edit budget.
-    /// When many signals share the trailing component exactly, the count
-    /// is added with a `--list-signals` pointer. Empty-input note handled
-    /// by the caller; this never returns an empty string.
-    fn watch_suggestions(&self, cand: &str) -> String {
+    /// Ranked near-match candidates for an unmatched name: (tier, distance,
+    /// full signal name) pairs sorted best-first, plus the count of signals
+    /// sharing the trailing component. Tiers — 0: same trailing name
+    /// component (the signal exists, the instance path is off), 1: trailing
+    /// component within the edit budget (a typo'd component), 2: full name
+    /// within the edit budget.
+    fn watch_suggestion_candidates(&self, cand: &str) -> (Vec<(u8, usize, &str)>, usize) {
         let key = cand.to_ascii_lowercase();
         let last = key.rsplit('.').next().unwrap_or(&key).to_string();
         let max_d = (key.len() / 3).max(3);
@@ -113,6 +132,18 @@ impl Simulator {
             }
         }
         cands.sort();
+        (cands, suffix_count)
+    }
+
+    /// rustc-style help for an unmatched `--watch` name: up to three
+    /// similarly named signals ranked by [`Self::watch_suggestion_candidates`]
+    /// (with the shared-trailing-component count as a `--list-signals`
+    /// pointer). Empty-input note handled by the caller; this never returns
+    /// an empty string.
+    pub(super) fn watch_suggestions(&self, cand: &str) -> String {
+        let (cands, suffix_count) = self.watch_suggestion_candidates(cand);
+        let key = cand.to_ascii_lowercase();
+        let last = key.rsplit('.').next().unwrap_or(&key).to_string();
         let shown: Vec<&str> = cands.iter().take(3).map(|(_, _, n)| *n).collect();
         let mut out = String::new();
         match shown.len() {
@@ -185,13 +216,7 @@ impl Simulator {
             .find(|(id, _)| *id == sig)
             .map(|(_, n)| n.as_str())
             .unwrap_or_default();
-        let driver = match self.cur_proc {
-            Some(p) if (p as usize) < self.flat.procs.len() => {
-                format!(" driver={}", self.flat.procs[p as usize].origin)
-            }
-            Some(_) => " driver=assign".to_string(),
-            None => String::new(),
-        };
+        let driver = self.driver_suffix();
         eprintln!(
             "watch t={} d{} {} {}->{}{}",
             fmt_time(self.time),

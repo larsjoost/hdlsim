@@ -22,6 +22,7 @@ use hdl_syntax::source::Span;
 
 mod ckpt;
 mod observe;
+mod probe;
 mod proc_copyback;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
@@ -362,6 +363,14 @@ pub struct Simulator {
     watch_snapshots: bool,
     watch_max_lines: u64,
     watch_lines: u64,
+    /// `--when` rules (`--when 'sig=value@T'`): echo a line when the signal
+    /// changes, filtered by exact value and time window — see `probe.rs`.
+    /// Empty by default — the hot-path check in `set_sig` is a bare
+    /// `is_empty()`.
+    when_rules: Vec<probe::WhenRule>,
+    /// `--examine` rules: one settled-value print per rule at its time point
+    /// (or the end-of-run value), deduped via `printed`.
+    examine_rules: Vec<probe::ExamineRule>,
     /// Delta cycle number within the current timestamp (pump's
     /// `delta_count`), shown in watch lines so the settling sequence of a
     /// single timestamp is readable.
@@ -546,6 +555,8 @@ impl Simulator {
             watch_snapshots: false,
             watch_max_lines: 0,
             watch_lines: 0,
+            when_rules: Vec::new(),
+            examine_rules: Vec::new(),
             delta_no: 0,
             fn_steps: std::cell::Cell::new(0),
             monitor: Vec::new(),
@@ -1401,6 +1412,7 @@ impl Simulator {
             self.watch_snapshot();
             // Advance time to the next event.
             let next = self.time_events.keys().next().copied();
+            self.examine_settle(next);
             match next {
                 Some(t) if t <= max_time_fs => {
                     // Only a real advance resets the delta budget: same-time
@@ -3062,6 +3074,9 @@ impl Simulator {
         self.sig_evt[sig as usize] = self.delta_epoch;
         if !self.watch.is_empty() {
             self.watch_change(sig, &old, &new);
+        }
+        if !self.when_rules.is_empty() {
+            self.when_change(sig, &old, &new);
         }
         self.emit(SimEvent::SignalChange {
             sig,

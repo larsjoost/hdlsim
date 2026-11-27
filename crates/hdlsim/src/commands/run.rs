@@ -64,6 +64,20 @@ struct RunArgs {
     /// With --watch: cap on watch lines before suppression.
     #[arg(long, default_value_t = 2000)]
     watch_max: u64,
+    /// Echo a line when a signal changes and the rule matches:
+    /// `--when 'sig=value@T0-T1'` — value and window are optional (`@T` =
+    /// exactly at T, `@T0-T1` = inclusive range; value = exact bit-state
+    /// match: 0x/0b literal, decimal, or — for std_logic — a single state
+    /// letter). Repeatable; one signal name per spec (dot-suffix match like
+    /// --watch). Lines look like:
+    /// `when t=15ns d3 tb.dut.q 0b0001->"xxxx" driver=foo.vhd:57`.
+    #[arg(long, value_name = "SPEC")]
+    when: Vec<String>,
+    /// Print a signal's settled value once: `--examine 'sig@2us'` prints the
+    /// value at exactly 2us; bare `--examine sig` prints the end-of-run
+    /// value. Repeatable.
+    #[arg(long, value_name = "SPEC")]
+    examine: Vec<String>,
     /// List signal names (hierarchical) after elaboration and exit, no
     /// simulation — use it to find the exact name for --watch. Optional
     /// `=PATTERN` (case-insensitive substring) filters, e.g.
@@ -425,8 +439,12 @@ impl Command for Run {
             sim.set_watch(spec, a.watch_x, a.watch_deltas, a.watch_max)
                 .map_err(anyhow::Error::msg)?;
         }
+        sim.set_when_rules(&a.when).map_err(anyhow::Error::msg)?;
+        sim.set_examine_rules(&a.examine)
+            .map_err(anyhow::Error::msg)?;
         let sim_phase = crate::phase::Phase::start("simulate");
         sim.run(max_time_fs);
+        sim.examine_flush_final();
         sim_phase.done(format!("t={}", hdl_ir::fmt_time(sim.time())));
         println!(
             "hdlsim: simulation stopped at t={} ({} signals, {} processes)",
