@@ -10,6 +10,9 @@ use hdl_syntax::source::Span;
 use serde::Serialize;
 use std::collections::HashMap;
 
+pub use stmt_util::is_bodiless;
+mod stmt_util;
+
 /// Field-level serializer for `Stmt::Spanned::span`: `Span`/`FileId` live in
 /// `hdl-syntax`, which is deliberately dependency-free — serialize the parts
 /// as plain numbers instead of adding serde to that crate.
@@ -298,20 +301,6 @@ pub enum Conn {
     Positional(Expr),
 }
 
-/// Is this statement the empty body of an interface-only subprogram stub?
-/// Declarations without a body (spec-only packages like ieee_proposed's
-/// to_* family, forward declarations whose body never landed) lower to
-/// `Null` or an empty `Block`; the kernel must not execute them — dispatch
-/// treats them as last-resort candidates and built-in names fall through to
-/// their kernel implementation.
-pub fn is_bodiless(body: &Stmt) -> bool {
-    match body {
-        Stmt::Null => true,
-        Stmt::Block(ss) => ss.is_empty(),
-        _ => false,
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub enum Stmt {
     Block(Vec<Stmt>),
@@ -452,8 +441,12 @@ pub enum Expr {
     Prev(Box<Expr>),
     /// VHDL `to_integer(x)` — unsigned numeric value as a 32-bit integer.
     ToInt(Box<Expr>),
-    /// VHDL `t'image(x)` — decimal string of the value, as ASCII bytes.
-    ToString(Box<Expr>),
+    /// VHDL `t'image(x)` — value as ASCII bytes; with `boolean`, 1-bit
+    /// values spell `true`/`false` (wider operands keep the decimal form).
+    ToString {
+        e: Box<Expr>,
+        boolean: bool,
+    },
     /// Resize to a fixed width: `to_unsigned(x, n)` / `resize(x, n)`.
     /// `signed` selects sign-extension (truncation keeps the low bits).
     Resize {
@@ -521,7 +514,7 @@ impl Expr {
             | Expr::Falling(e)
             | Expr::Prev(e)
             | Expr::ToInt(e)
-            | Expr::ToString(e) => e.collect_sigs(out),
+            | Expr::ToString { e, .. } => e.collect_sigs(out),
             Expr::Resize { e, .. } => e.collect_sigs(out),
             Expr::Signed(e) => e.collect_sigs(out),
         }

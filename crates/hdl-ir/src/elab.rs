@@ -429,16 +429,6 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
     Ok(f)
 }
 
-/// A lowered-but-empty function body: the interface-only form a package-spec
-/// function lowers to before its package body is seen.
-fn func_body_is_stub(f: &FlatFunc) -> bool {
-    match &*f.body {
-        Stmt::Null => true,
-        Stmt::Block(ss) => ss.is_empty(),
-        _ => false,
-    }
-}
-
 /// Package-spec functions and their package-body definitions lower as
 /// separate design units, so the interface-only stub and the real body both
 /// reach this list. The body wins (matching the simulator's overload table,
@@ -471,9 +461,9 @@ fn dedup_functions(f: &mut Flat) {
                 // `conj(complex_float_array)`, both w194) — they must
                 // coexist, or element-wise recursion inside one of them
                 // resolves back to itself and never terminates.
-                if func_body_is_stub(&merged[i]) {
+                if is_bodiless(&merged[i].body) {
                     merged[i] = func;
-                } else if !func_body_is_stub(&func) {
+                } else if !is_bodiless(&func.body) {
                     merged.push(func);
                 }
             }
@@ -896,7 +886,10 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
         Expr::Prev(e) => Expr::Prev(Box::new(remap_expr(e, map))),
         Expr::Falling(e) => Expr::Falling(Box::new(remap_expr(e, map))),
         Expr::ToInt(e) => Expr::ToInt(Box::new(remap_expr(e, map))),
-        Expr::ToString(e) => Expr::ToString(Box::new(remap_expr(e, map))),
+        Expr::ToString { e, boolean } => Expr::ToString {
+            e: Box::new(remap_expr(e, map)),
+            boolean: *boolean,
+        },
         Expr::Resize { e, width, signed } => Expr::Resize {
             e: Box::new(remap_expr(e, map)),
             width: *width,

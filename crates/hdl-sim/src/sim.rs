@@ -22,6 +22,7 @@ use hdl_syntax::source::Span;
 
 mod assign;
 mod ckpt;
+mod image;
 mod observe;
 mod probe;
 mod proc_copyback;
@@ -2117,7 +2118,10 @@ impl Simulator {
             Expr::Prev(e) => Expr::Prev(Box::new(self.concretize_target(e))),
             Expr::Falling(e) => Expr::Falling(Box::new(self.concretize_target(e))),
             Expr::ToInt(e) => Expr::ToInt(Box::new(self.concretize_target(e))),
-            Expr::ToString(e) => Expr::ToString(Box::new(self.concretize_target(e))),
+            Expr::ToString { e, boolean } => Expr::ToString {
+                e: Box::new(self.concretize_target(e)),
+                boolean: *boolean,
+            },
             Expr::Resize { e, width, signed } => Expr::Resize {
                 e: Box::new(self.concretize_target(e)),
                 width: *width,
@@ -3248,7 +3252,7 @@ impl Simulator {
             Expr::Rising(_) | Expr::Falling(_) => 1,
             Expr::Prev(e) => self.expr_width(e, locals),
             Expr::ToInt(_) => 32,
-            Expr::ToString(_) => 8 * 12, // decimal digits, upper bound
+            Expr::ToString { .. } => 8 * 12, // decimal digits, upper bound
             Expr::Resize { width, .. } => *width,
             Expr::Signed(e) => self.expr_width(e, locals),
         }
@@ -3604,26 +3608,14 @@ impl Simulator {
                     None => Value::x(32),
                 }
             }
-            Expr::ToString(e) => {
+            Expr::ToString { e, boolean } => {
                 let v = self.eval_expr(e, locals);
-                let s = if self.expr_real(e, locals) {
-                    match v.to_f64() {
-                        Some(f) => format!("{}", f),
-                        None => "x".to_string(),
-                    }
-                } else if self.expr_signed(e, locals) {
-                    // Signed integer image: sign-extend from the value's own
-                    // width (`integer'image(-1)` is "-1", not 4294967295).
-                    match v.to_i64() {
-                        Some(n) => n.to_string(),
-                        None => "x".to_string(),
-                    }
-                } else {
-                    match v.to_u64() {
-                        Some(n) => n.to_string(),
-                        None => "x".to_string(),
-                    }
-                };
+                let s = image::format_image(
+                    &v,
+                    self.expr_real(e, locals),
+                    self.expr_signed(e, locals),
+                    *boolean,
+                );
                 pack_str_value(&s)
             }
             Expr::Un { op, e } => {

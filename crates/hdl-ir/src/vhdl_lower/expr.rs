@@ -1304,36 +1304,7 @@ impl<'a> Lower<'a> {
                     .find(|(i, k)| *i != ap && is_expr_node(k.kind()))
                     .map(|(_, k)| k)
                 {
-                    let e = self.lower_expr(arg, env);
-                    // `boolean'image` spells `true`/`false`, not the decimal
-                    // bit value every `ToString` evaluator renders. Fold the
-                    // constant case here; non-constant arguments keep the
-                    // decimal fallback (enum/character'image likewise). Only
-                    // genuinely 1-bit values qualify — a wider operand under
-                    // a `boolean` prefix (loose typing, e.g. a natural)
-                    // keeps the decimal rendering.
-                    if prefix.eq_ignore_ascii_case("boolean") {
-                        if let Some(v) = self.ce(&e).filter(|v| v.width() == 1) {
-                            let s = if v.to_u64().unwrap_or(0) & 1 == 1 {
-                                "true"
-                            } else {
-                                "false"
-                            };
-                            return Expr::Lit(string_value(s));
-                        }
-                    }
-                    // A signed-integer image renders two's complement
-                    // (`integer'image(-1)` is "-1"): mark the operand so the
-                    // evaluator sign-extends instead of printing raw bits.
-                    let e = if matches!(
-                        self.types.get(&prefix.to_ascii_lowercase()),
-                        Some(TypeInfo::Integer { signed: true })
-                    ) {
-                        Expr::Signed(Box::new(e))
-                    } else {
-                        e
-                    };
-                    return Expr::ToString(Box::new(e));
+                    return self.attr_image_expr(arg, env, &prefix);
                 }
             }
             // `type'val(x)` / `type'pos(x)` — numeric identity, but 'val takes

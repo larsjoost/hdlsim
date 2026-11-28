@@ -20,7 +20,7 @@
 //! subprograms in `subprogram` (slot machinery in `slots`), processes in
 //! `process`, sequential statements in `seq` (loops/waits in `loops`),
 //! selected-name chains in `chains`, aggregates in `aggregate`,
-//! expressions/attributes in `expr`/`dims`/`dump`.
+//! expressions/attributes in `expr`/`attrs`/`dump`.
 
 use crate::ir::*;
 use crate::levenshtein_bounded;
@@ -51,11 +51,11 @@ use std::rc::Rc;
 
 mod aggregate;
 mod arch;
+mod attrs;
 mod chains;
 mod compare;
 mod config;
 mod decls;
-mod dims;
 mod dump;
 mod entity;
 mod expr;
