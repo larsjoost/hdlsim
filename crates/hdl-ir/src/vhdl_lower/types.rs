@@ -72,46 +72,7 @@ impl<'a> Lower<'a> {
         self.types.insert("character".into(), TypeInfo::Char);
         self.types
             .insert("string".into(), TypeInfo::Vector { signed: false });
-        // std.standard control-character literals (VHDL is case-insensitive):
-        // `LF`, `CR`, `HT`, `NUL`, ... are enum literals of type character.
-        const CHAR_LITS: &[(&str, u8)] = &[
-            ("nul", 0),
-            ("soh", 1),
-            ("stx", 2),
-            ("etx", 3),
-            ("eot", 4),
-            ("enq", 5),
-            ("ack", 6),
-            ("bel", 7),
-            ("bs", 8),
-            ("ht", 9),
-            ("lf", 10),
-            ("vt", 11),
-            ("ff", 12),
-            ("cr", 13),
-            ("so", 14),
-            ("si", 15),
-            ("dle", 16),
-            ("dc1", 17),
-            ("dc2", 18),
-            ("dc3", 19),
-            ("dc4", 20),
-            ("nak", 21),
-            ("syn", 22),
-            ("etb", 23),
-            ("can", 24),
-            ("em", 25),
-            ("sub", 26),
-            ("esc", 27),
-            ("fs", 28),
-            ("gs", 29),
-            ("rs", 30),
-            ("us", 31),
-            ("del", 127),
-        ];
-        for (n, c) in CHAR_LITS {
-            Rc::make_mut(&mut self.consts).insert(n.to_string(), Value::from_u64(8, *c as u64));
-        }
+        self.register_char_lits();
         // std.standard file_open_kind / file_open_status (VHDL-2008).
         for (n, v) in [
             ("read_mode", 0u64),
