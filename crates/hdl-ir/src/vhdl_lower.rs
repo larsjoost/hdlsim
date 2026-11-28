@@ -9,18 +9,20 @@
 //! `numeric_std` functions (`rising_edge`, `to_integer`, `resize`, …) are
 //! built in: recognized by name here and lowered to dedicated `Expr` nodes.
 //!
-//! Layout: this file holds `lower_file` and module-level helpers; the public
-//! design-unit IR types live in `units`, the `Lower` context struct (its
-//! fields are the module's real interface — each submodule's `//!` header
-//! states which fields it owns) and its core methods here, and the tests in
-//! `tests`. The lowering itself lives in per-responsibility submodules: `context`-free
-//! helpers in `scalar`, config/binding in `config`, architecture selection
-//! in `variant`, object/record naming in `objects`, type decls in `types`,
-//! widths in `width`, entities in `entity`, packages in `package`,
-//! architectures/concurrent in `arch`, object decls in `decls`,
-//! subprograms in `subprogram` (slot machinery in `slots`), processes in
-//! `process`, sequential statements in `seq` (loops/waits in `loops`),
-//! selected-name chains in `chains`, aggregates in `aggregate`,
+//! Layout: this file holds `lower_file`, the `Lower` core impl (`new`, the
+//! entity-map snapshot/install and context-merge methods, diagnostics and
+//! text helpers), and module-level helpers. The design-unit IR types live in
+//! `units`, the `Lower` struct itself (its fields are the module's real
+//! interface — each submodule's `//!` header states which fields it owns) in
+//! `env`, the per-file unit passes in `passes`, and the tests in `tests`.
+//! The lowering itself lives in per-responsibility submodules:
+//! `context`-free helpers in `scalar`, config/binding in `config`,
+//! architecture selection in `variant`, object/record naming in `objects`,
+//! type decls in `types`, widths in `width`, entities in `entity`, packages
+//! in `package`, architectures/concurrent in `arch`, object decls in
+//! `decls`, subprograms in `subprogram` (slot machinery in `slots`),
+//! processes in `process`, sequential statements in `seq` (loops/waits in
+//! `loops`), selected-name chains in `chains`, aggregates in `aggregate`,
 //! expressions/attributes in `expr`/`attrs`/`dump`.
 
 use crate::ir::*;
