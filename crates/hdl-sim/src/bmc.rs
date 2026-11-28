@@ -36,10 +36,11 @@ use crate::sat::{is_neg, neg, var_of, Lit};
 use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::value::{BinOp, UnOp, Value, V1};
 use hdl_ir::{Expr, ShapeBind, SigKind, Stmt};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 mod bitvec;
 mod builder;
 mod classify;
+mod encode;
 mod expr_util;
 mod property;
 mod stmt_scan;
@@ -48,8 +49,8 @@ use bitvec::{
     add_bits, and_bits, and_vec, divmod_bits, eq_bits, extend, ge_bits, lt_bits, mul_bits, mux_vec,
     not_bits, or_bits, or_vec, resize_bits, shift_bits, sub_bits, xor_vec, ShiftDir,
 };
-use builder::Builder;
-use classify::{classify, Class, ProcCls, Writer};
+use classify::classify;
+use encode::Encoder;
 use property::extract_properties;
 
 pub use property::Property;
@@ -229,213 +230,20 @@ pub fn wrap_top(design: &mut hdl_ir::Design, top: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Encoder
-// ---------------------------------------------------------------------------
-
-struct Encoder<'a> {
-    b: Builder,
-    flat: &'a Flat,
-    cls: Class,
-    /// lits[t][sig][bit]
-    lits: Vec<Vec<Vec<Lit>>>,
-    comb_done: Vec<HashSet<FlatSigId>>,
-}
-
-impl<'a> Encoder<'a> {
-    fn new(flat: &'a Flat, cls: Class, steps: usize) -> Result<Encoder<'a>, String> {
-        let mut b = Builder::new();
-        let mut lits = Vec::with_capacity(steps + 1);
-        for _t in 0..=steps {
-            let mut row: Vec<Vec<Lit>> = Vec::with_capacity(flat.signals.len());
-            for sig in &flat.signals {
-                let w = sig.width.max(1);
-                let mut bits = Vec::with_capacity(w);
-                for _ in 0..w {
-                    bits.push(b.fresh());
-                }
-                row.push(bits);
-            }
-            lits.push(row);
-        }
-        Ok(Encoder {
-            b,
-            flat,
-            cls,
-            lits,
-            comb_done: vec![HashSet::new(); steps + 1],
-        })
-    }
-
-    fn width(&self, s: FlatSigId) -> usize {
-        self.flat.signals[s as usize].width.max(1)
-    }
-
-    /// Encode all combinational writers at step t (topological order).
-    fn encode_comb(&mut self, t: usize) -> Result<(), String> {
-        let order = self.cls.comb_order.clone();
-        for w in order {
-            match w {
-                Writer::Assign(ai) => {
-                    let a = self.flat.assigns[ai].clone();
-                    let Expr::Sig(s) = &a.lhs else {
-                        return Err("prove: bad continuous assign LHS".to_string());
-                    };
-                    let s = *s;
-                    let mut ex = Exec::comb(self, t);
-                    let v = ex.eval(&a.rhs)?;
-                    let bits = resize_bits(&self.b, &v.bits, self.width(s));
-                    self.lits[t][s as usize] = bits;
-                    self.comb_done[t].insert(s);
-                }
-                Writer::Proc(pi) => {
-                    let body = self.flat.procs[pi].body.clone();
-                    let writes = self.cls.procs[pi].1.clone();
-                    let results: Vec<(FlatSigId, Vec<Lit>)> = {
-                        let mut ex = Exec::comb(self, t);
-                        ex.exec_stmt(&body)?;
-                        let mut out = Vec::new();
-                        for s in &writes {
-                            let bits = match ex.env.get(s) {
-                                Some(v) => v.clone(),
-                                None => ex.val(*s)?,
-                            };
-                            out.push((*s, bits));
-                        }
-                        out
-                    };
-                    for (s, v) in results {
-                        let bits = resize_bits(&self.b, &v, self.width(s));
-                        self.lits[t][s as usize] = bits;
-                        self.comb_done[t].insert(s);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Step-0 init: declaration init values, then initial blocks.
-    fn encode_init(&mut self) -> Result<(), String> {
-        let state = self.cls.state.clone();
-        let procs = self.cls.procs.clone();
-        let mut init_written: HashSet<FlatSigId> = HashSet::new();
-        for (pc, writes) in &procs {
-            if *pc == ProcCls::Init {
-                init_written.extend(writes.iter().copied());
-            }
-        }
-        for s in &state {
-            if init_written.contains(s) {
-                continue; // initial blocks override declaration init
-            }
-            if let Some(v) = &self.flat.signals[*s as usize].init {
-                for (i, &bit) in v.bits.iter().enumerate() {
-                    if i < self.width(*s) {
-                        let l = self.b.const_lit(bit == V1);
-                        let eq = self.b.eq_lit(self.lits[0][*s as usize][i], l);
-                        self.b.clause(&[eq]);
-                    }
-                }
-            }
-        }
-        for (pi, (pc, writes)) in procs.iter().enumerate() {
-            if *pc != ProcCls::Init {
-                continue;
-            }
-            let body = self.flat.procs[pi].body.clone();
-            let results: Vec<(FlatSigId, Vec<Lit>)> = {
-                let mut ex = Exec::at(self, 0);
-                ex.exec_stmt(&body)?;
-                let mut out = Vec::new();
-                for s in writes {
-                    if let Some(v) = ex.env.get(s) {
-                        out.push((*s, v.clone()));
-                    }
-                }
-                out
-            };
-            for (s, v) in results {
-                let w = self.width(s);
-                let bits = resize_bits(&self.b, &v, w);
-                for (i, &bit) in bits.iter().enumerate().take(w) {
-                    let eq = self.b.eq_lit(self.lits[0][s as usize][i], bit);
-                    self.b.clause(&[eq]);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Transition t → t+1: run all clocked processes at step t.
-    fn encode_transition(&mut self, t: usize) -> Result<(), String> {
-        let procs = self.cls.procs.clone();
-        let mut written: HashSet<FlatSigId> = HashSet::new();
-        for (pi, (pc, writes)) in procs.iter().enumerate() {
-            if *pc != ProcCls::Clocked || writes.is_empty() {
-                continue; // property-only procs (e.g. `|=>`) write nothing
-            }
-            let body = self.flat.procs[pi].body.clone();
-            let nexts: Vec<(FlatSigId, Vec<Lit>)> = {
-                let mut ex = Exec::at(self, t);
-                let ctrl = ex.exec_stmt(&body)?;
-                if ctrl != Ctrl::Done {
-                    return Err("prove: break/continue outside a loop".to_string());
-                }
-                // NBA results take precedence over blocking writes (they are
-                // applied in the NBA region, after the active region).
-                let mut out = Vec::new();
-                for s in writes.iter() {
-                    let next = match ex.nba_env.get(s).or_else(|| ex.env.get(s)) {
-                        Some(v) => v.clone(),
-                        None => ex.val(*s)?,
-                    };
-                    out.push((*s, next));
-                }
-                out
-            };
-            for (s, v) in nexts {
-                written.insert(s);
-                let w = self.width(s);
-                let bits = resize_bits(&self.b, &v, w);
-                for (i, &bit) in bits.iter().enumerate().take(w) {
-                    let eq = self.b.eq_lit(self.lits[t + 1][s as usize][i], bit);
-                    self.b.clause(&[eq]);
-                }
-            }
-        }
-        // Unwritten state holds its value.
-        let state = self.cls.state.clone();
-        for s in state {
-            if written.contains(&s) {
-                continue;
-            }
-            let w = self.width(s);
-            for i in 0..w {
-                let eq = self
-                    .b
-                    .eq_lit(self.lits[t + 1][s as usize][i], self.lits[t][s as usize][i]);
-                self.b.clause(&[eq]);
-            }
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Symbolic execution
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Ctrl {
+pub(in crate::bmc) enum Ctrl {
     Done,
     Break,
     Continue,
 }
 
 /// A symbolic value: bit literals + signedness.
-struct Val {
-    bits: Vec<Lit>,
-    signed: bool,
+pub(in crate::bmc) struct Val {
+    pub(in crate::bmc) bits: Vec<Lit>,
+    pub(in crate::bmc) signed: bool,
 }
 
 /// A compile-time constant value (used for indices / loop bounds).
@@ -444,21 +252,21 @@ struct CVal {
     signed: bool,
 }
 
-struct Exec<'e, 'a> {
-    enc: &'e mut Encoder<'a>,
-    t: usize,
-    env: HashMap<FlatSigId, Vec<Lit>>,
+pub(in crate::bmc) struct Exec<'e, 'a> {
+    pub(in crate::bmc) enc: &'e mut Encoder<'a>,
+    pub(in crate::bmc) t: usize,
+    pub(in crate::bmc) env: HashMap<FlatSigId, Vec<Lit>>,
     /// Function slot space (args then locals) while executing a function body.
-    locals: Option<HashMap<u32, Vec<Lit>>>,
+    pub(in crate::bmc) locals: Option<HashMap<u32, Vec<Lit>>>,
     /// Non-blocking assign results, applied at the end of the time step.
     /// Kept separately from `env` so if/case merges can mux both.
-    nba_env: HashMap<FlatSigId, Vec<Lit>>,
+    pub(in crate::bmc) nba_env: HashMap<FlatSigId, Vec<Lit>>,
     /// During comb encoding: reading a not-yet-encoded comb signal is an error.
-    strict_comb: bool,
+    pub(in crate::bmc) strict_comb: bool,
 }
 
 impl<'e, 'a> Exec<'e, 'a> {
-    fn at(enc: &'e mut Encoder<'a>, t: usize) -> Exec<'e, 'a> {
+    pub(in crate::bmc) fn at(enc: &'e mut Encoder<'a>, t: usize) -> Exec<'e, 'a> {
         Exec {
             enc,
             t,
@@ -469,7 +277,7 @@ impl<'e, 'a> Exec<'e, 'a> {
         }
     }
 
-    fn comb(enc: &'e mut Encoder<'a>, t: usize) -> Exec<'e, 'a> {
+    pub(in crate::bmc) fn comb(enc: &'e mut Encoder<'a>, t: usize) -> Exec<'e, 'a> {
         let mut e = Exec::at(enc, t);
         e.strict_comb = true;
         e
@@ -479,7 +287,7 @@ impl<'e, 'a> Exec<'e, 'a> {
         self.enc.width(s)
     }
 
-    fn val(&self, s: FlatSigId) -> Result<Vec<Lit>, String> {
+    pub(in crate::bmc) fn val(&self, s: FlatSigId) -> Result<Vec<Lit>, String> {
         if let Some(l) = &self.locals {
             if let Some(v) = l.get(&s) {
                 return Ok(v.clone());
@@ -514,7 +322,7 @@ impl<'e, 'a> Exec<'e, 'a> {
 
     // --- statements ---
 
-    fn exec_stmt(&mut self, s: &Stmt) -> Result<Ctrl, String> {
+    pub(in crate::bmc) fn exec_stmt(&mut self, s: &Stmt) -> Result<Ctrl, String> {
         match s {
             Stmt::Spanned { inner, .. } => self.exec_stmt(inner),
             Stmt::Null => Ok(Ctrl::Done),
@@ -854,7 +662,7 @@ impl<'e, 'a> Exec<'e, 'a> {
 
     // --- expressions ---
 
-    fn eval(&mut self, e: &Expr) -> Result<Val, String> {
+    pub(in crate::bmc) fn eval(&mut self, e: &Expr) -> Result<Val, String> {
         match e {
             Expr::SigAttr { .. } => Err(
                 "prove: runtime sig'length/'high on unconstrained ports unsupported".to_string(),
