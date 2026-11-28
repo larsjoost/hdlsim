@@ -376,6 +376,11 @@ impl Command for Run {
         if let Some(s) = seed {
             sim.set_seed(s);
         }
+        if opts.progress {
+            // `--progress` also ticks in-simulation: decile lines against
+            // --max-time on stderr (see hdl_sim's progress module).
+            sim.set_progress_ticks(true);
+        }
         sim.add_observer(Box::new(Transcript::new(mgr.db().clone())));
         // Coverage collector, kept behind a shared handle so we can report
         // after the run.
