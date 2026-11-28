@@ -4,7 +4,7 @@
 //! guarded wait whose condition reads `sig /= '0'` while the signal is
 //! still uninitialized must be taken. Composite equality must likewise
 //! compare values, reconciling the bit-packed-literal and byte-packed-string
-//! value shapes.
+//! value shapes, and metavalues ('Z', '-') compare as ordinary values.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -71,4 +71,31 @@ fn string_equality_reconciles_bit_packed_literal_shapes() {
         stderr
     );
     assert!(stdout.contains("PASS string_eq"), "{}", stdout);
+}
+
+#[test]
+fn scalar_metavalue_equality_is_value_comparison() {
+    let (out, stdout, stderr) = run(
+        "tb_scalar_meta_eq",
+        "tests/fixtures/vhdl_scalar_meta_eq_tb.vhd",
+        &["--max-time", "1us"],
+    );
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("PASS scalar_meta_eq"), "{}", stdout);
+    // 'Z' and '-' are ordinary distinct values to the predefined operators,
+    // never wildcards and never an unknown result.
+    assert!(
+        stdout.contains("('Z' = '0')  is false"),
+        "metavalue equality must be a value comparison: {}",
+        stdout
+    );
+    assert!(stdout.contains("('Z' /= '0') is true"), "{}", stdout);
+    assert!(stdout.contains("('Z' = 'Z')  is true"), "{}", stdout);
+    assert!(stdout.contains("('-'  = '0')  is false"), "{}", stdout);
 }
