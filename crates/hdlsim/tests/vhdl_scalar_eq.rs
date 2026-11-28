@@ -2,7 +2,9 @@
 //! operators): the result is a boolean value comparison, never the
 //! X-propagating variant — `'U' = '0'` is false, `'U' /= '0'` is true, so a
 //! guarded wait whose condition reads `sig /= '0'` while the signal is
-//! still uninitialized must be taken.
+//! still uninitialized must be taken. Composite equality must likewise
+//! compare values, reconciling the bit-packed-literal and byte-packed-string
+//! value shapes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,4 +54,21 @@ fn scalar_eq_on_uninitialized_is_false_not_x() {
         "inequality must compare values: {}",
         stdout
     );
+}
+
+#[test]
+fn string_equality_reconciles_bit_packed_literal_shapes() {
+    let (out, stdout, stderr) = run(
+        "tb_string_eq",
+        "tests/fixtures/vhdl_string_eq_tb.vhd",
+        &["--max-time", "1us"],
+    );
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("PASS string_eq"), "{}", stdout);
 }

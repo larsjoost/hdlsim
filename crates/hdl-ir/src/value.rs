@@ -30,9 +30,11 @@ pub fn is_xz(b: u8) -> bool {
     matches!(b, VX | VZ | VW | VU)
 }
 
-/// Loose equality between a narrow bit vector and a wide byte-packed string
-/// (chars MSB-first, first char in the high byte — the string-literal
-/// packing). Two shapes compare loosely:
+/// String-shape reconciliation between a narrow bit-packed value and a wide
+/// byte-packed char string (chars MSB-first, first char in the high byte —
+/// the string-literal packing). Both the loose and strict variants call
+/// this: shape matters, not metavalueness (VHDL `=` lowers to EqStrict).
+/// Two shapes compare equal:
 /// - both sides are byte-packed char strings and the wide side carries whole
 ///   leading NUL chars (zero-extended return slot padding);
 /// - the wide side is exactly 8× the narrow one and each byte is the char of
@@ -381,11 +383,9 @@ impl Value {
                 if !strict && any_unknown {
                     return Value::x(1);
                 }
-                if !strict && !all_eq {
-                    // String-aware fallback: `to_bstring(v) = "1010"` compares a
-                    // byte-packed char string against a bit-vector literal.
-                    all_eq = eq_string_loose(self, rhs);
-                }
+                // eq_string_loose reconciles the bit-packed-literal vs
+                // byte-packed-string shapes; it gates neither variant.
+                all_eq = all_eq || eq_string_loose(self, rhs);
                 let r = match op {
                     Eq | EqStrict => all_eq,
                     _ => !all_eq,
