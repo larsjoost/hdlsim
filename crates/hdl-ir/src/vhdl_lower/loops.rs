@@ -65,31 +65,28 @@ impl<'a> Lower<'a> {
         Expr::Lit(Value::from_u64(32, 0))
     }
 
-    /// VHDL for-loop variables are implicitly declared by the loop: reuse
-    /// the slot if the name is already bound, else allocate a fresh 32-bit
-    /// wire named `__for_<var>`.
-    fn declare_for_var(&mut self, var: &str) -> SigId {
-        match self.sig_id(var) {
-            Some(id) => id,
-            None => {
-                let id = (self.extra_base + self.extra_signals.len()) as SigId;
-                self.extra_signals.push(SignalIr {
-                    name: format!("__for_{}", var),
-                    width: 32,
-                    kind: SigKind::Wire,
-                    init: None,
-                    mem: None,
-                    // VHDL loop variables are integers: a signed slot keeps
-                    // null ranges null (`for i in 0 to -1` / `-1 downto 0`
-                    // must run zero iterations — unsigned, the -1 bound
-                    // reads 4294967295 and the loop guard stays true for
-                    // ~2^31 iterations).
-                    signed: true,
-                });
-                self.names.insert(var.to_string(), id);
-                id
-            }
-        }
+    /// VHDL for-loop variables are implicitly declared by the loop: every
+    /// loop allocates a fresh 32-bit wire named `__for_<var>`. Two loops
+    /// never share a slot — LRM 1076 §8.9 makes each loop parameter its own
+    /// constant, and bodies suspend on waits, so a shared slot would let
+    /// one loop's step clobber another's counter (the wires are flat, so
+    /// this applies across processes too).
+    fn fresh_for_var(&mut self, var: &str) -> SigId {
+        let id = (self.extra_base + self.extra_signals.len()) as SigId;
+        self.extra_signals.push(SignalIr {
+            name: format!("__for_{}", var),
+            width: 32,
+            kind: SigKind::Wire,
+            init: None,
+            mem: None,
+            // VHDL loop variables are integers: a signed slot keeps
+            // null ranges null (`for i in 0 to -1` / `-1 downto 0`
+            // must run zero iterations — unsigned, the -1 bound
+            // reads 4294967295 and the loop guard stays true for
+            // ~2^31 iterations).
+            signed: true,
+        });
+        id
     }
 
     pub(super) fn lower_for(&mut self, s: &SyntaxNode) -> Stmt {
@@ -112,9 +109,22 @@ impl<'a> Lower<'a> {
             self.err(s.span(), "malformed for loop");
             return Stmt::Null;
         };
-        let var_id = self.declare_for_var(&var);
+        let var_id = self.fresh_for_var(&var);
         let (lo, hi, downto) = self.for_range_bounds(range);
+        // The loop parameter's scope is the loop itself (LRM 1076 §8.9):
+        // bind the name only for the body, then restore whatever `var`
+        // meant before — an outer object of the same name must not see
+        // the loop's writes, and a later loop must get its own slot.
+        let outer = self.names.insert(var.to_string(), var_id);
         let body = self.lower_seq_block(s);
+        match outer {
+            Some(id) => {
+                self.names.insert(var, id);
+            }
+            None => {
+                self.names.remove(&var);
+            }
+        }
         self.make_for(var_id, lo, hi, downto, body)
     }
 
