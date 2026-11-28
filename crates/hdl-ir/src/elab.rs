@@ -13,11 +13,12 @@
 //! - Elaboration errors are `Err(String)` with the instance path — no panics.
 
 use crate::ir::*;
-use crate::value::Value;
+use crate::value::{Value, V0, V1, VDASH, VH, VL, VU, VW, VX, VZ};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
+mod generics;
 
 /// Field-level serializer for `FlatFunc::body` (`Arc<Stmt>`): serde needs the
 /// `rc` feature for `Arc<T>`, which this crate does not enable — serialize
@@ -184,7 +185,7 @@ pub fn elaborate_with(
     top: &str,
     resolver: &mut dyn UnitResolver,
 ) -> Result<Flat, ElabError> {
-    elaborate_with_opts(design, top, resolver, true)
+    elaborate_with_opts(design, top, resolver, true, &[])
 }
 
 /// Like [`elaborate_with`], but `register_pkg_funcs = false` skips copying all
@@ -196,22 +197,24 @@ pub fn elaborate_with_opts(
     top: &str,
     resolver: &mut dyn UnitResolver,
     register_pkg_funcs: bool,
+    top_generics: &[(String, String)],
 ) -> Result<Flat, ElabError> {
     // The top itself may live in a library: resolve it before elaborating.
     if !design.modules.iter().any(|m| m.name == top) {
         resolver.resolve(design, top).map_err(ElabError::Message)?;
     }
+    // -g overrides re-lower the top as a generic-map variant (elab/generics.rs).
+    let top = generics::apply_top_generics(design, top, resolver, top_generics)?;
     let mut tried: Vec<String> = Vec::new();
     loop {
         resolve_positional_params(design)?;
         bind_param_variants(design, resolver).map_err(ElabError::Message)?;
-        match try_elaborate(design, top, register_pkg_funcs) {
+        match try_elaborate(design, &top, register_pkg_funcs) {
             Ok(f) => return Ok(f),
             Err(ElabError::UnknownUnit { name, .. }) => {
                 if tried.contains(&name) {
                     return Err(ElabError::Message(format!(
-                        "dependency cycle involving '{}'",
-                        name
+                        "dependency cycle involving '{name}'"
                     )));
                 }
                 tried.push(name.clone());
@@ -372,10 +375,7 @@ fn try_elaborate(design: &Design, top: &str, register_pkg_funcs: bool) -> Result
             })?;
         (pos, Some(top.to_ascii_lowercase()))
     } else {
-        return Err(ElabError::Message(format!(
-            "top module '{}' not found",
-            top
-        )));
+        return Err(ElabError::Message(format!("top module '{top}' not found")));
     };
     let mut f = Flat::default();
     let root = f.new_scope("", None);

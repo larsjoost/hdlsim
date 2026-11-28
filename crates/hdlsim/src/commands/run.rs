@@ -20,6 +20,14 @@ struct RunArgs {
     /// Top-level unit (default: the single compiled module).
     #[arg(long)]
     top: Option<String>,
+    /// Override a top-level generic: `-g NAME=VALUE` (e.g.
+    /// `-g G_DATA_WIDTH=32 -g G_VERBOSE=true`). Repeatable; names are
+    /// case-insensitive. The top is re-lowered with the values applied
+    /// (like a generic-map variant), so widths, ranges, and generate
+    /// decisions see them. Values: signed decimal integer, VHDL based
+    /// literal (`16#20#`), true/false, or a single bit state ('0','1','x','z').
+    #[arg(short = 'g', long = "generic", value_name = "NAME=VALUE")]
+    generic: Vec<String>,
     /// Write waves to this VCD file.
     #[arg(long)]
     vcd: Option<PathBuf>,
@@ -280,8 +288,17 @@ impl Command for Run {
             Some(t) => t,
             None => super::pick_default_top(&design)?,
         };
+        // `-g NAME=VALUE` overrides for the top's generics; a spec without
+        // '=' is a usage error before any elaboration work.
+        let mut generics: Vec<(String, String)> = Vec::new();
+        for g in &a.generic {
+            let Some((n, v)) = g.split_once('=') else {
+                return Err(anyhow::anyhow!("bad --generic '{g}' (expected NAME=VALUE)"));
+            };
+            generics.push((n.trim().to_string(), v.trim().to_string()));
+        }
         let elab_phase = crate::phase::Phase::start("elaborate");
-        let flat = elab::elaborate_with(&mut design, &top_name, &mut mgr)
+        let flat = elab::elaborate_with_opts(&mut design, &top_name, &mut mgr, true, &generics)
             .map_err(|e| anyhow::anyhow!("elaboration error: {}", e))?;
         elab_phase.done(format!(
             "{} signals, {} processes, {} assigns, max-mem-depth {}",
