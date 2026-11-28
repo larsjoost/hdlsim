@@ -26,6 +26,7 @@ mod image;
 mod observe;
 mod probe;
 mod proc_copyback;
+mod type_flags;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
@@ -386,6 +387,13 @@ pub struct Simulator {
     /// drives the FnRunner heartbeat/stop checks (loops inside function
     /// bodies run entirely inside FnRunner and touch no other budget).
     fn_steps: std::cell::Cell<u64>,
+    /// Memoized `expr_real`/`expr_signed` classification, keyed by node
+    /// address — see `sim/type_flags.rs` for the stability contract.
+    expr_flags_memo: std::cell::RefCell<type_flags::FlagMemo>,
+    /// Set only while evaluating trees owned by `flat` (the assign fixpoint,
+    /// `run_func` bodies): the only contexts whose node addresses are stable
+    /// enough to memoize type flags against. See `sim/type_flags.rs`.
+    expr_memo: std::cell::Cell<bool>,
 }
 
 impl Simulator {
@@ -567,6 +575,8 @@ impl Simulator {
             trace_assigns: Vec::new(),
             delta_no: 0,
             fn_steps: std::cell::Cell::new(0),
+            expr_flags_memo: std::cell::RefCell::new(HashMap::default()),
+            expr_memo: std::cell::Cell::new(false),
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -2987,6 +2997,9 @@ impl Simulator {
         // inherit the last process statement's span.
         self.cur_span = None;
         self.fn_calls.set(0); // per-fixpoint call budget (see run_func)
+                              // Assign expressions are `flat`-owned — evaluated by reference on
+                              // every sweep, so their type flags memoize across delta cycles.
+        let saved_memo = self.expr_memo.replace(true);
         for sweep in 0..10_000 {
             self.delta_guard += 1;
             self.fix_sweep = sweep as u64 + 1;
@@ -3014,12 +3027,14 @@ impl Simulator {
                     self.fix_changed = n_changed;
                     if self.report_fn_runaway() {
                         self.cur_proc = None;
+                        self.expr_memo.set(saved_memo);
                         return any;
                     }
                     // Same for an external interrupt: report it at the pump
                     // level (with the location) instead of grinding on. Keep
                     // the sentinel cur_proc so the dump names the sweep.
                     if self.stop_requested() {
+                        self.expr_memo.set(saved_memo);
                         return any;
                     }
                     self.maybe_heartbeat();
@@ -3029,9 +3044,11 @@ impl Simulator {
             any |= changed;
             if !changed {
                 self.cur_proc = None;
+                self.expr_memo.set(saved_memo);
                 return any;
             }
         }
+        self.expr_memo.set(saved_memo);
         self.fail_comb_loop();
         any
     }
@@ -3177,37 +3194,6 @@ impl Simulator {
         }
     }
 
-    /// Whether an expression is a signed-typed value (VHDL `signed`).
-    fn expr_signed(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
-        match e {
-            Expr::Sig(s) => {
-                let i = *s as usize;
-                if let Some(l) = locals {
-                    if i < l.len() {
-                        return false; // function/variable slots are unsigned
-                    }
-                }
-                i < self.flat.signals.len() && self.flat.signals[i].signed
-            }
-            Expr::Bin { op, l, r } => {
-                // Shifts/rotates preserve the operand's signedness (the amount
-                // is just a count).
-                if matches!(
-                    op,
-                    BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
-                ) {
-                    self.expr_signed(l, locals)
-                } else {
-                    self.expr_signed(l, locals) && self.expr_signed(r, locals)
-                }
-            }
-            Expr::Un { e, .. } => self.expr_signed(e, locals),
-            Expr::Resize { e, signed, .. } => *signed || self.expr_signed(e, locals),
-            Expr::Signed(_) => true,
-            _ => false,
-        }
-    }
-
     fn expr_width(&self, e: &Expr, locals: Option<&Vec<Value>>) -> usize {
         match e {
             Expr::Lit(v) => v.width(),
@@ -3259,72 +3245,6 @@ impl Simulator {
     }
 
     // ---- expression evaluation -----------------------------------------------------------
-
-    /// Whether an expression is real-typed (Verilog/VHDL `real`).
-    fn expr_real(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
-        match e {
-            Expr::Real(_) => true,
-            Expr::Sig(s) => {
-                let i = *s as usize;
-                if let Some(l) = locals {
-                    if i < l.len() {
-                        return false; // function/variable slots are not real
-                    }
-                }
-                i < self.flat.signals.len() && self.flat.signals[i].kind == SigKind::Real
-            }
-            // Record-field select on a real-typed field (`r.re`): decode the
-            // slice as IEEE-754 instead of an integer bit pattern. Constant
-            // bounds only — the lowerer emits literals for record fields.
-            Expr::Sel { e, msb, lsb } => {
-                let (Expr::Sig(s), Some(m), Some(l)) = (
-                    &**e,
-                    self.const_bound(msb, locals),
-                    self.const_bound(lsb, locals),
-                ) else {
-                    return false;
-                };
-                let i = *s as usize;
-                if let Some(lc) = locals {
-                    if i < lc.len() {
-                        return false;
-                    }
-                }
-                self.flat
-                    .signals
-                    .get(i)
-                    .map(|s| s.real_ranges.iter().any(|&(lo, hi)| lo == l && hi == m))
-                    .unwrap_or(false)
-            }
-            // Only arithmetic propagates realness; comparisons/logical ops
-            // yield 1-bit results even on real operands.
-            Expr::Bin {
-                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
-                l,
-                r,
-            } => self.expr_real(l, locals) || self.expr_real(r, locals),
-            Expr::Bin { .. } => false,
-            Expr::Un {
-                op: UnOp::Neg | UnOp::Pos | UnOp::Abs,
-                e,
-            } => self.expr_real(e, locals),
-            Expr::Un { .. } => false,
-            Expr::Resize { e, .. } | Expr::Signed(e) => self.expr_real(e, locals),
-            Expr::Cond { c, t, e } => {
-                self.expr_real(c, locals) || self.expr_real(t, locals) || self.expr_real(e, locals)
-            }
-            _ => false,
-        }
-    }
-
-    /// Constant bound of a select (record-field bounds are literals from the
-    /// lowerer); dynamic bounds conservatively report None.
-    fn const_bound(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Option<u32> {
-        if matches!(e, Expr::Lit(_)) {
-            return self.eval_expr(e, locals).to_u64().map(|v| v as u32);
-        }
-        None
-    }
 
     /// One operand of a real-typed binop as f64: real operands decode their
     /// bit pattern, integer operands convert their integer value.
@@ -3482,8 +3402,9 @@ impl Simulator {
                 // Real-typed expression: IEEE-754 arithmetic on f64 operands.
                 // A value-level marker covers function frames, whose slots
                 // have no type metadata (`expr_real` cannot see a real
-                // formal/variable behind a slot id).
-                if self.expr_real(l, locals) || self.expr_real(r, locals) || lv.real || rv.real {
+                // formal/variable behind a slot id) — test it before the
+                // (memoized) subtree walks.
+                if lv.real || rv.real || self.expr_real(l, locals) || self.expr_real(r, locals) {
                     return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
                 }
                 // VHDL signed operands: sign-extend both to the wider width
@@ -4373,12 +4294,15 @@ impl Simulator {
         self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         // Functions with delays are not supported — execute recursively.
         let saved_fn = self.cur_fn.replace(Some(fi));
+        // The body is `flat`-owned (executed by reference): memoizable.
+        let saved_memo = self.expr_memo.replace(true);
         let mut runner = FnRunner {
             sim: self,
             locals: &mut lvals,
             returned: false,
         };
         runner.exec(&f.body);
+        self.expr_memo.set(saved_memo);
         let r = lvals[0].clone();
         self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
@@ -4398,6 +4322,9 @@ impl Simulator {
         caller: Option<&mut Vec<Value>>,
     ) {
         let f = self.flat.functions[fi].clone();
+        // Procedure bodies are per-call clones — their node addresses churn,
+        // so type-flag memoization must stay off here even when a function
+        // body called us (see sim/type_flags.rs).
         // Same recursion guard as `run_func` (shared `fn_depth`, so function
         // ↔ procedure call chains count together). Procedure calls from a
         // process count toward the same runaway-call budget.
@@ -4435,12 +4362,14 @@ impl Simulator {
         });
         self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         let saved_fn = self.cur_fn.replace(Some(fi));
+        let saved_memo = self.expr_memo.replace(false);
         let mut runner = ProcRunner {
             sim: self,
             locals: &mut lvals,
             returned: false,
         };
         runner.exec(&f.body);
+        self.expr_memo.set(saved_memo);
         self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
         self.fn_stack.borrow_mut().pop();
