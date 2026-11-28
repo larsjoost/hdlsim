@@ -1,7 +1,9 @@
-//! VHDL expression lowering: expressions, calls, attribute access,
-//! literals, and aggregates. Extracted verbatim from the lowerer body
-//! (pure move, no logic changes); decomposition into per-kind helpers
-//! follows in separate changes.
+//! VHDL expression lowering: the per-kind dispatch (`lower_expr`) plus
+//! the call shape-binding trio. Each expression form lowers in a child
+//! module: literals (`literal`), aggregates (`aggregate`), attributes and
+//! qualified expressions (`attr_expr`), operators (`operators`), part
+//! selects (`part_sel`), name resolution (`name`), calls (`call`) with
+//! the fname dispatch (`dispatch`).
 
 use super::*;
 
