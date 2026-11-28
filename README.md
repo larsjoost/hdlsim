@@ -224,8 +224,10 @@ its argument is a diagnostic level, not an exit status.
 severity tag, and the instance path of the scope that emitted them:
 `file:line: [warning] message (at u_core.u_fifo)`. The tag keeps the level
 legible without color; the path matches the names `--list-signals` prints, so
-a check instantiated more than once is attributable to the exact instance
-(top-level statements have no path suffix). Colors stay on by default — even
+a check instantiated more than once is attributable to the exact instance —
+including generate-unrolled copies, which name their lane (`(at lane_gen(0))`,
+`(at lane_gen[1].u_lane)`; top-level statements have no path suffix). Colors
+stay on by default — even
 piped, so agent-consumed transcripts keep the signal; `NO_COLOR` or
 `--no-color` disables, `--color auto` colors only on a terminal. A severity
 written as a named `severity_level` constant is const-folded
