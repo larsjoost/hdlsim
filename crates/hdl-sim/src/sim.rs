@@ -26,6 +26,7 @@ mod image;
 mod observe;
 mod probe;
 mod proc_copyback;
+mod progress;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
@@ -342,6 +343,9 @@ pub struct Simulator {
     /// Last pump-visible time advance / heartbeat print (heartbeat only).
     last_advance: Option<std::time::Instant>,
     last_heartbeat: std::cell::Cell<Option<std::time::Instant>>,
+    /// `--progress` simulation ticks: decile lines against `--max-time`, or
+    /// wall-clock rate-limited lines without it (see the `progress` module).
+    progress: progress::SimProgress,
     /// Set when the run ended via signal or wall budget: (reason, exit code).
     interrupt_info: Option<(String, i32)>,
     /// Most recently dispatched process — the between-events fallback for
@@ -553,6 +557,7 @@ impl Simulator {
             wall_start: std::cell::Cell::new(None),
             last_advance: None,
             last_heartbeat: std::cell::Cell::new(None),
+            progress: progress::SimProgress::Off,
             interrupt_info: None,
             last_proc: None,
             fix_sweep: 0,
@@ -1243,51 +1248,12 @@ impl Simulator {
         self.stopped = true;
     }
 
-    /// Periodic "still running" note on stderr for runs that grind without
-    /// time advance (`--progress <s>`, 0/absent = off). Shows
-    /// the same location as the interrupt dump, so a hung or slow run
-    /// announces where it is instead of silently burning CPU.
-    /// Wall-clock origin: the first caller initializes it (sim start). Reads
-    /// go through this helper because `Cell::get()` returns a *copy* —
-    /// `get_or_insert` on the copy is silently discarded, which once broke
-    /// `--max-wall` (the budget re-seeded a fresh `Instant` every check and
-    /// never elapsed) and silenced the heartbeat.
-    fn wall_origin(&self) -> std::time::Instant {
-        if self.wall_start.get().is_none() {
-            self.wall_start.set(Some(std::time::Instant::now()));
-        }
-        self.wall_start
-            .get()
-            .unwrap_or_else(std::time::Instant::now)
-    }
-
-    fn maybe_heartbeat(&self) {
-        let interval = progress_interval();
-        if interval.is_zero() {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let start = self.wall_origin();
-        if now.duration_since(start) < interval {
-            return;
-        }
-        let report = self.last_heartbeat.get().unwrap_or(start);
-        let advance = self.last_advance.unwrap_or(start);
-        if now.duration_since(report) >= interval && now.duration_since(advance) >= interval {
-            eprintln!(
-                "hdlsim: still running ({:.0} s without time advance) at {}",
-                now.duration_since(advance).as_secs_f64(),
-                self.where_am_i()
-            );
-            self.last_heartbeat.set(Some(now));
-        }
-    }
-
     fn pump(&mut self, max_time_fs: u64, soft: bool) {
         // Delta cycles since the last time advance: a design whose processes
         // or assigns keep re-triggering without time moving would otherwise
         // loop forever (time-based limits like --max-time cannot see it).
         let mut delta_count: u64 = 0;
+        self.progress_arm(max_time_fs, soft);
         loop {
             if self.finished || self.stopped {
                 break;
@@ -1350,6 +1316,7 @@ impl Simulator {
                 break;
             }
             self.maybe_heartbeat();
+            self.progress_wall_tick();
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
                 self.in_active[pid as usize] = false;
@@ -1433,6 +1400,7 @@ impl Simulator {
                     }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
+                    self.progress_tick();
                     if !self.check_mem() {
                         break;
                     }
