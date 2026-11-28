@@ -31,6 +31,7 @@ impl Expr {
                     b.asc.collect_sigs(out);
                 }
             }
+            Expr::Stream { e, .. } => e.collect_sigs(out),
             Expr::Concat(parts) => {
                 for p in parts {
                     p.collect_sigs(out);

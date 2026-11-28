@@ -20,9 +20,12 @@ use std::collections::{HashMap, HashSet};
 mod ce_proc;
 mod literals;
 mod pattern;
+mod proc;
+mod stream;
 
 pub use literals::parse_int_literal;
 use literals::{parse_real_literal, time_literal_fs};
+pub use stream::stream_reverse;
 
 /// Lower one parsed file into modules plus diagnostics, with the LRM default
 /// time unit of 1 ns.
@@ -194,6 +197,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Call
             | SyntaxKind::Concat
             | SyntaxKind::Replicate
+            | SyntaxKind::StreamConcat
             | SyntaxKind::PartSelect
             | SyntaxKind::IndexedPartSelect
             | SyntaxKind::Index
@@ -1605,116 +1609,6 @@ impl<'a> Lower<'a> {
                 }
             }
             i += 1;
-        }
-    }
-
-    // ---- processes ----------------------------------------------------------
-
-    fn lower_process(
-        &mut self,
-        module: &mut ModuleIr,
-        p: &SyntaxNode,
-        env: &HashMap<String, Value>,
-    ) {
-        let kind = if p.kind() == SyntaxKind::Initial {
-            ProcKind::Initial
-        } else {
-            ProcKind::Always
-        };
-        let kids = real_children(p);
-        // No sensitivity list at all (`always #5 ...`): an empty list means
-        // "no event sensitivity — start once at t=0 and loop on the body".
-        // `@*` lowers to Sens::All via the SensList arm below.
-        let mut sens = Sens::List(Vec::new());
-        let mut body = None;
-        let mut origin = String::new();
-        for k in &kids {
-            match k.kind() {
-                SyntaxKind::SensList => {
-                    sens = self.lower_sens_list(k, env);
-                    let kw = match kind {
-                        ProcKind::Initial => "initial",
-                        ProcKind::Always => "always",
-                    };
-                    origin = format!("{} @{}", kw, self.text(k));
-                }
-                SyntaxKind::Ident | SyntaxKind::Punct => {}
-                _ => body = Some(k.clone()),
-            }
-        }
-        let body = match body {
-            Some(b) => self.lower_stmt(&b, env),
-            None => Stmt::Null,
-        };
-        if origin.is_empty() {
-            origin = match kind {
-                ProcKind::Initial => "initial".to_string(),
-                ProcKind::Always => "always".to_string(),
-            };
-        }
-        module.processes.push(ProcessIr {
-            kind,
-            sens,
-            body,
-            origin,
-            gen_scope: self.gen_path.join("."),
-            initial: false,
-        });
-    }
-
-    fn lower_sens_list(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Sens {
-        let mut edges: Vec<Edge> = Vec::new();
-        let mut pending = EdgeKind::Any;
-        for c in real_children(s) {
-            match c.kind() {
-                SyntaxKind::Ident => {
-                    let t = self.text(&c);
-                    if t == "posedge" {
-                        pending = EdgeKind::Pos;
-                    } else if t == "negedge" {
-                        pending = EdgeKind::Neg;
-                    }
-                    // `or` separators carry no meaning beyond joining the list.
-                }
-                SyntaxKind::IffCond => {
-                    // Event qualifier on the entry lowered just before it.
-                    let cond = real_children(&c)
-                        .into_iter()
-                        .find(|k| is_expr_node(k.kind()))
-                        .map(|k| self.lower_expr(&k, env));
-                    match edges.last_mut() {
-                        Some(e) => e.iff = cond,
-                        None => self.err(c.span(), "`iff` qualifier without a preceding event"),
-                    }
-                }
-                _ if is_expr_node(c.kind()) => {
-                    let e = self.lower_expr(&c, env);
-                    // `a`, `a[1:0]`, `a[i]` — the entry's base signal.
-                    let base_sig = match &e {
-                        Expr::Sig(id) => Some(*id),
-                        Expr::Idx { e, .. } | Expr::Sel { e, .. } => match &**e {
-                            Expr::Sig(id) => Some(*id),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    match base_sig {
-                        Some(id) => edges.push(Edge {
-                            sig: id,
-                            kind: pending,
-                            iff: None,
-                        }),
-                        None => self.err(c.span(), "sensitivity list entry must be a signal"),
-                    }
-                    pending = EdgeKind::Any;
-                }
-                _ => {}
-            }
-        }
-        if edges.is_empty() {
-            Sens::All
-        } else {
-            Sens::List(edges)
         }
     }
 
@@ -3198,6 +3092,45 @@ impl<'a> Lower<'a> {
                     .map(|k| self.lower_expr(&k, env))
                     .collect(),
             ),
+            // SV streaming operator `{>>{e}}` (identity) / `{<<W{e}}`
+            // (chunk-reverse, LRM 11.4.14). `>>` lowers to the operand
+            // unchanged; `<<` carries the slice width to the kernel, which
+            // reverses the value's `slice`-wide chunks at runtime (the
+            // lowerer has no general expression width to do it statically).
+            // Expr children: just the operand, or the slice then the operand.
+            SyntaxKind::StreamConcat => {
+                let exprs: Vec<SyntaxNode> = real_children(e)
+                    .into_iter()
+                    .filter(|k| is_expr_node(k.kind()))
+                    .collect();
+                let (slice_expr, op) = match exprs.as_slice() {
+                    [op] => (None, op),
+                    [slice, op] => (Some(slice), op),
+                    _ => {
+                        self.err(e.span(), "stream operator needs exactly one operand");
+                        return Expr::Lit(Value::x(32));
+                    }
+                };
+                let slice = match slice_expr {
+                    None => 1,
+                    Some(w) => {
+                        let wv = self.lower_expr(w, env);
+                        self.ce(&wv, env)
+                            .and_then(|v| v.to_u64())
+                            .map(|n| n.max(1) as u32)
+                            .unwrap_or(1)
+                    }
+                };
+                let lowered = self.lower_expr(op, env);
+                if self.text(e).starts_with("{>>") {
+                    lowered
+                } else {
+                    Expr::Stream {
+                        e: Box::new(lowered),
+                        slice,
+                    }
+                }
+            }
             // Assignment pattern `'{ a: x, b: y }`: lowered contextually in
             // assignments (struct field order); here, positional concat.
             // `Field:` label names are children too — skip them.
@@ -3692,6 +3625,12 @@ fn ce_impl(
                 vals.push(ce_impl(p, env, funcs, extras, slots.as_deref_mut())?);
             }
             Some(Value::concat(&vals))
+        }
+        // A streamed constant folds to the streamed value (the `>>` identity
+        // never reaches the IR — the lowerer folds it away).
+        Expr::Stream { e, slice } => {
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
+            Some(stream_reverse(&v, *slice))
         }
         Expr::Replicate { count, e } => {
             let n = ce_impl(count, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;

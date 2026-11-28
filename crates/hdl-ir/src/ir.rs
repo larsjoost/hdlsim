@@ -426,6 +426,14 @@ pub enum Expr {
     },
     /// `{a, b, ...}` — parts[0] is most significant.
     Concat(Vec<Expr>),
+    /// SV streaming operator `{>>{e}}` / `{<<W{e}}` (LRM 11.4.14): the
+    /// operand's value re-streamed in `slice`-wide chunks; `>>` is the
+    /// identity, `<<` reverses the chunk order (LSB-first chunking). The
+    /// kernel applies the reversal at runtime.
+    Stream {
+        e: Box<Expr>,
+        slice: u32,
+    },
     Replicate {
         count: Box<Expr>,
         e: Box<Expr>,

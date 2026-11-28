@@ -64,6 +64,11 @@ pub(super) fn w_expr(w: &mut W, e: &Expr) {
             w_expr(w, count);
             w_expr(w, e);
         }
+        Expr::Stream { e, slice } => {
+            w.u8(19);
+            w_expr(w, e);
+            w.u32(*slice);
+        }
         Expr::Sel { e, msb, lsb } => {
             w.u8(8);
             w_expr(w, e);
@@ -194,6 +199,10 @@ pub(super) fn r_expr(r: &mut R) -> Result<Expr, String> {
         10 => Expr::Rising(Box::new(r_expr(r)?)),
         11 => Expr::Falling(Box::new(r_expr(r)?)),
         17 => Expr::Prev(Box::new(r_expr(r)?)),
+        19 => Expr::Stream {
+            e: Box::new(r_expr(r)?),
+            slice: r.u32()?,
+        },
         12 => Expr::ToInt(Box::new(r_expr(r)?)),
         13 => Expr::ToString {
             e: Box::new(r_expr(r)?),

@@ -17,6 +17,7 @@
 use crate::events::{MessageSeverity, Observer, SimEvent};
 use crate::rand::{self, Rng};
 use hdl_ir::elab::{Flat, FlatSigId};
+use hdl_ir::verilog_lower::stream_reverse;
 use hdl_ir::{FormalShape, ShapeBind};
 use hdl_syntax::source::Span;
 
@@ -27,84 +28,11 @@ mod observe;
 mod probe;
 mod proc_copyback;
 mod sens;
+mod value_util;
+
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
+use value_util::*;
 
-/// Pack a string as a Value: first char in the high byte, MSB-first — the same
-/// layout as VHDL/Verilog string literals.
-fn pack_str_value(s: &str) -> Value {
-    let bytes = s.as_bytes();
-    let n = bytes.len().max(1);
-    let mut bits = vec![V0; n * 8];
-    for (bi, &b) in bytes.iter().enumerate() {
-        for j in 0..8 {
-            bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
-        }
-    }
-    Value { bits, real: false }
-}
-
-/// Inverse of [`pack_str_value`]: bytes of a packed string Value → String.
-fn unpack_str_value(v: &Value) -> String {
-    let n = v.bits.len() / 8;
-    let mut s = String::new();
-    for bi in 0..n {
-        let mut b = 0u8;
-        for j in 0..8 {
-            if v.bits.get((n - 1 - bi) * 8 + j) == Some(&V1) {
-                b |= 1 << j;
-            }
-        }
-        s.push(b as char);
-    }
-    s
-}
-
-/// VHDL `to_hstring`/`to_ostring`/`to_bstring` of a value (MSB-first digits).
-fn vhdl_radix_string(v: &Value, radix: u32) -> String {
-    let bits_per = match radix {
-        16 => 4,
-        8 => 3,
-        _ => 1,
-    };
-    let w = v.bits.len();
-    let pad = (bits_per - (w % bits_per)) % bits_per;
-    let mut out = String::new();
-    let mut i = w + pad;
-    while i > 0 {
-        i -= bits_per;
-        let mut digit = 0u32;
-        let mut known = true;
-        for j in 0..bits_per {
-            let idx = i + j;
-            let b = if idx < w { v.bits[idx] } else { V0 };
-            if b == V1 {
-                digit |= 1 << j;
-            } else if b != V0 {
-                known = false;
-            }
-        }
-        if radix == 2 {
-            out.push(if known {
-                if digit == 1 {
-                    '1'
-                } else {
-                    '0'
-                }
-            } else {
-                'X'
-            });
-        } else if known {
-            out.push(
-                char::from_digit(digit, radix)
-                    .expect("digit < radix, so from_digit succeeds")
-                    .to_ascii_uppercase(),
-            );
-        } else {
-            out.push('X');
-        }
-    }
-    out
-}
 use hdl_ir::fmt_time;
 use hdl_ir::{BinOp, Edge, EdgeKind, Expr, ProcKind, Sens, SigId, SigKind, Stmt, UnOp};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -2073,6 +2001,10 @@ impl Simulator {
             Expr::Concat(es) => {
                 Expr::Concat(es.iter().map(|e| self.concretize_target(e)).collect())
             }
+            Expr::Stream { e, slice } => Expr::Stream {
+                e: Box::new(self.concretize_target(e)),
+                slice: *slice,
+            },
             Expr::Replicate { count, e } => Expr::Replicate {
                 count: Box::new(Expr::Lit(self.eval_expr(count, None))),
                 e: Box::new(self.concretize_target(e)),
@@ -3141,6 +3073,9 @@ impl Simulator {
             Expr::Un { e, .. } => self.expr_width(e, locals),
             Expr::Cond { t, e, .. } => self.expr_width(t, locals).max(self.expr_width(e, locals)),
             Expr::Concat(parts) => parts.iter().map(|p| self.expr_width(p, locals)).sum(),
+            // The streamed value has the operand's width (chunks re-ordered,
+            // none added or removed).
+            Expr::Stream { e, .. } => self.expr_width(e, locals),
             Expr::Sel { msb, lsb, .. } => {
                 let a = self.eval_expr(msb, locals).to_u64().unwrap_or(1) as usize;
                 let b = self.eval_expr(lsb, locals).to_u64().unwrap_or(0) as usize;
@@ -3557,6 +3492,13 @@ impl Simulator {
             Expr::Concat(parts) => {
                 let vals: Vec<Value> = parts.iter().map(|p| self.eval_expr(p, locals)).collect();
                 Value::concat(&vals)
+            }
+            // SV streaming operator `{<<W{e}}` (LRM 11.4.14): the operand's
+            // value re-streamed in W-wide chunks (`>>` folded away at lower
+            // time).
+            Expr::Stream { e, slice } => {
+                let v = self.eval_expr(e, locals);
+                stream_reverse(&v, *slice)
             }
             Expr::Replicate { count, e } => {
                 let n = self.eval_expr(count, locals).to_u64().unwrap_or(0) as usize;
@@ -4905,20 +4847,6 @@ impl<'a> ProcRunner<'a> {
     }
 }
 
-/// Sign-extend `v` to `width` bits (VHDL signed semantics).
-fn sign_extend(v: &Value, width: usize) -> Value {
-    let w = width.max(v.width()).max(1);
-    let mut bits = vec![V0; w];
-    bits[..v.width()].copy_from_slice(&v.bits);
-    let sign = v.bit(v.width().saturating_sub(1));
-    if sign != V0 && sign != V1 {
-        bits[v.width()..w].fill(sign); // X/Z sign-extends as X/Z
-    } else if sign == V1 {
-        bits[v.width()..w].fill(V1);
-    }
-    Value { bits, real: false }
-}
-
 /// Heartbeat interval (`--progress-sec <s>`), armed via
 /// [`set_progress_interval`]; 0 (the default) disables the pump's
 /// "still running" heartbeat. A free function so the CLI can arm it
@@ -4938,39 +4866,6 @@ fn progress_interval() -> std::time::Duration {
     std::time::Duration::from_millis(
         PROGRESS_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed),
     )
-}
-
-fn truthy(v: &Value) -> bool {
-    v.to_u64().is_some_and(|x| x != 0)
-}
-
-fn eq_strict(a: &Value, b: &Value) -> bool {
-    a.binop(BinOp::EqStrict, b).to_u64() == Some(1)
-}
-
-fn lhs_sig(e: &Expr) -> Option<FlatSigId> {
-    match e {
-        Expr::Sig(s) => Some(*s),
-        _ => None,
-    }
-}
-
-fn string_of(v: &Value) -> String {
-    // Interpret value bits as bytes, MSB chunk first (first char = high byte,
-    // matching how string literals are packed and Value::concat orders parts).
-    let mut bytes = Vec::new();
-    for chunk in v.bits.chunks(8).rev() {
-        let mut byte = 0u8;
-        for (j, &b) in chunk.iter().enumerate() {
-            if b == V1 {
-                byte |= 1 << j;
-            }
-        }
-        if byte != 0 {
-            bytes.push(byte);
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]

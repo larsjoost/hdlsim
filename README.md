@@ -101,7 +101,7 @@ Early development. Verilog-2005, a SystemVerilog subset (packages with
 structs/enums, `parameter type`, typed parameters, gen-block localparams,
 multi-dim ranges, `inst.port` reads, arrays/queues, classes with
 `randomize()` + constraints, generate, `unique case`, `iff` event
-qualifiers, time literals in delays), and VHDL incl. VHDL-2008
+qualifiers, time literals in delays, streaming operators), and VHDL incl. VHDL-2008
 (`process(all)`, matching
 case/operators, `to_xstring`, conditional/selected assigns) are supported and
 locked in by self-checking examples in `examples/features/` (each prints

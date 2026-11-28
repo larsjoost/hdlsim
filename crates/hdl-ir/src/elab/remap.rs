@@ -38,6 +38,10 @@ pub fn remap_expr(e: &Expr, map: &[FlatSigId]) -> Expr {
                 .collect(),
         },
         Expr::Concat(parts) => Expr::Concat(parts.iter().map(|p| remap_expr(p, map)).collect()),
+        Expr::Stream { e, slice } => Expr::Stream {
+            e: Box::new(remap_expr(e, map)),
+            slice: *slice,
+        },
         Expr::Replicate { count, e } => Expr::Replicate {
             count: Box::new(remap_expr(count, map)),
             e: Box::new(remap_expr(e, map)),

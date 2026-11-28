@@ -38,6 +38,9 @@ use hdl_ir::value::{BinOp, UnOp, Value, V1};
 use hdl_ir::{Expr, ProcKind, Sens, ShapeBind, SigKind, Stmt};
 use std::collections::{HashMap, HashSet};
 mod expr_util;
+mod stmt_scan;
+
+use stmt_scan::{lhs_roots, stmt_has_sva, stmt_writes};
 
 use self::expr_util::{expr_has_dash, sig_root};
 
@@ -617,84 +620,6 @@ struct Class {
 impl Class {
     fn is_comb(&self, s: FlatSigId) -> bool {
         self.comb_writer_of.contains_key(&s)
-    }
-}
-
-/// Root signals of an LHS chain (`mem[i]`, `q[3:0]`, `{a, b}` recurse).
-fn lhs_roots(e: &Expr, out: &mut Vec<FlatSigId>) {
-    match e {
-        Expr::Sig(s) => out.push(*s),
-        Expr::Idx { e: x, .. } | Expr::Sel { e: x, .. } => lhs_roots(x, out),
-        Expr::Concat(parts) => {
-            for p in parts {
-                lhs_roots(p, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn stmt_writes(s: &Stmt, out: &mut Vec<FlatSigId>) {
-    match s {
-        Stmt::Spanned { inner, .. } => stmt_writes(inner, out),
-        Stmt::Block(ss) => {
-            for s in ss {
-                stmt_writes(s, out);
-            }
-        }
-        Stmt::If { then, els, .. } => {
-            stmt_writes(then, out);
-            if let Some(e) = els {
-                stmt_writes(e, out);
-            }
-        }
-        Stmt::Case { items, default, .. } => {
-            for (_, b) in items {
-                stmt_writes(b, out);
-            }
-            if let Some(d) = default {
-                stmt_writes(d, out);
-            }
-        }
-        Stmt::Assign { lhs, .. } | Stmt::AssignDelayed { lhs, .. } => lhs_roots(lhs, out),
-        Stmt::Delay { stmt, .. } => stmt_writes(stmt, out),
-        Stmt::Wait { body, .. } => stmt_writes(body, out),
-        // `wait until` writes nothing; there is no nested body.
-        Stmt::WaitUntil { .. } => {}
-        Stmt::For {
-            init, step, body, ..
-        } => {
-            stmt_writes(init, out);
-            stmt_writes(step, out);
-            stmt_writes(body, out);
-        }
-        Stmt::Repeat { body, .. } => stmt_writes(body, out),
-        Stmt::SysCall { .. } | Stmt::Break | Stmt::Continue | Stmt::ExprStmt(_) | Stmt::Null => {}
-        Stmt::Return(_) => {}
-    }
-}
-
-fn stmt_has_sva(s: &Stmt) -> bool {
-    match s {
-        Stmt::Spanned { inner, .. } => stmt_has_sva(inner),
-        Stmt::Block(ss) => ss.iter().any(stmt_has_sva),
-        Stmt::If { then, els, .. } => {
-            stmt_has_sva(then) || els.as_ref().is_some_and(|e| stmt_has_sva(e))
-        }
-        Stmt::Case { items, default, .. } => {
-            items.iter().any(|(_, b)| stmt_has_sva(b))
-                || default.as_ref().is_some_and(|d| stmt_has_sva(d))
-        }
-        Stmt::Assign { .. } | Stmt::AssignDelayed { .. } | Stmt::Return(_) => false,
-        Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
-        Stmt::Wait { body, .. } => stmt_has_sva(body),
-        Stmt::WaitUntil { .. } => false,
-        Stmt::For {
-            init, step, body, ..
-        } => stmt_has_sva(init) || stmt_has_sva(step) || stmt_has_sva(body),
-        Stmt::Repeat { body, .. } => stmt_has_sva(body),
-        Stmt::SysCall { name, .. } => name == "sva_assert" || name == "assert",
-        Stmt::Break | Stmt::Continue | Stmt::ExprStmt(_) | Stmt::Null => false,
     }
 }
 
@@ -1774,6 +1699,9 @@ impl<'e, 'a> Exec<'e, 'a> {
                     bits,
                     signed: false,
                 })
+            }
+            Expr::Stream { .. } => {
+                Err("prove: SV streaming operator is unsupported in BMC".to_string())
             }
             Expr::Replicate { count, e } => {
                 let n = self

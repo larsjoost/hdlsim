@@ -129,6 +129,7 @@ impl<'a> Lower<'a> {
                 self.refs_impure_call(c) || self.refs_impure_call(t) || self.refs_impure_call(e)
             }
             Expr::Concat(v) => v.iter().any(|e| self.refs_impure_call(e)),
+            Expr::Stream { e, .. } => self.refs_impure_call(e),
             Expr::Replicate { count, e } => {
                 self.refs_impure_call(count) || self.refs_impure_call(e)
             }
