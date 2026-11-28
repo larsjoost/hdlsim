@@ -70,6 +70,7 @@ mod expr;
 mod loops;
 mod objects;
 mod package;
+mod passes;
 mod proc_vars;
 mod process;
 mod process_sel;
@@ -104,141 +105,24 @@ pub fn lower_file(
     cfgs: &HashMap<String, Rc<ConfigIr>>,
 ) -> Lowered {
     let _ = file;
-    let mut lx = Lower::new(db, diags);
-    lx.register_builtin_types();
-    lx.file_root = Some(root.clone());
-    lx.pkgs = pkgs
-        .iter()
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-        .collect();
-    lx.funcs_ce = pkg_funcs.clone();
-    lx.cfgs = cfgs
-        .iter()
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-        .collect();
-    lx.apply_context_clauses(root);
+    let mut lx = Lower::for_file(root, db, diags, pkgs, pkg_funcs, cfgs);
     let mut modules: Vec<ModuleIr> = Vec::new();
-    let mut entities: HashMap<String, usize> = HashMap::new();
-    let mut packages: Vec<PackageIr> = Vec::new();
-    let mut configurations: Vec<ConfigIr> = Vec::new();
-    let mut pending: Vec<PendingArch> = Vec::new();
     // Pass 0: packages and package instantiations, before anything that may
-    // `use` them — so `use work.my_pkg.all;` also resolves when `my_pkg` is
-    // declared in this same file.
-    for child in real_children(root) {
-        match child.kind() {
-            SyntaxKind::Package => {
-                let p = lx.lower_package(&child, root, &HashMap::new());
-                // First (declaration) wins in `pkgs`; decl+body merge happens
-                // on the design, like for cross-file packages.
-                lx.pkgs
-                    .entry(p.name.to_ascii_lowercase())
-                    .or_insert_with(|| Rc::new(p.clone()));
-                packages.push(p);
-            }
-            SyntaxKind::PackageInst => {
-                if let Some(p) = lx.lower_package_inst(&child) {
-                    // The instantiation's items win over the generic
-                    // package's defaults that pass 0 put into scope.
-                    lx.merge_package(&p, None, true);
-                    lx.pkgs
-                        .insert(p.name.to_ascii_lowercase(), Rc::new(p.clone()));
-                    packages.push(p);
-                }
-            }
-            // A VHDL-2008 context declaration (`context c is use ...; end
-            // context;`) exports no items itself, but `context lib.c;` must
-            // apply its use/context clauses. Model it as an item-less package
-            // whose `uses` are the declaration's clause units, so the existing
-            // transitive-`use` merge applies it (and nested context refs).
-            SyntaxKind::ContextDecl => {
-                let name = real_children(&child)
-                    .iter()
-                    .filter(|k| k.kind() == SyntaxKind::Ident)
-                    .map(|k| lx.kw(k))
-                    .find(|w| w != "context")
-                    .unwrap_or_default();
-                if !name.is_empty() {
-                    let uses = context_units(lx.db, &child);
-                    let p = PackageIr {
-                        name: name.clone(),
-                        types: Vec::new(),
-                        consts: Vec::new(),
-                        functions: Vec::new(),
-                        generics: Vec::new(),
-                        type_actuals: Vec::new(),
-                        rec_field_tys: Vec::new(),
-                        rec_field_dims: Vec::new(),
-                        prot_tys: Vec::new(),
-                        sig_types: Vec::new(),
-                        sig_widths: Vec::new(),
-                        const_tys: Vec::new(),
-                        const_dims: Vec::new(),
-                        type_widths: Vec::new(),
-                        type_dims: Vec::new(),
-                        type_elem: Vec::new(),
-                        decl: Some(child.clone()),
-                        src: Some(root.clone()),
-                        uses,
-                        attr_decls: Vec::new(),
-                    };
-                    lx.pkgs.entry(name).or_insert_with(|| Rc::new(p.clone()));
-                    packages.push(p);
-                }
-            }
-            _ => {}
-        }
-    }
+    // `use` them (see `lower_pass0_packages`).
+    let mut packages = passes::lower_pass0_packages(&mut lx, root);
     // Re-apply the context clauses now that same-file packages (plain and
     // instantiated) are in `pkgs`.
     lx.apply_context_clauses(root);
     // Pass 1: entities (interfaces).
-    let mut entity_roots: Vec<(String, SyntaxNode)> = Vec::new();
-    for child in real_children(root) {
-        if child.kind() == SyntaxKind::Entity {
-            let m = lx.lower_entity(&child);
-            entity_roots.push((m.name.clone(), root.clone()));
-            entities.insert(m.name.clone(), modules.len());
-            modules.push(m);
-        }
-    }
+    let (entity_roots, entities) = passes::lower_pass1_entities(&mut lx, root, &mut modules);
     // Configurations first, so `configuration work.cfg` instantiations and
     // `use configuration` bindings resolve regardless of declaration order.
-    let mut config_defaults: HashMap<String, String> = HashMap::new();
-    for child in real_children(root) {
-        if child.kind() == SyntaxKind::ConfigDecl {
-            let cfg = lx.lower_config_decl(&child);
-            if let Some(arch) = &cfg.arch {
-                config_defaults.insert(cfg.entity.clone(), arch.clone());
-            }
-            lx.cfgs
-                .insert(cfg.name.to_ascii_lowercase(), Rc::new(cfg.clone()));
-            configurations.push(cfg);
-        }
-    }
-    // Pass 2: architectures (bodies). An architecture whose entity is not
-    // declared in this file is deferred (`pending`): the entity may live in a
-    // file compiled later, so binding happens design-wide in
-    // `lower_pending_architectures`.
-    let mut last_arch: HashMap<String, String> = HashMap::new();
-    for child in real_children(root) {
-        if child.kind() == SyntaxKind::Architecture {
-            let known = arch_entity(&child, db)
-                .map(|(_, name)| entities.contains_key(&name))
-                .unwrap_or(false);
-            if known {
-                if let Some((ent, arch)) = lx.lower_architecture(&child, &mut modules, &entities) {
-                    last_arch.insert(ent, arch);
-                }
-            } else {
-                pending.push(PendingArch {
-                    root: root.clone(),
-                    arch: child.clone(),
-                    lib: None,
-                });
-            }
-        }
-    }
+    let (configurations, config_defaults) = passes::lower_config_decls(&mut lx, root);
+    // Pass 2: architectures (bodies); ones whose entity is not declared in
+    // this file are deferred (`pending`) — see `lower_pass2_architectures`.
+    let mut pending: Vec<PendingArch> = Vec::new();
+    let last_arch =
+        passes::lower_pass2_architectures(&mut lx, db, root, &entities, &mut modules, &mut pending);
     apply_default_archs(&mut modules, &entities, &last_arch, &config_defaults, None);
     // Package instantiations from declarative parts (registered on the fly).
     packages.append(&mut lx.inst_packages);
@@ -604,6 +488,35 @@ impl<'a> Lower<'a> {
             file_seq: 0,
             gen_path: Vec::new(),
         }
+    }
+
+    /// A blank lowerer wired for one design file: built-in types registered,
+    /// the design-wide package/config tables installed (lowercased keys,
+    /// matching the `use`-clause lookups), and the file's context clauses
+    /// applied.
+    #[allow(clippy::too_many_arguments)]
+    fn for_file(
+        root: &SyntaxNode,
+        db: &'a SourceDb,
+        diags: &'a mut Vec<Diagnostic>,
+        pkgs: &HashMap<String, Rc<PackageIr>>,
+        pkg_funcs: &std::rc::Rc<HashMap<String, Vec<std::rc::Rc<FuncIr>>>>,
+        cfgs: &HashMap<String, Rc<ConfigIr>>,
+    ) -> Lower<'a> {
+        let mut lx = Lower::new(db, diags);
+        lx.register_builtin_types();
+        lx.file_root = Some(root.clone());
+        lx.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lx.funcs_ce = pkg_funcs.clone();
+        lx.cfgs = cfgs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
+        lx.apply_context_clauses(root);
+        lx
     }
 
     /// Snapshot the current signal maps (called after an entity's ports are
