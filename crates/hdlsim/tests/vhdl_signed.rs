@@ -36,6 +36,24 @@ fn run_snippet(name: &str, dut: &str, tb: &str) -> String {
     log
 }
 
+/// Compile and run one VHDL testbench (top unit `tb`) and return its transcript.
+fn run_tb(source: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("hdlsim_tb_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("tb.vhd");
+    std::fs::write(&f, source).unwrap();
+    let compiled = compile_paths(&[f]);
+    assert!(!compiled.has_errors(), "{}", compiled.render_diags());
+    let flat = elab::elaborate(&compiled.design, "tb").unwrap();
+    let mut sim = Simulator::new(flat);
+    let msgs = Arc::new(Mutex::new(Vec::new()));
+    sim.add_observer(Box::new(Messages(msgs.clone())));
+    sim.run(1_000_000_000);
+    let log = msgs.lock().unwrap().join("");
+    let _ = std::fs::remove_dir_all(&dir);
+    log
+}
+
 const TB_HEAD: &str = r#"
 library ieee;
 use ieee.std_logic_1164.all;
@@ -247,4 +265,57 @@ end architecture;
     );
     let log = run_snippet(NAME, dut, &tb);
     assert!(log.contains("PASS"), "transcript:\n{}", log);
+}
+
+#[test]
+fn integer_subtypes_keep_signed_two_complement_semantics() {
+    // `natural`/`positive` are integer subtypes (LRM 1076, integer types):
+    // they must keep integer's signed two's-complement semantics so that
+    // `s < 0` sees a negative value. Lowering them as unsigned made the
+    // UNIFORM (IEEE 1076.2 math_real) fixup `if s2 < 0 then s2 := s2 +
+    // 2147483563` never fire — the seed wrapped negative and every later
+    // draw was garbage.
+    let tb = r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity tb is end entity;
+architecture sim of tb is
+  -- IEEE 1076.2-1996 UNIFORM, inlined; the fixup on `s2 < 0` is the
+  -- behavior under test.
+  procedure lrm_uniform (variable s1, s2 : inout positive; variable x : out real) is
+    variable k, z : integer;
+  begin
+    k := s1 / 53668;
+    s1 := 40014 * (s1 - k * 53668) - k * 12211;
+    if s1 < 0 then s1 := s1 + 2147483563; end if;
+    k := s2 / 52774;
+    s2 := 40692 * (s2 - k * 52774) - k * 3791;
+    if s2 < 0 then s2 := s2 + 2147483563; end if;
+    z := s1 - s2;
+    if z < 1 then z := z + 2147483562; end if;
+    x := real(z) * 4.656613e-10;
+  end procedure;
+begin
+  main : process
+    variable seed1 : positive := 1;
+    variable seed2 : positive := 1;
+    variable x : real;
+  begin
+    for step in 1 to 3 loop
+      lrm_uniform(seed1, seed2, x);
+      report "STEP " & integer'image(step)
+        & " seeds=(" & integer'image(seed1) & "," & integer'image(seed2) & ")";
+    end loop;
+    wait;
+  end process;
+end architecture;
+"#;
+    let log = run_tb(tb);
+    // Third LRM step: the s2 fixup must fire (2103410427 = -44073136 +
+    // 2147483563), so the seeds stay inside the positive subtype.
+    assert!(
+        log.contains("STEP 3 seeds=(1346387765,2103410427)"),
+        "transcript:\n{}",
+        log
+    );
 }

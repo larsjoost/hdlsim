@@ -64,10 +64,19 @@ impl<'a> Lower<'a> {
         self.types
             .insert("integer".into(), TypeInfo::Integer { signed: true });
         self.types.insert("real".into(), TypeInfo::Real);
+        // `natural` and `positive` are subtypes of `integer` (LRM 1076,
+        // predefined integer subtypes): same 32-bit two's-complement
+        // representation and signed comparisons. Registered unsigned once,
+        // which silently skipped negative-operand fixups — e.g. the
+        // math_real UNIFORM recurrence produces negative intermediates that
+        // its `IF seed < 0` correction must catch, and an unsigned compare
+        // read them as ~2^32 so the correction never fired and the seeds
+        // leaked negative values. Legal non-negative values compare
+        // identically either way.
         self.types
-            .insert("natural".into(), TypeInfo::Integer { signed: false });
+            .insert("natural".into(), TypeInfo::Integer { signed: true });
         self.types
-            .insert("positive".into(), TypeInfo::Integer { signed: false });
+            .insert("positive".into(), TypeInfo::Integer { signed: true });
         self.types.insert("char".into(), TypeInfo::Char);
         self.types.insert("character".into(), TypeInfo::Char);
         self.types
