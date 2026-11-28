@@ -171,6 +171,24 @@ impl super::Parser<'_> {
         t
     }
 
+    /// Skip a balanced `(...)` / `[...]` group whose opening delimiter is at
+    /// the current position, consuming both delimiters and everything between
+    /// (subprogram signatures and other skipped token runs).
+    pub(super) fn skip_balanced(&mut self, open: char, close: char) {
+        if !self.eat_punct(open) {
+            return;
+        }
+        let mut depth = 1;
+        while depth > 0 && self.peek().kind != TokenKind::Eof {
+            if self.at_punct(open) {
+                depth += 1;
+            } else if self.at_punct(close) {
+                depth -= 1;
+            }
+            self.bump();
+        }
+    }
+
     pub(super) fn eat_punct(&mut self, c: char) -> bool {
         if self.at_punct(c) {
             self.bump();
