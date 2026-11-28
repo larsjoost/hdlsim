@@ -5,7 +5,7 @@
 use super::bitvec::resize_bits;
 use super::builder::Builder;
 use super::classify::{Class, ProcCls, Writer};
-use super::{Ctrl, Exec};
+use super::exec::{Ctrl, Exec};
 use crate::sat::Lit;
 use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::value::V1;
