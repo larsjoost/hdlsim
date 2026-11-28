@@ -442,76 +442,9 @@ impl super::Parser<'_> {
         }
         self.builder.start_node(SyntaxKind::Delay);
         self.bump();
-        if self.eat_punct('(') {
-            loop {
-                self.parse_expression();
-                if !self.eat_punct(',') {
-                    break;
-                }
-            }
-            self.expect_punct(')', "to close the assignment delay");
-        } else {
-            self.parse_primary();
-        }
+        self.parse_delay_value("to close the assignment delay");
         self.builder.finish_node();
     }
-
-    /// Consume `=` (blocking) or `<=` (non-blocking). Returns false if neither.
-    fn parse_assign_op(&mut self) -> bool {
-        // Two/three-char operators lex as separate puncts; match on raw text.
-        let t2 = format!("{}{}", self.peek_text(), self.peek2_text());
-        let t3 = format!(
-            "{}{}{}",
-            self.peek_text(),
-            self.peek2_text(),
-            self.peek3_text()
-        );
-        for op in ["<<<=", ">>>="] {
-            if t3 == op {
-                self.bump();
-                self.bump();
-                self.bump();
-                return true;
-            }
-        }
-        for op in ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="] {
-            if t2 == op {
-                self.bump();
-                self.bump();
-                return true;
-            }
-        }
-        if self.peek_op2().as_deref() == Some("<=") {
-            self.bump();
-            self.bump();
-            true
-        } else if self.at_punct('=') {
-            self.bump();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// `lhs = expr` without a trailing semicolon (for-loop init/step).
-    pub(super) fn parse_assign_no_semi(&mut self) {
-        self.builder.start_node(SyntaxKind::StmtAssign);
-        self.eat_type_words(); // `for (int i = 0; ...)`
-                               // `for (...; i++)` step: a bare inc/dec needs no assignment operator.
-        let is_incdec = (self.peek2_text() == "+" && self.peek3_text() == "+")
-            || (self.peek2_text() == "-" && self.peek3_text() == "-");
-        self.parse_postfix();
-        if !self.parse_assign_op() {
-            if is_incdec {
-                self.builder.finish_node();
-                return;
-            }
-            self.error_here("expected `=` or `<=` in for-loop assignment");
-        }
-        self.parse_expression();
-        self.builder.finish_node();
-    }
-
     fn parse_case(&mut self) {
         self.builder.start_node(SyntaxKind::Case);
         self.parse_case_tail();
