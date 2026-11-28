@@ -1483,10 +1483,10 @@ impl<'a> Parser<'a> {
 
     fn parse_instantiation(&mut self) {
         self.builder.start_node(SyntaxKind::Inst);
-        // Module name.
-        self.builder.start_node(SyntaxKind::Name);
-        self.bump();
-        self.builder.finish_node();
+        // bump_name_node flushes leading trivia first — a comment directly
+        // above must not join the module name, which is the design-unit name
+        // resolved at elaboration.
+        self.bump_name_node();
         // Optional parameter override `#(...)` — structured as ParamAssign nodes.
         if self.at_punct('#') {
             self.bump();

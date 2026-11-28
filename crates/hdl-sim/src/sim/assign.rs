@@ -8,8 +8,40 @@
 use super::Simulator;
 use crate::events::{MessageSeverity, SimEvent};
 use hdl_ir::elab::FlatSigId;
-use hdl_ir::value::Value;
-use hdl_ir::Expr;
+use hdl_ir::{BinOp, Expr, UnOp, Value};
+
+/// Which operands of a binary op are context-determined (re-extended to the
+/// assignment context width) vs self-determined (LRM 11.6, Table 11-21):
+/// shifts/rotates take the left operand's width, so the amount is
+/// self-determined; arithmetic and bitwise ops are context-determined on
+/// both sides; comparisons and logical ops are self-determined (1-bit
+/// result).
+fn ctx_operand_arms(op: BinOp) -> (bool, bool) {
+    if matches!(
+        op,
+        BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
+    ) {
+        (true, false)
+    } else if matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::BAnd
+            | BinOp::BOr
+            | BinOp::BXor
+            | BinOp::BNand
+            | BinOp::BNor
+            | BinOp::BXnor
+    ) {
+        (true, true)
+    } else {
+        (false, false)
+    }
+}
 
 impl Simulator {
     /// Wake processes sensitive to a memory (array) signal after an element
@@ -260,5 +292,216 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    // ---- assignment-context RHS evaluation ----------------------------------------------
+
+    /// Evaluate an assignment RHS in the assignment's width context (LRM
+    /// 11.4.14 / 11.6): with a concatenation LHS, `{carry, sum} = a + b`
+    /// makes `a + b` a 9-bit addition whose bit 8 is the carry — the RHS is
+    /// evaluated in the context of the LHS width, not at its own
+    /// self-determined width. The rule applies to concatenation targets
+    /// only: VHDL shares this evaluator and sizes its operations from the
+    /// operands alone (no assignment context), and a concatenation
+    /// assignment target is a Verilog-only shape. Reals are skipped too:
+    /// real arithmetic has no integer sizing to extend.
+    pub(super) fn eval_assign_rhs(
+        &self,
+        lhs: &Expr,
+        rhs: &Expr,
+        locals: Option<&Vec<Value>>,
+    ) -> Value {
+        if !matches!(lhs, Expr::Concat(_)) || self.expr_real(rhs, locals) {
+            return self.eval_expr(rhs, locals);
+        }
+        // The context width is the sum of the part widths — the same widths
+        // `assign_to` splits the value by, so the slices line up.
+        let ctx = self.expr_width(lhs, locals);
+        if ctx <= self.expr_width(rhs, locals) {
+            // Nothing to widen: at or below the RHS's own self-determined
+            // width the evaluation is unchanged.
+            return self.eval_expr(rhs, locals);
+        }
+        let widened = self.widen_ctx(rhs, ctx, locals, false);
+        // The widened tree is a fresh allocation per evaluation, so its node
+        // addresses churn (allocator reuse can serve a later tree's node at
+        // an earlier tree's address) — the same not-flat-stable class as PCA
+        // clones, which the fixpoint sweep also evaluates with the memo off
+        // (see sim/type_flags.rs). A pointer-keyed flag entry from a
+        // recycled address would poison the classification, so the widened
+        // evaluation walks uncached; the flags consulted on the flat-owned
+        // `rhs` above still memoize.
+        let saved_memo = self.expr_memo.replace(false);
+        let v = self.eval_expr(&widened, locals);
+        self.expr_memo.set(saved_memo);
+        v
+    }
+
+    /// Widen a context-determined RHS tree to the assignment context width
+    /// (LRM 11.6, Table 11-21): context-determined operators re-extend their
+    /// operands to the context width so the operation itself computes at
+    /// that width (an add's carry survives into the wide LHS), while leaves
+    /// and self-determined sub-expressions keep their value and only get a
+    /// value-preserving extension. `sign_ext` is set inside a `Signed`
+    /// marker: its leaves must sign-extend (a zero-extend under `signed'()`
+    /// would flip a negative operand's bits).
+    fn widen_ctx(&self, e: &Expr, ctx: usize, locals: Option<&Vec<Value>>, sign_ext: bool) -> Expr {
+        match e {
+            Expr::Bin { op, l, r } => {
+                let (lw, rw) = ctx_operand_arms(*op);
+                Expr::Bin {
+                    op: *op,
+                    l: Box::new(if lw {
+                        self.widen_ctx(l, ctx, locals, sign_ext)
+                    } else {
+                        self.keep_ctx(l, ctx, locals, sign_ext)
+                    }),
+                    r: Box::new(if rw {
+                        self.widen_ctx(r, ctx, locals, sign_ext)
+                    } else {
+                        self.keep_ctx(r, ctx, locals, sign_ext)
+                    }),
+                }
+            }
+            Expr::Un { op, e } => {
+                // Reductions are self-determined (1-bit result); every other
+                // unary op inherits the context width through its operand.
+                let inner = if matches!(
+                    op,
+                    UnOp::RedAnd
+                        | UnOp::RedOr
+                        | UnOp::RedXor
+                        | UnOp::RedNand
+                        | UnOp::RedNor
+                        | UnOp::RedXnor
+                ) {
+                    self.keep_ctx(e, ctx, locals, sign_ext)
+                } else {
+                    self.widen_ctx(e, ctx, locals, sign_ext)
+                };
+                Expr::Un {
+                    op: *op,
+                    e: Box::new(inner),
+                }
+            }
+            Expr::Cond { c, t, e } => Expr::Cond {
+                c: Box::new(self.keep_ctx(c, ctx, locals, sign_ext)),
+                t: Box::new(self.widen_ctx(t, ctx, locals, sign_ext)),
+                e: Box::new(self.widen_ctx(e, ctx, locals, sign_ext)),
+            },
+            // The signedness marker is transparent: widen inside it, with
+            // leaves sign-extending.
+            Expr::Signed(inner) => Expr::Signed(Box::new(self.widen_ctx(inner, ctx, locals, true))),
+            other => self.keep_ctx(other, ctx, locals, sign_ext),
+        }
+    }
+
+    /// Keep a sub-expression's own value in the widened tree: extend it to
+    /// the context width only when narrower, sign- or zero-extending per its
+    /// own signedness (or the enclosing `signed'()` marker) — both
+    /// value-preserving.
+    fn keep_ctx(&self, e: &Expr, ctx: usize, locals: Option<&Vec<Value>>, sign_ext: bool) -> Expr {
+        if self.expr_real(e, locals) || self.expr_width(e, locals) >= ctx {
+            return e.clone();
+        }
+        Expr::Resize {
+            e: Box::new(e.clone()),
+            width: ctx,
+            signed: sign_ext || self.expr_signed(e, locals),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hdl_ir::elab::{Flat, FlatSig, Scope, ScopeId};
+    use hdl_ir::ir::SigKind;
+    use hdl_ir::BinOp;
+
+    /// Signals: 0/1 = 8-bit operands, 2 = 1-bit carry, 3 = 8-bit sum,
+    /// 4 = 4-bit low part. All in one top-level scope.
+    fn sim_with_parts() -> Simulator {
+        let scope: ScopeId = 0;
+        let sig = |name: &str, width: usize| FlatSig {
+            name: name.to_string(),
+            width,
+            kind: SigKind::Wire,
+            init: None,
+            mem: None,
+            scope,
+            signed: false,
+            real_ranges: Vec::new(),
+        };
+        let flat = Flat {
+            signals: vec![
+                sig("aa", 8),
+                sig("bb", 8),
+                sig("cc", 1),
+                sig("ss", 8),
+                sig("ll", 4),
+            ],
+            scopes: vec![Scope {
+                name: String::new(),
+                parent: None,
+            }],
+            ..Flat::default()
+        };
+        let mut sim = Simulator::new(flat);
+        sim.vals[0] = Value::from_u64(8, 100);
+        sim.vals[1] = Value::from_u64(8, 55);
+        sim
+    }
+
+    #[test]
+    fn concat_lhs_widens_the_add_to_the_part_total() {
+        let sim = sim_with_parts();
+        // {cc, ss} = aa + bb — 9-bit context: 100 + 55 keeps bit 8 = 0.
+        let lhs = Expr::Concat(vec![Expr::Sig(2), Expr::Sig(3)]);
+        let rhs = Expr::Bin {
+            op: BinOp::Add,
+            l: Box::new(Expr::Sig(0)),
+            r: Box::new(Expr::Sig(1)),
+        };
+        let v = sim.eval_assign_rhs(&lhs, &rhs, None);
+        assert_eq!(v.width(), 9, "the add must evaluate at the LHS width");
+        assert_eq!(v.to_u64(), Some(155));
+        // 200 + 100 = 300: the carry bit (bit 8) is part of the value.
+        let mut sim = sim_with_parts();
+        sim.vals[0] = Value::from_u64(8, 200);
+        sim.vals[1] = Value::from_u64(8, 100);
+        let v = sim.eval_assign_rhs(&lhs, &rhs, None);
+        assert_eq!(v.width(), 9);
+        assert_eq!(v.to_u64(), Some(300));
+    }
+
+    #[test]
+    fn narrow_concat_lhs_keeps_the_rhs_self_determined_width() {
+        let sim = sim_with_parts();
+        // {cc, ll} = aa + bb — 5-bit context is below the RHS's own 8-bit
+        // self-determined size, so the add stays 8-bit.
+        let lhs = Expr::Concat(vec![Expr::Sig(2), Expr::Sig(4)]);
+        let rhs = Expr::Bin {
+            op: BinOp::Add,
+            l: Box::new(Expr::Sig(0)),
+            r: Box::new(Expr::Sig(1)),
+        };
+        let v = sim.eval_assign_rhs(&lhs, &rhs, None);
+        assert_eq!(v.width(), 8, "no widening below the RHS's own size");
+        assert_eq!(v.to_u64(), Some(155));
+    }
+
+    #[test]
+    fn plain_signal_lhs_is_not_widened() {
+        let sim = sim_with_parts();
+        // ss = aa + bb — a non-concat target keeps today's evaluation.
+        let rhs = Expr::Bin {
+            op: BinOp::Add,
+            l: Box::new(Expr::Sig(0)),
+            r: Box::new(Expr::Sig(1)),
+        };
+        let v = sim.eval_assign_rhs(&Expr::Sig(3), &rhs, None);
+        assert_eq!(v.width(), 8);
+        assert_eq!(v.to_u64(), Some(155));
     }
 }
