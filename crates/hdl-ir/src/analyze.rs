@@ -289,6 +289,7 @@ mod tests {
                 sens: Sens::List(vec![Edge {
                     sig: 0,
                     kind: EdgeKind::Pos,
+                    iff: None,
                 }]),
                 body: Stmt::Assign {
                     lhs: Expr::Sig(4),

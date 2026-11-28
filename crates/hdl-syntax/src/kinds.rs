@@ -48,6 +48,12 @@ pub enum SyntaxKind {
     Always,
     /// The `@(...)` sensitivity list of an `always` block.
     SensList,
+    /// An `iff <cond>` event qualifier inside a sensitivity list (SV LRM
+    /// 9.4.2.3): the preceding edge fires only when the condition is true.
+    IffCond,
+    /// SV streaming operator `{>>{a}}` / `{<<W{a}}` (LRM 11.4.14): re-stream
+    /// the operand's bits, chunk width `W` (default 1).
+    StreamConcat,
     Initial,
     Function,
     Generate,
@@ -282,6 +288,8 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::Assign,
     SyntaxKind::Always,
     SyntaxKind::SensList,
+    SyntaxKind::IffCond,
+    SyntaxKind::StreamConcat,
     SyntaxKind::Initial,
     SyntaxKind::Function,
     SyntaxKind::Generate,
@@ -585,7 +593,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 127);
+        assert_eq!(ALL.len(), 129);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

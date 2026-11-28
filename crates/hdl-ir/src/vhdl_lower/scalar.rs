@@ -277,6 +277,7 @@ pub(super) fn edges_from_cond(c: &Expr, lx: &Lower) -> Option<Vec<Edge>> {
                     } else {
                         EdgeKind::Neg
                     },
+                    iff: None,
                 }]);
             }
             None
@@ -293,6 +294,7 @@ pub(super) fn edges_from_cond(c: &Expr, lx: &Lower) -> Option<Vec<Edge>> {
                         .map(|s| Edge {
                             sig: *s,
                             kind: EdgeKind::Any,
+                            iff: None,
                         })
                         .collect(),
                 )
