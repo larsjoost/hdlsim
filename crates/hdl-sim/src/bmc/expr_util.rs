@@ -24,6 +24,7 @@ pub(super) fn expr_has_dash(e: &Expr) -> bool {
         Expr::Cond { c, t, e } => expr_has_dash(c) || expr_has_dash(t) || expr_has_dash(e),
         Expr::Call { args, .. } => args.iter().any(expr_has_dash),
         Expr::Concat(parts) => parts.iter().any(expr_has_dash),
+        Expr::Stream { e, .. } => expr_has_dash(e),
         Expr::Replicate { count, e } => expr_has_dash(count) || expr_has_dash(e),
         Expr::Sel { e, msb, lsb } => expr_has_dash(e) || expr_has_dash(msb) || expr_has_dash(lsb),
         Expr::Idx { e, i } => expr_has_dash(e) || expr_has_dash(i),

@@ -10,7 +10,7 @@
 //! (args first, then locals) — elaboration must not remap those ids.
 
 use crate::ir::*;
-use crate::value::{BinOp, UnOp, Value, V0, V1, VX, VZ};
+use crate::value::{BinOp, UnOp, Value, V0, V1, VX};
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
@@ -18,6 +18,14 @@ use hdl_syntax::source::{FileId, SourceDb, Span};
 use std::collections::{HashMap, HashSet};
 
 mod ce_proc;
+mod literals;
+mod pattern;
+mod proc;
+mod stream;
+
+pub use literals::parse_int_literal;
+use literals::{parse_real_literal, time_literal_fs};
+pub use stream::stream_reverse;
 
 /// Lower one parsed file into modules plus diagnostics, with the LRM default
 /// time unit of 1 ns.
@@ -189,6 +197,7 @@ fn is_expr_node(k: SyntaxKind) -> bool {
             | SyntaxKind::Call
             | SyntaxKind::Concat
             | SyntaxKind::Replicate
+            | SyntaxKind::StreamConcat
             | SyntaxKind::PartSelect
             | SyntaxKind::IndexedPartSelect
             | SyntaxKind::Index
@@ -1605,104 +1614,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    // ---- processes ----------------------------------------------------------
-
-    fn lower_process(
-        &mut self,
-        module: &mut ModuleIr,
-        p: &SyntaxNode,
-        env: &HashMap<String, Value>,
-    ) {
-        let kind = if p.kind() == SyntaxKind::Initial {
-            ProcKind::Initial
-        } else {
-            ProcKind::Always
-        };
-        let kids = real_children(p);
-        // No sensitivity list at all (`always #5 ...`): an empty list means
-        // "no event sensitivity — start once at t=0 and loop on the body".
-        // `@*` lowers to Sens::All via the SensList arm below.
-        let mut sens = Sens::List(Vec::new());
-        let mut body = None;
-        let mut origin = String::new();
-        for k in &kids {
-            match k.kind() {
-                SyntaxKind::SensList => {
-                    sens = self.lower_sens_list(k, env);
-                    let kw = match kind {
-                        ProcKind::Initial => "initial",
-                        ProcKind::Always => "always",
-                    };
-                    origin = format!("{} @{}", kw, self.text(k));
-                }
-                SyntaxKind::Ident | SyntaxKind::Punct => {}
-                _ => body = Some(k.clone()),
-            }
-        }
-        let body = match body {
-            Some(b) => self.lower_stmt(&b, env),
-            None => Stmt::Null,
-        };
-        if origin.is_empty() {
-            origin = match kind {
-                ProcKind::Initial => "initial".to_string(),
-                ProcKind::Always => "always".to_string(),
-            };
-        }
-        module.processes.push(ProcessIr {
-            kind,
-            sens,
-            body,
-            origin,
-            gen_scope: self.gen_path.join("."),
-            initial: false,
-        });
-    }
-
-    fn lower_sens_list(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Sens {
-        let mut edges = Vec::new();
-        let mut pending = EdgeKind::Any;
-        for c in real_children(s) {
-            match c.kind() {
-                SyntaxKind::Ident => {
-                    let t = self.text(&c);
-                    if t == "posedge" {
-                        pending = EdgeKind::Pos;
-                    } else if t == "negedge" {
-                        pending = EdgeKind::Neg;
-                    }
-                    // `or` separators carry no meaning beyond joining the list.
-                }
-                _ if is_expr_node(c.kind()) => {
-                    let e = self.lower_expr(&c, env);
-                    // `a`, `a[1:0]`, `a[i]` — the entry's base signal.
-                    let base_sig = match &e {
-                        Expr::Sig(id) => Some(*id),
-                        Expr::Idx { e, .. } | Expr::Sel { e, .. } => match &**e {
-                            Expr::Sig(id) => Some(*id),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    match base_sig {
-                        Some(id) => edges.push(Edge {
-                            sig: id,
-                            kind: pending,
-                        }),
-                        None => self.err(c.span(), "sensitivity list entry must be a signal"),
-                    }
-                    pending = EdgeKind::Any;
-                }
-                _ => {}
-            }
-        }
-        if edges.is_empty() {
-            Sens::All
-        } else {
-            Sens::List(edges)
-        }
-    }
-
     // ---- statements -----------------------------------------------------------
 
     /// Lower one statement, wrapped in a `Stmt::Spanned` with its source span
@@ -2382,75 +2293,6 @@ impl<'a> Lower<'a> {
             }
             _ => Stmt::Null,
         }
-    }
-
-    /// Lower `'{a: x, b: y}` against the LHS struct type: build a concat in
-    /// field order (msb first). Missing fields fall back to positional
-    /// entries, then `default:`, then X.
-    fn lower_pattern(
-        &mut self,
-        pat: &SyntaxNode,
-        lhs: &SyntaxNode,
-        env: &HashMap<String, Value>,
-    ) -> Option<Expr> {
-        if lhs.kind() != SyntaxKind::Name {
-            return None;
-        }
-        let id = self.sig_id(&self.text(lhs))?;
-        let tn = self.sig_types.get(&id)?.clone();
-        let td = self.types.get(&tn)?.clone();
-        let fields = match &td.kind {
-            TypeKind::Struct(f) => f.clone(),
-            _ => return None,
-        };
-        let kids = real_children(pat);
-        let mut named: Vec<(String, Expr)> = Vec::new();
-        let mut positional: Vec<Expr> = Vec::new();
-        let mut default: Option<Expr> = None;
-        let mut i = 0;
-        while i < kids.len() {
-            if kids[i].kind() == SyntaxKind::Name {
-                let n = self.text(&kids[i]);
-                i += 1;
-                if i < kids.len() && is_expr_node(kids[i].kind()) {
-                    let e = self.lower_expr(&kids[i], env);
-                    if n == "default" {
-                        default = Some(e);
-                    } else {
-                        named.push((n, e));
-                    }
-                    i += 1;
-                }
-            } else if is_expr_node(kids[i].kind()) {
-                positional.push(self.lower_expr(&kids[i], env));
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        let mut ordered = fields.clone();
-        ordered.sort_by_key(|f| std::cmp::Reverse(f.2)); // descending lsb → msb first
-        let mut pos = 0;
-        let mut parts: Vec<Expr> = Vec::new();
-        for (n, w, _) in &ordered {
-            let e = named
-                .iter()
-                .find(|(fn_, _)| fn_ == n)
-                .map(|(_, e)| e.clone())
-                .or_else(|| {
-                    if pos < positional.len() {
-                        let e = positional[pos].clone();
-                        pos += 1;
-                        Some(e)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| default.clone())
-                .unwrap_or_else(|| Expr::Lit(Value::x(*w)));
-            parts.push(e);
-        }
-        Some(Expr::Concat(parts))
     }
 
     fn lower_case(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {
@@ -3297,6 +3139,45 @@ impl<'a> Lower<'a> {
                     .map(|k| self.lower_expr(&k, env))
                     .collect(),
             ),
+            // SV streaming operator `{>>{e}}` (identity) / `{<<W{e}}`
+            // (chunk-reverse, LRM 11.4.14). `>>` lowers to the operand
+            // unchanged; `<<` carries the slice width to the kernel, which
+            // reverses the value's `slice`-wide chunks at runtime (the
+            // lowerer has no general expression width to do it statically).
+            // Expr children: just the operand, or the slice then the operand.
+            SyntaxKind::StreamConcat => {
+                let exprs: Vec<SyntaxNode> = real_children(e)
+                    .into_iter()
+                    .filter(|k| is_expr_node(k.kind()))
+                    .collect();
+                let (slice_expr, op) = match exprs.as_slice() {
+                    [op] => (None, op),
+                    [slice, op] => (Some(slice), op),
+                    _ => {
+                        self.err(e.span(), "stream operator needs exactly one operand");
+                        return Expr::Lit(Value::x(32));
+                    }
+                };
+                let slice = match slice_expr {
+                    None => 1,
+                    Some(w) => {
+                        let wv = self.lower_expr(w, env);
+                        self.ce(&wv, env)
+                            .and_then(|v| v.to_u64())
+                            .map(|n| n.max(1) as u32)
+                            .unwrap_or(1)
+                    }
+                };
+                let lowered = self.lower_expr(op, env);
+                if self.text(e).starts_with("{>>") {
+                    lowered
+                } else {
+                    Expr::Stream {
+                        e: Box::new(lowered),
+                        slice,
+                    }
+                }
+            }
             // Assignment pattern `'{ a: x, b: y }`: lowered contextually in
             // assignments (struct field order); here, positional concat.
             // `Field:` label names are children too — skip them.
@@ -3432,6 +3313,9 @@ impl<'a> Lower<'a> {
             }
             return Expr::Lit(Value { bits, real: false });
         }
+        if let Some(fs) = time_literal_fs(&t) {
+            return self.lower_time_literal(fs);
+        }
         if let Some(f) = parse_real_literal(&t) {
             return Expr::Real(f);
         }
@@ -3442,6 +3326,23 @@ impl<'a> Lower<'a> {
                 Expr::Lit(Value::x(32))
             }
         }
+    }
+
+    /// SV time literal (`1ns`, `#(2*1ns)`, `#(1 ps)`): the literal's absolute
+    /// fs value scaled into the module's time units (SV LRM 5.7.1 scales a
+    /// time literal to the module's timescale; hdlsim keeps only the unit
+    /// scale, so `#1ns` delays one unit and `#(2*1ns)` composes with the
+    /// `#N`-unit delay scaling, and both give the same absolute time).
+    fn lower_time_literal(&mut self, fs: u64) -> Expr {
+        let units = if self.time_unit_fs == 0 {
+            0
+        } else {
+            ((fs as f64) / (self.time_unit_fs as f64)).round() as u64
+        };
+        Expr::Lit(
+            parse_int_literal(&units.to_string())
+                .expect("a u64 unit count always parses as a decimal Verilog literal"),
+        )
     }
 }
 
@@ -3521,102 +3422,6 @@ fn type_kw_width(t: &str) -> Option<usize> {
 
 /// Parse a Verilog integer literal (`42`, `8'hFF`, `'b1010`, `4'd3`) into a
 /// Value with per-bit X/Z for x/z/? digits. Returns None for non-integers.
-/// Parse a Verilog real literal (`1.5`, `1e3`, `.5`, `2.0E-2`). Base-specified
-/// literals (`8'hFF`) and plain integers are not real literals.
-pub fn parse_real_literal(t: &str) -> Option<f64> {
-    let t = t.trim();
-    if t.contains('\'') {
-        return None;
-    }
-    if !(t.contains('.') || t.contains('e') || t.contains('E')) {
-        return None;
-    }
-    let c: String = t.chars().filter(|&c| c != '_').collect();
-    c.parse::<f64>().ok()
-}
-
-pub fn parse_int_literal(t: &str) -> Option<Value> {
-    let t = t.trim();
-    let (size, rest) = match t.find('\'') {
-        Some(q) => {
-            let (sz, r) = t.split_at(q);
-            let size = if sz.is_empty() {
-                None
-            } else {
-                Some(sz.parse::<u64>().ok()?)
-            };
-            (size, &r[1..])
-        }
-        None => (None, t),
-    };
-    let rest = rest.trim_start_matches(['s', 'S']);
-    let (base, digits) = match rest.chars().next()? {
-        'b' | 'B' => (2u32, &rest[1..]),
-        'o' | 'O' => (8, &rest[1..]),
-        'd' | 'D' => (10, &rest[1..]),
-        'h' | 'H' => (16, &rest[1..]),
-        c if c.is_ascii_digit() => (10, rest),
-        _ => return None,
-    };
-    let digits = digits.replace('_', "");
-    if digits.is_empty() {
-        return None;
-    }
-    // Verilog unsized literals (plain decimal or `'b...` without a size) are
-    // at least 32 bits wide; sized literals keep their declared size.
-    let width = size.map(|s| s as usize).unwrap_or(32);
-    if !digits
-        .chars()
-        .any(|c| matches!(c.to_ascii_lowercase(), 'x' | 'z' | '?'))
-    {
-        let v = u128::from_str_radix(&digits, base).ok()?;
-        let mut bits = vec![V0; width.max(1)];
-        for (i, b) in bits.iter_mut().enumerate().take(width.min(128)) {
-            *b = if (v >> i) & 1 == 1 { V1 } else { V0 };
-        }
-        return Some(Value { bits, real: false });
-    }
-    let digit_bits = match base {
-        2 => 1,
-        8 => 3,
-        16 => 4,
-        _ => 1,
-    };
-    let mut bits = vec![VX; width.max(1)];
-    for (i, c) in digits.chars().enumerate() {
-        let from_lsb = (digits.len() - 1 - i) * digit_bits;
-        match c.to_ascii_lowercase() {
-            'x' | '?' => {
-                for j in 0..digit_bits {
-                    let idx = from_lsb + j;
-                    if idx < bits.len() {
-                        bits[idx] = VX;
-                    }
-                }
-            }
-            'z' => {
-                for j in 0..digit_bits {
-                    let idx = from_lsb + j;
-                    if idx < bits.len() {
-                        bits[idx] = VZ;
-                    }
-                }
-            }
-            _ => {
-                if let Some(d) = c.to_digit(base) {
-                    for j in 0..digit_bits {
-                        let idx = from_lsb + j;
-                        if idx < bits.len() {
-                            bits[idx] = if (d >> j) & 1 == 1 { V1 } else { V0 };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Some(Value { bits, real: false })
-}
-
 impl<'a> Lower<'a> {
     /// Const-evaluate with the global function table (package functions) so
     /// param defaults like `cc_pkg::idx_width(Depth)` resolve.
@@ -3867,6 +3672,12 @@ fn ce_impl(
                 vals.push(ce_impl(p, env, funcs, extras, slots.as_deref_mut())?);
             }
             Some(Value::concat(&vals))
+        }
+        // A streamed constant folds to the streamed value (the `>>` identity
+        // never reaches the IR — the lowerer folds it away).
+        Expr::Stream { e, slice } => {
+            let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
+            Some(stream_reverse(&v, *slice))
         }
         Expr::Replicate { count, e } => {
             let n = ce_impl(count, env, funcs, extras, slots.as_deref_mut())?.to_u64()? as usize;
@@ -4602,29 +4413,6 @@ endmodule
         let ptr = m.signals.iter().find(|s| s.name == "ptr").unwrap();
         // W = idx_width(8) = $clog2(8) = 4 with the bits-needed formula.
         assert_eq!(ptr.width, 4);
-    }
-
-    #[test]
-    fn parse_real_literals() {
-        assert_eq!(parse_real_literal("1.5"), Some(1.5));
-        assert_eq!(parse_real_literal("2.0E-2"), Some(0.02));
-        assert_eq!(parse_real_literal("1e3"), Some(1000.0));
-        assert_eq!(parse_real_literal(".5"), Some(0.5));
-        assert_eq!(parse_real_literal("42"), None); // plain integer
-        assert_eq!(parse_real_literal("8'hFF"), None); // based literal
-        assert_eq!(parse_real_literal("8'h1E"), None); // 'E' inside based literal
-        assert_eq!(parse_real_literal("1_000.5"), Some(1000.5));
-    }
-
-    #[test]
-    fn parse_int_literals() {
-        assert_eq!(parse_int_literal("42").unwrap().to_u64(), Some(42));
-        assert_eq!(parse_int_literal("8'hFF").unwrap().to_u64(), Some(255));
-        assert_eq!(parse_int_literal("'b1010").unwrap().to_u64(), Some(10));
-        assert_eq!(parse_int_literal("4'd3").unwrap().to_u64(), Some(3));
-        let x = parse_int_literal("4'b10x1").unwrap();
-        assert_eq!(x.to_u64(), None);
-        assert_eq!(x.bit(1), VX);
     }
 
     #[test]
