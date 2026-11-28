@@ -2274,11 +2274,11 @@ impl Simulator {
                 });
             }
             "assert" => {
+                // Fire only when definitely false; an X condition is unknown (no fire).
                 let ok = args
                     .first()
-                    .map(|a| truthy(&self.eval_expr(a, locals.as_deref())))
-                    .unwrap_or(true);
-                if !ok {
+                    .map(|a| self.eval_expr(a, locals.as_deref()).to_u64() != Some(0));
+                if !ok.unwrap_or(true) {
                     let msg = args
                         .get(1)
                         .map(|a| string_of(&self.eval_expr(a, locals.as_deref())))
