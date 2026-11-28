@@ -26,7 +26,9 @@ mod image;
 mod observe;
 mod probe;
 mod proc_copyback;
+mod progress;
 mod real_eval;
+mod type_flags;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
@@ -211,6 +213,10 @@ pub struct Simulator {
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
+    /// Active procedural continuous assignments (LRM 9.2.2): registered by
+    /// `assign lhs = rhs;` in a process, removed by `deassign lhs;`. Swept
+    /// with the continuous assigns in every fixpoint.
+    proc_assigns: Vec<(FlatSigId, Expr, Expr)>,
     /// Function/procedure registry: name → indices into `flat.functions`.
     /// Overloads share a bare name, so lookups with several candidates
     /// resolve by formal count (`func_match`).
@@ -343,6 +349,9 @@ pub struct Simulator {
     /// Last pump-visible time advance / heartbeat print (heartbeat only).
     last_advance: Option<std::time::Instant>,
     last_heartbeat: std::cell::Cell<Option<std::time::Instant>>,
+    /// `--progress` simulation ticks: decile lines against `--max-time`, or
+    /// wall-clock rate-limited lines without it (see the `progress` module).
+    progress: progress::SimProgress,
     /// Set when the run ended via signal or wall budget: (reason, exit code).
     interrupt_info: Option<(String, i32)>,
     /// Most recently dispatched process — the between-events fallback for
@@ -387,6 +396,13 @@ pub struct Simulator {
     /// drives the FnRunner heartbeat/stop checks (loops inside function
     /// bodies run entirely inside FnRunner and touch no other budget).
     fn_steps: std::cell::Cell<u64>,
+    /// Memoized `expr_real`/`expr_signed` classification, keyed by node
+    /// address — see `sim/type_flags.rs` for the stability contract.
+    expr_flags_memo: std::cell::RefCell<type_flags::FlagMemo>,
+    /// Set only while evaluating trees owned by `flat` (the assign fixpoint,
+    /// `run_func` bodies): the only contexts whose node addresses are stable
+    /// enough to memoize type flags against. See `sim/type_flags.rs`.
+    expr_memo: std::cell::Cell<bool>,
 }
 
 impl Simulator {
@@ -527,6 +543,7 @@ impl Simulator {
             proc_sens: Vec::new(),
             proc_all: Vec::new(),
             proc_rt: Vec::new(),
+            proc_assigns: Vec::new(),
             funcs: HashMap::new(),
             observers: Vec::new(),
             finished: false,
@@ -554,6 +571,7 @@ impl Simulator {
             wall_start: std::cell::Cell::new(None),
             last_advance: None,
             last_heartbeat: std::cell::Cell::new(None),
+            progress: progress::SimProgress::Off,
             interrupt_info: None,
             last_proc: None,
             fix_sweep: 0,
@@ -568,6 +586,8 @@ impl Simulator {
             trace_assigns: Vec::new(),
             delta_no: 0,
             fn_steps: std::cell::Cell::new(0),
+            expr_flags_memo: std::cell::RefCell::new(HashMap::default()),
+            expr_memo: std::cell::Cell::new(false),
             monitor: Vec::new(),
             monitor_last: Vec::new(),
             delta_guard: 0,
@@ -1244,51 +1264,12 @@ impl Simulator {
         self.stopped = true;
     }
 
-    /// Periodic "still running" note on stderr for runs that grind without
-    /// time advance (`--progress <s>`, 0/absent = off). Shows
-    /// the same location as the interrupt dump, so a hung or slow run
-    /// announces where it is instead of silently burning CPU.
-    /// Wall-clock origin: the first caller initializes it (sim start). Reads
-    /// go through this helper because `Cell::get()` returns a *copy* —
-    /// `get_or_insert` on the copy is silently discarded, which once broke
-    /// `--max-wall` (the budget re-seeded a fresh `Instant` every check and
-    /// never elapsed) and silenced the heartbeat.
-    fn wall_origin(&self) -> std::time::Instant {
-        if self.wall_start.get().is_none() {
-            self.wall_start.set(Some(std::time::Instant::now()));
-        }
-        self.wall_start
-            .get()
-            .unwrap_or_else(std::time::Instant::now)
-    }
-
-    fn maybe_heartbeat(&self) {
-        let interval = progress_interval();
-        if interval.is_zero() {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let start = self.wall_origin();
-        if now.duration_since(start) < interval {
-            return;
-        }
-        let report = self.last_heartbeat.get().unwrap_or(start);
-        let advance = self.last_advance.unwrap_or(start);
-        if now.duration_since(report) >= interval && now.duration_since(advance) >= interval {
-            eprintln!(
-                "hdlsim: still running ({:.0} s without time advance) at {}",
-                now.duration_since(advance).as_secs_f64(),
-                self.where_am_i()
-            );
-            self.last_heartbeat.set(Some(now));
-        }
-    }
-
     fn pump(&mut self, max_time_fs: u64, soft: bool) {
         // Delta cycles since the last time advance: a design whose processes
         // or assigns keep re-triggering without time moving would otherwise
         // loop forever (time-based limits like --max-time cannot see it).
         let mut delta_count: u64 = 0;
+        self.progress_arm(max_time_fs, soft);
         loop {
             if self.finished || self.stopped {
                 break;
@@ -1351,6 +1332,7 @@ impl Simulator {
                 break;
             }
             self.maybe_heartbeat();
+            self.progress_wall_tick();
             let mut drain_guard = 0u64;
             while let Some(pid) = self.active.pop_front() {
                 self.in_active[pid as usize] = false;
@@ -1434,6 +1416,7 @@ impl Simulator {
                     }
                     self.time = t;
                     self.emit(SimEvent::TimeAdvance { time_fs: t });
+                    self.progress_tick();
                     if !self.check_mem() {
                         break;
                     }
@@ -1953,6 +1936,40 @@ impl Simulator {
                 }
                 Control::Done
             }
+            // Procedural continuous assignment (LRM 9.2.2): one write now,
+            // then keep driving in every fixpoint until a `deassign`.
+            Stmt::ProcContAssign { lhs, rhs } => {
+                let v = self.eval_expr(&rhs, None);
+                let v = self.convert_for_target(&lhs, &rhs, v, None);
+                self.assign_to(&lhs, v.clone(), None);
+                match lhs_sig(&lhs) {
+                    Some(sig) => {
+                        // A later PCA on the same target replaces the earlier
+                        // one (the LRM lvalue is a simple variable).
+                        self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                        self.proc_assigns.push((sig, lhs, rhs));
+                    }
+                    None => self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
+                        text: format!(
+                            "error: procedural continuous assignment target must be a simple variable at t={}\n",
+                            fmt_time(self.time)
+                        ),
+                        time_fs: self.time,
+                        span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
+                    }),
+                }
+                Control::Done
+            }
+            // `deassign` stops the continuous drive; the target keeps the
+            // value it held (LRM 9.2.2).
+            Stmt::Deassign { lhs } => {
+                if let Some(sig) = lhs_sig(&lhs) {
+                    self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                }
+                Control::Done
+            }
             Stmt::Delay { time_fs, stmt } => {
                 self.proc_rt[pid as usize]
                     .frames
@@ -2436,7 +2453,17 @@ impl Simulator {
                 if args.len() >= 2 {
                     if let (Expr::Lit(fname), Expr::Sig(mem)) = (&args[0], &args[1]) {
                         let fname = string_of(fname);
-                        self.read_mem_file(mem, &fname, name == "readmemb");
+                        let range = self.mem_task_range(&args, locals.as_deref());
+                        self.read_mem_file(mem, &fname, name == "readmemb", range);
+                    }
+                }
+            }
+            "writememh" | "writememb" => {
+                if args.len() >= 2 {
+                    if let (Expr::Lit(fname), Expr::Sig(mem)) = (&args[0], &args[1]) {
+                        let fname = string_of(fname);
+                        let range = self.mem_task_range(&args, locals.as_deref());
+                        self.write_mem_file(mem, &fname, name == "writememb", range);
                     }
                 }
             }
@@ -2853,37 +2880,138 @@ impl Simulator {
         }
     }
 
-    fn read_mem_file(&mut self, mem: &SigId, fname: &str, binary: bool) {
+    /// Optional START/FINISH address arguments of the memory load/store
+    /// tasks (LRM 21.4), evaluated once in the caller's frame.
+    fn mem_task_range(
+        &mut self,
+        args: &[Expr],
+        locals: Option<&Vec<Value>>,
+    ) -> (Option<u64>, Option<u64>) {
+        let start = args
+            .get(2)
+            .map(|a| self.eval_expr(a, locals))
+            .and_then(|v| v.to_u64());
+        let finish = args
+            .get(3)
+            .map(|a| self.eval_expr(a, locals))
+            .and_then(|v| v.to_u64());
+        (start, finish)
+    }
+
+    /// $readmemh/$readmemb (LRM 21.4): load data words into the memory,
+    /// overwriting in place from address 0 or the last `@hex` address
+    /// directive. Words outside the optional [start, finish] window are
+    /// skipped; an address beyond the declared depth grows the memory with
+    /// a warning, since reads index the same storage.
+    fn read_mem_file(
+        &mut self,
+        mem: &SigId,
+        fname: &str,
+        binary: bool,
+        range: (Option<u64>, Option<u64>),
+    ) {
         let Ok(text) = std::fs::read_to_string(fname) else {
-            self.emit(SimEvent::Message {
-                scope: self.cur_scope(),
-                text: format!("error: cannot read memory file '{}'", fname),
-                time_fs: self.time,
-                span: None,
-                severity: Some(MessageSeverity::Error),
-            });
+            self.mem_task_msg(
+                format!("cannot read memory file '{fname}'"),
+                MessageSeverity::Error,
+            );
             return;
         };
         let sig = *mem as usize;
         let width = self.flat.signals[sig].width.max(1);
+        let depth = self.mems[sig].len();
+        // Loading begins at the START argument; `@` directives in the file
+        // override from there (LRM 21.4).
+        let mut addr: u64 = range.0.unwrap_or(0);
+        let mut warned = false;
         for tok in text.split_whitespace() {
-            let t = tok.trim_start_matches('@');
-            if tok.starts_with('@') {
-                continue; // address directive: we fill sequentially for simplicity
+            if let Some(hex) = tok.strip_prefix('@') {
+                match u64::from_str_radix(&hex.replace('_', ""), 16) {
+                    Ok(a) => addr = a,
+                    Err(_) => self.mem_task_msg(
+                        format!("bad address directive '{tok}' in '{fname}'"),
+                        MessageSeverity::Warning,
+                    ),
+                }
+                continue;
             }
-            let v = if binary {
-                hdl_ir::verilog_lower::parse_int_literal(&format!("'b{}", t.replace('_', "")))
+            let in_window = range.0.is_none_or(|s| addr >= s) && range.1.is_none_or(|f| addr <= f);
+            let lit = if binary {
+                format!("'b{}", tok.replace('_', ""))
             } else {
-                hdl_ir::verilog_lower::parse_int_literal(&format!(
-                    "{}'h{}",
-                    width,
-                    t.replace('_', "")
-                ))
+                format!("{width}'h{}", tok.replace('_', ""))
             };
-            if let Some(v) = v {
-                self.mems[sig].push(v.resize(width));
+            if let (true, Some(v)) = (in_window, hdl_ir::verilog_lower::parse_int_literal(&lit)) {
+                if (addr as usize) >= depth && !warned {
+                    warned = true;
+                    self.mem_task_msg(
+                        format!(
+                            "'{fname}': address {addr:#x} beyond memory depth {depth}; \
+                             extending with x"
+                        ),
+                        MessageSeverity::Warning,
+                    );
+                }
+                while self.mems[sig].len() <= addr as usize {
+                    self.mems[sig].push(Value::x(width));
+                }
+                self.mems[sig][addr as usize] = v.resize(width);
             }
+            addr += 1;
         }
+    }
+
+    /// $writememh/$writememb (LRM 21.4): write the memory words to a file —
+    /// data words 8 per line, with an `@hex` address directive whenever the
+    /// address is not the previous word plus one (a contiguous dump starts
+    /// with no directive, so a read-back can begin at a chosen START).
+    /// Words outside [start, finish] are skipped.
+    fn write_mem_file(
+        &mut self,
+        mem: &SigId,
+        fname: &str,
+        binary: bool,
+        range: (Option<u64>, Option<u64>),
+    ) {
+        let sig = *mem as usize;
+        let fmt = if binary { "b" } else { "h" };
+        let mut out = String::new();
+        let mut row = 0usize;
+        let mut prev: Option<u64> = None;
+        for (i, v) in self.mems[sig].iter().enumerate() {
+            let a = i as u64;
+            if !(range.0.is_none_or(|s| a >= s) && range.1.is_none_or(|f| a <= f)) {
+                continue;
+            }
+            if row == 8 || prev.is_some_and(|p| p + 1 != a) || (prev.is_none() && a != 0) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("@{a:x}\n"));
+                row = 0;
+            }
+            out.push_str(&v.display(fmt));
+            out.push(' ');
+            row += 1;
+            prev = Some(a);
+        }
+        if let Err(e) = std::fs::write(fname, out) {
+            self.mem_task_msg(
+                format!("cannot write memory file '{fname}': {e}"),
+                MessageSeverity::Error,
+            );
+        }
+    }
+
+    /// Message for a memory load/store task, at the current time.
+    fn mem_task_msg(&mut self, text: String, severity: MessageSeverity) {
+        self.emit(SimEvent::Message {
+            scope: self.cur_scope(),
+            text,
+            time_fs: self.time,
+            span: None,
+            severity: Some(severity),
+        });
     }
 
     fn fmt_args(&mut self, args: &[Expr], locals: Option<&Vec<Value>>) -> String {
@@ -2988,6 +3116,9 @@ impl Simulator {
         // inherit the last process statement's span.
         self.cur_span = None;
         self.fn_calls.set(0); // per-fixpoint call budget (see run_func)
+                              // Assign expressions are `flat`-owned — evaluated by reference on
+                              // every sweep, so their type flags memoize across delta cycles.
+        let saved_memo = self.expr_memo.replace(true);
         for sweep in 0..10_000 {
             self.delta_guard += 1;
             self.fix_sweep = sweep as u64 + 1;
@@ -2996,13 +3127,14 @@ impl Simulator {
             let mut n_changed = 0u64;
             let n_assigns = self.flat.assigns.len();
             for ai in 0..n_assigns {
-                let a = self.flat.assigns[ai].clone();
+                let a = &self.flat.assigns[ai];
                 let rhs = self.eval_expr(&a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
                 if !self.trace_assigns.is_empty() {
                     self.assign_trace_eval(ai, &a.lhs, &a.rhs, &rhs);
                 }
-                if self.assign_to(&a.lhs, rhs, None) {
+                let lhs = a.lhs.clone();
+                if self.assign_to(&lhs, rhs, None) {
                     changed = true;
                     n_changed += 1;
                 }
@@ -3014,26 +3146,57 @@ impl Simulator {
                     self.fix_changed = n_changed;
                     if self.report_fn_runaway() {
                         self.cur_proc = None;
+                        self.expr_memo.set(saved_memo);
                         return any;
                     }
                     // Same for an external interrupt: report it at the pump
                     // level (with the location) instead of grinding on. Keep
                     // the sentinel cur_proc so the dump names the sweep.
                     if self.stop_requested() {
+                        self.expr_memo.set(saved_memo);
                         return any;
                     }
                     self.maybe_heartbeat();
                 }
             }
+            // Procedural continuous assignments drive in the same fixpoint as
+            // continuous assigns (their RHS may read either kind of source).
+            // Their trees are runtime-registered clones — removed by
+            // `deassign`, re-cloned on re-`assign` — not flat-stable, so
+            // they walk uncached (see sim/type_flags.rs).
+            let pca_memo = self.expr_memo.replace(false);
+            if self.eval_proc_assigns(&mut n_changed) {
+                changed = true;
+            }
+            self.expr_memo.set(pca_memo);
             self.fix_changed = n_changed;
             any |= changed;
             if !changed {
                 self.cur_proc = None;
+                self.expr_memo.set(saved_memo);
                 return any;
             }
         }
+        self.expr_memo.set(saved_memo);
         self.fail_comb_loop();
         any
+    }
+
+    /// One sweep of the active procedural continuous assignments (LRM 9.2.2).
+    /// Appends the number of changed writes to `n_changed`; returns true when
+    /// any signal changed (which may have scheduled processes).
+    fn eval_proc_assigns(&mut self, n_changed: &mut u64) -> bool {
+        let mut changed = false;
+        for pi in 0..self.proc_assigns.len() {
+            let (_, lhs, rhs) = self.proc_assigns[pi].clone();
+            let v = self.eval_expr(&rhs, None);
+            let v = self.convert_for_target(&lhs, &rhs, v, None);
+            if self.assign_to(&lhs, v, None) {
+                changed = true;
+                *n_changed += 1;
+            }
+        }
+        changed
     }
 
     /// Report unconverged continuous assigns: the combinational-loop guard.
@@ -3076,27 +3239,27 @@ impl Simulator {
 
     /// Returns true if the signal actually changed.
     fn set_sig(&mut self, sig: FlatSigId, v: Value) -> bool {
-        let old = self.vals[sig as usize].clone();
-        let new = v;
-        if old == new {
+        // No-change is the common case: compare by reference, clone nothing.
+        if self.vals[sig as usize] == v {
             return false;
         }
+        // One clone each for `vals`/`prev`; the owned pair moves into the event.
+        let old = std::mem::replace(&mut self.vals[sig as usize], v.clone());
         self.prev[sig as usize] = old.clone();
-        self.vals[sig as usize] = new.clone();
-        // Stamp the delta epoch of this change — edge tests (`rising_edge`,
-        // `falling_edge`, `'event`) consult it to stay true only while the
-        // change is current (see the field docs).
+        // Stamp the change's delta epoch — edge tests read it (see field docs).
         self.sig_evt[sig as usize] = self.delta_epoch;
         if !self.watch.is_empty() {
-            self.watch_change(sig, &old, &new);
+            self.watch_change(sig, &old, &v);
         }
         if !self.when_rules.is_empty() {
-            self.when_change(sig, &old, &new);
+            self.when_change(sig, &old, &v);
         }
+        // Scheduling only enqueues (the pump runs processes): no emitted line changes.
+        self.schedule_sensitive(sig, &old, &v);
         self.emit(SimEvent::SignalChange {
             sig,
             old,
-            new: new.clone(),
+            new: v,
             time_fs: self.time,
         });
         if let Some(p) = self.cur_proc {
@@ -3109,7 +3272,6 @@ impl Simulator {
             }
             self.last_driver[sig as usize] = Some((p, self.time));
         }
-        self.schedule_sensitive(sig, &self.prev[sig as usize].clone(), &new);
         true
     }
 
@@ -3178,37 +3340,6 @@ impl Simulator {
         }
     }
 
-    /// Whether an expression is a signed-typed value (VHDL `signed`).
-    fn expr_signed(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
-        match e {
-            Expr::Sig(s) => {
-                let i = *s as usize;
-                if let Some(l) = locals {
-                    if i < l.len() {
-                        return false; // function/variable slots are unsigned
-                    }
-                }
-                i < self.flat.signals.len() && self.flat.signals[i].signed
-            }
-            Expr::Bin { op, l, r } => {
-                // Shifts/rotates preserve the operand's signedness (the amount
-                // is just a count).
-                if matches!(
-                    op,
-                    BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
-                ) {
-                    self.expr_signed(l, locals)
-                } else {
-                    self.expr_signed(l, locals) && self.expr_signed(r, locals)
-                }
-            }
-            Expr::Un { e, .. } => self.expr_signed(e, locals),
-            Expr::Resize { e, signed, .. } => *signed || self.expr_signed(e, locals),
-            Expr::Signed(_) => true,
-            _ => false,
-        }
-    }
-
     fn expr_width(&self, e: &Expr, locals: Option<&Vec<Value>>) -> usize {
         match e {
             Expr::Lit(v) => v.width(),
@@ -3260,63 +3391,6 @@ impl Simulator {
     }
 
     // ---- expression evaluation -----------------------------------------------------------
-
-    /// Whether an expression is real-typed (Verilog/VHDL `real`).
-    fn expr_real(&self, e: &Expr, locals: Option<&Vec<Value>>) -> bool {
-        match e {
-            Expr::Real(_) => true,
-            Expr::Sig(s) => {
-                let i = *s as usize;
-                if let Some(l) = locals {
-                    if i < l.len() {
-                        return false; // function/variable slots are not real
-                    }
-                }
-                i < self.flat.signals.len() && self.flat.signals[i].kind == SigKind::Real
-            }
-            // Record-field select on a real-typed field (`r.re`): decode the
-            // slice as IEEE-754 instead of an integer bit pattern. Constant
-            // bounds only — the lowerer emits literals for record fields.
-            Expr::Sel { e, msb, lsb } => {
-                let (Expr::Sig(s), Some(m), Some(l)) = (
-                    &**e,
-                    self.const_bound(msb, locals),
-                    self.const_bound(lsb, locals),
-                ) else {
-                    return false;
-                };
-                let i = *s as usize;
-                if let Some(lc) = locals {
-                    if i < lc.len() {
-                        return false;
-                    }
-                }
-                self.flat
-                    .signals
-                    .get(i)
-                    .map(|s| s.real_ranges.iter().any(|&(lo, hi)| lo == l && hi == m))
-                    .unwrap_or(false)
-            }
-            // Only arithmetic propagates realness; comparisons/logical ops
-            // yield 1-bit results even on real operands.
-            Expr::Bin {
-                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
-                l,
-                r,
-            } => self.expr_real(l, locals) || self.expr_real(r, locals),
-            Expr::Bin { .. } => false,
-            Expr::Un {
-                op: UnOp::Neg | UnOp::Pos | UnOp::Abs,
-                e,
-            } => self.expr_real(e, locals),
-            Expr::Un { .. } => false,
-            Expr::Resize { e, .. } | Expr::Signed(e) => self.expr_real(e, locals),
-            Expr::Cond { c, t, e } => {
-                self.expr_real(c, locals) || self.expr_real(t, locals) || self.expr_real(e, locals)
-            }
-            _ => false,
-        }
-    }
 
     /// Convert an assigned value to the target signal's type: integer -> real
     /// (value becomes f64), real -> integer (round to nearest, per Verilog).
@@ -3423,8 +3497,9 @@ impl Simulator {
                 // Real-typed expression: IEEE-754 arithmetic on f64 operands.
                 // A value-level marker covers function frames, whose slots
                 // have no type metadata (`expr_real` cannot see a real
-                // formal/variable behind a slot id).
-                if self.expr_real(l, locals) || self.expr_real(r, locals) || lv.real || rv.real {
+                // formal/variable behind a slot id) — test it before the
+                // (memoized) subtree walks.
+                if lv.real || rv.real || self.expr_real(l, locals) || self.expr_real(r, locals) {
                     return self.eval_bin_real(*op, l, r, &lv, &rv, locals);
                 }
                 // VHDL signed operands: sign-extend both to the wider width
@@ -4314,12 +4389,15 @@ impl Simulator {
         self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         // Functions with delays are not supported — execute recursively.
         let saved_fn = self.cur_fn.replace(Some(fi));
+        // The body is `flat`-owned (executed by reference): memoizable.
+        let saved_memo = self.expr_memo.replace(true);
         let mut runner = FnRunner {
             sim: self,
             locals: &mut lvals,
             returned: false,
         };
         runner.exec(&f.body);
+        self.expr_memo.set(saved_memo);
         let r = lvals[0].clone();
         self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
@@ -4339,6 +4417,9 @@ impl Simulator {
         caller: Option<&mut Vec<Value>>,
     ) {
         let f = self.flat.functions[fi].clone();
+        // Procedure bodies are per-call clones — their node addresses churn,
+        // so type-flag memoization must stay off here even when a function
+        // body called us (see sim/type_flags.rs).
         // Same recursion guard as `run_func` (shared `fn_depth`, so function
         // ↔ procedure call chains count together). Procedure calls from a
         // process count toward the same runaway-call budget.
@@ -4376,12 +4457,14 @@ impl Simulator {
         });
         self.fold_dyn_locals(&f.dyn_locals, &mut lvals);
         let saved_fn = self.cur_fn.replace(Some(fi));
+        let saved_memo = self.expr_memo.replace(false);
         let mut runner = ProcRunner {
             sim: self,
             locals: &mut lvals,
             returned: false,
         };
         runner.exec(&f.body);
+        self.expr_memo.set(saved_memo);
         self.cur_fn.set(saved_fn);
         self.fn_depth.set(d - 1);
         self.fn_stack.borrow_mut().pop();
@@ -4819,6 +4902,8 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Break => Control::Break,
             Stmt::Continue => Control::Continue,
+            Stmt::ProcContAssign { lhs, rhs } => self.exec_proc_cont_assign(lhs, rhs),
+            Stmt::Deassign { lhs } => self.exec_proc_deassign(lhs),
             Stmt::Delay { .. } | Stmt::Wait { .. } | Stmt::WaitUntil { .. } => {
                 // The body runs inline inside one `sys_call`, so a suspend
                 // cannot return to the caller with its position saved. Warn
@@ -4837,6 +4922,45 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Null => Control::Done,
         }
+    }
+
+    /// Procedural continuous assignment in a procedure body: register it only
+    /// when its expressions do not reference the procedure's frame slots —
+    /// those die with the call, and the fixpoint would read wrong values
+    /// afterwards. The one-shot write happens either way.
+    fn exec_proc_cont_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Control {
+        let v = self.sim.eval_expr(rhs, Some(self.locals));
+        let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+        self.sim.assign_to(lhs, v, Some(self.locals));
+        let mut reads: Vec<SigId> = Vec::new();
+        lhs.collect_sigs(&mut reads);
+        rhs.collect_sigs(&mut reads);
+        let uses_locals = reads.iter().any(|s| (*s as usize) < self.locals.len());
+        match lhs_sig(lhs) {
+            Some(sig) if !uses_locals => {
+                self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+                self.sim.proc_assigns.push((sig, lhs.clone(), rhs.clone()));
+            }
+            _ => self.sim.emit(SimEvent::Message {
+                scope: self.sim.cur_scope(),
+                text: format!(
+                    "warning: procedural continuous assignment inside a procedure is only driven while it references module signals at t={}\n",
+                    self.sim.time
+                ),
+                time_fs: self.sim.time,
+                span: self.sim.cur_span,
+                severity: Some(MessageSeverity::Warning),
+            }),
+        }
+        Control::Done
+    }
+
+    /// `deassign` inside a procedure body: drop the target's registration.
+    fn exec_proc_deassign(&mut self, lhs: &Expr) -> Control {
+        if let Some(sig) = lhs_sig(lhs) {
+            self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+        }
+        Control::Done
     }
 
     /// Assign `v` to `lhs` in a procedure body: frame-slot writes for

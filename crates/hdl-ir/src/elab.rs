@@ -483,6 +483,18 @@ impl Flat {
         id
     }
 
+    /// Instance path of a process: the enclosing module's instance prefix and
+    /// the process's generate-block path (`lane_gen(0)`), dot-joined; either
+    /// part may be empty.
+    fn proc_scope(prefix: &str, gen_scope: &str) -> String {
+        match (prefix.is_empty(), gen_scope.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => gen_scope.to_string(),
+            (false, true) => prefix.to_string(),
+            (false, false) => format!("{prefix}.{gen_scope}"),
+        }
+    }
+
     fn new_sig(
         &mut self,
         name: String,
@@ -658,7 +670,7 @@ impl Flat {
                 sens,
                 body,
                 origin: p.origin.clone(),
-                scope: prefix.to_string(),
+                scope: Self::proc_scope(prefix, &p.gen_scope),
                 initial: p.initial,
             });
         }
@@ -732,14 +744,17 @@ impl Flat {
                     }
                 }
             }
-            let child_conns: Vec<Conn> = inst
-                .conns
-                .iter()
-                .map(|c| match c {
-                    Conn::Named(n, e) => Conn::Named(n.clone(), remap_expr(e, &map)),
-                    Conn::Positional(e) => Conn::Positional(remap_expr(e, &map)),
-                })
-                .collect();
+            let child_conns: Vec<Conn> = self
+                .resolve_conns(
+                    design,
+                    child_id,
+                    &inst.conns,
+                    &map,
+                    m,
+                    &child_prefix,
+                    &where_,
+                )
+                .map_err(ElabError::Message)?;
             self.instantiate(
                 design,
                 child_id,
@@ -753,6 +768,108 @@ impl Flat {
 
         Ok(map)
     }
+
+    /// Expand `.name` shorthand and `.*` wildcards in an instance's port
+    /// connections against the parent's visible signals (SV LRM 23.3.2.4):
+    /// explicit connections win, everything else binds to the same-named
+    /// signal — an unmatched port is an error.
+    // One signature listing the expansion inputs; a params struct would just
+    // relocate the same fields (same rationale as `instantiate` above).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_conns(
+        &mut self,
+        design: &Design,
+        child_id: usize,
+        conns: &[Conn],
+        map: &[FlatSigId],
+        parent: &ModuleIr,
+        child_prefix: &str,
+        where_: &str,
+    ) -> Result<Vec<Conn>, String> {
+        let has = |c: &Conn| matches!(c, Conn::ByName(_) | Conn::Wildcard);
+        if !conns.iter().any(has) {
+            return Ok(conns
+                .iter()
+                .map(|c| match c {
+                    Conn::Named(n, e) => Conn::Named(n.clone(), remap_expr(e, map)),
+                    Conn::Positional(e) => Conn::Positional(remap_expr(e, map)),
+                    // Excluded by the `any` guard above; pass through unchanged.
+                    Conn::ByName(_) | Conn::Wildcard => c.clone(),
+                })
+                .collect());
+        }
+        // Parent in-scope signal names → flat ids (the parent's own ports
+        // alias their incoming nets, so they are in scope too).
+        let by_name: HashMap<&str, FlatSigId> = parent
+            .signals
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.as_str(), map[i]))
+            .collect();
+        let child = &design.modules[child_id];
+        let mut out: Vec<Conn> = Vec::new();
+        for c in conns {
+            match c {
+                Conn::ByName(n) => out.push(shorthand_conn(n, &by_name, where_)?),
+                Conn::Wildcard => {
+                    push_wildcard_conns(child, conns, &by_name, child_prefix, where_, &mut out)?
+                }
+                Conn::Named(n, e) => out.push(Conn::Named(n.clone(), remap_expr(e, map))),
+                Conn::Positional(e) => out.push(Conn::Positional(remap_expr(e, map))),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `.name` shorthand → a Named conn to the same-named parent signal.
+fn shorthand_conn(
+    n: &str,
+    by_name: &HashMap<&str, FlatSigId>,
+    where_: &str,
+) -> Result<Conn, String> {
+    let id = by_name.get(n).ok_or_else(|| {
+        format!("{where_}: shorthand connection '.{n}' has no signal named '{n}'")
+    })?;
+    Ok(Conn::Named(n.to_string(), Expr::Sig(*id)))
+}
+
+/// `.*` → a Named conn for every port not already connected (explicitly by
+/// name, or positionally); a port with no same-named signal in scope is an
+/// error (SV LRM 23.3.2.4: "it shall be an error" without a matching name).
+fn push_wildcard_conns(
+    child: &ModuleIr,
+    conns: &[Conn],
+    by_name: &HashMap<&str, FlatSigId>,
+    child_prefix: &str,
+    where_: &str,
+    out: &mut Vec<Conn>,
+) -> Result<(), String> {
+    let explicit: std::collections::HashSet<&str> = conns
+        .iter()
+        .filter_map(|c| match c {
+            Conn::Named(n, _) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    let positional = conns
+        .iter()
+        .filter(|c| matches!(c, Conn::Positional(_)))
+        .count();
+    for (pi, port) in child.ports.iter().enumerate() {
+        if pi < positional || explicit.contains(port.name.as_str()) {
+            continue;
+        }
+        let id = by_name.get(port.name.as_str()).ok_or_else(|| {
+            format!(
+                "{where_}: wildcard connection '.*' on '{child_prefix}': \
+                 port '{}' has no matching signal in scope",
+                port.name
+            )
+        })?;
+        out.push(Conn::Named(port.name.clone(), Expr::Sig(*id)));
+    }
+    Ok(())
 }
 
 /// Apply a configuration's block bindings to an instance list: `for label :
@@ -786,11 +903,16 @@ fn apply_config_blocks(cfg: &crate::vhdl_lower::ConfigIr, instances: &[InstIr]) 
             continue; // after the named blocks
         }
         for (i, inst) in out.iter_mut().enumerate() {
+            // A generate-unrolled instance's name carries its generate path
+            // (`lane_gen(0).u_lane`); a block spec's label matches the full
+            // name or the bare instance label.
+            let bare = inst.name.rsplit('.').next().unwrap_or(&inst.name);
             let hit = if blk.all {
                 true
             } else {
                 !blk.path.is_empty()
-                    && blk.path[0].eq_ignore_ascii_case(&inst.name)
+                    && (blk.path[0].eq_ignore_ascii_case(&inst.name)
+                        || blk.path[0].eq_ignore_ascii_case(bare))
                     && (blk.path.len() == 1 || blk.path[1].eq_ignore_ascii_case(&inst.module))
             };
             if hit {
@@ -832,6 +954,9 @@ fn conn_for<'a>(conns: &'a [Conn], ports: &[PortIr], i: usize) -> Option<&'a Exp
                 }
                 positional += 1;
             }
+            // Shorthand/wildcard conns are expanded to Named before the child
+            // is instantiated; treat any leftover as unconnected.
+            Conn::ByName(_) | Conn::Wildcard => {}
         }
     }
     None
@@ -948,6 +1073,13 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             lhs: remap_expr(lhs, map),
             rhs: remap_expr(rhs, map),
             nba: *nba,
+        },
+        Stmt::ProcContAssign { lhs, rhs } => Stmt::ProcContAssign {
+            lhs: remap_expr(lhs, map),
+            rhs: remap_expr(rhs, map),
+        },
+        Stmt::Deassign { lhs } => Stmt::Deassign {
+            lhs: remap_expr(lhs, map),
         },
         Stmt::AssignDelayed { lhs, rhs, delay } => Stmt::AssignDelayed {
             lhs: remap_expr(lhs, map),

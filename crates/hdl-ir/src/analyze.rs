@@ -103,6 +103,12 @@ fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) 
             lhs_roots(lhs, driven);
             read(rhs, reads);
         }
+        Stmt::ProcContAssign { lhs, rhs } => {
+            lhs_roots(lhs, driven);
+            read(rhs, reads);
+        }
+        // `deassign` stops driving the target; it neither reads nor drives.
+        Stmt::Deassign { .. } => {}
         Stmt::AssignDelayed { lhs, rhs, delay } => {
             lhs_roots(lhs, driven);
             read(rhs, reads);
@@ -176,9 +182,12 @@ fn analyze_module(m: &ModuleIr) -> Vec<Finding> {
     }
     for inst in &m.instances {
         for c in &inst.conns {
+            // Shorthand/wildcard conns carry no expression here: they resolve
+            // against the parent scope at elaboration time.
             let e = match c {
                 Conn::Named(_, e) => e,
                 Conn::Positional(e) => e,
+                Conn::ByName(_) | Conn::Wildcard => continue,
             };
             read(e, &mut reads);
         }
@@ -287,6 +296,7 @@ mod tests {
                     nba: false,
                 },
                 origin: "always @(posedge clk)".to_string(),
+                gen_scope: String::new(),
                 initial: false,
             }],
             functions: vec![],

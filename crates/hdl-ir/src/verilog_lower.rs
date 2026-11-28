@@ -92,6 +92,7 @@ pub fn lower_file_with_time_scoped(
         class_mems: HashMap::new(),
         cur_class: None,
         inst_conns: HashMap::new(),
+        gen_path: Vec::new(),
     };
     // Classes first (modules may reference them), then packages, then modules.
     let children = real_children(root);
@@ -237,6 +238,8 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::DoWhile
             | SyntaxKind::BreakStmt
             | SyntaxKind::ContinueStmt
+            | SyntaxKind::DeassignStmt
+            | SyntaxKind::Assign
             | SyntaxKind::SysCall
             | SyntaxKind::SvaStmt
             | SyntaxKind::Foreach
@@ -280,6 +283,12 @@ struct Lower<'a> {
     /// Current module's instances: instance name → port connections, for
     /// hierarchical reads `inst.port`.
     inst_conns: HashMap<String, Vec<Conn>>,
+    /// Generate blocks currently being unrolled, innermost last: one element
+    /// per enclosing for-generate, `label[index]` (genvar-name fallback when
+    /// the block is unlabeled). Processes and instances lowered inside get it
+    /// as an instance-path suffix, so two unrolled lanes are distinguishable
+    /// in the transcript and in signal names.
+    gen_path: Vec<String>,
 }
 
 /// A user-defined type (typedef, enum, struct, class).
@@ -1324,6 +1333,7 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin: format!("assert property {}", self.text(prop_node)),
+            gen_scope: self.gen_path.join("."),
             initial: false,
         });
     }
@@ -1489,6 +1499,7 @@ impl<'a> Lower<'a> {
                                         shapes: Vec::new(),
                                     },
                                     origin: format!("{} = new(...)", name),
+                                    gen_scope: self.gen_path.join("."),
                                     initial: true,
                                 });
                             }
@@ -1643,6 +1654,7 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin,
+            gen_scope: self.gen_path.join("."),
             initial: false,
         });
     }
@@ -2314,6 +2326,43 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::BreakStmt => Stmt::Break,
             SyntaxKind::ContinueStmt => Stmt::Continue,
+            // Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2).
+            // Module-level continuous assigns reach the module-item path, not
+            // this statement lowering.
+            SyntaxKind::Assign => {
+                let kids = real_children(s);
+                let eq = kids
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+                match eq {
+                    Some(eq) => {
+                        let lhs = kids[..eq].iter().find(|k| is_expr_node(k.kind()));
+                        let rhs = kids[eq + 1..].iter().find(|k| is_expr_node(k.kind()));
+                        match (lhs, rhs) {
+                            (Some(l), Some(r)) => Stmt::ProcContAssign {
+                                lhs: self.lower_expr(l, env),
+                                rhs: self.lower_expr(r, env),
+                            },
+                            _ => {
+                                self.err(s.span(), "malformed procedural continuous assign");
+                                Stmt::Null
+                            }
+                        }
+                    }
+                    None => {
+                        self.err(s.span(), "assign without `=`");
+                        Stmt::Null
+                    }
+                }
+            }
+            SyntaxKind::DeassignStmt => {
+                let lhs = real_children(s)
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|l| self.lower_expr(l, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(1)));
+                Stmt::Deassign { lhs }
+            }
             SyntaxKind::SysCall => {
                 let kids = real_children(s);
                 let name = kids
@@ -2484,6 +2533,27 @@ impl<'a> Lower<'a> {
             self.err(g.span(), "generate for: init value not constant");
             return;
         };
+        // Block label `begin : lane_gen` when the body names one; the genvar
+        // names the scope otherwise. It prefixes instance labels and process
+        // scopes inside (`lane_gen[0].u_lane`), so parallel lanes are
+        // distinguishable in the transcript and in signal names.
+        let gen_label = match &body {
+            Some(b) if matches!(b.kind(), SyntaxKind::Block | SyntaxKind::GenBlock) => {
+                real_children(b)
+                    .iter()
+                    .find(|k| k.kind() == SyntaxKind::Name)
+                    .map(|k| self.text(k).to_string())
+                    .filter(|l| !l.is_empty())
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| {
+            if var.is_empty() {
+                "gen".to_string()
+            } else {
+                var.clone()
+            }
+        });
         let step = &assigns[1];
         let body_node = body.expect("body.is_none() returned early above").clone();
         let mut iter = 0u32;
@@ -2542,6 +2612,7 @@ impl<'a> Lower<'a> {
             if !go {
                 break;
             }
+            self.gen_path.push(format!("{gen_label}[{i}]"));
             match body_node.kind() {
                 SyntaxKind::Block | SyntaxKind::GenBlock => {
                     for k in real_children(&body_node) {
@@ -2557,6 +2628,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => self.lower_module_item(module, &body_node, &env2),
             }
+            self.gen_path.pop();
             match &step_expr {
                 Some(Expr::Bin { op, l, r }) => {
                     let lv = const_eval(l, &env2).and_then(|v| v.to_u64());
@@ -2785,6 +2857,9 @@ impl<'a> Lower<'a> {
             return;
         }
         self.inst_conns.insert(inst_name.clone(), conns.clone());
+        if !self.gen_path.is_empty() {
+            inst_name = format!("{}.{}", self.gen_path.join("."), inst_name);
+        }
         module.instances.push(InstIr {
             module: module_name,
             name: inst_name,
@@ -2816,6 +2891,13 @@ impl<'a> Lower<'a> {
 
     fn lower_conn(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Conn {
         let kids = real_children(c);
+        // `.*` — the wildcard marker is the lone `*` punct child.
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "*")
+        {
+            return Conn::Wildcard;
+        }
         // First Name child = port name; first expr node after it = connection.
         let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
         let name = name_pos.map(|i| self.text(&kids[i]));
@@ -2827,7 +2909,8 @@ impl<'a> Lower<'a> {
         match (name, expr) {
             (Some(n), Some(e)) => Conn::Named(n, e),
             (None, Some(e)) => Conn::Positional(e),
-            (Some(n), None) => Conn::Named(n, Expr::Lit(Value::x(1))),
+            // `.name` shorthand: bind to the same-named signal in scope.
+            (Some(n), None) => Conn::ByName(n),
             (None, None) => Conn::Positional(Expr::Lit(Value::x(1))),
         }
     }

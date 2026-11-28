@@ -9,15 +9,6 @@ use hdl_ir::value::Value;
 use hdl_ir::{BinOp, Expr};
 
 impl Simulator {
-    /// Constant bound of a select (record-field bounds are literals from the
-    /// lowerer); dynamic bounds conservatively report None.
-    pub(super) fn const_bound(&self, e: &Expr, locals: Option<&Vec<Value>>) -> Option<u32> {
-        if matches!(e, Expr::Lit(_)) {
-            return self.eval_expr(e, locals).to_u64().map(|v| v as u32);
-        }
-        None
-    }
-
     /// One operand of a real-typed binop as f64: real operands decode their
     /// bit pattern, integer operands convert their integer value.
     fn operand_f64(&self, e: &Expr, v: &Value, locals: Option<&Vec<Value>>) -> Option<f64> {

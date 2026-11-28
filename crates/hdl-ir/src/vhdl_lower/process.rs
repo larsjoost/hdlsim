@@ -112,6 +112,7 @@ impl<'a> Lower<'a> {
             sens,
             body,
             origin,
+            gen_scope: self.gen_path.join("."),
             // VHDL processes execute once at t=0 (LRM 11.3), unlike a
             // Verilog `always @(...)` which waits for the first event.
             initial: true,
@@ -212,6 +213,7 @@ impl<'a> Lower<'a> {
             ),
             body,
             origin: format!("concurrent assert #{idx}"),
+            gen_scope: self.gen_path.join("."),
             initial: true,
         }
     }
@@ -369,6 +371,7 @@ impl<'a> Lower<'a> {
                     sens: Sens::List(Vec::new()),
                     body,
                     origin: format!("concurrent assign #{}", idx),
+                    gen_scope: self.gen_path.join("."),
                     initial: false,
                 }));
             }
@@ -397,6 +400,7 @@ impl<'a> Lower<'a> {
                 sens: Sens::List(Vec::new()),
                 body,
                 origin: format!("concurrent assign #{}", idx),
+                gen_scope: self.gen_path.join("."),
                 initial: false,
             }));
         }

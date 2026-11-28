@@ -172,6 +172,12 @@ pub struct ProcessIr {
     pub body: Stmt,
     /// Human-readable origin for debug/wave display, e.g. "always @(posedge clk)".
     pub origin: String,
+    /// Instance-path suffix of the enclosing generate blocks (`lane_gen(0)`,
+    /// dotted when nested; VHDL parentheses, Verilog brackets; empty outside
+    /// generates). The elaborator appends it to the module's instance prefix
+    /// to build `FlatProc::scope`, so the transcript can attribute a report
+    /// to the exact unrolled instance.
+    pub gen_scope: String,
     /// Run once at t=0 before waiting on `sens`. VHDL processes always do;
     /// Verilog `always @(...)` blocks do not.
     pub initial: bool,
@@ -299,6 +305,13 @@ pub struct InstIr {
 pub enum Conn {
     Named(String, Expr),
     Positional(Expr),
+    /// `.name` shorthand: bind this port to the same-named signal in the
+    /// enclosing scope (resolved during elaboration).
+    ByName(String),
+    /// `.*`: bind every port not otherwise connected to the same-named signal
+    /// in the enclosing scope (SV LRM 23.3.2.4; resolved during elaboration,
+    /// error on a port with no matching signal).
+    Wildcard,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -374,6 +387,17 @@ pub enum Stmt {
     /// function body (unlike a plain assign to the function-name slot, which
     /// falls through).
     Return(Box<Expr>),
+    /// Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2):
+    /// drives `lhs` continuously from here on, until a `deassign lhs;`.
+    ProcContAssign {
+        lhs: Expr,
+        rhs: Expr,
+    },
+    /// `deassign lhs;` — stop the procedural continuous assignment on `lhs`;
+    /// it keeps the value it held (LRM 9.2.2).
+    Deassign {
+        lhs: Expr,
+    },
     /// `break;` — exit the innermost loop.
     Break,
     /// `continue;` — jump to the innermost loop's step/next iteration.
@@ -559,6 +583,11 @@ impl Stmt {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
             }
+            Stmt::ProcContAssign { lhs, rhs } => {
+                lhs.collect_sigs(out);
+                rhs.collect_sigs(out);
+            }
+            Stmt::Deassign { lhs } => lhs.collect_sigs(out),
             Stmt::AssignDelayed { lhs, rhs, delay } => {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
