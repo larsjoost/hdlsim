@@ -27,6 +27,18 @@ impl<'a> Lower<'a> {
             TypeKind::Struct(f) => f.clone(),
             _ => return None,
         };
+        let (named, positional, default) = self.scan_pattern(pat, env);
+        Some(pattern_concat(fields, named, positional, default))
+    }
+
+    /// Split the `'{...}` items into named `field: expr` pairs (a
+    /// `default:` key is pulled out separately), positional expressions,
+    /// and the `default` expression.
+    fn scan_pattern(
+        &mut self,
+        pat: &SyntaxNode,
+        env: &HashMap<String, Value>,
+    ) -> (Vec<(String, Expr)>, Vec<Expr>, Option<Expr>) {
         let kids = real_children(pat);
         let mut named: Vec<(String, Expr)> = Vec::new();
         let mut positional: Vec<Expr> = Vec::new();
@@ -52,28 +64,40 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
         }
-        let mut ordered = fields.clone();
-        ordered.sort_by_key(|f| std::cmp::Reverse(f.2)); // descending lsb → msb first
-        let mut pos = 0;
-        let mut parts: Vec<Expr> = Vec::new();
-        for (n, w, _) in &ordered {
-            let e = named
-                .iter()
-                .find(|(fn_, _)| fn_ == n)
-                .map(|(_, e)| e.clone())
-                .or_else(|| {
-                    if pos < positional.len() {
-                        let e = positional[pos].clone();
-                        pos += 1;
-                        Some(e)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| default.clone())
-                .unwrap_or_else(|| Expr::Lit(Value::x(*w)));
-            parts.push(e);
-        }
-        Some(Expr::Concat(parts))
+        (named, positional, default)
     }
+}
+
+/// Order the struct fields descending lsb → msb and build the concat
+/// parts: a named match first, else the next positional expression, else
+/// `default`, else all-x at the field width.
+fn pattern_concat(
+    fields: Vec<(String, usize, usize)>,
+    named: Vec<(String, Expr)>,
+    positional: Vec<Expr>,
+    default: Option<Expr>,
+) -> Expr {
+    let mut ordered = fields.clone();
+    ordered.sort_by_key(|f| std::cmp::Reverse(f.2)); // descending lsb → msb first
+    let mut pos = 0;
+    let mut parts: Vec<Expr> = Vec::new();
+    for (n, w, _) in &ordered {
+        let e = named
+            .iter()
+            .find(|(fn_, _)| fn_ == n)
+            .map(|(_, e)| e.clone())
+            .or_else(|| {
+                if pos < positional.len() {
+                    let e = positional[pos].clone();
+                    pos += 1;
+                    Some(e)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| default.clone())
+            .unwrap_or_else(|| Expr::Lit(Value::x(*w)));
+        parts.push(e);
+    }
+    Expr::Concat(parts)
 }
