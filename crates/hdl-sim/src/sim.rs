@@ -28,6 +28,7 @@ mod observe;
 mod probe;
 mod proc_copyback;
 mod progress;
+mod real_eval;
 mod sens;
 mod type_flags;
 mod value_util;
@@ -3241,57 +3242,6 @@ impl Simulator {
     }
 
     // ---- expression evaluation -----------------------------------------------------------
-
-    /// One operand of a real-typed binop as f64: real operands decode their
-    /// bit pattern, integer operands convert their integer value.
-    fn operand_f64(&self, e: &Expr, v: &Value, locals: Option<&Vec<Value>>) -> Option<f64> {
-        if self.expr_real(e, locals) || v.real {
-            v.to_f64()
-        } else {
-            v.to_u64().map(|n| n as f64)
-        }
-    }
-
-    /// IEEE-754 arithmetic/comparison for real-typed binops.
-    fn eval_bin_real(
-        &self,
-        op: BinOp,
-        l: &Expr,
-        r: &Expr,
-        lv: &Value,
-        rv: &Value,
-        locals: Option<&Vec<Value>>,
-    ) -> Value {
-        let a = self.operand_f64(l, lv, locals);
-        let b = self.operand_f64(r, rv, locals);
-        match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => match (a, b) {
-                (Some(x), Some(y)) => Value::from_f64(match op {
-                    BinOp::Add => x + y,
-                    BinOp::Sub => x - y,
-                    BinOp::Mul => x * y,
-                    BinOp::Div => x / y,
-                    _ => x % y,
-                }),
-                _ => Value::x(64),
-            },
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => match (a, b) {
-                (Some(x), Some(y)) => Value::from_u64(
-                    1,
-                    match op {
-                        BinOp::Lt => x < y,
-                        BinOp::Le => x <= y,
-                        BinOp::Gt => x > y,
-                        BinOp::Ge => x >= y,
-                        BinOp::Eq => x == y,
-                        _ => x != y,
-                    } as u64,
-                ),
-                _ => Value::x(1),
-            },
-            _ => Value::x(64), // bitwise/shift ops on reals: undefined
-        }
-    }
 
     /// Convert an assigned value to the target signal's type: integer -> real
     /// (value becomes f64), real -> integer (round to nearest, per Verilog).

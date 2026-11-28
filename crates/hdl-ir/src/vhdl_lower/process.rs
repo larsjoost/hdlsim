@@ -13,6 +13,9 @@ impl<'a> Lower<'a> {
         let mut sens = Sens::List(Vec::new());
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
         let mut local_fns: Vec<SyntaxNode> = Vec::new();
+        // Names this process's variable declarations bind, with their
+        // previous meanings — restored after the body below.
+        let mut bound_vars: Vec<(String, Option<SigId>)> = Vec::new();
         for k in &kids {
             match k.kind() {
                 SyntaxKind::SensList => {
@@ -34,7 +37,7 @@ impl<'a> Lower<'a> {
                     // Process-local declarations.
                     match k.kind() {
                         SyntaxKind::VariableDecl => {
-                            self.lower_process_var(module, k, idx);
+                            self.lower_process_var(module, k, idx, &mut bound_vars);
                         }
                         SyntaxKind::ConstantDecl => {
                             self.lower_constant_decl(k);
@@ -70,6 +73,19 @@ impl<'a> Lower<'a> {
         } else {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
         };
+        // Un-bind this process's variables (reverse order undoes shadowing
+        // within the process too): later processes and the architecture
+        // must resolve those names to their own declarations again.
+        for (n, prev) in bound_vars.iter().rev() {
+            match prev {
+                Some(id) => {
+                    self.names.insert(n.clone(), *id);
+                }
+                None => {
+                    self.names.remove(n);
+                }
+            }
+        }
         for sig in self.extra_signals.drain(..) {
             module.signals.push(sig);
         }
@@ -100,102 +116,6 @@ impl<'a> Lower<'a> {
             // VHDL processes execute once at t=0 (LRM 11.3), unlike a
             // Verilog `always @(...)` which waits for the first event.
             initial: true,
-        }
-    }
-
-    /// A process-local variable becomes a (hidden) signal — VHDL variables
-    /// keep their value between activations, exactly like a signal.
-    pub(super) fn lower_process_var(
-        &mut self,
-        module: &mut ModuleIr,
-        d: &SyntaxNode,
-        proc_idx: usize,
-    ) {
-        let kids = real_children(d);
-        let colon = kids
-            .iter()
-            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == ":");
-        let Some(colon) = colon else { return };
-        let names: Vec<String> = kids[..colon]
-            .iter()
-            .filter(|k| k.kind() == SyntaxKind::Name)
-            .map(|k| self.text(k))
-            .collect();
-        let type_mark = kids[colon + 1..]
-            .iter()
-            .find(|k| k.kind() == SyntaxKind::Name);
-        let constraint = kids[colon + 1..]
-            .iter()
-            .find(|k| k.kind() == SyntaxKind::Range);
-        // The initializer follows `:=` and may be a bare name (constant or
-        // parameterless call) — see `lower_signal_decl`.
-        let init = kids[colon + 1..]
-            .iter()
-            .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=")
-            .and_then(|e| {
-                kids[colon + 1 + e + 1..]
-                    .iter()
-                    .find(|k| is_expr_node(k.kind()))
-                    .cloned()
-            });
-        let span = d.span();
-        let type_name = type_mark.map(|tm| self.text(tm).to_ascii_lowercase());
-        let (width, signed, _, real) = match type_mark {
-            Some(tm) => self.resolve_type(tm, constraint, span),
-            None => (32, false, None, false),
-        };
-        let init_v = init.and_then(|e| {
-            // A string target's `(others => ' ')` replicate must cover the
-            // whole object; without the target context it baked a fixed
-            // 32-bit count (see `agg_target_w`).
-            let saved_w = self.agg_target_w;
-            if e.kind() == SyntaxKind::Aggregate
-                && type_mark.is_some_and(|tm| self.string_typed(tm))
-            {
-                self.agg_target_w = Some(width);
-            }
-            let ex = self.lower_expr(&e, &self.consts.clone());
-            self.agg_target_w = saved_w;
-            self.ce(&ex)
-        });
-        for n in &names {
-            let id = module.signals.len() as SigId;
-            module.signals.push(SignalIr {
-                name: format!("__p{}_var_{}", proc_idx, n),
-                width,
-                kind: if real { SigKind::Real } else { SigKind::Wire },
-                init: init_v.clone(),
-                mem: None,
-                signed,
-            });
-            self.sig_signed.insert(id, signed);
-            self.sig_width.insert(id, width);
-            self.record_obj_shape(id, type_mark, constraint);
-            if let Some(tn) = &type_name {
-                if let Some(rn) = self.as_record(tn) {
-                    self.sig_rec.insert(id, rn.clone());
-                    module
-                        .real_ranges
-                        .insert(n.clone(), self.record_real_ranges(&rn));
-                }
-                if let Some(en) = self.as_elem_record(tn) {
-                    self.sig_elem_rec.insert(id, en);
-                }
-                // Protected-type object local: member selects placeholder.
-                if matches!(self.types.get(tn), Some(TypeInfo::Handle)) {
-                    self.sig_prot.insert(id, tn.clone());
-                }
-                if let Some(TypeInfo::Array { dims, .. }) = self.types.get(tn) {
-                    if !dims.is_empty() {
-                        let dd = match constraint {
-                            Some(c) => self.constraint_dims(c),
-                            None => dims.clone(),
-                        };
-                        self.sig_dims.insert(id, dd);
-                    }
-                }
-            }
-            self.names.insert(n.clone(), id);
         }
     }
 

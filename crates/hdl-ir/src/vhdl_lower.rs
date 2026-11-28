@@ -59,6 +59,7 @@ pub use context::{
 mod arch;
 mod attrs;
 mod chains;
+mod char_lits;
 mod compare;
 mod config;
 mod decls;
@@ -68,6 +69,7 @@ mod expr;
 mod loops;
 mod objects;
 mod package;
+mod proc_vars;
 mod process;
 mod process_sel;
 mod scalar;
