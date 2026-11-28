@@ -118,7 +118,7 @@ impl Command for Check {
             // No simulation follows, so package function bodies need not be
             // copied into each elaboration (O(all bodies) per top otherwise).
             let t0 = std::time::Instant::now();
-            let _ = elab::elaborate_with_opts(&mut design, t, &mut mgr, false);
+            let _ = elab::elaborate_with_opts(&mut design, t, &mut mgr, false, &[]);
             slowest.push((t0.elapsed(), t.clone()));
         }
         slowest.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));

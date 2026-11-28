@@ -23,6 +23,10 @@ struct IrArgs {
     /// architectures).
     #[arg(long)]
     top: Option<String>,
+    /// Override a top-level generic: `-g NAME=VALUE` (same forms as
+    /// `hdlsim run -g`). Repeatable.
+    #[arg(short = 'g', long = "generic", value_name = "NAME=VALUE")]
+    generic: Vec<String>,
     /// Write the JSON here instead of stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -90,7 +94,14 @@ impl Command for Ir {
             }
         };
         let elab_phase = crate::phase::Phase::start("elaborate");
-        let flat = elab::elaborate_with(&mut design, &top, &mut mgr)
+        let mut generics: Vec<(String, String)> = Vec::new();
+        for g in &a.generic {
+            let Some((n, v)) = g.split_once('=') else {
+                return Err(anyhow::anyhow!("bad --generic '{g}' (expected NAME=VALUE)"));
+            };
+            generics.push((n.trim().to_string(), v.trim().to_string()));
+        }
+        let flat = elab::elaborate_with_opts(&mut design, &top, &mut mgr, true, &generics)
             .with_context(|| format!("elaborating '{top}'"))?;
         elab_phase.done(format!(
             "{} signals, {} processes, {} functions",

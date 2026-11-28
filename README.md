@@ -141,6 +141,7 @@ hdlsim check file.v ...                      # parse + lower + resolve, report d
 hdlsim ast file.v                            # dump the reusable CST (s-expression)
 hdlsim run --top tb_counter counter.v tb.v   # simulate; --vcd out.vcd --max-time 1us --seed 42
 hdlsim run --top tb tb.v -L work=rtl         # resolve missing units from libraries
+hdlsim run --top tb tb.v -g WIDTH=32         # override a top-level generic (repeatable; widths/decisions see it)
 hdlsim run --top tb                           # no files: resolve everything from hdlsim.ini libraries
 hdlsim run --top tb tb.v --wave waves.html   # offline interactive wave viewer
 hdlsim run --top tb tb.v --hwf waves.hwf     # compact binary wave format
