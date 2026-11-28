@@ -238,6 +238,8 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::DoWhile
             | SyntaxKind::BreakStmt
             | SyntaxKind::ContinueStmt
+            | SyntaxKind::DeassignStmt
+            | SyntaxKind::Assign
             | SyntaxKind::SysCall
             | SyntaxKind::SvaStmt
             | SyntaxKind::Foreach
@@ -2324,6 +2326,43 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::BreakStmt => Stmt::Break,
             SyntaxKind::ContinueStmt => Stmt::Continue,
+            // Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2).
+            // Module-level continuous assigns reach the module-item path, not
+            // this statement lowering.
+            SyntaxKind::Assign => {
+                let kids = real_children(s);
+                let eq = kids
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+                match eq {
+                    Some(eq) => {
+                        let lhs = kids[..eq].iter().find(|k| is_expr_node(k.kind()));
+                        let rhs = kids[eq + 1..].iter().find(|k| is_expr_node(k.kind()));
+                        match (lhs, rhs) {
+                            (Some(l), Some(r)) => Stmt::ProcContAssign {
+                                lhs: self.lower_expr(l, env),
+                                rhs: self.lower_expr(r, env),
+                            },
+                            _ => {
+                                self.err(s.span(), "malformed procedural continuous assign");
+                                Stmt::Null
+                            }
+                        }
+                    }
+                    None => {
+                        self.err(s.span(), "assign without `=`");
+                        Stmt::Null
+                    }
+                }
+            }
+            SyntaxKind::DeassignStmt => {
+                let lhs = real_children(s)
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|l| self.lower_expr(l, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(1)));
+                Stmt::Deassign { lhs }
+            }
             SyntaxKind::SysCall => {
                 let kids = real_children(s);
                 let name = kids
@@ -2852,6 +2891,13 @@ impl<'a> Lower<'a> {
 
     fn lower_conn(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Conn {
         let kids = real_children(c);
+        // `.*` — the wildcard marker is the lone `*` punct child.
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "*")
+        {
+            return Conn::Wildcard;
+        }
         // First Name child = port name; first expr node after it = connection.
         let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
         let name = name_pos.map(|i| self.text(&kids[i]));
@@ -2863,7 +2909,8 @@ impl<'a> Lower<'a> {
         match (name, expr) {
             (Some(n), Some(e)) => Conn::Named(n, e),
             (None, Some(e)) => Conn::Positional(e),
-            (Some(n), None) => Conn::Named(n, Expr::Lit(Value::x(1))),
+            // `.name` shorthand: bind to the same-named signal in scope.
+            (Some(n), None) => Conn::ByName(n),
             (None, None) => Conn::Positional(Expr::Lit(Value::x(1))),
         }
     }
