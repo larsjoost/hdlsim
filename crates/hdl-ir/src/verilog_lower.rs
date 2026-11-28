@@ -10,7 +10,7 @@
 //! (args first, then locals) — elaboration must not remap those ids.
 
 use crate::ir::*;
-use crate::value::{BinOp, UnOp, Value, V0, V1, VX, VZ};
+use crate::value::{BinOp, UnOp, Value, V0, V1, VX};
 use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
@@ -18,6 +18,10 @@ use hdl_syntax::source::{FileId, SourceDb, Span};
 use std::collections::{HashMap, HashSet};
 
 mod ce_proc;
+mod literals;
+
+pub use literals::parse_int_literal;
+use literals::{parse_real_literal, time_literal_fs};
 
 /// Lower one parsed file into modules plus diagnostics, with the LRM default
 /// time unit of 1 ns.
@@ -3385,6 +3389,9 @@ impl<'a> Lower<'a> {
             }
             return Expr::Lit(Value { bits, real: false });
         }
+        if let Some(fs) = time_literal_fs(&t) {
+            return self.lower_time_literal(fs);
+        }
         if let Some(f) = parse_real_literal(&t) {
             return Expr::Real(f);
         }
@@ -3395,6 +3402,23 @@ impl<'a> Lower<'a> {
                 Expr::Lit(Value::x(32))
             }
         }
+    }
+
+    /// SV time literal (`1ns`, `#(2*1ns)`, `#(1 ps)`): the literal's absolute
+    /// fs value scaled into the module's time units (SV LRM 5.7.1 scales a
+    /// time literal to the module's timescale; hdlsim keeps only the unit
+    /// scale, so `#1ns` delays one unit and `#(2*1ns)` composes with the
+    /// `#N`-unit delay scaling, and both give the same absolute time).
+    fn lower_time_literal(&mut self, fs: u64) -> Expr {
+        let units = if self.time_unit_fs == 0 {
+            0
+        } else {
+            ((fs as f64) / (self.time_unit_fs as f64)).round() as u64
+        };
+        Expr::Lit(
+            parse_int_literal(&units.to_string())
+                .expect("a u64 unit count always parses as a decimal Verilog literal"),
+        )
     }
 }
 
@@ -3474,102 +3498,6 @@ fn type_kw_width(t: &str) -> Option<usize> {
 
 /// Parse a Verilog integer literal (`42`, `8'hFF`, `'b1010`, `4'd3`) into a
 /// Value with per-bit X/Z for x/z/? digits. Returns None for non-integers.
-/// Parse a Verilog real literal (`1.5`, `1e3`, `.5`, `2.0E-2`). Base-specified
-/// literals (`8'hFF`) and plain integers are not real literals.
-pub fn parse_real_literal(t: &str) -> Option<f64> {
-    let t = t.trim();
-    if t.contains('\'') {
-        return None;
-    }
-    if !(t.contains('.') || t.contains('e') || t.contains('E')) {
-        return None;
-    }
-    let c: String = t.chars().filter(|&c| c != '_').collect();
-    c.parse::<f64>().ok()
-}
-
-pub fn parse_int_literal(t: &str) -> Option<Value> {
-    let t = t.trim();
-    let (size, rest) = match t.find('\'') {
-        Some(q) => {
-            let (sz, r) = t.split_at(q);
-            let size = if sz.is_empty() {
-                None
-            } else {
-                Some(sz.parse::<u64>().ok()?)
-            };
-            (size, &r[1..])
-        }
-        None => (None, t),
-    };
-    let rest = rest.trim_start_matches(['s', 'S']);
-    let (base, digits) = match rest.chars().next()? {
-        'b' | 'B' => (2u32, &rest[1..]),
-        'o' | 'O' => (8, &rest[1..]),
-        'd' | 'D' => (10, &rest[1..]),
-        'h' | 'H' => (16, &rest[1..]),
-        c if c.is_ascii_digit() => (10, rest),
-        _ => return None,
-    };
-    let digits = digits.replace('_', "");
-    if digits.is_empty() {
-        return None;
-    }
-    // Verilog unsized literals (plain decimal or `'b...` without a size) are
-    // at least 32 bits wide; sized literals keep their declared size.
-    let width = size.map(|s| s as usize).unwrap_or(32);
-    if !digits
-        .chars()
-        .any(|c| matches!(c.to_ascii_lowercase(), 'x' | 'z' | '?'))
-    {
-        let v = u128::from_str_radix(&digits, base).ok()?;
-        let mut bits = vec![V0; width.max(1)];
-        for (i, b) in bits.iter_mut().enumerate().take(width.min(128)) {
-            *b = if (v >> i) & 1 == 1 { V1 } else { V0 };
-        }
-        return Some(Value { bits, real: false });
-    }
-    let digit_bits = match base {
-        2 => 1,
-        8 => 3,
-        16 => 4,
-        _ => 1,
-    };
-    let mut bits = vec![VX; width.max(1)];
-    for (i, c) in digits.chars().enumerate() {
-        let from_lsb = (digits.len() - 1 - i) * digit_bits;
-        match c.to_ascii_lowercase() {
-            'x' | '?' => {
-                for j in 0..digit_bits {
-                    let idx = from_lsb + j;
-                    if idx < bits.len() {
-                        bits[idx] = VX;
-                    }
-                }
-            }
-            'z' => {
-                for j in 0..digit_bits {
-                    let idx = from_lsb + j;
-                    if idx < bits.len() {
-                        bits[idx] = VZ;
-                    }
-                }
-            }
-            _ => {
-                if let Some(d) = c.to_digit(base) {
-                    for j in 0..digit_bits {
-                        let idx = from_lsb + j;
-                        if idx < bits.len() {
-                            bits[idx] = if (d >> j) & 1 == 1 { V1 } else { V0 };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Some(Value { bits, real: false })
-}
-
 impl<'a> Lower<'a> {
     /// Const-evaluate with the global function table (package functions) so
     /// param defaults like `cc_pkg::idx_width(Depth)` resolve.
@@ -4555,29 +4483,6 @@ endmodule
         let ptr = m.signals.iter().find(|s| s.name == "ptr").unwrap();
         // W = idx_width(8) = $clog2(8) = 4 with the bits-needed formula.
         assert_eq!(ptr.width, 4);
-    }
-
-    #[test]
-    fn parse_real_literals() {
-        assert_eq!(parse_real_literal("1.5"), Some(1.5));
-        assert_eq!(parse_real_literal("2.0E-2"), Some(0.02));
-        assert_eq!(parse_real_literal("1e3"), Some(1000.0));
-        assert_eq!(parse_real_literal(".5"), Some(0.5));
-        assert_eq!(parse_real_literal("42"), None); // plain integer
-        assert_eq!(parse_real_literal("8'hFF"), None); // based literal
-        assert_eq!(parse_real_literal("8'h1E"), None); // 'E' inside based literal
-        assert_eq!(parse_real_literal("1_000.5"), Some(1000.5));
-    }
-
-    #[test]
-    fn parse_int_literals() {
-        assert_eq!(parse_int_literal("42").unwrap().to_u64(), Some(42));
-        assert_eq!(parse_int_literal("8'hFF").unwrap().to_u64(), Some(255));
-        assert_eq!(parse_int_literal("'b1010").unwrap().to_u64(), Some(10));
-        assert_eq!(parse_int_literal("4'd3").unwrap().to_u64(), Some(3));
-        let x = parse_int_literal("4'b10x1").unwrap();
-        assert_eq!(x.to_u64(), None);
-        assert_eq!(x.bit(1), VX);
     }
 
     #[test]

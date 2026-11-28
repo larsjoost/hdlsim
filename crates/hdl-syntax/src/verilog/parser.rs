@@ -14,8 +14,9 @@
 //! for/if/case and named generate blocks, module and gate-primitive
 //! instantiations, defparam, event declarations and triggers, typedef/enum/
 //! struct/union, if/else, case/casez/casex (incl. `unique`/`priority` and
-//! `inside`), blocking/non-blocking assignments, `#delay`, `@`/wait event
-//! controls, while/repeat/forever/do-while, fork/join, disable, SV immediate
+//! `inside`), blocking/non-blocking assignments, `#delay` (incl. SV time
+//! literals `#1ns`, `#(2*1ns)`), `@`/wait event controls,
+//! while/repeat/forever/do-while, fork/join, disable, SV immediate
 //! assertions, system task calls, concatenation/replication, part-selects,
 //! casts (`signed'(e)`, `8'(e)`), and the full expression operator set via
 //! precedence climbing. Escaped identifiers (`\foo `) are lexed as names.
@@ -26,6 +27,8 @@ use crate::kinds::SyntaxKind;
 use crate::source::{FileId, SourceFile};
 use crate::token::{Token, TokenKind};
 use std::collections::{HashMap, HashSet};
+
+mod sva;
 
 /// Output of parsing one file.
 pub struct ParsedFile {
@@ -148,6 +151,9 @@ fn binop_prec(text: &str) -> Option<(u8, bool)> {
 
 const UNARY_OPS: &[&str] = &["!", "~", "&", "|", "^", "~&", "~|", "~^", "^~", "+", "-"];
 
+/// SV time-literal unit suffixes (`1ns`, `#(2*1us)`, SV LRM 5.7.1).
+const TIME_UNITS: &[&str] = &["fs", "ps", "ns", "us", "ms", "s"];
+
 /// Multi-char operators the lexer split into single Punct tokens.
 const MULTI_OPS: &[&str] = &[
     "<<", ">>", "<<<", ">>>", "<=", ">=", "==", "!=", "===", "!==", "&&", "||", "**", "~&", "~|",
@@ -234,6 +240,15 @@ impl<'a> Parser<'a> {
     fn at_kw(&self, kw: &str) -> bool {
         let t = self.peek();
         t.kind == TokenKind::Ident && self.peek_text() == kw
+    }
+
+    /// SV time-unit identifier directly after the number being parsed (`1`
+    /// `ns`): the lexed shape of a time literal (SV LRM 5.7.1, with or
+    /// without a space). `N unit` is never valid Verilog otherwise, so
+    /// absorbing the unit into the Literal node cannot misparse a legal
+    /// program.
+    fn at_time_unit(&self) -> bool {
+        self.peek2().kind == TokenKind::Ident && TIME_UNITS.contains(&self.peek2_text().as_str())
     }
 
     fn at_punct(&self, c: char) -> bool {
@@ -1146,61 +1161,6 @@ impl<'a> Parser<'a> {
             self.parse_sens_list();
         }
         self.parse_statement();
-        self.builder.finish_node();
-    }
-
-    /// `assert|assume|cover property (@(sens) prop);` module item (SVA-lite).
-    fn parse_sva_property(&mut self, kw: &str) {
-        let kind = match kw {
-            "assert" => SyntaxKind::AssertProperty,
-            "assume" => SyntaxKind::AssumeProperty,
-            _ => SyntaxKind::CoverProperty,
-        };
-        self.builder.start_node(kind);
-        self.bump(); // assert/assume/cover
-        if !self.eat_kw("property") {
-            self.error_here("expected `property`");
-        }
-        if !self.eat_punct('(') {
-            self.error_here("expected `(` after `property`");
-        }
-        if self.eat_punct('@') {
-            self.parse_sens_list();
-        } else {
-            self.error_here("SVA-lite property needs a clocking event, e.g. `@(posedge clk)`");
-        }
-        self.parse_property();
-        self.expect_punct(')', "to close the property");
-        self.expect_punct(';', "to end the property declaration");
-        self.builder.finish_node();
-    }
-
-    /// Property expression: `expr`, `expr |-> expr`, or `expr |=> expr`.
-    /// `|->` / `|=>` lex as the single-char puncts `|`, `-`/`=`, `>`, so the
-    /// antecedent/consequent are parsed one precedence level above `|`.
-    fn parse_property(&mut self) {
-        self.builder.start_node(SyntaxKind::Property);
-        let mark = self.builder.mark();
-        self.parse_unary();
-        self.parse_binops(mark, 7);
-        let imp = if self.at_punct('|') && self.peek2_text() == "-" && self.peek3_text() == ">" {
-            Some("|->")
-        } else if self.at_punct('|') && self.peek2_text() == "=" && self.peek3_text() == ">" {
-            Some("|=>")
-        } else {
-            None
-        };
-        if imp.is_some() {
-            self.bump(); // |
-            self.bump(); // - or =
-            self.bump(); // >
-            let mark2 = self.builder.mark();
-            self.parse_unary();
-            self.parse_binops(mark2, 7);
-        } else {
-            // Plain boolean property: allow the remaining top-level `|`.
-            self.parse_binops(mark, 6);
-        }
         self.builder.finish_node();
     }
 
@@ -2628,8 +2588,17 @@ impl<'a> Parser<'a> {
         }
         match t.kind {
             TokenKind::IntLiteral | TokenKind::RealLiteral | TokenKind::StrLiteral => {
+                // A plain (non-based) number directly followed by a time-unit
+                // identifier is an SV time literal (`1ns`, `#(2*1ns)`,
+                // `#(1 ns)`); the unit token joins the Literal node.
+                let plain_number = t.kind != TokenKind::StrLiteral
+                    && !self.peek_text().contains('\'')
+                    && self.at_time_unit();
                 self.builder.start_node(SyntaxKind::Literal);
                 self.bump();
+                if plain_number {
+                    self.bump();
+                }
                 self.builder.finish_node();
             }
             TokenKind::SysTask => {
@@ -3305,6 +3274,27 @@ endmodule : m
     fn parses_intra_assignment_delay() {
         let sexp = ok("module m(input d, output reg q); always @(d) q <= #100 d; endmodule\n");
         assert!(sexp.contains("(Delay"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_time_literals_in_delays() {
+        // `1ns` (adjacent), `1 ns` (spaced) and `2*1ns` in an expression all
+        // form one Literal node spanning the number and the unit identifier.
+        let sexp = ok(
+            "module m(output reg q); initial begin #1ns q = 1; #(2*1ns) q = 0; #(1 ns) q = 1; end endmodule\n",
+        );
+        assert!(
+            sexp.matches("(Literal IntLiteral \"1\" Ident \"ns\")")
+                .count()
+                == 3,
+            "{}",
+            sexp
+        );
+        // A unit identifier reached through an operator stays a name: the
+        // number and `ns` never join into one Literal node.
+        let sexp = ok("module m; wire [7:0] y = 2 * ns; endmodule\n");
+        assert!(sexp.contains("(BinExpr"), "{}", sexp);
+        assert!(!sexp.contains("Literal IntLiteral \"2\" Ident"), "{}", sexp);
     }
 
     #[test]
