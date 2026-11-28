@@ -294,6 +294,7 @@ mod tests {
                     sens: Sens::All,
                     body,
                     origin: "always".into(),
+                    gen_scope: String::new(),
                     initial: false,
                 }],
                 functions: vec![],
