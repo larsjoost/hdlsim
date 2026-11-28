@@ -117,7 +117,20 @@ impl Simulator {
     fn edge_iff_true(&self, iff: &Option<Expr>) -> bool {
         match iff {
             None => true,
-            Some(c) => truthy(&self.eval_expr(c, None)),
+            Some(c) => {
+                // `schedule_sensitive` runs inside the fixpoint's memo region
+                // (assign drives reach it through `set_sig`), but the Edge
+                // trees here are per-wake/park clones — `schedule_sensitive`
+                // clones the fanout list, `park`/`unpark` swap wait edges in
+                // and out — so their addresses churn and get recycled, and a
+                // pointer-keyed flags memo could return a stale
+                // classification. Walk uncached, like the PCA trees (see
+                // `sim/type_flags.rs`).
+                let saved = self.expr_memo.replace(false);
+                let r = truthy(&self.eval_expr(c, None));
+                self.expr_memo.set(saved);
+                r
+            }
         }
     }
 }
