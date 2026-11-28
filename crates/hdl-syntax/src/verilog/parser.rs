@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 
 mod decls;
 mod expr;
+mod gen;
 mod inst;
 mod proc;
 mod stmt;
@@ -153,6 +154,12 @@ pub(super) const DECL_KEYWORDS: &[&str] = &[
     "wire", "reg", "logic", "integer", "real", "time", "genvar", "tri", "tri0", "tri1", "trireg",
     "wand", "wor", "supply0", "supply1", "bit", "byte", "shortint", "int", "longint", "string",
     "chandle", "vectored", "scalared", "var", "const", "rand", "randc",
+];
+
+/// Gate primitive keywords (`and (o, a, b);` et al., IEEE 1364-2005 ch. 7).
+const GATE_KEYWORDS: &[&str] = &[
+    "and", "nand", "or", "nor", "xor", "xnor", "buf", "not", "bufif0", "bufif1", "notif0",
+    "notif1", "tran", "tranif0", "tranif1", "rtran", "rtranif0", "rtranif1", "pullup", "pulldown",
 ];
 
 impl<'a> Parser<'a> {
@@ -813,73 +820,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One module-body item (after attributes): dispatch on the leading
+    /// token. Macro invocations and directives are skipped; SystemVerilog
+    /// `assert`-family items are SVA-lite properties.
     fn parse_module_item(&mut self) {
         self.eat_attributes();
         let t = self.peek().clone();
         let text = self.peek_text().to_string();
         match t.kind {
-            TokenKind::Ident => match text.as_str() {
-                "input" | "output" | "inout" => self.parse_port_decl_stmt(),
-                "wire" | "reg" | "logic" | "integer" | "real" | "time" | "genvar" | "tri"
-                | "tri0" | "tri1" | "trireg" | "wand" | "wor" | "supply0" | "supply1" | "bit"
-                | "byte" | "shortint" | "int" | "longint" | "string" | "chandle" | "vectored"
-                | "scalared" | "var" | "const" | "rand" | "randc" => self.parse_decl(),
-                "parameter" | "localparam" => self.parse_param_decl(),
-                "assign" => self.parse_assign(),
-                "always" | "always_comb" | "always_ff" | "always_latch" => self.parse_always(),
-                "initial" => self.parse_initial(),
-                "final" => self.parse_final(),
-                "function" => self.parse_function(),
-                "task" => self.parse_task(),
-                "event" => self.parse_event_decl(),
-                "defparam" => self.parse_defparam(),
-                "typedef" => self.parse_typedef(),
-                "enum" => self.parse_enum_decl(),
-                "class" => self.parse_class(),
-                "import" => self.parse_import(false),
-                "export" => self.parse_import(true),
-                "generate" => self.parse_generate(),
-                // Implicit generate regions: `if (...) begin ... end`,
-                // `for (...) ...`, `case (...) ...`, `begin : name ... end`.
-                "if" | "for" | "case" | "casez" | "casex" | "begin" => self.parse_gen_item(),
-                "assert" | "assume" | "cover" => self.parse_sva_property(text.as_str()),
-                // `endmodule` here means the enclosing construct was never
-                // closed — report and skip so no loop can spin on it.
-                "endmodule" => {
-                    self.error_here("unexpected `endmodule`");
-                    self.bump();
-                }
-                "and" | "nand" | "or" | "nor" | "xor" | "xnor" | "buf" | "not" | "bufif0"
-                | "bufif1" | "notif0" | "notif1" | "tran" | "tranif0" | "tranif1" | "rtran"
-                | "rtranif0" | "rtranif1" | "pullup" | "pulldown" => self.parse_gate_inst(),
-                // `specify ... endspecify` timing blocks: parse as a skipped node.
-                "specify" => {
-                    self.builder.start_node(SyntaxKind::Specify);
-                    self.bump();
-                    while !self.at_kw("endspecify") && self.peek().kind != TokenKind::Eof {
-                        self.bump();
-                    }
-                    self.eat_kw("endspecify");
-                    self.builder.finish_node();
-                }
-                _ => {
-                    // Declaration with a user type: `word_t w;` / `C obj;`.
-                    // A name list followed by `(` or `#` is a module
-                    // instantiation; anything else (`type_t a, b;`) is a
-                    // declaration with a (possibly package-imported) type.
-                    if self.instantiation_ahead() {
-                        // Module instantiation: `modname [#(...)] inst (...) ;`
-                        self.parse_instantiation();
-                    } else if self.peek2().kind == TokenKind::Ident
-                        || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "[")
-                    {
-                        self.parse_decl();
-                    } else {
-                        self.error_here(format!("unexpected `{}` in module body", text));
-                        self.bump();
-                    }
-                }
-            },
+            TokenKind::Ident => self.parse_module_item_ident(&text),
             TokenKind::SysTask => self.parse_statement(),
             // Macro invocation / compiler directive inside the module body:
             // skipped (unexpanded or handled by the preprocessor).
@@ -889,6 +838,75 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
+    }
+
+    /// Dispatch on the leading keyword of a module-body item. The keyword
+    /// sets are disjoint, so table membership and literal arms are
+    /// interchangeable.
+    fn parse_module_item_ident(&mut self, text: &str) {
+        match text {
+            "input" | "output" | "inout" => self.parse_port_decl_stmt(),
+            _ if DECL_KEYWORDS.contains(&text) => self.parse_decl(),
+            "parameter" | "localparam" => self.parse_param_decl(),
+            "assign" => self.parse_assign(),
+            "always" | "always_comb" | "always_ff" | "always_latch" => self.parse_always(),
+            "initial" => self.parse_initial(),
+            "final" => self.parse_final(),
+            "function" => self.parse_function(),
+            "task" => self.parse_task(),
+            "event" => self.parse_event_decl(),
+            "defparam" => self.parse_defparam(),
+            "typedef" => self.parse_typedef(),
+            "enum" => self.parse_enum_decl(),
+            "class" => self.parse_class(),
+            "import" => self.parse_import(false),
+            "export" => self.parse_import(true),
+            "generate" => self.parse_generate(),
+            // Implicit generate regions: `if (...) begin ... end`,
+            // `for (...) ...`, `case (...) ...`, `begin : name ... end`.
+            "if" | "for" | "case" | "casez" | "casex" | "begin" => self.parse_gen_item(),
+            "assert" | "assume" | "cover" => self.parse_sva_property(text),
+            // `endmodule` here means the enclosing construct was never
+            // closed — report and skip so no loop can spin on it.
+            "endmodule" => {
+                self.error_here("unexpected `endmodule`");
+                self.bump();
+            }
+            _ if GATE_KEYWORDS.contains(&text) => self.parse_gate_inst(),
+            "specify" => self.parse_specify_block(),
+            _ => self.parse_module_item_other(text),
+        }
+    }
+
+    /// A leading identifier that is no known keyword: a module
+    /// instantiation (`modname [#(...)] inst (...)`), a user-typed
+    /// declaration, or a reported error.
+    fn parse_module_item_other(&mut self, text: &str) {
+        // A name list followed by `(` or `#` is a module instantiation;
+        // anything else (`type_t a, b;`) is a declaration with a (possibly
+        // package-imported) type.
+        if self.instantiation_ahead() {
+            // Module instantiation: `modname [#(...)] inst (...) ;`
+            self.parse_instantiation();
+        } else if self.peek2().kind == TokenKind::Ident
+            || (self.peek2().kind == TokenKind::Punct && self.peek2_text() == "[")
+        {
+            self.parse_decl();
+        } else {
+            self.error_here(format!("unexpected `{}` in module body", text));
+            self.bump();
+        }
+    }
+
+    /// `specify ... endspecify` timing blocks: parsed as a skipped node.
+    fn parse_specify_block(&mut self) {
+        self.builder.start_node(SyntaxKind::Specify);
+        self.bump();
+        while !self.at_kw("endspecify") && self.peek().kind != TokenKind::Eof {
+            self.bump();
+        }
+        self.eat_kw("endspecify");
+        self.builder.finish_node();
     }
 
     /// True when the upcoming tokens are `Ident [, Ident]*` followed by `(` or
@@ -937,156 +955,6 @@ impl<'a> Parser<'a> {
         let k = self.skip_trivia_from(j + 1);
         let t = &self.tokens[k.min(self.tokens.len() - 1)];
         self.src.text()[t.span.start as usize..t.span.end as usize].to_string()
-    }
-
-    fn parse_generate(&mut self) {
-        self.builder.start_node(SyntaxKind::Generate);
-        self.bump(); // generate
-        while !self.at_kw("endgenerate")
-            && !self.at_kw("endmodule")
-            && self.peek().kind != TokenKind::Eof
-        {
-            self.parse_gen_item();
-        }
-        if !self.eat_kw("endgenerate") {
-            self.error_here("expected `endgenerate`");
-        }
-        self.builder.finish_node();
-    }
-
-    /// One generate-region item: a begin-block, nested for/if/case, or a
-    /// module item. Also used for implicit generate regions at module level
-    /// (`if (...) begin ... end` without the `generate` keyword).
-    fn parse_gen_item(&mut self) {
-        if self.at_kw("begin") {
-            self.parse_gen_block();
-        } else if self.at_kw("for") {
-            self.parse_gen_for();
-        } else if self.at_kw("if") {
-            self.parse_gen_if();
-        } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
-            self.parse_gen_case();
-        } else {
-            self.parse_module_item();
-        }
-    }
-
-    /// `begin : name module-items end` inside a generate region.
-    fn parse_gen_block(&mut self) {
-        self.builder.start_node(SyntaxKind::GenBlock);
-        self.bump(); // begin
-        if self.eat_punct(':') && self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
-            self.bump();
-            self.builder.finish_node();
-        }
-        while !self.at_kw("end")
-            && !self.at_kw("endgenerate")
-            && !self.at_kw("endmodule")
-            && self.peek().kind != TokenKind::Eof
-        {
-            self.parse_gen_item();
-        }
-        if !self.eat_kw("end") {
-            self.error_here("expected `end`");
-        }
-        self.builder.finish_node();
-    }
-
-    /// `case (expr) item: items... endcase` in a generate region. Item bodies
-    /// are module items; a new item starts at an expression or `default`.
-    fn parse_gen_case(&mut self) {
-        self.builder.start_node(SyntaxKind::GenCase);
-        self.bump(); // case/casez/casex
-        self.expect_punct('(', "after `case`");
-        self.parse_expression();
-        self.expect_punct(')', "to close the case expression");
-        loop {
-            if self.at_kw("endcase") || self.peek().kind == TokenKind::Eof {
-                break;
-            }
-            self.builder.start_node(SyntaxKind::CaseItem);
-            if self.at_kw("default") {
-                self.bump();
-            } else {
-                loop {
-                    self.parse_expression();
-                    if !self.eat_punct(',') {
-                        break;
-                    }
-                }
-            }
-            self.expect_punct(':', "before the generate case item body");
-            while !self.at_kw("endcase") && !self.at_gen_case_item_start() {
-                if self.peek().kind == TokenKind::Eof {
-                    break;
-                }
-                if self.at_kw("for") {
-                    self.parse_gen_for();
-                } else if self.at_kw("if") {
-                    self.parse_gen_if();
-                } else if self.at_kw("case") || self.at_kw("casez") || self.at_kw("casex") {
-                    self.parse_gen_case();
-                } else if self.at_kw("begin") {
-                    self.parse_gen_block();
-                } else {
-                    self.parse_module_item();
-                }
-            }
-            self.builder.finish_node();
-        }
-        if !self.eat_kw("endcase") {
-            self.error_here("expected `endcase`");
-        }
-        self.builder.finish_node();
-    }
-
-    /// Heuristic: does the current position start a new generate-case item
-    /// (an expression label or `default`) rather than a module item?
-    fn at_gen_case_item_start(&self) -> bool {
-        if self.at_kw("default") {
-            return true;
-        }
-        // `begin` opens a named generate block in an item body, not a label.
-        if self.at_kw("begin") {
-            return false;
-        }
-        match self.peek().kind {
-            TokenKind::IntLiteral | TokenKind::RealLiteral | TokenKind::StrLiteral => true,
-            TokenKind::Ident => {
-                let t2 = self.peek2_text();
-                matches!(t2.as_str(), ":" | ",")
-            }
-            _ => false,
-        }
-    }
-
-    fn parse_gen_for(&mut self) {
-        self.builder.start_node(SyntaxKind::GenFor);
-        self.bump(); // for
-        self.expect_punct('(', "after `for`");
-        self.eat_kw("genvar"); // `for (genvar j = 0; ...)`
-        self.parse_assign_no_semi(); // init
-        self.expect_punct(';', "in for header");
-        self.parse_expression(); // condition
-        self.expect_punct(';', "in for header");
-        self.parse_assign_no_semi(); // step
-        self.expect_punct(')', "to close the for header");
-        self.parse_gen_item();
-        self.builder.finish_node();
-    }
-
-    fn parse_gen_if(&mut self) {
-        self.builder.start_node(SyntaxKind::GenIf);
-        self.bump(); // if
-        self.expect_punct('(', "after `if`");
-        self.parse_expression();
-        self.expect_punct(')', "to close the if condition");
-        self.parse_gen_item();
-        if self.eat_kw("else") {
-            self.parse_gen_item();
-        }
-        self.builder.finish_node();
     }
 }
 
