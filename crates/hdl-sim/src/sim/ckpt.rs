@@ -368,6 +368,12 @@ pub(crate) fn save(sim: &Simulator, out: &mut Vec<u8>) {
     for e in &sim.sig_evt {
         w.u64(*e);
     }
+    // Active procedural continuous assignments: (target, lhs, rhs).
+    w.u32(sim.proc_assigns.len() as u32);
+    for (_, lhs, rhs) in &sim.proc_assigns {
+        w_expr(&mut w, lhs);
+        w_expr(&mut w, rhs);
+    }
     w.u32(sim.mems.len() as u32);
     for m in &sim.mems {
         w.u32(m.len() as u32);
@@ -521,6 +527,18 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     sim.sig_evt.clear();
     for _ in 0..n {
         sim.sig_evt.push(r.u64()?);
+    }
+    let n = r.u32()? as usize;
+    if n > (1 << 16) {
+        return Err("too many proc assigns".to_string());
+    }
+    sim.proc_assigns.clear();
+    for _ in 0..n {
+        let lhs = r_expr(&mut r)?;
+        let rhs = r_expr(&mut r)?;
+        let sig =
+            crate::sim::lhs_sig(&lhs).ok_or("proc assign target must be a simple variable")?;
+        sim.proc_assigns.push((sig, lhs, rhs));
     }
     let n = r.u32()? as usize;
     if n != sim.mems.len() {

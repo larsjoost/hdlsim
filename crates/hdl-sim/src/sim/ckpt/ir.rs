@@ -353,6 +353,15 @@ pub(super) fn w_stmt(w: &mut W, s: &Stmt) {
         Stmt::Break => w.u8(10),
         Stmt::Continue => w.u8(11),
         Stmt::Null => w.u8(12),
+        Stmt::ProcContAssign { lhs, rhs } => {
+            w.u8(17);
+            w_expr(w, lhs);
+            w_expr(w, rhs);
+        }
+        Stmt::Deassign { lhs } => {
+            w.u8(18);
+            w_expr(w, lhs);
+        }
         Stmt::Spanned { span, inner } => {
             w.u8(13);
             w_span(w, span);
@@ -478,6 +487,11 @@ pub(super) fn r_stmt(r: &mut R) -> Result<Stmt, String> {
         10 => Stmt::Break,
         11 => Stmt::Continue,
         12 => Stmt::Null,
+        17 => Stmt::ProcContAssign {
+            lhs: r_expr(r)?,
+            rhs: r_expr(r)?,
+        },
+        18 => Stmt::Deassign { lhs: r_expr(r)? },
         13 => Stmt::Spanned {
             span: r_span(r)?,
             inner: Box::new(r_stmt(r)?),

@@ -308,6 +308,13 @@ pub struct InstIr {
 pub enum Conn {
     Named(String, Expr),
     Positional(Expr),
+    /// `.name` shorthand: bind this port to the same-named signal in the
+    /// enclosing scope (resolved during elaboration).
+    ByName(String),
+    /// `.*`: bind every port not otherwise connected to the same-named signal
+    /// in the enclosing scope (SV LRM 23.3.2.4; resolved during elaboration,
+    /// error on a port with no matching signal).
+    Wildcard,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -383,6 +390,17 @@ pub enum Stmt {
     /// function body (unlike a plain assign to the function-name slot, which
     /// falls through).
     Return(Box<Expr>),
+    /// Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2):
+    /// drives `lhs` continuously from here on, until a `deassign lhs;`.
+    ProcContAssign {
+        lhs: Expr,
+        rhs: Expr,
+    },
+    /// `deassign lhs;` — stop the procedural continuous assignment on `lhs`;
+    /// it keeps the value it held (LRM 9.2.2).
+    Deassign {
+        lhs: Expr,
+    },
     /// `break;` — exit the innermost loop.
     Break,
     /// `continue;` — jump to the innermost loop's step/next iteration.

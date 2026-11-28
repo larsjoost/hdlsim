@@ -77,6 +77,8 @@ pub fn coverage_universe(design: &Design) -> (HashSet<Span>, HashSet<Span>) {
             Stmt::Repeat { body, .. } => walk(body, lines, branches),
             Stmt::Break | Stmt::Continue => {}
             Stmt::Assign { .. }
+            | Stmt::ProcContAssign { .. }
+            | Stmt::Deassign { .. }
             | Stmt::AssignDelayed { .. }
             | Stmt::ExprStmt(_)
             | Stmt::Null

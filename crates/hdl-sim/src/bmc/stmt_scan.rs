@@ -43,6 +43,10 @@ pub(super) fn stmt_writes(s: &Stmt, out: &mut Vec<FlatSigId>) {
             }
         }
         Stmt::Assign { lhs, .. } | Stmt::AssignDelayed { lhs, .. } => lhs_roots(lhs, out),
+        // A procedural continuous assignment writes its target from now on.
+        Stmt::ProcContAssign { lhs, .. } => lhs_roots(lhs, out),
+        // `deassign` stops driving; it writes nothing itself.
+        Stmt::Deassign { .. } => {}
         Stmt::Delay { stmt, .. } => stmt_writes(stmt, out),
         Stmt::Wait { body, .. } => stmt_writes(body, out),
         // `wait until` writes nothing; there is no nested body.
@@ -72,6 +76,7 @@ pub(super) fn stmt_has_sva(s: &Stmt) -> bool {
                 || default.as_ref().is_some_and(|d| stmt_has_sva(d))
         }
         Stmt::Assign { .. } | Stmt::AssignDelayed { .. } | Stmt::Return(_) => false,
+        Stmt::ProcContAssign { .. } | Stmt::Deassign { .. } => false,
         Stmt::Delay { stmt, .. } => stmt_has_sva(stmt),
         Stmt::Wait { body, .. } => stmt_has_sva(body),
         Stmt::WaitUntil { .. } => false,

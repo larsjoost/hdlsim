@@ -99,6 +99,11 @@ impl Stmt {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
             }
+            Stmt::ProcContAssign { lhs, rhs } => {
+                lhs.collect_sigs(out);
+                rhs.collect_sigs(out);
+            }
+            Stmt::Deassign { lhs } => lhs.collect_sigs(out),
             Stmt::AssignDelayed { lhs, rhs, delay } => {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);

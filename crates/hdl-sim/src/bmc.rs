@@ -1311,6 +1311,12 @@ impl<'e, 'a> Exec<'e, 'a> {
                 }
                 Ok(Ctrl::Done)
             }
+            // Procedural continuous assignment/deassign are time-persistent
+            // state; BMC's unrolled frames do not model them.
+            Stmt::ProcContAssign { .. } => {
+                Err("prove: procedural continuous assignment is not supported".to_string())
+            }
+            Stmt::Deassign { .. } => Err("prove: deassign is not supported in prove".to_string()),
             Stmt::For {
                 init,
                 cond,

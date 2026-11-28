@@ -123,6 +123,8 @@ pub enum SyntaxKind {
     ContinueStmt,
     /// `disable name;`
     Disable,
+    /// `deassign lhs;` — procedural deassignment (LRM 9.2.2).
+    DeassignStmt,
     /// `fork ... join` / `join_any` / `join_none`.
     ForkJoin,
     /// Event trigger: `-> name;` / `->> name;`.
@@ -327,6 +329,7 @@ pub const ALL: &[SyntaxKind] = &[
     SyntaxKind::BreakStmt,
     SyntaxKind::ContinueStmt,
     SyntaxKind::Disable,
+    SyntaxKind::DeassignStmt,
     SyntaxKind::ForkJoin,
     SyntaxKind::Trigger,
     SyntaxKind::SysCall,
@@ -590,7 +593,7 @@ mod tests {
 
     #[test]
     fn kind_index_roundtrips_for_all_variants() {
-        assert_eq!(ALL.len(), 128);
+        assert_eq!(ALL.len(), 129);
         for (i, k) in ALL.iter().enumerate() {
             assert_eq!(k.to_index() as usize, i, "{:?} out of order", k);
             assert_eq!(SyntaxKind::from_index(k.to_index()), Some(*k));

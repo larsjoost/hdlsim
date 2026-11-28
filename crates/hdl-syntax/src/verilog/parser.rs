@@ -89,7 +89,7 @@ pub fn parse_with_preproc(
     file: FileId,
     src: &SourceFile,
     incdirs: &[std::path::PathBuf],
-) -> (ParsedFile, HashMap<String, String>) {
+) -> (ParsedFile, HashMap<String, super::preproc::Macro>) {
     let mut macros = HashMap::new();
     let mut diags = Vec::new();
     let text = super::preproc::preprocess(file, src, incdirs, &mut macros, &mut diags);
@@ -1546,22 +1546,33 @@ impl<'a> Parser<'a> {
     fn parse_port_conn(&mut self) {
         self.builder.start_node(SyntaxKind::PortConn);
         if self.eat_punct('.') {
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
+            if self.eat_punct('*') {
+                // `.*`: unconnected ports bind to same-named signals; elab resolves.
                 self.builder.finish_node();
+                return;
             }
-            if self.eat_punct('(') {
-                if !self.at_punct(')') {
-                    self.parse_expression();
-                }
-                self.expect_punct(')', "to close the port connection");
-            }
+            self.parse_conn_name_and_value("to close the port connection");
         } else {
             // Positional connection.
             self.parse_expression();
         }
         self.builder.finish_node();
+    }
+
+    /// After the leading `.`, parse `name` with an optional `(expr)` — shared
+    /// by port connections and named call arguments (same CST shape).
+    fn parse_conn_name_and_value(&mut self, close_msg: &str) {
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        }
+        if self.eat_punct('(') {
+            if !self.at_punct(')') {
+                self.parse_expression();
+            }
+            self.expect_punct(')', close_msg);
+        }
     }
 
     // ---- grammar: statements -------------------------------------------------
@@ -1575,9 +1586,16 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if text == "foreach" => self.parse_foreach(),
             TokenKind::Ident if text == "import" => self.parse_import(false),
             TokenKind::Ident if text == "export" => self.parse_import(true),
-            // `deassign x;` / `force x = e;` / `release x;` — parse and drop the
-            // procedural-assignment part (not simulated).
-            TokenKind::Ident if text == "deassign" || text == "release" => {
+            // `deassign lhs;` — procedural deassignment (LRM 9.2.2). `release`
+            // parses and drops (force/release are not simulated).
+            TokenKind::Ident if text == "deassign" => {
+                self.builder.start_node(SyntaxKind::DeassignStmt);
+                self.bump();
+                self.parse_expression();
+                self.expect_punct(';', "to end the statement");
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "release" => {
                 self.bump();
                 self.parse_expression();
                 self.expect_punct(';', "to end the statement");
@@ -2344,17 +2362,7 @@ impl<'a> Parser<'a> {
         if self.at_punct('.') {
             self.builder.start_node(SyntaxKind::PortConn);
             self.bump();
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
-            }
-            if self.eat_punct('(') {
-                if !self.at_punct(')') {
-                    self.parse_expression();
-                }
-                self.expect_punct(')', "to close the named argument");
-            }
+            self.parse_conn_name_and_value("to close the named argument");
             self.builder.finish_node();
         } else {
             self.parse_expression();
@@ -2600,6 +2608,68 @@ mod tests {
         let mut db = SourceDb::new();
         let id = db.add_file("t.v", src).unwrap();
         (parse_file(id, db.file(id)), db)
+    }
+
+    #[test]
+    fn parses_wildcard_and_shorthand_port_conns() {
+        let src = "module inner(input a, output y);
+assign y = ~a;
+endmodule
+module tb;
+reg a; wire y;
+inner u1 (.*);
+inner u2 (.a, .y);
+endmodule
+";
+        let (p, db) = parse_str(src);
+        assert!(
+            !p.diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "{:?}",
+            p.diags.iter().map(|d| d.render(&db)).collect::<Vec<_>>()
+        );
+        let sexp = p.root.debug_sexp(&db);
+        // The wildcard conn keeps its `.` and `*` punct children, and the
+        // shorthand conn has a name but no expression.
+        assert!(
+            sexp.contains(r#"(PortConn Punct "." Punct "*")"#),
+            "{}",
+            sexp
+        );
+        assert!(sexp.contains(r#"(PortConn Punct "." (Name"#), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_deassign_and_procedural_continuous_assign() {
+        let src = "module tb;
+reg q, d;
+initial begin
+assign q = d;
+#5 deassign q;
+end
+endmodule
+";
+        let (p, db) = parse_str(src);
+        assert!(
+            !p.diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "{:?}",
+            p.diags.iter().map(|d| d.render(&db)).collect::<Vec<_>>()
+        );
+        let kinds: Vec<SyntaxKind> = p.root.descendants().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::DeassignStmt),
+            "{}",
+            p.root.debug_sexp(&db)
+        );
+        // The process-level `assign q = d;` keeps its Assign node.
+        assert!(
+            kinds.contains(&SyntaxKind::Assign),
+            "{}",
+            p.root.debug_sexp(&db)
+        );
     }
 
     #[test]
