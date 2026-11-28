@@ -3678,7 +3678,7 @@ fn ce_impl(
             v.to_u64().map(|n| Value::from_u64(32, n))
         }
         // `T'image(x)` in a constant initializer (e.g. integer'image(42)).
-        Expr::ToString(e) => {
+        Expr::ToString { e, .. } => {
             let v = ce_impl(e, env, funcs, extras, slots.as_deref_mut())?;
             let s = if ce_real(e) || v.real {
                 ce_f64(&v).map(|f| format!("{}", f))?

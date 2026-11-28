@@ -122,7 +122,7 @@ impl<'a> Lower<'a> {
             }
             Expr::Lit(_) | Expr::Real(_) | Expr::Sig(_) | Expr::SigAttr { .. } => false,
             Expr::Bin { l, r, .. } => self.refs_impure_call(l) || self.refs_impure_call(r),
-            Expr::Un { e, .. } | Expr::Signed(e) | Expr::ToInt(e) | Expr::ToString(e) => {
+            Expr::Un { e, .. } | Expr::Signed(e) | Expr::ToInt(e) | Expr::ToString { e, .. } => {
                 self.refs_impure_call(e)
             }
             Expr::Cond { c, t, e } => {
@@ -406,7 +406,7 @@ impl<'a> Lower<'a> {
             }
             Expr::Resize { width, .. } => *width,
             Expr::Signed(e) => self.expr_width_est(e),
-            Expr::ToString(_) => 8 * 12,
+            Expr::ToString { .. } => 8 * 12,
             _ => 32,
         }
     }

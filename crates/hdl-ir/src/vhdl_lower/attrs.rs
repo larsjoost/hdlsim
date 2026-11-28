@@ -1,4 +1,5 @@
-//! VHDL lowering: dimension and `'length`-family attribute resolution.
+//! VHDL lowering: type-mark attributes — the `'length` family (with an
+//! explicit dimension) and `t'image(x)`.
 //!
 //! `attr_dim_lookup` is the lookup order for dimension-suffixed attributes
 //! (`'length(d)`, `'high(d)`, …): signal dims (`sig_dims`), object dims
@@ -500,5 +501,53 @@ fn dim_attr_value(attr: &str, lo: i64, sz: usize) -> u64 {
         "length" => sz as u64,
         "high" | "left" => (lo + sz as i64 - 1).max(0) as u64,
         _ => lo.max(0) as u64, // low | right
+    }
+}
+
+impl<'a> Lower<'a> {
+    /// Lower `t'image(x)` for the argument node `arg` and the type-mark
+    /// `prefix` the attribute is applied to.
+    pub(super) fn attr_image_expr(
+        &mut self,
+        arg: &SyntaxNode,
+        env: &HashMap<String, Value>,
+        prefix: &str,
+    ) -> Expr {
+        let e = self.lower_expr(arg, env);
+        // `boolean'image` spells `true`/`false`, not the decimal bit value
+        // every `ToString` evaluator renders. Fold the constant case here;
+        // non-constant arguments render in the evaluator (`ToString`'s
+        // decimal fallback reads as -1/1/0). Only genuinely 1-bit values
+        // qualify — a wider operand under a `boolean` prefix (loose typing,
+        // e.g. a natural) keeps the decimal rendering.
+        if prefix.eq_ignore_ascii_case("boolean") {
+            if let Some(v) = self.ce(&e).filter(|v| v.width() == 1) {
+                let s = if v.to_u64().unwrap_or(0) & 1 == 1 {
+                    "true"
+                } else {
+                    "false"
+                };
+                return Expr::Lit(string_value(s));
+            }
+            return Expr::ToString {
+                e: Box::new(e),
+                boolean: true,
+            };
+        }
+        // A signed-integer image renders two's complement
+        // (`integer'image(-1)` is "-1"): mark the operand so the
+        // evaluator sign-extends instead of printing raw bits.
+        let e = if matches!(
+            self.types.get(&prefix.to_ascii_lowercase()),
+            Some(TypeInfo::Integer { signed: true })
+        ) {
+            Expr::Signed(Box::new(e))
+        } else {
+            e
+        };
+        Expr::ToString {
+            e: Box::new(e),
+            boolean: false,
+        }
     }
 }

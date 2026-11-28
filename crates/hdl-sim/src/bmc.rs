@@ -37,6 +37,9 @@ use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::value::{BinOp, UnOp, Value, V1};
 use hdl_ir::{Expr, ProcKind, Sens, ShapeBind, SigKind, Stmt};
 use std::collections::{HashMap, HashSet};
+mod expr_util;
+
+use self::expr_util::{expr_has_dash, sig_root};
 
 /// A safety property extracted from an `assert property` / `assert` process.
 #[derive(Clone, Debug)]
@@ -1844,7 +1847,7 @@ impl<'e, 'a> Exec<'e, 'a> {
                     signed: false,
                 })
             }
-            Expr::ToString(_) => Err("prove: string conversion is not supported".to_string()),
+            Expr::ToString { .. } => Err("prove: string conversion is not supported".to_string()),
             Expr::Resize { e, width, signed } => {
                 let v = self.eval(e)?;
                 let b = &self.enc.b;
@@ -2196,35 +2199,6 @@ fn const_unop(op: UnOp, a: &[bool]) -> Option<Vec<bool>> {
         UnOp::RedNor => vec![!a.iter().any(|&b| b)],
         UnOp::RedXnor => vec![!a.iter().fold(false, |acc, &b| acc != b)],
     })
-}
-
-fn sig_root(e: &Expr) -> Result<FlatSigId, String> {
-    match e {
-        Expr::Sig(s) => Ok(*s),
-        Expr::Idx { e: x, .. } | Expr::Sel { e: x, .. } => sig_root(x),
-        _ => Err("prove: unsupported LHS root".to_string()),
-    }
-}
-
-/// Does this expression contain a don't-care ('-') literal bit?
-fn expr_has_dash(e: &Expr) -> bool {
-    match e {
-        Expr::SigAttr { .. } => false,
-        Expr::Lit(v) => v.bits.contains(&hdl_ir::value::VDASH),
-        Expr::Bin { l, r, .. } => expr_has_dash(l) || expr_has_dash(r),
-        Expr::Un { e, .. } => expr_has_dash(e),
-        Expr::Cond { c, t, e } => expr_has_dash(c) || expr_has_dash(t) || expr_has_dash(e),
-        Expr::Call { args, .. } => args.iter().any(expr_has_dash),
-        Expr::Concat(parts) => parts.iter().any(expr_has_dash),
-        Expr::Replicate { count, e } => expr_has_dash(count) || expr_has_dash(e),
-        Expr::Sel { e, msb, lsb } => expr_has_dash(e) || expr_has_dash(msb) || expr_has_dash(lsb),
-        Expr::Idx { e, i } => expr_has_dash(e) || expr_has_dash(i),
-        Expr::Rising(e) | Expr::Falling(e) | Expr::Prev(e) | Expr::ToInt(e) | Expr::ToString(e) => {
-            expr_has_dash(e)
-        }
-        Expr::Resize { e, .. } | Expr::Signed(e) => expr_has_dash(e),
-        Expr::Sig(_) | Expr::Real(_) => false,
-    }
 }
 
 #[cfg(test)]
