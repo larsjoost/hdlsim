@@ -2995,13 +2995,14 @@ impl Simulator {
             let mut n_changed = 0u64;
             let n_assigns = self.flat.assigns.len();
             for ai in 0..n_assigns {
-                let a = self.flat.assigns[ai].clone();
+                let a = &self.flat.assigns[ai];
                 let rhs = self.eval_expr(&a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
                 if !self.trace_assigns.is_empty() {
                     self.assign_trace_eval(ai, &a.lhs, &a.rhs, &rhs);
                 }
-                if self.assign_to(&a.lhs, rhs, None) {
+                let lhs = a.lhs.clone();
+                if self.assign_to(&lhs, rhs, None) {
                     changed = true;
                     n_changed += 1;
                 }
@@ -3075,27 +3076,27 @@ impl Simulator {
 
     /// Returns true if the signal actually changed.
     fn set_sig(&mut self, sig: FlatSigId, v: Value) -> bool {
-        let old = self.vals[sig as usize].clone();
-        let new = v;
-        if old == new {
+        // No-change is the common case: compare by reference, clone nothing.
+        if self.vals[sig as usize] == v {
             return false;
         }
+        // One clone each for `vals`/`prev`; the owned pair moves into the event.
+        let old = std::mem::replace(&mut self.vals[sig as usize], v.clone());
         self.prev[sig as usize] = old.clone();
-        self.vals[sig as usize] = new.clone();
-        // Stamp the delta epoch of this change — edge tests (`rising_edge`,
-        // `falling_edge`, `'event`) consult it to stay true only while the
-        // change is current (see the field docs).
+        // Stamp the change's delta epoch — edge tests read it (see field docs).
         self.sig_evt[sig as usize] = self.delta_epoch;
         if !self.watch.is_empty() {
-            self.watch_change(sig, &old, &new);
+            self.watch_change(sig, &old, &v);
         }
         if !self.when_rules.is_empty() {
-            self.when_change(sig, &old, &new);
+            self.when_change(sig, &old, &v);
         }
+        // Scheduling only enqueues (the pump runs processes): no emitted line changes.
+        self.schedule_sensitive(sig, &old, &v);
         self.emit(SimEvent::SignalChange {
             sig,
             old,
-            new: new.clone(),
+            new: v,
             time_fs: self.time,
         });
         if let Some(p) = self.cur_proc {
@@ -3108,7 +3109,6 @@ impl Simulator {
             }
             self.last_driver[sig as usize] = Some((p, self.time));
         }
-        self.schedule_sensitive(sig, &self.prev[sig as usize].clone(), &new);
         true
     }
 
