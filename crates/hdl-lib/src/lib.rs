@@ -26,6 +26,7 @@ pub mod bundle;
 pub mod cache;
 pub mod doctor;
 pub mod providers;
+mod scope;
 mod variant;
 
 use hdl_ir::elab::UnitResolver;
@@ -706,9 +707,12 @@ impl LibraryManager {
         text: &str,
     ) -> Result<(), String> {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if !self.compiled.insert(canon) {
+        if !self.compiled.insert(canon.clone()) {
             return Ok(()); // already compiled this session
         }
+        // The library directory the file lives in — `work` in its context
+        // clauses resolves here (LRM 13.2), before any global name match.
+        let owner_lib = scope::owning_library(&self.providers, &canon);
         // VHDL: resolve the units named in context clauses (`use lib.pkg.all;`)
         // first, so their packages are on the design and visible while lowering.
         if Language::from_path(path) == Some(Language::Vhdl) {
@@ -754,9 +758,7 @@ impl LibraryManager {
                         let resolved = self.resolve_in_library(design, &unit, &unit, lib)?;
                         if !resolved {
                             if let Err(e) = self.resolve(design, &unit) {
-                                if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
-                                    self.unresolved_units.push((unit, e));
-                                }
+                                self.record_unresolved(&unit, e);
                             }
                         }
                     }
@@ -789,8 +791,18 @@ impl LibraryManager {
                 // it. Falls back to the global search when `lib` is unknown
                 // or lacks the unit.
                 let mut resolved = false;
-                if let Some(lib) = &lib {
-                    resolved = self.resolve_in_library(design, &unit, &unit, lib)?;
+                if let Some(l) = &lib {
+                    // LRM 13.2: `work` names the library the unit is analyzed
+                    // into — resolve in the file's own library first, so a
+                    // vendor library declaring a same-named unit (indexed
+                    // earlier in the ini) cannot shadow it via the global
+                    // name match.
+                    let scope = if l == "work" {
+                        owner_lib.as_deref().unwrap_or(l)
+                    } else {
+                        l
+                    };
+                    resolved = self.resolve_in_library(design, &unit, &unit, scope)?;
                 }
                 if !resolved {
                     // Resolve even when a same-named unit is already on the
@@ -798,9 +810,7 @@ impl LibraryManager {
                     // compiled so their items merge (try_one skips
                     // already-compiled candidates).
                     if let Err(e) = self.resolve(design, &unit) {
-                        if !self.unresolved_units.iter().any(|(u, _)| *u == unit) {
-                            self.unresolved_units.push((unit, e));
-                        }
+                        self.record_unresolved(&unit, e);
                     }
                 }
             }
@@ -839,6 +849,14 @@ impl LibraryManager {
         v
     }
 
+    /// Record a unit-resolution failure once (the same unit can fail from
+    /// several files; the report lists every distinct unit).
+    fn record_unresolved(&mut self, unit: &str, e: String) {
+        if !self.unresolved_units.iter().any(|(u, _)| u == unit) {
+            self.unresolved_units.push((unit.to_string(), e));
+        }
+    }
+
     /// Compile a list of explicit files (e.g. the CLI's file arguments).
     /// After all files are lowered, architectures whose entity lives in
     /// another file are bound design-wide (regardless of file order);
@@ -854,27 +872,7 @@ impl LibraryManager {
         // may declare another same-named entity).
         self.batch = true;
         let watch = CompileWatch::start();
-        let mut pkgs: Vec<&PathBuf> = Vec::new();
-        let mut rest: Vec<&PathBuf> = Vec::new();
-        for p in paths {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase());
-            let text = std::fs::read_to_string(p).unwrap_or_default();
-            let is_verilog_pkg = matches!(ext.as_deref(), Some("v") | Some("sv"))
-                && text.lines().any(|l| l.trim_start().starts_with("package "));
-            let is_vhdl_pkg_decl = matches!(ext.as_deref(), Some("vhd") | Some("vhdl"))
-                && text.lines().any(|l| {
-                    let t = l.trim_start();
-                    t.starts_with("package ") && !t.starts_with("package body")
-                });
-            if is_verilog_pkg || is_vhdl_pkg_decl {
-                pkgs.push(p);
-            } else {
-                rest.push(p);
-            }
-        }
+        let (pkgs, rest) = scope::package_files_first(paths);
         for p in pkgs.into_iter().chain(rest) {
             // The directory of an explicitly compiled file is a project root
             // for the out-of-the-box fallback search.

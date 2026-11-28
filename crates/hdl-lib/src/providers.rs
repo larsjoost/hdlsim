@@ -43,6 +43,14 @@ pub trait UnitProvider {
     fn source_files(&self) -> Vec<PathBuf> {
         Vec::new()
     }
+
+    /// The directory the provider maps, if it is a filesystem directory.
+    /// Used to attribute a source file to the library it lives in — `work`
+    /// inside a unit means that library (LRM 13.2), not the ini's literal
+    /// `work` row.
+    fn dir(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// A library whose sources are embedded in the binary (`include_str!`).
@@ -127,6 +135,10 @@ impl DirProvider {
 impl UnitProvider for DirProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn dir(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 
     fn scan(&self) -> Vec<(String, PathBuf)> {
