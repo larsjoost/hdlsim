@@ -45,6 +45,21 @@ fn is_digit(b: u8) -> bool {
     b.is_ascii_digit()
 }
 
+/// A base-specifier byte (`b`/`o`/`d`/`h`, case-insensitive).
+fn is_base_char(b: Option<u8>) -> bool {
+    matches!(
+        b,
+        Some(b'b')
+            | Some(b'B')
+            | Some(b'o')
+            | Some(b'O')
+            | Some(b'd')
+            | Some(b'D')
+            | Some(b'h')
+            | Some(b'H')
+    )
+}
+
 impl<'a> Lexer<'a> {
     fn run(&mut self) {
         while self.pos < self.text.len() {
@@ -275,16 +290,7 @@ impl<'a> Lexer<'a> {
         // or an unsized `'0 '1 'x 'z 'X 'Z '?'.
         let start = self.pos;
         self.pos += 1; // `'`
-        if matches!(
-            self.peek(0),
-            Some(b'0')
-                | Some(b'1')
-                | Some(b'x')
-                | Some(b'X')
-                | Some(b'z')
-                | Some(b'Z')
-                | Some(b'?')
-        ) {
+        if self.unsized_value_ahead() {
             self.pos += 1;
             self.tokens.push(Token::new(
                 TokenKind::IntLiteral,
@@ -300,127 +306,94 @@ impl<'a> Lexer<'a> {
             ));
             return;
         }
-        let mut ok = false;
         if matches!(self.peek(0), Some(b's') | Some(b'S')) {
             self.pos += 1;
         }
-        if matches!(
-            self.peek(0),
-            Some(b'b')
-                | Some(b'B')
-                | Some(b'o')
-                | Some(b'O')
-                | Some(b'd')
-                | Some(b'D')
-                | Some(b'h')
-                | Some(b'H')
-        ) {
-            self.pos += 1;
-            ok = true;
-            while self.pos < self.text.len()
-                && (is_digit(self.text[self.pos])
-                    || matches!(
-                        self.text[self.pos],
-                        b'a'..=b'f' | b'A'..=b'F' | b'_' | b'x' | b'X' | b'z' | b'Z' | b'?'
-                    ))
-            {
-                self.pos += 1;
-            }
-        }
-        if ok {
+        if is_base_char(self.peek(0)) {
+            self.pos += 1; // base char
+            self.eat_base_digits();
             self.tokens.push(Token::new(
                 TokenKind::IntLiteral,
                 Span::new(self.file, start as u32, self.pos as u32),
             ));
-        } else {
-            // Lone `'` — not valid Verilog outside a based literal.
-            self.diags.push(
-                Diagnostic::error(
-                    "E0106",
-                    Some(Span::new(self.file, start as u32, start as u32 + 1)),
-                    "expected a base specifier after `'`",
-                )
-                .with_help("valid bases: 'b 'o 'd 'h (optionally signed: 'sb …)"),
-            );
-            self.tokens.push(Token::new(
-                TokenKind::Error,
-                Span::new(self.file, start as u32, start as u32 + 1),
-            ));
+            return;
         }
+        self.lone_tick_error(start);
+    }
+
+    /// An unsized `'0`/`'1`/`'x`/`'z`/`'?` directly after the tick.
+    fn unsized_value_ahead(&self) -> bool {
+        matches!(
+            self.peek(0),
+            Some(b'0')
+                | Some(b'1')
+                | Some(b'x')
+                | Some(b'X')
+                | Some(b'z')
+                | Some(b'Z')
+                | Some(b'?')
+        )
+    }
+
+    /// A lone `'` — not valid Verilog outside a based literal: diagnostic
+    /// and an Error token, so lexing continues after it.
+    fn lone_tick_error(&mut self, start: usize) {
+        self.diags.push(
+            Diagnostic::error(
+                "E0106",
+                Some(Span::new(self.file, start as u32, start as u32 + 1)),
+                "expected a base specifier after `'`",
+            )
+            .with_help("valid bases: 'b 'o 'd 'h (optionally signed: 'sb …)"),
+        );
+        self.tokens.push(Token::new(
+            TokenKind::Error,
+            Span::new(self.file, start as u32, start as u32 + 1),
+        ));
     }
 
     fn number(&mut self) {
         // `[size]'[sS]?base value` | decimal | real (`1.5`, `1e-3`).
         let start = self.pos;
-        while self.pos < self.text.len()
-            && (is_digit(self.text[self.pos]) || self.text[self.pos] == b'_')
-        {
+        self.eat_dec_digits();
+        if self.peek(0) == Some(b'\'') && is_base_char(self.sized_base_ahead()) {
+            self.number_based(start);
+            return;
+        }
+        self.number_decimal_or_real(start);
+    }
+
+    /// The base byte after the current `'` (skipping an `s`/`S` sign), or
+    /// None when no base specifier follows.
+    fn sized_base_ahead(&self) -> Option<u8> {
+        let after_quote = self.peek(1);
+        match after_quote {
+            Some(b's') | Some(b'S') => self.peek(2),
+            _ => after_quote,
+        }
+    }
+
+    /// `[size]'[sS]?base value` with the size digits already consumed: the
+    /// `'`, optional sign, base char, and value digits form one IntLiteral.
+    fn number_based(&mut self, start: usize) {
+        self.pos += 1; // `'`
+        if matches!(self.peek(0), Some(b's') | Some(b'S')) {
             self.pos += 1;
         }
-        // Based literal with explicit size: `16'hFF`.
-        if self.peek(0) == Some(b'\'') {
-            let after_quote = self.peek(1);
-            let base_ahead = match after_quote {
-                Some(b's') | Some(b'S') => self.peek(2),
-                _ => after_quote,
-            };
-            if matches!(
-                base_ahead,
-                Some(b'b')
-                    | Some(b'B')
-                    | Some(b'o')
-                    | Some(b'O')
-                    | Some(b'd')
-                    | Some(b'D')
-                    | Some(b'h')
-                    | Some(b'H')
-            ) {
-                self.pos += 1; // `'`
-                if matches!(self.peek(0), Some(b's') | Some(b'S')) {
-                    self.pos += 1;
-                }
-                self.pos += 1; // base char
-                while self.pos < self.text.len()
-                    && (is_digit(self.text[self.pos])
-                        || matches!(
-                            self.text[self.pos],
-                            b'a'..=b'f' | b'A'..=b'F' | b'_' | b'x' | b'X' | b'z' | b'Z' | b'?'
-                        ))
-                {
-                    self.pos += 1;
-                }
-                self.tokens.push(Token::new(
-                    TokenKind::IntLiteral,
-                    Span::new(self.file, start as u32, self.pos as u32),
-                ));
-                return;
-            }
-        }
-        // Real literal: digits '.' digits [exponent] | digits exponent.
-        let mut is_real = false;
-        if self.peek(0) == Some(b'.') && self.peek(1).is_some_and(|b| is_digit(b) || b == b'_') {
+        self.pos += 1; // base char
+        self.eat_base_digits();
+        self.tokens.push(Token::new(
+            TokenKind::IntLiteral,
+            Span::new(self.file, start as u32, self.pos as u32),
+        ));
+    }
+
+    /// Decimal or real (`1.5`, `1.5e-3`, `1e3`) with the leading digits
+    /// already consumed.
+    fn number_decimal_or_real(&mut self, start: usize) {
+        let mut is_real = self.fraction_digits();
+        if self.exponent_digits() {
             is_real = true;
-            self.pos += 1;
-            while self.pos < self.text.len()
-                && (is_digit(self.text[self.pos]) || self.text[self.pos] == b'_')
-            {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(0), Some(b'e') | Some(b'E')) {
-            let exp_start = self.pos;
-            self.pos += 1;
-            if matches!(self.peek(0), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            if self.peek(0).is_some_and(is_digit) {
-                is_real = true;
-                while self.pos < self.text.len() && is_digit(self.text[self.pos]) {
-                    self.pos += 1;
-                }
-            } else {
-                self.pos = exp_start; // not an exponent after all
-            }
         }
         let kind = if is_real {
             TokenKind::RealLiteral
@@ -432,160 +405,61 @@ impl<'a> Lexer<'a> {
             Span::new(self.file, start as u32, self.pos as u32),
         ));
     }
+
+    /// `.` digits — consumes the fraction and returns true when present.
+    fn fraction_digits(&mut self) -> bool {
+        if self.peek(0) == Some(b'.') && self.peek(1).is_some_and(|b| is_digit(b) || b == b'_') {
+            self.pos += 1;
+            self.eat_dec_digits();
+            return true;
+        }
+        false
+    }
+
+    /// `[eE] [+-] digits` — consumes a full exponent and returns true; a
+    /// bare `[eE]` without digits is left in place (it ends the number).
+    fn exponent_digits(&mut self) -> bool {
+        if !matches!(self.peek(0), Some(b'e') | Some(b'E')) {
+            return false;
+        }
+        let exp_start = self.pos;
+        self.pos += 1;
+        if matches!(self.peek(0), Some(b'+') | Some(b'-')) {
+            self.pos += 1;
+        }
+        if self.peek(0).is_some_and(is_digit) {
+            while self.pos < self.text.len() && is_digit(self.text[self.pos]) {
+                self.pos += 1;
+            }
+            return true;
+        }
+        self.pos = exp_start; // not an exponent after all
+        false
+    }
+
+    /// Decimal digits and `_` separators (`1_000`).
+    fn eat_dec_digits(&mut self) {
+        while self.pos < self.text.len()
+            && (is_digit(self.text[self.pos]) || self.text[self.pos] == b'_')
+        {
+            self.pos += 1;
+        }
+    }
+
+    /// The value digits of a based literal: hex digits, `_`, and the x/z/?
+    /// unknown states.
+    fn eat_base_digits(&mut self) {
+        while self.pos < self.text.len()
+            && (is_digit(self.text[self.pos])
+                || matches!(
+                    self.text[self.pos],
+                    b'a'..=b'f' | b'A'..=b'F' | b'_' | b'x' | b'X' | b'z' | b'Z' | b'?'
+                ))
+        {
+            self.pos += 1;
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Tokens carry only spans, so the SourceFile can be dropped after lexing.
-    fn lex_str(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
-        let file = SourceFile::new("t.v", src);
-        lex(FileId(0), &file)
-    }
-
-    fn kinds(src: &str) -> Vec<TokenKind> {
-        lex_str(src).0.iter().map(|t| t.kind).collect()
-    }
-
-    #[test]
-    fn lexes_module_header() {
-        let ks = kinds("module m;");
-        assert_eq!(
-            ks,
-            vec![
-                TokenKind::Ident,
-                TokenKind::Whitespace,
-                TokenKind::Ident,
-                TokenKind::Punct,
-                TokenKind::Eof
-            ]
-        );
-    }
-
-    #[test]
-    fn lexes_comments_and_strings() {
-        let ks = kinds("// hi\n/* x */ \"a\\\"b\"");
-        assert_eq!(
-            ks,
-            vec![
-                TokenKind::Comment,
-                TokenKind::Whitespace,
-                TokenKind::Comment,
-                TokenKind::Whitespace,
-                TokenKind::StrLiteral,
-                TokenKind::Eof
-            ]
-        );
-    }
-
-    #[test]
-    fn lexes_sys_task_directive_and_literals() {
-        let ks = kinds("$display(`WIDTH, 16'hFF, 'b10, 3.14, 1e-3)");
-        assert_eq!(
-            ks,
-            vec![
-                TokenKind::SysTask,
-                TokenKind::Punct,
-                TokenKind::Directive,
-                TokenKind::Punct,
-                TokenKind::Whitespace,
-                TokenKind::IntLiteral,
-                TokenKind::Punct,
-                TokenKind::Whitespace,
-                TokenKind::IntLiteral,
-                TokenKind::Punct,
-                TokenKind::Whitespace,
-                TokenKind::RealLiteral,
-                TokenKind::Punct,
-                TokenKind::Whitespace,
-                TokenKind::RealLiteral,
-                TokenKind::Punct,
-                TokenKind::Eof
-            ]
-        );
-    }
-
-    #[test]
-    fn token_spans_reconstruct_source() {
-        let src = "module m; // c\nendmodule";
-        let (tokens, diags) = lex_str(src);
-        assert!(diags.is_empty());
-        let mut recon = String::new();
-        let file = SourceFile::new("t.v", src);
-        for t in &tokens {
-            if t.kind == TokenKind::Eof {
-                continue;
-            }
-            recon.push_str(&file.text()[t.span.start as usize..t.span.end as usize]);
-        }
-        assert_eq!(recon, src);
-    }
-
-    #[test]
-    fn unterminated_string_is_a_diagnostic_not_a_panic() {
-        let (_, diags) = lex_str("\"oops");
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("unterminated string"));
-    }
-
-    #[test]
-    fn trailing_backslash_in_string_stays_in_bounds() {
-        // `"\\` — the escape consumes the byte after the backslash even at
-        // EOF; the token span must not run past the end of the source.
-        let src = "\"\\\\";
-        let (tokens, diags) = lex_str(src);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("unterminated string")));
-        for t in &tokens {
-            assert!(t.span.start as usize <= t.span.end as usize);
-            assert!(t.span.end as usize <= src.len());
-        }
-        let str_tok = tokens
-            .iter()
-            .find(|t| t.kind == TokenKind::StrLiteral)
-            .expect("string token");
-        assert_eq!(str_tok.span.end as usize, src.len());
-    }
-
-    #[test]
-    fn lexes_escaped_identifiers_and_unsized_literals() {
-        // `\a+b` is one escaped identifier (no whitespace inside); the
-        // terminating whitespace is a separate token.
-        let ks = kinds("\\a+b = '0 + '1 + 'x;");
-        assert_eq!(
-            ks,
-            vec![
-                TokenKind::Ident, // \a+b
-                TokenKind::Whitespace,
-                TokenKind::Punct, // =
-                TokenKind::Whitespace,
-                TokenKind::IntLiteral, // '0
-                TokenKind::Whitespace,
-                TokenKind::Punct, // +
-                TokenKind::Whitespace,
-                TokenKind::IntLiteral, // '1
-                TokenKind::Whitespace,
-                TokenKind::Punct, // +
-                TokenKind::Whitespace,
-                TokenKind::IntLiteral, // 'x
-                TokenKind::Punct,      // ;
-                TokenKind::Eof
-            ]
-        );
-        // The cast tick is punctuation, not a literal start.
-        let ks = kinds("signed'(x) 8'(y)");
-        assert!(ks.contains(&TokenKind::Punct));
-        assert!(!ks.contains(&TokenKind::Error));
-    }
-
-    #[test]
-    fn never_panics_on_arbitrary_bytes() {
-        // Fuzz-lite: every single byte and some slices must lex without panic.
-        for b in 0u16..=255 {
-            let _ = lex_str(&String::from_utf8_lossy(&[b as u8]));
-        }
-        let _ = lex_str("\u{1F600} \u{0} $ ` ' \" /*");
-    }
-}
+mod tests;
