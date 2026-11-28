@@ -305,6 +305,13 @@ pub struct InstIr {
 pub enum Conn {
     Named(String, Expr),
     Positional(Expr),
+    /// `.name` shorthand: bind this port to the same-named signal in the
+    /// enclosing scope (resolved during elaboration).
+    ByName(String),
+    /// `.*`: bind every port not otherwise connected to the same-named signal
+    /// in the enclosing scope (SV LRM 23.3.2.4; resolved during elaboration,
+    /// error on a port with no matching signal).
+    Wildcard,
 }
 
 #[derive(Clone, Debug, Serialize)]

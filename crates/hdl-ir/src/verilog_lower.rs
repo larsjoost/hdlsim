@@ -2852,6 +2852,13 @@ impl<'a> Lower<'a> {
 
     fn lower_conn(&mut self, c: &SyntaxNode, env: &HashMap<String, Value>) -> Conn {
         let kids = real_children(c);
+        // `.*` — the wildcard marker is the lone `*` punct child.
+        if kids
+            .iter()
+            .any(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "*")
+        {
+            return Conn::Wildcard;
+        }
         // First Name child = port name; first expr node after it = connection.
         let name_pos = kids.iter().position(|k| k.kind() == SyntaxKind::Name);
         let name = name_pos.map(|i| self.text(&kids[i]));
@@ -2863,7 +2870,8 @@ impl<'a> Lower<'a> {
         match (name, expr) {
             (Some(n), Some(e)) => Conn::Named(n, e),
             (None, Some(e)) => Conn::Positional(e),
-            (Some(n), None) => Conn::Named(n, Expr::Lit(Value::x(1))),
+            // `.name` shorthand: bind to the same-named signal in scope.
+            (Some(n), None) => Conn::ByName(n),
             (None, None) => Conn::Positional(Expr::Lit(Value::x(1))),
         }
     }

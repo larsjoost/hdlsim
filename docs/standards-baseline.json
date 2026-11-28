@@ -12,10 +12,10 @@
     "crates/hdl-wave/src/sinks/fst.rs": 1
   },
   "module_lines": {
-    "crates/hdl-ir/src/elab.rs": 1189,
-    "crates/hdl-ir/src/ir.rs": 620,
+    "crates/hdl-ir/src/elab.rs": 1297,
+    "crates/hdl-ir/src/ir.rs": 627,
     "crates/hdl-ir/src/value.rs": 1033,
-    "crates/hdl-ir/src/verilog_lower.rs": 4668,
+    "crates/hdl-ir/src/verilog_lower.rs": 4676,
     "crates/hdl-ir/src/vhdl_lower.rs": 1667,
     "crates/hdl-ir/src/vhdl_lower/arch.rs": 904,
     "crates/hdl-ir/src/vhdl_lower/decls.rs": 723,
@@ -32,7 +32,7 @@
     "crates/hdl-sim/src/sim.rs": 5116,
     "crates/hdl-sim/src/sim/ckpt.rs": 1389,
     "crates/hdl-syntax/src/diagnostic.rs": 790,
-    "crates/hdl-syntax/src/verilog/parser.rs": 3324,
+    "crates/hdl-syntax/src/verilog/parser.rs": 3355,
     "crates/hdl-syntax/src/vhdl/parser.rs": 4112,
     "crates/hdl-wave/src/fst.rs": 1229,
     "crates/hdl-wave/src/sinks/fst.rs": 706,

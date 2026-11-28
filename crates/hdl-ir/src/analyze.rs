@@ -176,9 +176,12 @@ fn analyze_module(m: &ModuleIr) -> Vec<Finding> {
     }
     for inst in &m.instances {
         for c in &inst.conns {
+            // Shorthand/wildcard conns carry no expression here: they resolve
+            // against the parent scope at elaboration time.
             let e = match c {
                 Conn::Named(_, e) => e,
                 Conn::Positional(e) => e,
+                Conn::ByName(_) | Conn::Wildcard => continue,
             };
             read(e, &mut reads);
         }

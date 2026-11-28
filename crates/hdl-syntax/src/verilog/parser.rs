@@ -1791,22 +1791,33 @@ impl<'a> Parser<'a> {
     fn parse_port_conn(&mut self) {
         self.builder.start_node(SyntaxKind::PortConn);
         if self.eat_punct('.') {
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
+            if self.eat_punct('*') {
+                // `.*`: unconnected ports bind to same-named signals; elab resolves.
                 self.builder.finish_node();
+                return;
             }
-            if self.eat_punct('(') {
-                if !self.at_punct(')') {
-                    self.parse_expression();
-                }
-                self.expect_punct(')', "to close the port connection");
-            }
+            self.parse_conn_name_and_value("to close the port connection");
         } else {
             // Positional connection.
             self.parse_expression();
         }
         self.builder.finish_node();
+    }
+
+    /// After the leading `.`, parse `name` with an optional `(expr)` — shared
+    /// by port connections and named call arguments (same CST shape).
+    fn parse_conn_name_and_value(&mut self, close_msg: &str) {
+        if self.peek().kind == TokenKind::Ident {
+            self.builder.start_node(SyntaxKind::Name);
+            self.bump();
+            self.builder.finish_node();
+        }
+        if self.eat_punct('(') {
+            if !self.at_punct(')') {
+                self.parse_expression();
+            }
+            self.expect_punct(')', close_msg);
+        }
     }
 
     // ---- grammar: statements -------------------------------------------------
@@ -2589,17 +2600,7 @@ impl<'a> Parser<'a> {
         if self.at_punct('.') {
             self.builder.start_node(SyntaxKind::PortConn);
             self.bump();
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
-            }
-            if self.eat_punct('(') {
-                if !self.at_punct(')') {
-                    self.parse_expression();
-                }
-                self.expect_punct(')', "to close the named argument");
-            }
+            self.parse_conn_name_and_value("to close the named argument");
             self.builder.finish_node();
         } else {
             self.parse_expression();
@@ -2832,6 +2833,36 @@ mod tests {
         let mut db = SourceDb::new();
         let id = db.add_file("t.v", src).unwrap();
         (parse_file(id, db.file(id)), db)
+    }
+
+    #[test]
+    fn parses_wildcard_and_shorthand_port_conns() {
+        let src = "module inner(input a, output y);
+assign y = ~a;
+endmodule
+module tb;
+reg a; wire y;
+inner u1 (.*);
+inner u2 (.a, .y);
+endmodule
+";
+        let (p, db) = parse_str(src);
+        assert!(
+            !p.diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "{:?}",
+            p.diags.iter().map(|d| d.render(&db)).collect::<Vec<_>>()
+        );
+        let sexp = p.root.debug_sexp(&db);
+        // The wildcard conn keeps its `.` and `*` punct children, and the
+        // shorthand conn has a name but no expression.
+        assert!(
+            sexp.contains(r#"(PortConn Punct "." Punct "*")"#),
+            "{}",
+            sexp
+        );
+        assert!(sexp.contains(r#"(PortConn Punct "." (Name"#), "{}", sexp);
     }
 
     #[test]
