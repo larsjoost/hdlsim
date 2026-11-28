@@ -82,7 +82,7 @@ pub fn parse_with_preproc(
     file: FileId,
     src: &SourceFile,
     incdirs: &[std::path::PathBuf],
-) -> (ParsedFile, HashMap<String, String>) {
+) -> (ParsedFile, HashMap<String, super::preproc::Macro>) {
     let mut macros = HashMap::new();
     let mut diags = Vec::new();
     let text = super::preproc::preprocess(file, src, incdirs, &mut macros, &mut diags);

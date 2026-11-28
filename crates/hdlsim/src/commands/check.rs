@@ -11,6 +11,7 @@ use hdl_ir::elab;
 use hdl_ir::Design;
 use hdl_syntax::diagnostic::Severity;
 use hdl_syntax::source::SourceDb;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -48,9 +49,7 @@ fn syntax_only(label: &str, files: &[PathBuf]) -> anyhow::Result<i32> {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         match ext.as_deref() {
-            Some("v") | Some("sv") => {
-                all_diags.extend(hdl_syntax::verilog::parser::parse_file(id, db.file(id)).diags);
-            }
+            Some("v") | Some("sv") => parse_verilog_syntax_only(&mut db, id, f, &mut all_diags),
             _ => {
                 all_diags.extend(hdl_syntax::vhdl::parser::parse_file(id, db.file(id)).diags);
             }
@@ -77,6 +76,28 @@ fn syntax_only(label: &str, files: &[PathBuf]) -> anyhow::Result<i32> {
     } else {
         println!("{label}: ok ({} warning(s))", all_diags.items.len());
         Ok(0)
+    }
+}
+
+/// Preprocess + parse one Verilog file. The compile pipeline preprocesses
+/// Verilog before parsing; syntax-only must see the same text or every
+/// macro-using file would fail here while compiling fine.
+fn parse_verilog_syntax_only(
+    db: &mut SourceDb,
+    id: hdl_syntax::source::FileId,
+    f: &std::path::Path,
+    all_diags: &mut hdl_syntax::diagnostic::Diagnostics,
+) {
+    let mut macros = HashMap::new();
+    let mut pdiags = Vec::new();
+    let expanded =
+        hdl_syntax::verilog::preproc::preprocess(id, db.file(id), &[], &mut macros, &mut pdiags);
+    all_diags.extend(pdiags);
+    let id2 = db
+        .add_file(f.display().to_string(), expanded)
+        .map_err(anyhow::Error::msg);
+    if let Ok(id2) = id2 {
+        all_diags.extend(hdl_syntax::verilog::parser::parse_file(id2, db.file(id2)).diags);
     }
 }
 

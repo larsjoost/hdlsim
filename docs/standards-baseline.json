@@ -78,7 +78,6 @@
     "crates/hdl-syntax/src/lint.rs": 1,
     "crates/hdl-syntax/src/verilog/lexer.rs": 2,
     "crates/hdl-syntax/src/verilog/parser.rs": 8,
-    "crates/hdl-syntax/src/verilog/preproc.rs": 1,
     "crates/hdl-syntax/src/vhdl/lexer.rs": 1,
     "crates/hdl-syntax/src/vhdl/parser.rs": 13,
     "crates/hdl-wave/src/fst.rs": 4,
