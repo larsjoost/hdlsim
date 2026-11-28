@@ -1803,7 +1803,7 @@ impl Simulator {
                 Control::Done
             }
             Stmt::Assign { lhs, rhs, nba } => {
-                let v = self.eval_expr(&rhs, None);
+                let v = self.eval_assign_rhs(&lhs, &rhs, None);
                 if nba {
                     // A memory-backed signal must not take the scalar NBA
                     // fast path: `vals` holds only the element width, so
@@ -1832,7 +1832,7 @@ impl Simulator {
             // Procedural continuous assignment (LRM 9.2.2): one write now,
             // then keep driving in every fixpoint until a `deassign`.
             Stmt::ProcContAssign { lhs, rhs } => {
-                let v = self.eval_expr(&rhs, None);
+                let v = self.eval_assign_rhs(&lhs, &rhs, None);
                 let v = self.convert_for_target(&lhs, &rhs, v, None);
                 self.assign_to(&lhs, v.clone(), None);
                 match lhs_sig(&lhs) {
@@ -3022,7 +3022,7 @@ impl Simulator {
             let n_assigns = self.flat.assigns.len();
             for ai in 0..n_assigns {
                 let a = &self.flat.assigns[ai];
-                let rhs = self.eval_expr(&a.rhs, None);
+                let rhs = self.eval_assign_rhs(&a.lhs, &a.rhs, None);
                 let rhs = self.convert_for_target(&a.lhs, &a.rhs, rhs, None);
                 if !self.trace_assigns.is_empty() {
                     self.assign_trace_eval(ai, &a.lhs, &a.rhs, &rhs);
@@ -3083,7 +3083,7 @@ impl Simulator {
         let mut changed = false;
         for pi in 0..self.proc_assigns.len() {
             let (_, lhs, rhs) = self.proc_assigns[pi].clone();
-            let v = self.eval_expr(&rhs, None);
+            let v = self.eval_assign_rhs(&lhs, &rhs, None);
             let v = self.convert_for_target(&lhs, &rhs, v, None);
             if self.assign_to(&lhs, v, None) {
                 changed = true;
@@ -4691,12 +4691,12 @@ impl<'a> ProcRunner<'a> {
                 }
             }
             Stmt::Assign { lhs, rhs, nba } => {
-                let v = self.sim.eval_expr(rhs, Some(self.locals));
+                let v = self.sim.eval_assign_rhs(lhs, rhs, Some(self.locals));
                 self.assign(lhs, rhs, v, *nba);
                 Control::Done
             }
             Stmt::AssignDelayed { lhs, rhs, delay } => {
-                let v = self.sim.eval_expr(rhs, Some(self.locals));
+                let v = self.sim.eval_assign_rhs(lhs, rhs, Some(self.locals));
                 let t = self
                     .sim
                     .eval_expr(delay, Some(self.locals))
