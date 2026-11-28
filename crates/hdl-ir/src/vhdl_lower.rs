@@ -30,6 +30,7 @@ use hdl_syntax::cst::SyntaxNode;
 use hdl_syntax::diagnostic::{Diagnostic, Severity};
 use hdl_syntax::kinds::SyntaxKind;
 use hdl_syntax::source::{FileId, SourceDb, Span};
+use serde::Serialize;
 
 /// Capacity of a simulated std.textio `line` buffer, in bytes.
 pub const TEXTIO_LINE_CAP: usize = 1024;
@@ -51,6 +52,7 @@ use std::rc::Rc;
 mod aggregate;
 mod arch;
 mod chains;
+mod compare;
 mod config;
 mod decls;
 mod dims;
@@ -63,6 +65,8 @@ mod package;
 mod process;
 mod scalar;
 mod seq;
+mod sigmaps;
+pub use sigmaps::{ProtType, SigMaps, TypeInfo};
 mod slots;
 mod subprogram;
 mod types;
@@ -692,53 +696,6 @@ fn package_decl_name(p: &SyntaxNode, db: &SourceDb) -> String {
         .unwrap_or_default()
 }
 
-/// Static type info for a VHDL type mark.
-#[derive(Clone, Debug)]
-pub enum TypeInfo {
-    /// Scalar 1-bit (std_logic, bit, boolean).
-    Scalar,
-    /// Vector (std_logic_vector/unsigned/signed/bit_vector); the width comes
-    /// from the constraint at the declaration site.
-    Vector { signed: bool },
-    /// 32-bit integer (natural/positive unsigned).
-    Integer { signed: bool },
-    /// 64-bit IEEE-754 real.
-    Real,
-    /// 8-bit char.
-    Char,
-    /// Enumeration: literals in declaration order.
-    Enum(Vec<String>),
-    /// Array type: element width + total depth (memories) + per-index
-    /// dimensions [(low, size), …] for multi-dimensional flat indexing.
-    /// `elem_name` is the element type mark (for arrays of records, so
-    /// `arr(i).field` can be lowered).
-    Array {
-        elem: usize,
-        depth: usize,
-        dims: Vec<(i64, usize)>,
-        elem_name: Option<String>,
-    },
-    /// Record type: fields as (name, width, signed) in declaration order.
-    /// Lowered as one flat vector; the first declared field is the MSB.
-    Record { fields: Vec<(String, usize, bool)> },
-    /// Protected type (VHDL-2008): objects are 64-bit handles into the
-    /// simulator's object store (same model as SV classes); state lives in
-    /// the object word, methods are `t::m` functions.
-    Handle,
-}
-
-/// A protected type's layout: state variables as (name, width, lsb, signed)
-/// in declaration order (first declared = MSB of the object word), plus the
-/// method names declared in the protected header.
-#[derive(Clone, Debug, Default)]
-pub struct ProtType {
-    pub fields: Vec<(String, usize, usize, bool)>,
-    pub methods: Vec<String>,
-    /// State-variable initializers (field name → lowered expr), written by
-    /// the generated `t::new` constructor.
-    pub inits: Vec<(String, Expr)>,
-}
-
 struct Lower<'a> {
     db: &'a SourceDb,
     diags: &'a mut Vec<Diagnostic>,
@@ -785,6 +742,11 @@ struct Lower<'a> {
     mems: HashMap<SigId, usize>,
     /// Signal id → signed flag (for `resize`/`to_signed` context).
     sig_signed: HashMap<SigId, bool>,
+    /// Signal id → std_logic_arith comparison class (see [`ObjClass`]).
+    sig_class: HashMap<SigId, ObjClass>,
+    /// std_logic_arith's wrap-semantics mixed comparisons are in scope
+    /// (this file's use clauses, or the inherited entity context).
+    arith_visible: bool,
     /// Signal id → record type name (for `sig.field` selects), if record-typed.
     sig_rec: HashMap<SigId, String>,
     /// (record type, field name) → effective element dims [(low, size), …]
@@ -981,56 +943,21 @@ struct Lower<'a> {
     file_seq: u64,
 }
 
-/// Per-module signal metadata (`SigId` is relative to one module).
-#[derive(Default, Clone)]
-pub struct SigMaps {
-    mems: HashMap<SigId, usize>,
-    sig_signed: HashMap<SigId, bool>,
-    sig_rec: HashMap<SigId, String>,
-    sig_elem_rec: HashMap<SigId, String>,
-    sig_width: HashMap<SigId, usize>,
-    sig_dims: HashMap<SigId, Vec<(i64, usize)>>,
-    sig_asc: HashMap<SigId, (i64, bool)>,
-    /// Element width in bits for multi-bit-element vectors (`string`: 8) —
-    /// see [`Lower::sig_elem`]. Mirrored with the entity's other signal maps
-    /// so an architecture addresses entity-declared strings correctly.
-    sig_elem: HashMap<SigId, usize>,
-    uncon_ports: std::collections::HashSet<SigId>,
-    /// Constants and types declared in the entity's declarative part — an
-    /// architecture sees them (the entity's declarative region encompasses
-    /// its architectures, LRM 1076 §1.2).
-    consts: HashMap<String, Value>,
-    types: HashMap<String, TypeInfo>,
-    /// `obj_dims` recorded in the entity's declarative part (generic and
-    /// constant shapes) — the architecture consults them for
-    /// `'length`-family folds on those names.
-    obj_dims: ObjDims,
-    /// `obj_asc` of the entity declarative part (see [`Lower::obj_asc`]).
-    obj_asc: HashMap<String, Vec<bool>>,
-    /// Aliases (and their record types) declared in the entity's declarative
-    /// part — visible in its architectures too. `SigId`s are module-relative
-    /// and the architecture reuses the entity module's signal table, so the
-    /// ids need no remapping.
-    aliases: HashMap<String, Expr>,
-    alias_rec: HashMap<String, String>,
-}
-
-impl SigMaps {
-    /// JSON view of the diagnosis-relevant lower-side maps: widths, array
-    /// dims, memory depths, ascending flags, unconstrained ports, and the
-    /// entity-declarative constants. Types and aliases are omitted (not
-    /// dim-related); this feeds `hdlsim ir --dump-maps`.
-    pub fn debug_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "sig_width": self.sig_width,
-            "sig_dims": self.sig_dims,
-            "mems": self.mems,
-            "sig_asc": self.sig_asc,
-            "sig_signed": self.sig_signed,
-            "uncon_ports": self.uncon_ports,
-            "consts": self.consts,
-        })
-    }
+/// std_logic_arith comparison class of a declared object: the two classes
+/// that drive mixed-comparison lowering (`unsigned`/`signed` arrays wrap the
+/// integer operand of a comparison to their own length — the package's
+/// comparison overloads convert with `conv_signed`/`conv_unsigned` to
+/// `L'LENGTH` — while plain vectors, records etc. keep the extend-to-wider
+/// comparison).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
+pub enum ObjClass {
+    /// `unsigned` or `signed` array object.
+    Arith,
+    /// Integer scalar object (`integer`/`natural`/`positive`).
+    Integer,
+    /// Everything else: no mixed-comparison rewriting.
+    #[default]
+    Other,
 }
 
 impl<'a> Lower<'a> {
@@ -1050,6 +977,8 @@ impl<'a> Lower<'a> {
             names: HashMap::new(),
             mems: HashMap::new(),
             sig_signed: HashMap::new(),
+            sig_class: HashMap::new(),
+            arith_visible: false,
             sig_rec: HashMap::new(),
             pkg_sig_types: HashMap::new(),
             pkg_sig_widths: HashMap::new(),
@@ -1111,6 +1040,8 @@ impl<'a> Lower<'a> {
         let maps = SigMaps {
             mems: self.mems.clone(),
             sig_signed: self.sig_signed.clone(),
+            sig_class: self.sig_class.clone(),
+            arith: self.arith_visible,
             sig_rec: self.sig_rec.clone(),
             sig_elem_rec: self.sig_elem_rec.clone(),
             sig_width: self.sig_width.clone(),
@@ -1134,6 +1065,7 @@ impl<'a> Lower<'a> {
         }
         self.mems.clear();
         self.sig_signed.clear();
+        self.sig_class.clear();
         self.sig_rec.clear();
         self.sig_elem_rec.clear();
         self.sig_width.clear();
@@ -1161,6 +1093,10 @@ impl<'a> Lower<'a> {
             .unwrap_or_default();
         self.mems = m.mems;
         self.sig_signed = m.sig_signed;
+        self.sig_class = m.sig_class;
+        // OR, not assign: an arch file's own `use ieee.std_logic_arith`
+        // must survive the entity's install (and vice versa).
+        self.arith_visible |= m.arith;
         self.sig_rec = m.sig_rec;
         self.sig_elem_rec = m.sig_elem_rec;
         self.sig_width = m.sig_width;
@@ -1221,6 +1157,12 @@ impl<'a> Lower<'a> {
                     2 => (parts[0], parts[1]),
                     _ => continue,
                 };
+                // std_logic_arith's mixed comparisons wrap the integer
+                // operand (numeric_std's extend instead) — recorded for the
+                // comparison gate in `wrap_mixed_compare`.
+                if unit.eq_ignore_ascii_case("std_logic_arith") {
+                    self.arith_visible = true;
+                }
                 if let Some(p) = self.pkgs.get(&unit.to_ascii_lowercase()).cloned() {
                     let item = item.to_ascii_lowercase();
                     self.merge_package(&p, if item == "all" { None } else { Some(&item) }, false);

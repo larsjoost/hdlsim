@@ -20,52 +20,6 @@ impl<'a> Lower<'a> {
         e
     }
 
-    /// Whether a lowered expression is signed by its declared type: the
-    /// `Signed`/`Resize` markers, or a signal/slot whose declaration recorded
-    /// signedness (integer objects). Mirrors the kernel's `expr_signed`.
-    fn expr_is_signed(&self, e: &Expr) -> bool {
-        match e {
-            Expr::Signed(_) => true,
-            Expr::Resize { signed, .. } => *signed,
-            Expr::Sig(i) => self.sig_signed.get(i).copied().unwrap_or(false),
-            Expr::Bin { op, l, r } => {
-                if matches!(
-                    op,
-                    BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror
-                ) {
-                    self.expr_is_signed(l)
-                } else {
-                    self.expr_is_signed(l) && self.expr_is_signed(r)
-                }
-            }
-            Expr::Un { e, .. } => self.expr_is_signed(e),
-            _ => false,
-        }
-    }
-
-    /// Build an ordered comparison (`<`, `<=`, `>`, `>=`): when either
-    /// operand is signed by its declared type, mark both so the comparison
-    /// sign-extends. Kernel slot reads (subprogram variables) default to
-    /// unsigned, and the 1076.2 UNIFORM seed fix-up (`if TSEED2 < 0`) must
-    /// see a negative seed, not 4294967295. Other operators keep their
-    /// operands untouched (two's-complement arithmetic is bit-identical).
-    fn mark_signed_compare(&self, op: BinOp, l: Expr, r: Expr) -> Expr {
-        if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
-            && (self.expr_is_signed(&l) || self.expr_is_signed(&r))
-        {
-            return Expr::Bin {
-                op,
-                l: Box::new(Expr::Signed(Box::new(l))),
-                r: Box::new(Expr::Signed(Box::new(r))),
-            };
-        }
-        Expr::Bin {
-            op,
-            l: Box::new(l),
-            r: Box::new(r),
-        }
-    }
-
     pub(super) fn lower_expr(&mut self, e: &SyntaxNode, env: &HashMap<String, Value>) -> Expr {
         match e.kind() {
             SyntaxKind::Literal => self.lower_literal(e, env),
@@ -2336,7 +2290,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            return Expr::Lit(Value { bits, real: false });
+            return self.lit_vec_mark(Value { bits, real: false });
         }
         if t.starts_with('\'') && t.ends_with('\'') && t.len() == 3 {
             // Character literal. The std_logic alphabet keeps its 1-bit value
@@ -2408,7 +2362,7 @@ impl<'a> Lower<'a> {
                         _ => VX,
                     };
                 }
-                return Expr::Lit(Value { bits, real: false });
+                return self.lit_vec_mark(Value { bits, real: false });
             }
             // String literal: first char in the high byte (MSB-first), so
             // `&`-concatenation and string_of read left to right. An empty
@@ -2423,7 +2377,7 @@ impl<'a> Lower<'a> {
                     bits[(n - 1 - bi) * 8 + j] = if (b >> j) & 1 == 1 { V1 } else { V0 };
                 }
             }
-            return Expr::Lit(Value { bits, real: false });
+            return self.lit_vec_mark(Value { bits, real: false });
         }
         if let Some(v) = self.parse_int_literal(t) {
             return Expr::Lit(v);
