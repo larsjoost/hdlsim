@@ -1074,6 +1074,13 @@ pub fn remap_stmt(s: &Stmt, map: &[FlatSigId]) -> Stmt {
             rhs: remap_expr(rhs, map),
             nba: *nba,
         },
+        Stmt::ProcContAssign { lhs, rhs } => Stmt::ProcContAssign {
+            lhs: remap_expr(lhs, map),
+            rhs: remap_expr(rhs, map),
+        },
+        Stmt::Deassign { lhs } => Stmt::Deassign {
+            lhs: remap_expr(lhs, map),
+        },
         Stmt::AssignDelayed { lhs, rhs, delay } => Stmt::AssignDelayed {
             lhs: remap_expr(lhs, map),
             rhs: remap_expr(rhs, map),

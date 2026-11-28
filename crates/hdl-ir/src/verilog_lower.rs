@@ -238,6 +238,8 @@ fn is_stmt_node(k: SyntaxKind) -> bool {
             | SyntaxKind::DoWhile
             | SyntaxKind::BreakStmt
             | SyntaxKind::ContinueStmt
+            | SyntaxKind::DeassignStmt
+            | SyntaxKind::Assign
             | SyntaxKind::SysCall
             | SyntaxKind::SvaStmt
             | SyntaxKind::Foreach
@@ -2324,6 +2326,43 @@ impl<'a> Lower<'a> {
             }
             SyntaxKind::BreakStmt => Stmt::Break,
             SyntaxKind::ContinueStmt => Stmt::Continue,
+            // Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2).
+            // Module-level continuous assigns reach the module-item path, not
+            // this statement lowering.
+            SyntaxKind::Assign => {
+                let kids = real_children(s);
+                let eq = kids
+                    .iter()
+                    .position(|k| k.kind() == SyntaxKind::Punct && self.text(k) == "=");
+                match eq {
+                    Some(eq) => {
+                        let lhs = kids[..eq].iter().find(|k| is_expr_node(k.kind()));
+                        let rhs = kids[eq + 1..].iter().find(|k| is_expr_node(k.kind()));
+                        match (lhs, rhs) {
+                            (Some(l), Some(r)) => Stmt::ProcContAssign {
+                                lhs: self.lower_expr(l, env),
+                                rhs: self.lower_expr(r, env),
+                            },
+                            _ => {
+                                self.err(s.span(), "malformed procedural continuous assign");
+                                Stmt::Null
+                            }
+                        }
+                    }
+                    None => {
+                        self.err(s.span(), "assign without `=`");
+                        Stmt::Null
+                    }
+                }
+            }
+            SyntaxKind::DeassignStmt => {
+                let lhs = real_children(s)
+                    .iter()
+                    .find(|k| is_expr_node(k.kind()))
+                    .map(|l| self.lower_expr(l, env))
+                    .unwrap_or_else(|| Expr::Lit(Value::x(1)));
+                Stmt::Deassign { lhs }
+            }
             SyntaxKind::SysCall => {
                 let kids = real_children(s);
                 let name = kids

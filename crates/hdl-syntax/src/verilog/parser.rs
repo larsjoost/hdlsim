@@ -1831,9 +1831,16 @@ impl<'a> Parser<'a> {
             TokenKind::Ident if text == "foreach" => self.parse_foreach(),
             TokenKind::Ident if text == "import" => self.parse_import(false),
             TokenKind::Ident if text == "export" => self.parse_import(true),
-            // `deassign x;` / `force x = e;` / `release x;` — parse and drop the
-            // procedural-assignment part (not simulated).
-            TokenKind::Ident if text == "deassign" || text == "release" => {
+            // `deassign lhs;` — procedural deassignment (LRM 9.2.2). `release`
+            // parses and drops (force/release are not simulated).
+            TokenKind::Ident if text == "deassign" => {
+                self.builder.start_node(SyntaxKind::DeassignStmt);
+                self.bump();
+                self.parse_expression();
+                self.expect_punct(';', "to end the statement");
+                self.builder.finish_node();
+            }
+            TokenKind::Ident if text == "release" => {
                 self.bump();
                 self.parse_expression();
                 self.expect_punct(';', "to end the statement");
@@ -2863,6 +2870,38 @@ endmodule
             sexp
         );
         assert!(sexp.contains(r#"(PortConn Punct "." (Name"#), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_deassign_and_procedural_continuous_assign() {
+        let src = "module tb;
+reg q, d;
+initial begin
+assign q = d;
+#5 deassign q;
+end
+endmodule
+";
+        let (p, db) = parse_str(src);
+        assert!(
+            !p.diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
+            "{:?}",
+            p.diags.iter().map(|d| d.render(&db)).collect::<Vec<_>>()
+        );
+        let kinds: Vec<SyntaxKind> = p.root.descendants().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::DeassignStmt),
+            "{}",
+            p.root.debug_sexp(&db)
+        );
+        // The process-level `assign q = d;` keeps its Assign node.
+        assert!(
+            kinds.contains(&SyntaxKind::Assign),
+            "{}",
+            p.root.debug_sexp(&db)
+        );
     }
 
     #[test]

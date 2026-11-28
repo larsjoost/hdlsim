@@ -210,6 +210,10 @@ pub struct Simulator {
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
+    /// Active procedural continuous assignments (LRM 9.2.2): registered by
+    /// `assign lhs = rhs;` in a process, removed by `deassign lhs;`. Swept
+    /// with the continuous assigns in every fixpoint.
+    proc_assigns: Vec<(FlatSigId, Expr, Expr)>,
     /// Function/procedure registry: name → indices into `flat.functions`.
     /// Overloads share a bare name, so lookups with several candidates
     /// resolve by formal count (`func_match`).
@@ -526,6 +530,7 @@ impl Simulator {
             proc_sens: Vec::new(),
             proc_all: Vec::new(),
             proc_rt: Vec::new(),
+            proc_assigns: Vec::new(),
             funcs: HashMap::new(),
             observers: Vec::new(),
             finished: false,
@@ -1952,6 +1957,40 @@ impl Simulator {
                 }
                 Control::Done
             }
+            // Procedural continuous assignment (LRM 9.2.2): one write now,
+            // then keep driving in every fixpoint until a `deassign`.
+            Stmt::ProcContAssign { lhs, rhs } => {
+                let v = self.eval_expr(&rhs, None);
+                let v = self.convert_for_target(&lhs, &rhs, v, None);
+                self.assign_to(&lhs, v.clone(), None);
+                match lhs_sig(&lhs) {
+                    Some(sig) => {
+                        // A later PCA on the same target replaces the earlier
+                        // one (the LRM lvalue is a simple variable).
+                        self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                        self.proc_assigns.push((sig, lhs, rhs));
+                    }
+                    None => self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
+                        text: format!(
+                            "error: procedural continuous assignment target must be a simple variable at t={}\n",
+                            fmt_time(self.time)
+                        ),
+                        time_fs: self.time,
+                        span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
+                    }),
+                }
+                Control::Done
+            }
+            // `deassign` stops the continuous drive; the target keeps the
+            // value it held (LRM 9.2.2).
+            Stmt::Deassign { lhs } => {
+                if let Some(sig) = lhs_sig(&lhs) {
+                    self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                }
+                Control::Done
+            }
             Stmt::Delay { time_fs, stmt } => {
                 self.proc_rt[pid as usize]
                     .frames
@@ -3135,6 +3174,11 @@ impl Simulator {
                     self.maybe_heartbeat();
                 }
             }
+            // Procedural continuous assignments drive in the same fixpoint as
+            // continuous assigns (their RHS may read either kind of source).
+            if self.eval_proc_assigns(&mut n_changed) {
+                changed = true;
+            }
             self.fix_changed = n_changed;
             any |= changed;
             if !changed {
@@ -3144,6 +3188,23 @@ impl Simulator {
         }
         self.fail_comb_loop();
         any
+    }
+
+    /// One sweep of the active procedural continuous assignments (LRM 9.2.2).
+    /// Appends the number of changed writes to `n_changed`; returns true when
+    /// any signal changed (which may have scheduled processes).
+    fn eval_proc_assigns(&mut self, n_changed: &mut u64) -> bool {
+        let mut changed = false;
+        for pi in 0..self.proc_assigns.len() {
+            let (_, lhs, rhs) = self.proc_assigns[pi].clone();
+            let v = self.eval_expr(&rhs, None);
+            let v = self.convert_for_target(&lhs, &rhs, v, None);
+            if self.assign_to(&lhs, v, None) {
+                changed = true;
+                *n_changed += 1;
+            }
+        }
+        changed
     }
 
     /// Report unconverged continuous assigns: the combinational-loop guard.
@@ -4989,6 +5050,8 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Break => Control::Break,
             Stmt::Continue => Control::Continue,
+            Stmt::ProcContAssign { lhs, rhs } => self.exec_proc_cont_assign(lhs, rhs),
+            Stmt::Deassign { lhs } => self.exec_proc_deassign(lhs),
             Stmt::Delay { .. } | Stmt::Wait { .. } | Stmt::WaitUntil { .. } => {
                 // The body runs inline inside one `sys_call`, so a suspend
                 // cannot return to the caller with its position saved. Warn
@@ -5007,6 +5070,45 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Null => Control::Done,
         }
+    }
+
+    /// Procedural continuous assignment in a procedure body: register it only
+    /// when its expressions do not reference the procedure's frame slots —
+    /// those die with the call, and the fixpoint would read wrong values
+    /// afterwards. The one-shot write happens either way.
+    fn exec_proc_cont_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Control {
+        let v = self.sim.eval_expr(rhs, Some(self.locals));
+        let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+        self.sim.assign_to(lhs, v, Some(self.locals));
+        let mut reads: Vec<SigId> = Vec::new();
+        lhs.collect_sigs(&mut reads);
+        rhs.collect_sigs(&mut reads);
+        let uses_locals = reads.iter().any(|s| (*s as usize) < self.locals.len());
+        match lhs_sig(lhs) {
+            Some(sig) if !uses_locals => {
+                self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+                self.sim.proc_assigns.push((sig, lhs.clone(), rhs.clone()));
+            }
+            _ => self.sim.emit(SimEvent::Message {
+                scope: self.sim.cur_scope(),
+                text: format!(
+                    "warning: procedural continuous assignment inside a procedure is only driven while it references module signals at t={}\n",
+                    self.sim.time
+                ),
+                time_fs: self.sim.time,
+                span: self.sim.cur_span,
+                severity: Some(MessageSeverity::Warning),
+            }),
+        }
+        Control::Done
+    }
+
+    /// `deassign` inside a procedure body: drop the target's registration.
+    fn exec_proc_deassign(&mut self, lhs: &Expr) -> Control {
+        if let Some(sig) = lhs_sig(lhs) {
+            self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+        }
+        Control::Done
     }
 
     /// Assign `v` to `lhs` in a procedure body: frame-slot writes for

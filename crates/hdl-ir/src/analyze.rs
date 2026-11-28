@@ -103,6 +103,12 @@ fn walk_stmt(s: &Stmt, driven: &mut HashSet<SigId>, reads: &mut HashSet<SigId>) 
             lhs_roots(lhs, driven);
             read(rhs, reads);
         }
+        Stmt::ProcContAssign { lhs, rhs } => {
+            lhs_roots(lhs, driven);
+            read(rhs, reads);
+        }
+        // `deassign` stops driving the target; it neither reads nor drives.
+        Stmt::Deassign { .. } => {}
         Stmt::AssignDelayed { lhs, rhs, delay } => {
             lhs_roots(lhs, driven);
             read(rhs, reads);

@@ -491,6 +491,15 @@ fn w_stmt(w: &mut W, s: &Stmt) {
         Stmt::Break => w.u8(10),
         Stmt::Continue => w.u8(11),
         Stmt::Null => w.u8(12),
+        Stmt::ProcContAssign { lhs, rhs } => {
+            w.u8(17);
+            w_expr(w, lhs);
+            w_expr(w, rhs);
+        }
+        Stmt::Deassign { lhs } => {
+            w.u8(18);
+            w_expr(w, lhs);
+        }
         Stmt::Spanned { span, inner } => {
             w.u8(13);
             w_span(w, span);
@@ -616,6 +625,11 @@ fn r_stmt(r: &mut R) -> Result<Stmt, String> {
         10 => Stmt::Break,
         11 => Stmt::Continue,
         12 => Stmt::Null,
+        17 => Stmt::ProcContAssign {
+            lhs: r_expr(r)?,
+            rhs: r_expr(r)?,
+        },
+        18 => Stmt::Deassign { lhs: r_expr(r)? },
         13 => Stmt::Spanned {
             span: r_span(r)?,
             inner: Box::new(r_stmt(r)?),
@@ -834,6 +848,12 @@ pub(crate) fn save(sim: &Simulator, out: &mut Vec<u8>) {
     for e in &sim.sig_evt {
         w.u64(*e);
     }
+    // Active procedural continuous assignments: (target, lhs, rhs).
+    w.u32(sim.proc_assigns.len() as u32);
+    for (_, lhs, rhs) in &sim.proc_assigns {
+        w_expr(&mut w, lhs);
+        w_expr(&mut w, rhs);
+    }
     w.u32(sim.mems.len() as u32);
     for m in &sim.mems {
         w.u32(m.len() as u32);
@@ -988,6 +1008,18 @@ pub(crate) fn load(flat: Flat, bytes: &[u8]) -> Result<Simulator, String> {
     sim.sig_evt.clear();
     for _ in 0..n {
         sim.sig_evt.push(r.u64()?);
+    }
+    let n = r.u32()? as usize;
+    if n > (1 << 16) {
+        return Err("too many proc assigns".to_string());
+    }
+    sim.proc_assigns.clear();
+    for _ in 0..n {
+        let lhs = r_expr(&mut r)?;
+        let rhs = r_expr(&mut r)?;
+        let sig =
+            crate::sim::lhs_sig(&lhs).ok_or("proc assign target must be a simple variable")?;
+        sim.proc_assigns.push((sig, lhs, rhs));
     }
     let n = r.u32()? as usize;
     if n != sim.mems.len() {

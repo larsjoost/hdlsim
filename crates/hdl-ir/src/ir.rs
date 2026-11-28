@@ -387,6 +387,17 @@ pub enum Stmt {
     /// function body (unlike a plain assign to the function-name slot, which
     /// falls through).
     Return(Box<Expr>),
+    /// Procedural continuous assignment `assign lhs = rhs;` (LRM 9.2.2):
+    /// drives `lhs` continuously from here on, until a `deassign lhs;`.
+    ProcContAssign {
+        lhs: Expr,
+        rhs: Expr,
+    },
+    /// `deassign lhs;` — stop the procedural continuous assignment on `lhs`;
+    /// it keeps the value it held (LRM 9.2.2).
+    Deassign {
+        lhs: Expr,
+    },
     /// `break;` — exit the innermost loop.
     Break,
     /// `continue;` — jump to the innermost loop's step/next iteration.
@@ -572,6 +583,11 @@ impl Stmt {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
             }
+            Stmt::ProcContAssign { lhs, rhs } => {
+                lhs.collect_sigs(out);
+                rhs.collect_sigs(out);
+            }
+            Stmt::Deassign { lhs } => lhs.collect_sigs(out),
             Stmt::AssignDelayed { lhs, rhs, delay } => {
                 lhs.collect_sigs(out);
                 rhs.collect_sigs(out);
