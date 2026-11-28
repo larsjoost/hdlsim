@@ -323,7 +323,18 @@ impl Simulator {
             return self.eval_expr(rhs, locals);
         }
         let widened = self.widen_ctx(rhs, ctx, locals, false);
-        self.eval_expr(&widened, locals)
+        // The widened tree is a fresh allocation per evaluation, so its node
+        // addresses churn (allocator reuse can serve a later tree's node at
+        // an earlier tree's address) — the same not-flat-stable class as PCA
+        // clones, which the fixpoint sweep also evaluates with the memo off
+        // (see sim/type_flags.rs). A pointer-keyed flag entry from a
+        // recycled address would poison the classification, so the widened
+        // evaluation walks uncached; the flags consulted on the flat-owned
+        // `rhs` above still memoize.
+        let saved_memo = self.expr_memo.replace(false);
+        let v = self.eval_expr(&widened, locals);
+        self.expr_memo.set(saved_memo);
+        v
     }
 
     /// Widen a context-determined RHS tree to the assignment context width
