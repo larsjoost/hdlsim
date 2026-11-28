@@ -212,6 +212,10 @@ pub struct Simulator {
     proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
+    /// Active procedural continuous assignments (LRM 9.2.2): registered by
+    /// `assign lhs = rhs;` in a process, removed by `deassign lhs;`. Swept
+    /// with the continuous assigns in every fixpoint.
+    proc_assigns: Vec<(FlatSigId, Expr, Expr)>,
     /// Function/procedure registry: name → indices into `flat.functions`.
     /// Overloads share a bare name, so lookups with several candidates
     /// resolve by formal count (`func_match`).
@@ -538,6 +542,7 @@ impl Simulator {
             proc_sens: Vec::new(),
             proc_all: Vec::new(),
             proc_rt: Vec::new(),
+            proc_assigns: Vec::new(),
             funcs: HashMap::new(),
             observers: Vec::new(),
             finished: false,
@@ -1930,6 +1935,40 @@ impl Simulator {
                 }
                 Control::Done
             }
+            // Procedural continuous assignment (LRM 9.2.2): one write now,
+            // then keep driving in every fixpoint until a `deassign`.
+            Stmt::ProcContAssign { lhs, rhs } => {
+                let v = self.eval_expr(&rhs, None);
+                let v = self.convert_for_target(&lhs, &rhs, v, None);
+                self.assign_to(&lhs, v.clone(), None);
+                match lhs_sig(&lhs) {
+                    Some(sig) => {
+                        // A later PCA on the same target replaces the earlier
+                        // one (the LRM lvalue is a simple variable).
+                        self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                        self.proc_assigns.push((sig, lhs, rhs));
+                    }
+                    None => self.emit(SimEvent::Message {
+                        scope: self.cur_scope(),
+                        text: format!(
+                            "error: procedural continuous assignment target must be a simple variable at t={}\n",
+                            fmt_time(self.time)
+                        ),
+                        time_fs: self.time,
+                        span: self.cur_span,
+                        severity: Some(MessageSeverity::Error),
+                    }),
+                }
+                Control::Done
+            }
+            // `deassign` stops the continuous drive; the target keeps the
+            // value it held (LRM 9.2.2).
+            Stmt::Deassign { lhs } => {
+                if let Some(sig) = lhs_sig(&lhs) {
+                    self.proc_assigns.retain(|(s, _, _)| *s != sig);
+                }
+                Control::Done
+            }
             Stmt::Delay { time_fs, stmt } => {
                 self.proc_rt[pid as usize]
                     .frames
@@ -2413,7 +2452,17 @@ impl Simulator {
                 if args.len() >= 2 {
                     if let (Expr::Lit(fname), Expr::Sig(mem)) = (&args[0], &args[1]) {
                         let fname = string_of(fname);
-                        self.read_mem_file(mem, &fname, name == "readmemb");
+                        let range = self.mem_task_range(&args, locals.as_deref());
+                        self.read_mem_file(mem, &fname, name == "readmemb", range);
+                    }
+                }
+            }
+            "writememh" | "writememb" => {
+                if args.len() >= 2 {
+                    if let (Expr::Lit(fname), Expr::Sig(mem)) = (&args[0], &args[1]) {
+                        let fname = string_of(fname);
+                        let range = self.mem_task_range(&args, locals.as_deref());
+                        self.write_mem_file(mem, &fname, name == "writememb", range);
                     }
                 }
             }
@@ -2830,37 +2879,138 @@ impl Simulator {
         }
     }
 
-    fn read_mem_file(&mut self, mem: &SigId, fname: &str, binary: bool) {
+    /// Optional START/FINISH address arguments of the memory load/store
+    /// tasks (LRM 21.4), evaluated once in the caller's frame.
+    fn mem_task_range(
+        &mut self,
+        args: &[Expr],
+        locals: Option<&Vec<Value>>,
+    ) -> (Option<u64>, Option<u64>) {
+        let start = args
+            .get(2)
+            .map(|a| self.eval_expr(a, locals))
+            .and_then(|v| v.to_u64());
+        let finish = args
+            .get(3)
+            .map(|a| self.eval_expr(a, locals))
+            .and_then(|v| v.to_u64());
+        (start, finish)
+    }
+
+    /// $readmemh/$readmemb (LRM 21.4): load data words into the memory,
+    /// overwriting in place from address 0 or the last `@hex` address
+    /// directive. Words outside the optional [start, finish] window are
+    /// skipped; an address beyond the declared depth grows the memory with
+    /// a warning, since reads index the same storage.
+    fn read_mem_file(
+        &mut self,
+        mem: &SigId,
+        fname: &str,
+        binary: bool,
+        range: (Option<u64>, Option<u64>),
+    ) {
         let Ok(text) = std::fs::read_to_string(fname) else {
-            self.emit(SimEvent::Message {
-                scope: self.cur_scope(),
-                text: format!("error: cannot read memory file '{}'", fname),
-                time_fs: self.time,
-                span: None,
-                severity: Some(MessageSeverity::Error),
-            });
+            self.mem_task_msg(
+                format!("cannot read memory file '{fname}'"),
+                MessageSeverity::Error,
+            );
             return;
         };
         let sig = *mem as usize;
         let width = self.flat.signals[sig].width.max(1);
+        let depth = self.mems[sig].len();
+        // Loading begins at the START argument; `@` directives in the file
+        // override from there (LRM 21.4).
+        let mut addr: u64 = range.0.unwrap_or(0);
+        let mut warned = false;
         for tok in text.split_whitespace() {
-            let t = tok.trim_start_matches('@');
-            if tok.starts_with('@') {
-                continue; // address directive: we fill sequentially for simplicity
+            if let Some(hex) = tok.strip_prefix('@') {
+                match u64::from_str_radix(&hex.replace('_', ""), 16) {
+                    Ok(a) => addr = a,
+                    Err(_) => self.mem_task_msg(
+                        format!("bad address directive '{tok}' in '{fname}'"),
+                        MessageSeverity::Warning,
+                    ),
+                }
+                continue;
             }
-            let v = if binary {
-                hdl_ir::verilog_lower::parse_int_literal(&format!("'b{}", t.replace('_', "")))
+            let in_window = range.0.is_none_or(|s| addr >= s) && range.1.is_none_or(|f| addr <= f);
+            let lit = if binary {
+                format!("'b{}", tok.replace('_', ""))
             } else {
-                hdl_ir::verilog_lower::parse_int_literal(&format!(
-                    "{}'h{}",
-                    width,
-                    t.replace('_', "")
-                ))
+                format!("{width}'h{}", tok.replace('_', ""))
             };
-            if let Some(v) = v {
-                self.mems[sig].push(v.resize(width));
+            if let (true, Some(v)) = (in_window, hdl_ir::verilog_lower::parse_int_literal(&lit)) {
+                if (addr as usize) >= depth && !warned {
+                    warned = true;
+                    self.mem_task_msg(
+                        format!(
+                            "'{fname}': address {addr:#x} beyond memory depth {depth}; \
+                             extending with x"
+                        ),
+                        MessageSeverity::Warning,
+                    );
+                }
+                while self.mems[sig].len() <= addr as usize {
+                    self.mems[sig].push(Value::x(width));
+                }
+                self.mems[sig][addr as usize] = v.resize(width);
             }
+            addr += 1;
         }
+    }
+
+    /// $writememh/$writememb (LRM 21.4): write the memory words to a file —
+    /// data words 8 per line, with an `@hex` address directive whenever the
+    /// address is not the previous word plus one (a contiguous dump starts
+    /// with no directive, so a read-back can begin at a chosen START).
+    /// Words outside [start, finish] are skipped.
+    fn write_mem_file(
+        &mut self,
+        mem: &SigId,
+        fname: &str,
+        binary: bool,
+        range: (Option<u64>, Option<u64>),
+    ) {
+        let sig = *mem as usize;
+        let fmt = if binary { "b" } else { "h" };
+        let mut out = String::new();
+        let mut row = 0usize;
+        let mut prev: Option<u64> = None;
+        for (i, v) in self.mems[sig].iter().enumerate() {
+            let a = i as u64;
+            if !(range.0.is_none_or(|s| a >= s) && range.1.is_none_or(|f| a <= f)) {
+                continue;
+            }
+            if row == 8 || prev.is_some_and(|p| p + 1 != a) || (prev.is_none() && a != 0) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("@{a:x}\n"));
+                row = 0;
+            }
+            out.push_str(&v.display(fmt));
+            out.push(' ');
+            row += 1;
+            prev = Some(a);
+        }
+        if let Err(e) = std::fs::write(fname, out) {
+            self.mem_task_msg(
+                format!("cannot write memory file '{fname}': {e}"),
+                MessageSeverity::Error,
+            );
+        }
+    }
+
+    /// Message for a memory load/store task, at the current time.
+    fn mem_task_msg(&mut self, text: String, severity: MessageSeverity) {
+        self.emit(SimEvent::Message {
+            scope: self.cur_scope(),
+            text,
+            time_fs: self.time,
+            span: None,
+            severity: Some(severity),
+        });
     }
 
     fn fmt_args(&mut self, args: &[Expr], locals: Option<&Vec<Value>>) -> String {
@@ -3008,6 +3158,16 @@ impl Simulator {
                     self.maybe_heartbeat();
                 }
             }
+            // Procedural continuous assignments drive in the same fixpoint as
+            // continuous assigns (their RHS may read either kind of source).
+            // Their trees are runtime-registered clones — removed by
+            // `deassign`, re-cloned on re-`assign` — not flat-stable, so
+            // they walk uncached (see sim/type_flags.rs).
+            let pca_memo = self.expr_memo.replace(false);
+            if self.eval_proc_assigns(&mut n_changed) {
+                changed = true;
+            }
+            self.expr_memo.set(pca_memo);
             self.fix_changed = n_changed;
             any |= changed;
             if !changed {
@@ -3019,6 +3179,23 @@ impl Simulator {
         self.expr_memo.set(saved_memo);
         self.fail_comb_loop();
         any
+    }
+
+    /// One sweep of the active procedural continuous assignments (LRM 9.2.2).
+    /// Appends the number of changed writes to `n_changed`; returns true when
+    /// any signal changed (which may have scheduled processes).
+    fn eval_proc_assigns(&mut self, n_changed: &mut u64) -> bool {
+        let mut changed = false;
+        for pi in 0..self.proc_assigns.len() {
+            let (_, lhs, rhs) = self.proc_assigns[pi].clone();
+            let v = self.eval_expr(&rhs, None);
+            let v = self.convert_for_target(&lhs, &rhs, v, None);
+            if self.assign_to(&lhs, v, None) {
+                changed = true;
+                *n_changed += 1;
+            }
+        }
+        changed
     }
 
     /// Report unconverged continuous assigns: the combinational-loop guard.
@@ -4775,6 +4952,8 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Break => Control::Break,
             Stmt::Continue => Control::Continue,
+            Stmt::ProcContAssign { lhs, rhs } => self.exec_proc_cont_assign(lhs, rhs),
+            Stmt::Deassign { lhs } => self.exec_proc_deassign(lhs),
             Stmt::Delay { .. } | Stmt::Wait { .. } | Stmt::WaitUntil { .. } => {
                 // The body runs inline inside one `sys_call`, so a suspend
                 // cannot return to the caller with its position saved. Warn
@@ -4793,6 +4972,45 @@ impl<'a> ProcRunner<'a> {
             }
             Stmt::Null => Control::Done,
         }
+    }
+
+    /// Procedural continuous assignment in a procedure body: register it only
+    /// when its expressions do not reference the procedure's frame slots —
+    /// those die with the call, and the fixpoint would read wrong values
+    /// afterwards. The one-shot write happens either way.
+    fn exec_proc_cont_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Control {
+        let v = self.sim.eval_expr(rhs, Some(self.locals));
+        let v = self.sim.convert_for_target(lhs, rhs, v, Some(self.locals));
+        self.sim.assign_to(lhs, v, Some(self.locals));
+        let mut reads: Vec<SigId> = Vec::new();
+        lhs.collect_sigs(&mut reads);
+        rhs.collect_sigs(&mut reads);
+        let uses_locals = reads.iter().any(|s| (*s as usize) < self.locals.len());
+        match lhs_sig(lhs) {
+            Some(sig) if !uses_locals => {
+                self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+                self.sim.proc_assigns.push((sig, lhs.clone(), rhs.clone()));
+            }
+            _ => self.sim.emit(SimEvent::Message {
+                scope: self.sim.cur_scope(),
+                text: format!(
+                    "warning: procedural continuous assignment inside a procedure is only driven while it references module signals at t={}\n",
+                    self.sim.time
+                ),
+                time_fs: self.sim.time,
+                span: self.sim.cur_span,
+                severity: Some(MessageSeverity::Warning),
+            }),
+        }
+        Control::Done
+    }
+
+    /// `deassign` inside a procedure body: drop the target's registration.
+    fn exec_proc_deassign(&mut self, lhs: &Expr) -> Control {
+        if let Some(sig) = lhs_sig(lhs) {
+            self.sim.proc_assigns.retain(|(s, _, _)| *s != sig);
+        }
+        Control::Done
     }
 
     /// Assign `v` to `lhs` in a procedure body: frame-slot writes for
