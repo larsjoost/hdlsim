@@ -9,7 +9,8 @@
 //! and the SystemVerilog scalar types (bit/byte/shortint/int/longint/string/
 //! chandle), parameters (body, `#(...)` header, `parameter type`), continuous
 //! assign (with `#delay` and drive strengths), always/always_comb/always_ff/
-//! always_latch (with @ sensitivity, posedge/negedge, `@*`), initial, final,
+//! always_latch (with @ sensitivity, posedge/negedge, `@*`, `iff` event
+//! qualifiers), initial, final,
 //! functions (incl. `automatic`/`void` and ANSI port lists), tasks, generate
 //! for/if/case and named generate blocks, module and gate-primitive
 //! instantiations, defparam, event declarations and triggers, typedef/enum/
@@ -28,6 +29,7 @@ use crate::source::{FileId, SourceFile};
 use crate::token::{Token, TokenKind};
 use std::collections::{HashMap, HashSet};
 
+mod proc;
 mod sva;
 
 /// Output of parsing one file.
@@ -1154,52 +1156,6 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_always(&mut self) {
-        self.builder.start_node(SyntaxKind::Always);
-        self.bump(); // always*
-        if self.eat_punct('@') {
-            self.parse_sens_list();
-        }
-        self.parse_statement();
-        self.builder.finish_node();
-    }
-
-    /// `@(...)`, `@*`, or `@sig` — shared by `always` and event waits.
-    fn parse_sens_list(&mut self) {
-        if self.at_punct('(') {
-            self.builder.start_node(SyntaxKind::SensList);
-            self.bump();
-            // Items: `[posedge|negedge] expr` separated by `,` or `or`; `@(*)` is all.
-            while !self.at_punct(')') && self.peek().kind != TokenKind::Eof {
-                if self.at_punct('*') {
-                    self.bump();
-                    break;
-                }
-                if self.at_kw("posedge") || self.at_kw("negedge") {
-                    self.bump();
-                }
-                self.parse_expression();
-                if !self.eat_punct(',') && !self.eat_kw("or") {
-                    break;
-                }
-            }
-            self.expect_punct(')', "to close the sensitivity list");
-            self.builder.finish_node();
-        } else if self.at_punct('*') {
-            self.bump();
-        } else {
-            // `@sig` — single signal.
-            self.parse_expression();
-        }
-    }
-
-    fn parse_initial(&mut self) {
-        self.builder.start_node(SyntaxKind::Initial);
-        self.bump(); // initial
-        self.parse_statement();
-        self.builder.finish_node();
-    }
-
     /// `function [automatic] [void|type] [range] name [(ports)] ; body endfunction`.
     /// Ports may be ANSI-style `(input [7:0] a)` or plain `input a;` decls.
     fn parse_function(&mut self) {
@@ -1302,25 +1258,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `event a, b;`
-    fn parse_event_decl(&mut self) {
-        self.builder.start_node(SyntaxKind::EventDecl);
-        self.bump(); // event
-        loop {
-            if self.peek().kind == TokenKind::Ident {
-                self.bump_name_node();
-            } else {
-                self.error_here("expected an event name");
-                break;
-            }
-            if !self.eat_punct(',') {
-                break;
-            }
-        }
-        self.expect_punct(';', "to end the event declaration");
-        self.builder.finish_node();
-    }
-
     /// `defparam a.b.P = expr, ...;`
     fn parse_defparam(&mut self) {
         self.builder.start_node(SyntaxKind::Defparam);
@@ -1347,14 +1284,6 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(';', "to end the defparam statement");
-        self.builder.finish_node();
-    }
-
-    /// `final` block — like `initial`, runs at the end of simulation.
-    fn parse_final(&mut self) {
-        self.builder.start_node(SyntaxKind::Final);
-        self.bump(); // final
-        self.parse_statement();
         self.builder.finish_node();
     }
 
@@ -2816,6 +2745,20 @@ mod tests {
         let sexp = p.root.debug_sexp(&db);
         assert!(sexp.contains("(Module"), "{}", sexp);
         assert!(sexp.contains("(Port"), "{}", sexp);
+    }
+
+    #[test]
+    fn parses_iff_event_qualifier() {
+        // `iff` wraps the condition in an IffCond node inside the SensList.
+        let sexp = ok(
+            "module m(input clk, input en, output reg q); always @(posedge clk iff en) q <= 1; endmodule\n",
+        );
+        assert!(sexp.contains("(IffCond"), "{}", sexp);
+        // Mixed list: the qualifier binds to the entry it follows.
+        let sexp = ok(
+            "module m(input clk, input en, input rst_n, output reg q); always @(posedge clk iff en or negedge rst_n) q <= 1; endmodule\n",
+        );
+        assert!(sexp.matches("(IffCond").count() == 1, "{}", sexp);
     }
 
     #[test]

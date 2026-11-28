@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 mod ce_proc;
 mod literals;
+mod pattern;
 
 pub use literals::parse_int_literal;
 use literals::{parse_real_literal, time_literal_fs};
@@ -1662,7 +1663,7 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_sens_list(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Sens {
-        let mut edges = Vec::new();
+        let mut edges: Vec<Edge> = Vec::new();
         let mut pending = EdgeKind::Any;
         for c in real_children(s) {
             match c.kind() {
@@ -1674,6 +1675,17 @@ impl<'a> Lower<'a> {
                         pending = EdgeKind::Neg;
                     }
                     // `or` separators carry no meaning beyond joining the list.
+                }
+                SyntaxKind::IffCond => {
+                    // Event qualifier on the entry lowered just before it.
+                    let cond = real_children(&c)
+                        .into_iter()
+                        .find(|k| is_expr_node(k.kind()))
+                        .map(|k| self.lower_expr(&k, env));
+                    match edges.last_mut() {
+                        Some(e) => e.iff = cond,
+                        None => self.err(c.span(), "`iff` qualifier without a preceding event"),
+                    }
                 }
                 _ if is_expr_node(c.kind()) => {
                     let e = self.lower_expr(&c, env);
@@ -1690,6 +1702,7 @@ impl<'a> Lower<'a> {
                         Some(id) => edges.push(Edge {
                             sig: id,
                             kind: pending,
+                            iff: None,
                         }),
                         None => self.err(c.span(), "sensitivity list entry must be a signal"),
                     }
@@ -2347,75 +2360,6 @@ impl<'a> Lower<'a> {
             }
             _ => Stmt::Null,
         }
-    }
-
-    /// Lower `'{a: x, b: y}` against the LHS struct type: build a concat in
-    /// field order (msb first). Missing fields fall back to positional
-    /// entries, then `default:`, then X.
-    fn lower_pattern(
-        &mut self,
-        pat: &SyntaxNode,
-        lhs: &SyntaxNode,
-        env: &HashMap<String, Value>,
-    ) -> Option<Expr> {
-        if lhs.kind() != SyntaxKind::Name {
-            return None;
-        }
-        let id = self.sig_id(&self.text(lhs))?;
-        let tn = self.sig_types.get(&id)?.clone();
-        let td = self.types.get(&tn)?.clone();
-        let fields = match &td.kind {
-            TypeKind::Struct(f) => f.clone(),
-            _ => return None,
-        };
-        let kids = real_children(pat);
-        let mut named: Vec<(String, Expr)> = Vec::new();
-        let mut positional: Vec<Expr> = Vec::new();
-        let mut default: Option<Expr> = None;
-        let mut i = 0;
-        while i < kids.len() {
-            if kids[i].kind() == SyntaxKind::Name {
-                let n = self.text(&kids[i]);
-                i += 1;
-                if i < kids.len() && is_expr_node(kids[i].kind()) {
-                    let e = self.lower_expr(&kids[i], env);
-                    if n == "default" {
-                        default = Some(e);
-                    } else {
-                        named.push((n, e));
-                    }
-                    i += 1;
-                }
-            } else if is_expr_node(kids[i].kind()) {
-                positional.push(self.lower_expr(&kids[i], env));
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        let mut ordered = fields.clone();
-        ordered.sort_by_key(|f| std::cmp::Reverse(f.2)); // descending lsb → msb first
-        let mut pos = 0;
-        let mut parts: Vec<Expr> = Vec::new();
-        for (n, w, _) in &ordered {
-            let e = named
-                .iter()
-                .find(|(fn_, _)| fn_ == n)
-                .map(|(_, e)| e.clone())
-                .or_else(|| {
-                    if pos < positional.len() {
-                        let e = positional[pos].clone();
-                        pos += 1;
-                        Some(e)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| default.clone())
-                .unwrap_or_else(|| Expr::Lit(Value::x(*w)));
-            parts.push(e);
-        }
-        Some(Expr::Concat(parts))
     }
 
     fn lower_case(&mut self, s: &SyntaxNode, env: &HashMap<String, Value>) -> Stmt {

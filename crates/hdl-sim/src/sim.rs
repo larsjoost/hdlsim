@@ -26,6 +26,7 @@ mod image;
 mod observe;
 mod probe;
 mod proc_copyback;
+mod sens;
 use hdl_ir::value::{Value, V0, V1, VDASH, VU, VX, VZ};
 
 /// Pack a string as a Value: first char in the high byte, MSB-first — the same
@@ -207,7 +208,7 @@ pub struct Simulator {
     nba: Vec<(FlatSigId, Value, Option<u32>)>,
     time_events: BTreeMap<u64, Vec<Ev>>,
     time: u64,
-    proc_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
+    proc_sens: Vec<Vec<Edge>>,
     proc_all: Vec<Vec<FlatSigId>>,
     proc_rt: Vec<ProcRt>,
     /// Function/procedure registry: name → indices into `flat.functions`.
@@ -300,10 +301,10 @@ pub struct Simulator {
     /// (see `park`). Scheduling a changed signal is O(fanout) instead of
     /// scanning every process's sensitivity list — the dominant cost on big
     /// designs.
-    sens_index: Vec<Vec<(u32, EdgeKind)>>,
+    sens_index: Vec<Vec<(u32, Edge)>>,
     /// Each process's entries currently in `sens_index` — `park` swaps them
     /// out for the parked wait's edges; wake swaps them back.
-    cur_sens: Vec<Vec<(FlatSigId, EdgeKind)>>,
+    cur_sens: Vec<Vec<Edge>>,
     /// "Already queued in `active`" per process — O(1) activate dedupe.
     in_active: Vec<bool>,
     /// RNG state for $random (Cell so expression evaluation can stay &self).
@@ -626,11 +627,11 @@ impl Simulator {
             .map(|_| ProcRt::default())
             .collect();
         for (pid, p) in sim.flat.procs.iter().enumerate() {
-            let list: Vec<(FlatSigId, EdgeKind)> = match &p.sens {
+            let list: Vec<Edge> = match &p.sens {
                 Sens::List(es) => {
                     // Keep `proc_all` index-aligned with `procs`.
                     sim.proc_all.push(Vec::new());
-                    es.iter().map(|e| (e.sig, e.kind)).collect()
+                    es.clone()
                 }
                 Sens::All => {
                     let mut sigs = Vec::new();
@@ -640,13 +641,17 @@ impl Simulator {
                     sim.proc_all
                         .push(sigs.iter().map(|s| *s as FlatSigId).collect());
                     sigs.iter()
-                        .map(|s| (*s as FlatSigId, EdgeKind::Any))
+                        .map(|s| Edge {
+                            sig: *s as SigId,
+                            kind: EdgeKind::Any,
+                            iff: None,
+                        })
                         .collect()
                 }
             };
             // Non-parked processes wake on their declared sensitivity.
-            for (s, ek) in &list {
-                sim.sens_index[*s as usize].push((pid as u32, *ek));
+            for e in &list {
+                sim.sens_index[e.sig as usize].push((pid as u32, e.clone()));
             }
             sim.cur_sens.push(list.clone());
             sim.proc_sens.push(list);
@@ -1493,50 +1498,6 @@ impl Simulator {
         self.active.push_back(pid);
     }
 
-    /// Park a process on an event list, at most once per process. The
-    /// process's `sens_index` entries swap from its declared sensitivity to
-    /// the wait's edges — while parked, only those can wake it.
-    fn park(&mut self, pid: u32, edges: Vec<(FlatSigId, EdgeKind)>) {
-        let i = pid as usize;
-        if self.parked[i] {
-            self.trace(format!(
-                "{}: park SKIPPED, already parked",
-                self.flat.procs[pid as usize].origin
-            ));
-            return;
-        }
-        self.trace(format!(
-            "{}: park on {:?}",
-            self.flat.procs[pid as usize].origin, edges
-        ));
-        let old = std::mem::replace(&mut self.cur_sens[i], edges.clone());
-        for (s, _ek) in &old {
-            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
-        }
-        for (s, ek) in &edges {
-            self.sens_index[*s as usize].push((pid, *ek));
-        }
-        self.parked[i] = true;
-    }
-
-    /// Release a process from its wait, swapping its `sens_index` entries back
-    /// to the declared sensitivity. Called before re-activation.
-    fn unpark(&mut self, pid: u32) {
-        let i = pid as usize;
-        if !self.parked[i] {
-            return;
-        }
-        self.parked[i] = false;
-        let old = std::mem::take(&mut self.cur_sens[i]);
-        for (s, _ek) in &old {
-            self.sens_index[*s as usize].retain(|(q, _)| *q != pid);
-        }
-        for (s, ek) in &self.proc_sens[i] {
-            self.sens_index[*s as usize].push((pid, *ek));
-        }
-        self.cur_sens[i] = self.proc_sens[i].clone();
-    }
-
     /// A `wait until ... for T` timeout expired. Pop the process's check
     /// frame and resume it — regardless of the condition (LRM 8.1). If the
     /// wake token does not match, the process already resumed from an earlier
@@ -1590,12 +1551,18 @@ impl Simulator {
                     // A bare `always` (no event list) re-runs immediately.
                     match &self.flat.procs[pid as usize].sens {
                         Sens::List(es) if !es.is_empty() => {
-                            let edges = es.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
-                            self.park(pid, edges);
+                            self.park(pid, es.clone());
                         }
                         Sens::All => {
                             let sigs = std::mem::take(&mut self.proc_all[pid as usize]);
-                            let edges = sigs.iter().map(|s| (*s, EdgeKind::Any)).collect();
+                            let edges = sigs
+                                .iter()
+                                .map(|s| Edge {
+                                    sig: *s as SigId,
+                                    kind: EdgeKind::Any,
+                                    iff: None,
+                                })
+                                .collect();
                             self.proc_all[pid as usize] = sigs;
                             self.park(pid, edges);
                         }
@@ -1814,8 +1781,7 @@ impl Simulator {
                         self.proc_rt[pid as usize].frames.pop();
                         continue;
                     }
-                    let parked: Vec<(FlatSigId, EdgeKind)> =
-                        edges.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                    let parked = edges.clone();
                     self.park(pid, parked);
                     return Control::Wait;
                 }
@@ -1959,12 +1925,10 @@ impl Simulator {
                 Control::Suspend(self.time + time_fs)
             }
             Stmt::Wait { sens, body } => {
-                let edges: Vec<(FlatSigId, EdgeKind)> =
-                    sens.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
                 self.proc_rt[pid as usize]
                     .frames
                     .push(Frame::block(vec![*body]));
-                self.park(pid, edges);
+                self.park(pid, sens.clone());
                 Control::Wait
             }
             Stmt::WaitUntil {
@@ -1991,8 +1955,7 @@ impl Simulator {
                         deadline,
                         gen,
                     });
-                let edges: Vec<(FlatSigId, EdgeKind)> =
-                    sens.iter().map(|e| (e.sig as FlatSigId, e.kind)).collect();
+                let edges = sens.clone();
                 self.trace(format!(
                     "{}: wait until ({} edges, deadline {})",
                     self.flat.procs[pid as usize].origin,
@@ -3128,53 +3091,6 @@ impl Simulator {
         }
         let words: Vec<Value> = m.iter().map(|el| el.clone().resize(w)).collect();
         Value::concat(&words)
-    }
-
-    fn schedule_sensitive(&mut self, sig: FlatSigId, old: &Value, new: &Value) {
-        // Lowering-internal signals (`__for_i` loop variables, `__pN_var_*`
-        // variable mirrors) are not VHDL signals: writing them must never
-        // wake a process. A (ALL) process's collect_sigs sensitivity
-        // includes them — the loop reads its own variable, the body reads
-        // its variables — so an unfiltered wake lets a process wake on its
-        // own loop/variable writes: an infinite zero-delay loop (observed
-        // as a (ALL) tb stimulus process re-running on every `__for_i`
-        // iteration write). Flat names are instance-qualified
-        // (`inst.__p0_var_x`), so test the last path segment. VHDL
-        // identifiers cannot begin with `__`, so the prefix is
-        // unambiguous.
-        if self.flat.signals[sig as usize]
-            .name
-            .rsplit('.')
-            .next()
-            .is_some_and(|n| n.starts_with("__"))
-        {
-            return;
-        }
-        let edge_of = |ek: &EdgeKind| match ek {
-            EdgeKind::Pos => new.bit(0) == V1 && old.bit(0) != V1,
-            EdgeKind::Neg => new.bit(0) == V0 && old.bit(0) != V0,
-            EdgeKind::Any => true,
-        };
-        // Fanout-driven wake: only processes whose CURRENT sensitivity (declared
-        // list, or the wait they are parked on) includes `sig` are considered —
-        // O(fanout) instead of scanning every process per write. Collect first
-        // (borrows self.sens_index), then wake.
-        let mut to_wake: Vec<u32> = Vec::new();
-        for (pid, ek) in self.sens_index[sig as usize].iter() {
-            if edge_of(ek) {
-                to_wake.push(*pid);
-            }
-        }
-        for pid in to_wake {
-            if self.parked[pid as usize] {
-                self.trace(format!(
-                    "{}: woken by edge on signal {sig} ({})",
-                    self.flat.procs[pid as usize].origin, self.flat.signals[sig as usize].name
-                ));
-            }
-            self.unpark(pid);
-            self.activate(pid);
-        }
     }
 
     /// Whether an expression is a signed-typed value (VHDL `signed`).
