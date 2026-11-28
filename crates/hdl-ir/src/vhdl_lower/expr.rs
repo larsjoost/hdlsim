@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod aggregate;
 mod literal;
 
 impl<'a> Lower<'a> {
@@ -73,12 +74,7 @@ impl<'a> Lower<'a> {
                             .map(|_| kids.len() - 1)
                             .unwrap_or(kids.len());
                         if !fields.is_empty() && start < end {
-                            return self.lower_record_agg_kids(
-                                &kids[start..end],
-                                &tn,
-                                &fields,
-                                env,
-                            );
+                            return self.record_agg_kids(&kids[start..end], &tn, &fields, env);
                         }
                     }
                     return Expr::Lit(Value::x(32));
@@ -1902,61 +1898,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn lower_aggregate(
-        &mut self,
-        e: &SyntaxNode,
-        env: &HashMap<String, Value>,
-        width: usize,
-    ) -> Expr {
-        // `(others => x)` → replicate x; `(a, b, c)` → concat.
-        let kids = real_children(e);
-        if kids.iter().any(|k| k.kind() == SyntaxKind::Others) {
-            let val = kids.iter().rev().find(|k| is_expr_node(k.kind()));
-            return match val {
-                Some(v) => {
-                    let inner = self.lower_expr(v, env);
-                    // Replicate by elements: a character value (`' '`) is
-                    // 8 bits, a std_logic value 1 — the target `width` is
-                    // total bits, so the count is width / element width.
-                    let iw = match &inner {
-                        Expr::Lit(v) => v.width().max(1),
-                        _ => 1,
-                    };
-                    Expr::Replicate {
-                        count: Box::new(Expr::Lit(Value::from_u64(32, (width / iw).max(1) as u64))),
-                        e: Box::new(inner),
-                    }
-                }
-                None => Expr::Lit(Value::x(width.max(1))),
-            };
-        }
-        // Positional values only: a choice followed by `=>` is an association
-        // name, not a value (record-typed targets use lower_record_aggregate).
-        let mut parts: Vec<Expr> = Vec::new();
-        let mut i = 0;
-        while i < kids.len() {
-            let k = &kids[i];
-            let arrow = kids
-                .get(i + 1)
-                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
-                .unwrap_or(false)
-                && kids
-                    .get(i + 2)
-                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
-                    .unwrap_or(false);
-            if is_expr_node(k.kind()) && !arrow {
-                parts.push(self.lower_expr(k, env));
-            }
-            i += 1;
-        }
-        Expr::Concat(parts)
-    }
-    /// Lower an aggregate against a record type `tn`, recursing into
-    /// aggregate-typed fields with their own types (nested record/array
-    /// aggregates keep their layout instead of degrading to X). Falls back
-    /// to plain `lower_expr` per field when a field is not itself an
-    /// aggregate of an aggregate type — so behavior matches
-    /// [`Self::lower_record_aggregate`] for scalar fields.
+    /// Thin dispatcher for [`Self::typed_record_aggregate`] (defined in the
+    /// `aggregate` child module); keeps the `pub(super)` call sites in
+    /// `decls.rs` unchanged.
     pub(super) fn lower_typed_record_aggregate(
         &mut self,
         e: &SyntaxNode,
@@ -1964,115 +1908,12 @@ impl<'a> Lower<'a> {
         fields: &[(String, usize, usize)],
         env: &HashMap<String, Value>,
     ) -> Expr {
-        let kids = real_children(e);
-        self.lower_record_agg_kids(&kids, tn, fields, env)
+        self.typed_record_aggregate(e, tn, fields, env)
     }
 
-    /// Record-aggregate fold over an explicit element-child list — shared by
-    /// [`Self::lower_typed_record_aggregate`] (an `Aggregate` node whose
-    /// children are the elements) and the qualified-record path (the parser
-    /// folds `T'(field => v, …)` directly into the `Qualified` node, so the
-    /// element children must be pre-extracted).
-    fn lower_record_agg_kids(
-        &mut self,
-        kids: &[SyntaxNode],
-        tn: &str,
-        fields: &[(String, usize, usize)],
-        env: &HashMap<String, Value>,
-    ) -> Expr {
-        let mut named: Vec<(String, usize)> = Vec::new();
-        let mut positional: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i < kids.len() {
-            let k = &kids[i];
-            let arrow = kids
-                .get(i + 1)
-                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
-                .unwrap_or(false)
-                && kids
-                    .get(i + 2)
-                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
-                    .unwrap_or(false);
-            if arrow {
-                named.push((self.text(k).to_ascii_lowercase(), i + 3));
-                i += 4;
-            } else if is_expr_node(k.kind()) {
-                positional.push(i);
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        let others = named.iter().find(|(n, _)| n == "others").map(|(_, v)| *v);
-        let mut parts: Vec<Expr> = Vec::new();
-        for (fi, (fname, _, fw)) in fields.iter().enumerate() {
-            let vi = named
-                .iter()
-                .find(|(n, _)| n == fname)
-                .map(|(_, v)| *v)
-                .or(others);
-            let raw = match vi {
-                Some(vi) => {
-                    let vnode = &kids[vi];
-                    let fty = self
-                        .rec_field_ty
-                        .get(&(tn.to_string(), fname.clone()))
-                        .cloned();
-                    self.lower_typed_field(vnode, fty.as_deref(), *fw, env)
-                }
-                None => positional
-                    .get(fi)
-                    .map(|&pi| self.lower_expr(&kids[pi], env))
-                    .unwrap_or_else(|| Expr::Lit(Value::x(*fw))),
-            };
-            parts.push(Expr::Resize {
-                e: Box::new(raw),
-                width: *fw,
-                signed: false,
-            });
-        }
-        Expr::Concat(parts)
-    }
-
-    /// Lower one aggregate element/field value against its type: nested
-    /// aggregates of record/array types recurse (typed layout); everything
-    /// else lowers normally. `fw` is the target width for the fallback
-    /// X-literal. `constraint` (decl-site range) supplies the array length
-    /// and low bound when the value is an array aggregate.
-    pub(super) fn lower_typed_field(
-        &mut self,
-        vnode: &SyntaxNode,
-        fty: Option<&str>,
-        fw: usize,
-        env: &HashMap<String, Value>,
-    ) -> Expr {
-        if vnode.kind() != SyntaxKind::Aggregate {
-            return self.lower_expr(vnode, env);
-        }
-        let Some(tn) = fty else {
-            return self.lower_expr(vnode, env);
-        };
-        match self.types.get(tn).cloned() {
-            Some(TypeInfo::Record { .. }) => {
-                let fields = self.record_fields_of_type(tn);
-                if fields.is_empty() {
-                    return self.lower_expr(vnode, env);
-                }
-                self.lower_typed_record_aggregate(vnode, tn, &fields, env)
-            }
-            Some(TypeInfo::Array { elem, .. }) => {
-                let (n, lo) = self.array_agg_len(fw, elem);
-                match n {
-                    Some(n) => self
-                        .lower_array_aggregate(vnode, tn, n, lo, env)
-                        .unwrap_or_else(|| self.lower_expr(vnode, env)),
-                    None => self.lower_expr(vnode, env),
-                }
-            }
-            _ => self.lower_expr(vnode, env),
-        }
-    }
-
+    /// Thin dispatcher for [`Self::array_aggregate_specs`] (defined in the
+    /// `aggregate` child module); keeps the `pub(super)` call sites in
+    /// `decls.rs` and `aggregate.rs` unchanged.
     pub(super) fn lower_array_aggregate_specs(
         &mut self,
         e: &SyntaxNode,
@@ -2082,70 +1923,6 @@ impl<'a> Lower<'a> {
         elem_name: Option<String>,
         env: &HashMap<String, Value>,
     ) -> Option<Expr> {
-        let elem = elem.max(1);
-        let kids = real_children(e);
-        let mut named: Vec<(i64, usize)> = Vec::new();
-        let mut positional: Vec<usize> = Vec::new();
-        let mut others: Option<usize> = None;
-        let mut i = 0;
-        while i < kids.len() {
-            let k = &kids[i];
-            let arrow = kids
-                .get(i + 1)
-                .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == "=")
-                .unwrap_or(false)
-                && kids
-                    .get(i + 2)
-                    .map(|p| p.kind() == SyntaxKind::Punct && self.text(p) == ">")
-                    .unwrap_or(false);
-            if arrow {
-                if k.kind() == SyntaxKind::Others {
-                    others = Some(i + 3);
-                } else if is_expr_node(k.kind()) {
-                    let cex = self.lower_expr(k, env);
-                    let iv = self
-                        .ce_env(&cex, env)
-                        .and_then(|v| v.to_u64())
-                        .map(|v| v as i64)?;
-                    named.push((iv, i + 3));
-                }
-                i += 4;
-            } else if is_expr_node(k.kind()) {
-                positional.push(i);
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        let mut slots: Vec<Option<usize>> = vec![None; n];
-        for (iv, vi) in named {
-            let p = iv - lo;
-            if p < 0 || p as usize >= n {
-                return None; // choice outside the constraint: legacy path
-            }
-            slots[p as usize] = Some(vi);
-        }
-        for (j, &pi) in positional.iter().enumerate() {
-            if j >= n {
-                return None;
-            }
-            slots[j] = Some(pi);
-        }
-        let mut parts: Vec<Expr> = Vec::with_capacity(n);
-        for slot in slots.iter().copied() {
-            let raw = match slot.or(others) {
-                Some(vi) => {
-                    let vnode = kids[vi].clone();
-                    self.lower_typed_field(&vnode, elem_name.as_deref(), elem, env)
-                }
-                None => Expr::Lit(Value::x(elem)),
-            };
-            parts.push(Expr::Resize {
-                e: Box::new(raw),
-                width: elem,
-                signed: false,
-            });
-        }
-        Some(Expr::Concat(parts))
+        self.array_aggregate_specs(e, n, lo, elem, elem_name, env)
     }
 }
