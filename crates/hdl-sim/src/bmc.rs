@@ -95,32 +95,8 @@ pub fn prove(flat: &Flat, steps: usize) -> Result<ProveResult, String> {
             enc.encode_transition(t)?;
         }
     }
-    // Violation literals per (property, trigger step).
-    let mut violations: Vec<(usize, usize, Lit)> = Vec::new();
-    for (pi, p) in props.iter().enumerate() {
-        let last = steps.saturating_sub(p.delay);
-        for t in 0..=last {
-            let g = {
-                let mut ex = Exec::at(&mut enc, t);
-                let mut g = ex.enc.b.true_lit();
-                for guard in &p.guards {
-                    let v = ex.eval(guard)?;
-                    let gt = or_bits(&mut ex.enc.b, &v.bits);
-                    g = ex.enc.b.and_lit(g, gt);
-                }
-                g
-            };
-            let chk_bits = {
-                let mut ex = Exec::at(&mut enc, t + p.delay);
-                ex.eval(&p.check)?.bits
-            };
-            let bad = {
-                let chk_t = or_bits(&mut enc.b, &chk_bits);
-                enc.b.and_lit(g, neg(chk_t))
-            };
-            violations.push((pi, t, bad));
-        }
-    }
+    let violations = encode_violations(&mut enc, &props, steps)?;
+    // Assert the disjunction of all violations: SAT = some violation holds.
     let mut bad = enc.b.false_lit();
     for (_, _, v) in &violations {
         bad = enc.b.or_lit(bad, *v);
@@ -128,14 +104,8 @@ pub fn prove(flat: &Flat, steps: usize) -> Result<ProveResult, String> {
     enc.b.clause(&[bad]);
     let properties: Vec<String> = props.iter().map(|p| p.origin.clone()).collect();
     let model = match enc.b.s.solve() {
-        None => {
-            return Ok(ProveResult {
-                status: ProveStatus::Safe,
-                steps,
-                properties,
-                trace: Vec::new(),
-            });
-        }
+        // UNSAT: no violation within the bound.
+        None => return Ok(safe_result(properties, steps)),
         Some(m) => m,
     };
     let lit_val = |l: Lit| -> bool { model[var_of(l)] != is_neg(l) };
@@ -146,7 +116,66 @@ pub fn prove(flat: &Flat, steps: usize) -> Result<ProveResult, String> {
             break;
         }
     }
-    // Counterexample trace over inputs + state.
+    let trace = build_cex_trace(&enc, &lit_val, steps);
+    Ok(ProveResult {
+        status: ProveStatus::Violation(violated.0, violated.1),
+        steps,
+        properties,
+        trace,
+    })
+}
+
+/// The result for an UNSAT solve: no property violated within the bound.
+fn safe_result(properties: Vec<String>, steps: usize) -> ProveResult {
+    ProveResult {
+        status: ProveStatus::Safe,
+        steps,
+        properties,
+        trace: Vec::new(),
+    }
+}
+
+/// Violation literals per (property, trigger step): the guards' conjunction
+/// at step t AND-NOT the check at step t + delay.
+fn encode_violations(
+    enc: &mut Encoder,
+    props: &[Property],
+    steps: usize,
+) -> Result<Vec<(usize, usize, Lit)>, String> {
+    let mut violations: Vec<(usize, usize, Lit)> = Vec::new();
+    for (pi, p) in props.iter().enumerate() {
+        let last = steps.saturating_sub(p.delay);
+        for t in 0..=last {
+            let g = {
+                let mut ex = Exec::at(enc, t);
+                let mut g = ex.enc.b.true_lit();
+                for guard in &p.guards {
+                    let v = ex.eval(guard)?;
+                    let gt = or_bits(&mut ex.enc.b, &v.bits);
+                    g = ex.enc.b.and_lit(g, gt);
+                }
+                g
+            };
+            let chk_bits = {
+                let mut ex = Exec::at(enc, t + p.delay);
+                ex.eval(&p.check)?.bits
+            };
+            let bad = {
+                let chk_t = or_bits(&mut enc.b, &chk_bits);
+                enc.b.and_lit(g, neg(chk_t))
+            };
+            violations.push((pi, t, bad));
+        }
+    }
+    Ok(violations)
+}
+
+/// Counterexample trace over inputs + state signals, sorted by name.
+fn build_cex_trace(
+    enc: &Encoder,
+    lit_val: &impl Fn(Lit) -> bool,
+    steps: usize,
+) -> Vec<Vec<(String, u64)>> {
     let mut traced: Vec<FlatSigId> = enc.cls.input.clone();
     traced.extend(enc.cls.state.iter().copied());
     traced.sort_by_key(|s| enc.flat.signals[*s as usize].name.clone());
@@ -165,12 +194,7 @@ pub fn prove(flat: &Flat, steps: usize) -> Result<ProveResult, String> {
         }
         trace.push(row);
     }
-    Ok(ProveResult {
-        status: ProveStatus::Violation(violated.0, violated.1),
-        steps,
-        properties,
-        trace,
-    })
+    trace
 }
 
 /// Wrap `top` in a synthetic module `__hdlsim_prove_top` whose ports are
