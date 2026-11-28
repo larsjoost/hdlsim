@@ -114,6 +114,10 @@ impl Simulator {
                 let er = self.expr_flags(e, locals).0;
                 (cr || tr || er, false)
             }
+            // A streamed value keeps its operand's type flags: the chunks
+            // are re-ordered, not re-typed (`{>>{e}}` folds to `e` at lower
+            // time, so only `<<` reaches the IR).
+            Expr::Stream { e, .. } => self.expr_flags(e, locals),
             _ => (false, false),
         }
     }
@@ -174,5 +178,77 @@ impl Simulator {
             return self.eval_expr(e, locals).to_u64().map(|v| v as u32);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::Simulator;
+    use hdl_ir::elab::{Flat, FlatSig};
+
+    fn sim_with(signals: &[(usize, bool)]) -> Simulator {
+        let flat = Flat {
+            signals: signals
+                .iter()
+                .map(|(w, sgn)| FlatSig {
+                    name: "s".to_string(),
+                    width: *w,
+                    kind: SigKind::Wire,
+                    init: None,
+                    mem: None,
+                    scope: 0,
+                    signed: *sgn,
+                    real_ranges: Vec::new(),
+                })
+                .collect(),
+            procs: Vec::new(),
+            assigns: Vec::new(),
+            functions: Vec::new(),
+            scopes: Vec::new(),
+            top_scope: 0,
+        };
+        Simulator::new(flat)
+    }
+
+    #[test]
+    fn stream_inherits_operand_signedness_memoized() {
+        let sim = sim_with(&[(8, true)]);
+        sim.expr_memo.set(true); // the assign-fixpoint context
+        let e = Expr::Stream {
+            e: Box::new(Expr::Sig(0)),
+            slice: 2,
+        };
+        // First call computes + caches; the second must hit the memo and
+        // return the same classification (the flat-owned tree is stable).
+        assert!(sim.expr_signed(&e, None));
+        assert!(sim.expr_signed(&e, None));
+        assert!(!sim.expr_real(&e, None));
+    }
+
+    #[test]
+    fn stream_of_unsigned_operand_stays_unsigned() {
+        let sim = sim_with(&[(8, false)]);
+        sim.expr_memo.set(true);
+        let e = Expr::Stream {
+            e: Box::new(Expr::Sig(0)),
+            slice: 4,
+        };
+        assert!(!sim.expr_signed(&e, None));
+        assert!(!sim.expr_real(&e, None));
+    }
+
+    #[test]
+    fn stream_walks_uncached_when_memo_off() {
+        // PCA/process contexts run with expr_memo=false; the arm must
+        // compute the same answer without touching the memo.
+        let sim = sim_with(&[(8, true)]);
+        assert!(!sim.expr_memo.get());
+        let e = Expr::Stream {
+            e: Box::new(Expr::Sig(0)),
+            slice: 2,
+        };
+        assert!(sim.expr_signed(&e, None));
+        assert!(sim.expr_flags_memo.borrow().is_empty());
     }
 }
