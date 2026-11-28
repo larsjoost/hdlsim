@@ -941,6 +941,12 @@ struct Lower<'a> {
     /// Counter for path-less file declarations: each gets a unique
     /// `$file:name#n` marker constant, resolved at runtime by file_open.
     file_seq: u64,
+    /// Generate blocks currently being unrolled, innermost last: one element
+    /// per enclosing for-generate, `label(index)` (loop variable fallback
+    /// when unlabeled). Processes and instances lowered inside get it as an
+    /// instance-path suffix, so two unrolled lanes are distinguishable in the
+    /// transcript and in signal names.
+    gen_path: Vec<String>,
 }
 
 /// std_logic_arith comparison class of a declared object: the two classes
@@ -1031,6 +1037,7 @@ impl<'a> Lower<'a> {
             sig_prot: HashMap::new(),
             pending_funcs: Vec::new(),
             file_seq: 0,
+            gen_path: Vec::new(),
         }
     }
 

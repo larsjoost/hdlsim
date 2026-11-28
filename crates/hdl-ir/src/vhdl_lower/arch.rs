@@ -179,7 +179,11 @@ impl<'a> Lower<'a> {
             };
             let binding = self.lower_binding_kids(&fk[use_pos + 1..]);
             for inst in &mut module.instances {
-                if inst.name.eq_ignore_ascii_case(&label) {
+                // A generate-unrolled instance's name carries its generate
+                // path (`lane_gen(0).u_lane`); the spec's label matches the
+                // full name or the bare instance label.
+                let bare = inst.name.rsplit('.').next().unwrap_or(&inst.name);
+                if inst.name.eq_ignore_ascii_case(&label) || bare.eq_ignore_ascii_case(&label) {
                     self.apply_binding(inst, &binding, fs.span());
                 }
             }
@@ -227,6 +231,9 @@ impl<'a> Lower<'a> {
                         i.name = format!("inst{}", self.inst_count);
                         self.inst_count += 1;
                     }
+                    if !self.gen_path.is_empty() {
+                        i.name = format!("{}.{}", self.gen_path.join("."), i.name);
+                    }
                     module.instances.push(i);
                 }
             }
@@ -266,6 +273,31 @@ impl<'a> Lower<'a> {
             }
         }
         (decls, stmts)
+    }
+
+    /// Label of a concurrent statement, when the parser kept one as a
+    /// preceding sibling (`lane_gen : for i in …` — non-instantiation labels
+    /// stay outside the statement node). Only a `label :` immediately before
+    /// the statement counts; anything else is not a label.
+    fn stmt_label(&self, s: &SyntaxNode) -> Option<String> {
+        let parent = s.parent()?;
+        let kids = real_children(parent);
+        let pos = kids.iter().position(|k| k.span() == s.span())?;
+        let colon = kids.get(pos.checked_sub(1)?)?;
+        if colon.kind() != SyntaxKind::Punct || self.text(colon) != ":" {
+            return None;
+        }
+        let label = kids.get(pos.checked_sub(2)?)?;
+        (label.kind() == SyntaxKind::Ident).then(|| self.text(label).to_string())
+    }
+
+    /// Label a for-generate iteration's scope element is built from: the
+    /// generate's label, falling back to the loop variable's name when the
+    /// generate is unlabeled (`lane_gen`, `i`).
+    fn gen_label(&self, s: &SyntaxNode, var: Option<&str>) -> String {
+        self.stmt_label(s)
+            .or_else(|| var.map(str::to_string))
+            .unwrap_or_else(|| "gen".to_string())
     }
 
     /// Lower the declarative items of a generate/block body. When `fresh` is
@@ -471,14 +503,17 @@ impl<'a> Lower<'a> {
         } else {
             (lo..=hi).take(n as usize).collect()
         };
+        let gen_label = self.gen_label(s, var.as_deref());
         for v in vals {
             if let Some(var) = &var {
                 Rc::make_mut(&mut self.consts).insert(var.clone(), Value::from_u64(32, v));
             }
+            self.gen_path.push(format!("{gen_label}({v})"));
             self.lower_gen_decls(module, &decls, true);
             for k in &body {
                 self.lower_conc_stmt(module, k, proc_idx);
             }
+            self.gen_path.pop();
         }
         self.consts = saved_consts;
     }

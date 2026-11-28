@@ -287,6 +287,7 @@ mod tests {
                     nba: false,
                 },
                 origin: "always @(posedge clk)".to_string(),
+                gen_scope: String::new(),
                 initial: false,
             }],
             functions: vec![],

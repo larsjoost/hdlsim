@@ -483,6 +483,18 @@ impl Flat {
         id
     }
 
+    /// Instance path of a process: the enclosing module's instance prefix and
+    /// the process's generate-block path (`lane_gen(0)`), dot-joined; either
+    /// part may be empty.
+    fn proc_scope(prefix: &str, gen_scope: &str) -> String {
+        match (prefix.is_empty(), gen_scope.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => gen_scope.to_string(),
+            (false, true) => prefix.to_string(),
+            (false, false) => format!("{prefix}.{gen_scope}"),
+        }
+    }
+
     fn new_sig(
         &mut self,
         name: String,
@@ -658,7 +670,7 @@ impl Flat {
                 sens,
                 body,
                 origin: p.origin.clone(),
-                scope: prefix.to_string(),
+                scope: Self::proc_scope(prefix, &p.gen_scope),
                 initial: p.initial,
             });
         }
@@ -786,11 +798,16 @@ fn apply_config_blocks(cfg: &crate::vhdl_lower::ConfigIr, instances: &[InstIr]) 
             continue; // after the named blocks
         }
         for (i, inst) in out.iter_mut().enumerate() {
+            // A generate-unrolled instance's name carries its generate path
+            // (`lane_gen(0).u_lane`); a block spec's label matches the full
+            // name or the bare instance label.
+            let bare = inst.name.rsplit('.').next().unwrap_or(&inst.name);
             let hit = if blk.all {
                 true
             } else {
                 !blk.path.is_empty()
-                    && blk.path[0].eq_ignore_ascii_case(&inst.name)
+                    && (blk.path[0].eq_ignore_ascii_case(&inst.name)
+                        || blk.path[0].eq_ignore_ascii_case(bare))
                     && (blk.path.len() == 1 || blk.path[1].eq_ignore_ascii_case(&inst.module))
             };
             if hit {

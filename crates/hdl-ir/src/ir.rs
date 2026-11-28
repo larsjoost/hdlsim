@@ -172,6 +172,12 @@ pub struct ProcessIr {
     pub body: Stmt,
     /// Human-readable origin for debug/wave display, e.g. "always @(posedge clk)".
     pub origin: String,
+    /// Instance-path suffix of the enclosing generate blocks (`lane_gen(0)`,
+    /// dotted when nested; VHDL parentheses, Verilog brackets; empty outside
+    /// generates). The elaborator appends it to the module's instance prefix
+    /// to build `FlatProc::scope`, so the transcript can attribute a report
+    /// to the exact unrolled instance.
+    pub gen_scope: String,
     /// Run once at t=0 before waiting on `sens`. VHDL processes always do;
     /// Verilog `always @(...)` blocks do not.
     pub initial: bool,

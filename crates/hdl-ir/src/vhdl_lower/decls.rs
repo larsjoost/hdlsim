@@ -258,6 +258,7 @@ impl<'a> Lower<'a> {
                             shapes: Vec::new(),
                         },
                         origin: format!("init protected object {n}"),
+                        gen_scope: self.gen_path.join("."),
                         initial: false,
                     });
                 }
