@@ -9,6 +9,11 @@ use std::process::Command;
 fn hdlsim() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hdlsim"));
     c.arg("--no-cache");
+    // Memory-load examples ($writememh/$readmemh) write their scratch files
+    // relative to the CWD: run from a temp dir so nothing lands in the repo.
+    let scratch = std::env::temp_dir().join("hdlsim-feature-examples");
+    std::fs::create_dir_all(&scratch).expect("creates example scratch dir");
+    c.current_dir(scratch);
     c
 }
 
