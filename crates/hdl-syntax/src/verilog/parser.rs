@@ -29,6 +29,7 @@ use crate::source::{FileId, SourceFile};
 use crate::token::{Token, TokenKind};
 use std::collections::{HashMap, HashSet};
 
+mod class;
 mod decls;
 mod expr;
 mod gen;
@@ -334,6 +335,20 @@ impl<'a> Parser<'a> {
         d
     }
 
+    /// After `endclass`/`endpackage`: the optional trailing name — only if
+    /// it matches the construct's name AND is followed by `;`, so a
+    /// following declaration (`endclass\nC c;`) is not eaten.
+    fn eat_matching_trailing_name(&mut self, name: &str) {
+        if !name.is_empty()
+            && self.peek().kind == TokenKind::Ident
+            && self.peek_text() == name
+            && self.peek2().kind == TokenKind::Punct
+            && self.peek2_text() == ";"
+        {
+            self.bump();
+        }
+    }
+
     // ---- grammar: source text ----------------------------------------------
 
     fn parse_source_text(&mut self) {
@@ -625,147 +640,10 @@ impl<'a> Parser<'a> {
             self.parse_module_item();
         }
         self.eat_kw("endpackage");
-        // Optional trailing name — only if it matches the package name AND is
-        // followed by `;`.
-        if !pname.is_empty()
-            && self.peek().kind == TokenKind::Ident
-            && self.peek_text() == pname
-            && self.peek2().kind == TokenKind::Punct
-            && self.peek2_text() == ";"
-        {
-            self.bump();
-        }
+        self.eat_matching_trailing_name(&pname);
         self.eat_punct(';'); // optional
         self.builder.finish_node();
     }
-
-    /// `class [virtual] name [extends base]; items... endclass [name];`
-    fn parse_class(&mut self) {
-        self.builder.start_node(SyntaxKind::Class);
-        if self.at_kw("virtual") {
-            self.bump();
-        }
-        self.bump(); // class
-        let mut cname = String::new();
-        if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
-            cname = self.peek_text().to_string();
-            self.bump();
-            self.builder.finish_node();
-        } else {
-            self.error_here("expected a class name");
-        }
-        if !cname.is_empty() {
-            self.user_types.insert(cname.clone());
-        }
-        if self.at_kw("extends") {
-            self.bump();
-            if self.peek().kind == TokenKind::Ident {
-                self.builder.start_node(SyntaxKind::Name);
-                self.bump();
-                self.builder.finish_node();
-            }
-        }
-        self.expect_punct(';', "after the class header");
-        while !self.at_kw("endclass") && self.peek().kind != TokenKind::Eof {
-            let text = self.peek_text().to_string();
-            if text == "function" {
-                self.parse_function();
-            } else if text == "task" {
-                self.parse_task();
-            } else if text == "constraint" {
-                self.parse_constraint();
-            } else if self.user_types.contains(&text) && self.peek2().kind == TokenKind::Ident {
-                self.parse_decl();
-            } else if text == "static"
-                || text == "protected"
-                || text == "local"
-                || text == "virtual"
-                || text == "pure"
-            {
-                self.bump(); // class item modifier
-                continue;
-            } else {
-                self.parse_decl_or_stmt_class_item();
-            }
-        }
-        self.eat_kw("endclass");
-        // Optional trailing name — only if it matches the class name AND is
-        // followed by `;`, so a following decl (`endclass\nC c;`) is not eaten.
-        if !cname.is_empty()
-            && self.peek().kind == TokenKind::Ident
-            && self.peek_text() == cname
-            && self.peek2().kind == TokenKind::Punct
-            && self.peek2_text() == ";"
-        {
-            self.bump();
-        }
-        self.eat_punct(';'); // optional
-        self.builder.finish_node();
-    }
-
-    /// Declaration or constraint inside a class body.
-    fn parse_decl_or_stmt_class_item(&mut self) {
-        let text = self.peek_text().to_string();
-        match text.as_str() {
-            "wire" | "reg" | "logic" | "integer" | "real" | "time" | "bit" | "byte"
-            | "shortint" | "int" | "longint" | "string" | "chandle" | "var" | "const" | "rand"
-            | "randc" | "vectored" | "scalared" => self.parse_decl(),
-            "constraint" => self.parse_constraint(),
-            _ => {
-                self.error_here(format!("unexpected `{}` in class body", text));
-                // Recover: skip to the next `;`.
-                while self.peek().kind != TokenKind::Eof
-                    && !self.at_punct(';')
-                    && !self.at_kw("endclass")
-                {
-                    self.bump();
-                }
-                self.eat_punct(';');
-            }
-        }
-    }
-
-    /// `constraint name { expr; ... }` — parsed structurally, lowered later.
-    fn parse_constraint(&mut self) {
-        self.builder.start_node(SyntaxKind::Constraint);
-        self.bump(); // constraint
-        if self.peek().kind == TokenKind::Ident {
-            self.builder.start_node(SyntaxKind::Name);
-            self.bump();
-            self.builder.finish_node();
-        }
-        self.expect_punct('{', "to open the constraint block");
-        let mut depth = 1;
-        while depth > 0 && self.peek().kind != TokenKind::Eof {
-            if self.at_punct('{') {
-                depth += 1;
-                self.bump();
-            } else if self.at_punct('}') {
-                depth -= 1;
-                self.bump();
-            } else {
-                self.parse_expression();
-                // Constraint expression separators: `;`, `&&`, `->`, `solve ... before`.
-                while self.at_punct(';') || self.at_kw("and") || self.at_kw("solve") {
-                    if self.at_kw("and") || self.at_kw("solve") {
-                        // `a && b` inside a constraint: parse as expressions.
-                        self.bump();
-                        if self.at_kw("before") {
-                            self.bump();
-                        }
-                        continue;
-                    }
-                    self.bump(); // ;
-                    if self.at_punct('}') || self.at_kw("endclass") {
-                        break;
-                    }
-                }
-            }
-        }
-        self.builder.finish_node();
-    }
-
     /// `import p::*;` / `import p::a, q::b;` / `export p::*;`
     fn parse_import(&mut self, export: bool) {
         self.builder.start_node(SyntaxKind::Import);
