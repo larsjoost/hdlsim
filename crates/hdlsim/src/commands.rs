@@ -111,7 +111,7 @@ impl Command for Help {
         println!("              -I DIR         add an `include search directory");
         println!("              -S DIR         add DIR to the on-demand project search roots");
         println!(
-            "              --progress     show library indexing / resolution progress on stderr"
+            "              --progress     show library indexing / resolution / simulation progress on stderr"
         );
         println!(
             "              --lib-root DIR treat each subdir of DIR as a library named after it"
@@ -202,7 +202,7 @@ pub struct CommonOpts {
     pub lib_roots: Vec<PathBuf>,
     /// `-S DIR`: extra on-demand project search roots (no library name).
     pub search_dirs: Vec<PathBuf>,
-    /// Print indexing/resolution progress to stderr.
+    /// Print indexing/resolution progress to stderr (run/debug: also sim ticks).
     pub progress: bool,
     /// `--bundle repro.tar`: extract this reproducer bundle to a temp dir and
     /// resolve the whole project (config, libraries, include dirs) from there.
@@ -231,7 +231,7 @@ pub struct CommonArgs {
     /// Repeatable.
     #[arg(long, short = 'S', value_name = "DIR")]
     pub search_dir: Vec<PathBuf>,
-    /// Print library indexing / unit-resolution progress to stderr.
+    /// Print library indexing / unit-resolution / simulation progress to stderr.
     #[arg(long)]
     pub progress: bool,
     /// Read the whole project from a reproducer .tar.

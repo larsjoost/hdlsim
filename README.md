@@ -56,6 +56,12 @@ edit → simulate → diagnose cycle.
   budget with exit 124. `--progress-sec <seconds>` additionally prints a
   periodic "still running" heartbeat with the same location for runs that
   grind without time advance.
+- **Progress ticks.** `hdlsim run --progress` prints a stderr line while the
+  sim runs: with `--max-time 5us`, one line per decile of the budget the
+  simulated time crosses — `hdlsim: sim t=1.2us / 5us (24%)` — so a long run
+  shows how close it is to the stop time; without `--max-time`, rate-limited
+  `hdlsim: sim t=...` lines (>= 500 ms apart, only when time moved). Off by
+  default; all other output is byte-identical.
 - **Graphical display.** `hdlsim run tb --live` opens a real-time wave window in the
   browser (built-in HTTP server + SSE, pause/step controls); `--wave out.html`
   writes a self-contained interactive viewer; `--vcd` for interchange; `--fst`

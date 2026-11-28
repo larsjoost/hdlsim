@@ -125,6 +125,10 @@ impl Command for Debug {
         if let Some(s) = seed {
             sim.set_seed(s);
         }
+        if opts.progress {
+            // `--progress` also ticks in-simulation, as in `run`.
+            sim.set_progress_ticks(true);
+        }
         sim.set_when_rules(&when).map_err(anyhow::Error::msg)?;
         sim.set_examine_rules(&examine)
             .map_err(anyhow::Error::msg)?;
