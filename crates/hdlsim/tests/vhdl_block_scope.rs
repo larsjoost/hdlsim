@@ -11,7 +11,10 @@
 //! * guard-stopped runs exit nonzero so CI does not read them as passes;
 //! * a for-loop parameter is scoped to its loop: concurrent loops with the
 //!   same parameter name each run their own iteration count, and a loop
-//!   parameter never writes an outer object of the same name.
+//!   parameter never writes an outer object of the same name;
+//! * a process variable is scoped to its process: a later process reading
+//!   the same name resolves the architecture-level object, not the earlier
+//!   process's private slot.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -132,6 +135,27 @@ fn for_loop_parameter_is_scoped_to_its_loop() {
         stderr
     );
     for pass in ["PASS gen_a", "PASS gen_b", "PASS nest", "PASS guard"] {
+        assert!(stdout.contains(pass), "missing `{}`: {}", pass, stdout);
+    }
+}
+
+#[test]
+fn process_variable_scope_is_local_to_its_process() {
+    let out = hdlsim()
+        .args(["run", "--top", "tb_procvar_scope", "--max-time", "2us"])
+        .arg(fixture("vhdl_procvar_scope_tb.vhd"))
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected exit 0, got {:?}\n{}{}",
+        out.status,
+        stdout,
+        stderr
+    );
+    for pass in ["PASS first", "PASS second", "PASS guard"] {
         assert!(stdout.contains(pass), "missing `{}`: {}", pass, stdout);
     }
 }

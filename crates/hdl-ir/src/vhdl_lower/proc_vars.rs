@@ -6,12 +6,18 @@ use super::*;
 
 impl<'a> Lower<'a> {
     /// A process-local variable becomes a (hidden) signal — VHDL variables
-    /// keep their value between activations, exactly like a signal.
+    /// keep their value between activations, exactly like a signal. The
+    /// plain-name binding is recorded in `bound` so the caller can restore
+    /// it after the process body: a variable's scope is its process (LRM
+    /// 1076, process declarative part), and a leaked binding would silently
+    /// redirect a later process's reference to an architecture-level object
+    /// of the same name into this process's private slot.
     pub(super) fn lower_process_var(
         &mut self,
         module: &mut ModuleIr,
         d: &SyntaxNode,
         proc_idx: usize,
+        bound: &mut Vec<(String, Option<SigId>)>,
     ) {
         let kids = real_children(d);
         let colon = kids
@@ -97,7 +103,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            self.names.insert(n.clone(), id);
+            bound.push((n.clone(), self.names.insert(n.clone(), id)));
         }
     }
 }

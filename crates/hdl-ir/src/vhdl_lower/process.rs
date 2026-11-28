@@ -13,6 +13,9 @@ impl<'a> Lower<'a> {
         let mut sens = Sens::List(Vec::new());
         let mut stmt_nodes: Vec<SyntaxNode> = Vec::new();
         let mut local_fns: Vec<SyntaxNode> = Vec::new();
+        // Names this process's variable declarations bind, with their
+        // previous meanings — restored after the body below.
+        let mut bound_vars: Vec<(String, Option<SigId>)> = Vec::new();
         for k in &kids {
             match k.kind() {
                 SyntaxKind::SensList => {
@@ -34,7 +37,7 @@ impl<'a> Lower<'a> {
                     // Process-local declarations.
                     match k.kind() {
                         SyntaxKind::VariableDecl => {
-                            self.lower_process_var(module, k, idx);
+                            self.lower_process_var(module, k, idx, &mut bound_vars);
                         }
                         SyntaxKind::ConstantDecl => {
                             self.lower_constant_decl(k);
@@ -70,6 +73,19 @@ impl<'a> Lower<'a> {
         } else {
             Stmt::Block(stmt_nodes.iter().map(|k| self.lower_seq_stmt(k)).collect())
         };
+        // Un-bind this process's variables (reverse order undoes shadowing
+        // within the process too): later processes and the architecture
+        // must resolve those names to their own declarations again.
+        for (n, prev) in bound_vars.iter().rev() {
+            match prev {
+                Some(id) => {
+                    self.names.insert(n.clone(), *id);
+                }
+                None => {
+                    self.names.remove(n);
+                }
+            }
+        }
         for sig in self.extra_signals.drain(..) {
             module.signals.push(sig);
         }
@@ -475,8 +491,8 @@ impl<'a> Lower<'a> {
             }
             let mut cond: Option<Expr> = None;
             for c in choices {
-                // Strict equality: a metavalue selector ('U'/'X') must match
-                // a metavalue choice and never X-propagate into the OR chain.
+                // Strict equality: a metavalue selector ('U'/'X') must match a
+                // metalue choice and never X-propagate into the OR chain.
                 let e = Expr::Bin {
                     op: BinOp::EqStrict,
                     l: Box::new(sel.clone()),
