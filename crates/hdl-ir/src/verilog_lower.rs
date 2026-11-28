@@ -92,16 +92,15 @@ pub fn lower_file_with_time(
 /// Like [`lower_file_with_time`], but seeds the lowerer from `scope` (packages
 /// and qualified constants/functions of previously compiled files) and writes
 /// back the `pkg::`-qualified entries discovered in this file.
-pub fn lower_file_with_time_scoped(
-    file: FileId,
-    root: &SyntaxNode,
-    db: &SourceDb,
-    diags: &mut Vec<Diagnostic>,
+/// Build the file lowerer, seeding it from the cross-file scope
+/// (packages, qualified constants/functions, typedefs).
+fn lowerer_from_scope<'a>(
+    db: &'a SourceDb,
+    diags: &'a mut Vec<Diagnostic>,
     time_unit_fs: u64,
-    scope: &mut VerilogScope,
-) -> Vec<ModuleIr> {
-    let _ = file; // spans on nodes already carry the file id
-    let mut lx = Lower {
+    scope: &VerilogScope,
+) -> Lower<'a> {
+    Lower {
         db,
         diags,
         time_unit_fs,
@@ -120,7 +119,71 @@ pub fn lower_file_with_time_scoped(
         cur_class: None,
         inst_conns: HashMap::new(),
         gen_path: Vec::new(),
-    };
+    }
+}
+
+/// Bare-name aliases for package functions, so calls inside package
+/// function bodies (`cnt_width` calling `idx_width`) const-evaluate.
+fn register_pkg_aliases(lx: &mut Lower) {
+    // Bare-name aliases for package functions, so calls inside package
+    // function bodies (`cnt_width` calling `idx_width`) const-evaluate.
+    let pkg_funcs: Vec<(String, FuncIr)> = lx
+        .funcs_all
+        .iter()
+        .filter(|(k, _)| k.contains("::"))
+        .flat_map(|(k, v)| {
+            let bare = k
+                .rsplit("::")
+                .next()
+                .expect("rsplit always yields at least one item")
+                .to_string();
+            v.iter().map(move |f| (bare.clone(), f.clone()))
+        })
+        .collect();
+    for (k, v) in pkg_funcs {
+        let cands = lx.funcs_all.entry(k).or_default();
+        if !cands.iter().any(|c| c.name == v.name && c.args == v.args) {
+            cands.push(v);
+        }
+    }
+}
+
+/// Write back only qualified names (`pkg::x`, `module::param`) so a plain
+/// localparam of one file cannot leak into another file's scope.
+fn write_back_scope(lx: &mut Lower, scope: &mut VerilogScope) {
+    // Write back only qualified names (`pkg::x`, `module::param`) so a plain
+    // localparam of one file cannot leak into another file's scope.
+    scope.packages.extend(lx.packages.drain());
+    for (k, v) in lx.gconsts.drain() {
+        if k.contains("::") {
+            scope.gconsts.insert(k, v);
+        }
+    }
+    for (k, v) in lx.funcs_all.drain() {
+        if k.contains("::") {
+            scope.funcs_all.insert(k, v);
+        }
+    }
+    for (k, v) in lx.types.drain() {
+        if k.contains("::") {
+            scope.types.insert(k, v);
+        }
+    }
+}
+
+/// Like [`lower_file_with_time`], but seeds the lowerer from `scope` (packages
+/// and qualified constants/functions of previously compiled files) and writes
+/// back the `pkg::`-qualified entries discovered in this file.
+pub fn lower_file_with_time_scoped(
+    file: FileId,
+    root: &SyntaxNode,
+    db: &SourceDb,
+    diags: &mut Vec<Diagnostic>,
+    time_unit_fs: u64,
+    scope: &mut VerilogScope,
+) -> Vec<ModuleIr> {
+    let _ = file; // spans on nodes already carry the file id
+    let mut lx = lowerer_from_scope(db, diags, time_unit_fs, scope);
     // Classes first (modules may reference them), then packages, then modules.
     let children = real_children(root);
     for child in &children {
@@ -144,27 +207,7 @@ pub fn lower_file_with_time_scoped(
             lx.packages.insert(pkg.name.clone(), pkg);
         }
     }
-    // Bare-name aliases for package functions, so calls inside package
-    // function bodies (`cnt_width` calling `idx_width`) const-evaluate.
-    let pkg_funcs: Vec<(String, FuncIr)> = lx
-        .funcs_all
-        .iter()
-        .filter(|(k, _)| k.contains("::"))
-        .flat_map(|(k, v)| {
-            let bare = k
-                .rsplit("::")
-                .next()
-                .expect("rsplit always yields at least one item")
-                .to_string();
-            v.iter().map(move |f| (bare.clone(), f.clone()))
-        })
-        .collect();
-    for (k, v) in pkg_funcs {
-        let cands = lx.funcs_all.entry(k).or_default();
-        if !cands.iter().any(|c| c.name == v.name && c.args == v.args) {
-            cands.push(v);
-        }
-    }
+    register_pkg_aliases(&mut lx);
     for child in children {
         if child.kind() == SyntaxKind::Module {
             let m = lx.lower_module(&child);
@@ -177,24 +220,7 @@ pub fn lower_file_with_time_scoped(
             modules.push(m);
         }
     }
-    // Write back only qualified names (`pkg::x`, `module::param`) so a plain
-    // localparam of one file cannot leak into another file's scope.
-    scope.packages.extend(lx.packages.drain());
-    for (k, v) in lx.gconsts.drain() {
-        if k.contains("::") {
-            scope.gconsts.insert(k, v);
-        }
-    }
-    for (k, v) in lx.funcs_all.drain() {
-        if k.contains("::") {
-            scope.funcs_all.insert(k, v);
-        }
-    }
-    for (k, v) in lx.types.drain() {
-        if k.contains("::") {
-            scope.types.insert(k, v);
-        }
-    }
+    write_back_scope(&mut lx, scope);
     modules
 }
 
