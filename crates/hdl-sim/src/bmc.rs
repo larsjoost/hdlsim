@@ -32,14 +32,16 @@
 //! - A signal has at most one clocked driver and at most one comb driver.
 //! - Never panics on design content; all failures are `Err(String)`.
 
-use crate::sat::{is_neg, lit_of, neg, var_of, Lit, Solver};
+use crate::sat::{is_neg, neg, var_of, Lit};
 use hdl_ir::elab::{Flat, FlatSigId};
 use hdl_ir::value::{BinOp, UnOp, Value, V1};
 use hdl_ir::{Expr, ProcKind, Sens, ShapeBind, SigKind, Stmt};
 use std::collections::{HashMap, HashSet};
+mod builder;
 mod expr_util;
 mod stmt_scan;
 
+use builder::Builder;
 use stmt_scan::{lhs_roots, stmt_has_sva, stmt_writes};
 
 use self::expr_util::{expr_has_dash, sig_root};
@@ -227,136 +229,6 @@ pub fn wrap_top(design: &mut hdl_ir::Design, top: &str) -> Result<(), String> {
     };
     design.modules.push(wrapper);
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// CNF builder with Tseitin gates
-// ---------------------------------------------------------------------------
-
-/// CNF builder: a [`Solver`] plus gate helpers. Bit vectors are `Vec<Lit>`,
-/// LSB first. A reserved variable encodes the constants.
-struct Builder {
-    s: Solver,
-    tlit: Lit,
-}
-
-impl Builder {
-    fn new() -> Builder {
-        let mut s = Solver::new();
-        let t = lit_of(s.new_var(), false);
-        s.add_clause(&[t]);
-        Builder { s, tlit: t }
-    }
-    fn fresh(&mut self) -> Lit {
-        lit_of(self.s.new_var(), false)
-    }
-    fn true_lit(&self) -> Lit {
-        self.tlit
-    }
-    fn false_lit(&self) -> Lit {
-        neg(self.tlit)
-    }
-    fn const_lit(&self, b: bool) -> Lit {
-        if b {
-            self.tlit
-        } else {
-            neg(self.tlit)
-        }
-    }
-    fn clause(&mut self, lits: &[Lit]) {
-        self.s.add_clause(lits);
-    }
-    fn and_lit(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == self.false_lit() || b == self.false_lit() {
-            return self.false_lit();
-        }
-        if a == self.true_lit() {
-            return b;
-        }
-        if b == self.true_lit() {
-            return a;
-        }
-        if a == b {
-            return a;
-        }
-        let o = self.fresh();
-        self.clause(&[neg(o), a]);
-        self.clause(&[neg(o), b]);
-        self.clause(&[o, neg(a), neg(b)]);
-        o
-    }
-    fn or_lit(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == self.true_lit() || b == self.true_lit() {
-            return self.true_lit();
-        }
-        if a == self.false_lit() {
-            return b;
-        }
-        if b == self.false_lit() {
-            return a;
-        }
-        if a == b {
-            return a;
-        }
-        let o = self.fresh();
-        self.clause(&[o, neg(a)]);
-        self.clause(&[o, neg(b)]);
-        self.clause(&[neg(o), a, b]);
-        o
-    }
-    fn xor_lit(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == self.false_lit() {
-            return b;
-        }
-        if b == self.false_lit() {
-            return a;
-        }
-        if a == self.true_lit() {
-            return neg(b);
-        }
-        if b == self.true_lit() {
-            return neg(a);
-        }
-        if a == b {
-            return self.false_lit();
-        }
-        if a == neg(b) {
-            return self.true_lit();
-        }
-        let o = self.fresh();
-        self.clause(&[neg(o), a, b]);
-        self.clause(&[neg(o), neg(a), neg(b)]);
-        self.clause(&[o, neg(a), b]);
-        self.clause(&[o, a, neg(b)]);
-        o
-    }
-    /// out = c ? a : b
-    fn mux_lit(&mut self, c: Lit, a: Lit, b: Lit) -> Lit {
-        if c == self.true_lit() {
-            return a;
-        }
-        if c == self.false_lit() {
-            return b;
-        }
-        if a == b {
-            return a;
-        }
-        let o = self.fresh();
-        self.clause(&[neg(c), neg(o), a]);
-        self.clause(&[neg(c), o, neg(a)]);
-        self.clause(&[c, neg(o), b]);
-        self.clause(&[c, o, neg(b)]);
-        o
-    }
-    fn eq_lit(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == b {
-            return self.true_lit();
-        }
-        if a == neg(b) {
-            return self.false_lit();
-        }
-        neg(self.xor_lit(a, b))
-    }
 }
 
 // ---------------------------------------------------------------------------
