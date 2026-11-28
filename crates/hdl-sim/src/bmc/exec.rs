@@ -4,9 +4,9 @@
 //! `const_fold`).
 
 use super::bitvec::{mux_vec, or_bits, resize_bits};
+use super::const_fold::{const_bits, const_truthy};
 use super::encode::Encoder;
 use super::expr_util::{expr_has_dash, sig_root};
-use super::{const_bits, const_truthy};
 use crate::sat::Lit;
 use hdl_ir::elab::FlatSigId;
 use hdl_ir::value::Value;
