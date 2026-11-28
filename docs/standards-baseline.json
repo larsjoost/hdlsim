@@ -29,7 +29,7 @@
     "crates/hdl-sim/src/bmc.rs": 2413,
     "crates/hdl-sim/src/rand.rs": 784,
     "crates/hdl-sim/src/sat.rs": 698,
-    "crates/hdl-sim/src/sim.rs": 5329,
+    "crates/hdl-sim/src/sim.rs": 5297,
     "crates/hdl-sim/src/sim/ckpt.rs": 1421,
     "crates/hdl-syntax/src/diagnostic.rs": 790,
     "crates/hdl-syntax/src/verilog/parser.rs": 3394,
