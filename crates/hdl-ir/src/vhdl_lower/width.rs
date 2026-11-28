@@ -235,10 +235,12 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Record an object's index-constraint direction (`sig_asc`) and element
-    /// width (`sig_elem`) from its type mark and constraint, so index/slice
-    /// addressing can remap ascending ranges and scale multi-bit elements
-    /// (`string` characters). Both maps are lower-side addressing aids only.
+    /// Record an object's index-constraint direction (`sig_asc`), element
+    /// width (`sig_elem`), and std_logic_arith comparison class (`sig_class`)
+    /// from its type mark and constraint, so index/slice addressing can remap
+    /// ascending ranges, scale multi-bit elements (`string` characters), and
+    /// mixed comparisons can wrap the integer operand. All are lower-side
+    /// aids only.
     pub(super) fn record_obj_shape(
         &mut self,
         id: SigId,
@@ -266,6 +268,7 @@ impl<'a> Lower<'a> {
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            self.sig_class.insert(id, self.obj_class_of_type(&tn));
             if let Some(ew) = self.array_elem_width(&tn) {
                 // Overwrite even for 1-bit elements: slot ids are reused
                 // across subprogram bodies, and a stale multi-bit element

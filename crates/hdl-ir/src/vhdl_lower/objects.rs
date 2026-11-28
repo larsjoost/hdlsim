@@ -316,6 +316,22 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// std_logic_arith comparison class of a declared object from its type
+    /// mark: `unsigned`/`signed` are the array classes whose mixed
+    /// comparisons with integers wrap the integer operand to the array's
+    /// length; integer scalars are the wrapped side. Derived subtypes
+    /// classify as [`ObjClass::Other`] (conservative: the extend-to-wider
+    /// comparison stays).
+    pub(super) fn obj_class_of_type(&self, tn: &str) -> ObjClass {
+        match tn {
+            "unsigned" | "signed" => ObjClass::Arith,
+            _ => match self.types.get(tn) {
+                Some(TypeInfo::Integer { .. }) => ObjClass::Integer,
+                _ => ObjClass::Other,
+            },
+        }
+    }
+
     /// Xilinx implicit globals (`GSR`/`GRESTORE`/`GTS` from the auto-instantiated
     /// `glbl` primitive, referenced bare in unisim VHDL): materialize a
     /// per-module 1-bit signal on first reference. Caller must have armed
