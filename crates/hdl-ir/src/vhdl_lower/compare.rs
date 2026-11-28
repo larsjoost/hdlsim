@@ -49,6 +49,21 @@ impl<'a> Lower<'a> {
     /// see a negative seed, not 4294967295. Other operators keep their
     /// operands untouched (two's-complement arithmetic is bit-identical).
     pub(super) fn mark_signed_compare(&self, op: BinOp, l: Expr, r: Expr) -> Expr {
+        // Predefined equality is a value comparison (LRM 7.2) — but only the
+        // scalar shape stays strict here, where `'U' = '0'` must be false and
+        // never X. Wide (composite) operands keep the loose ops: their
+        // metavalues stay unknown (an X condition takes no action, and the
+        // string-shape reconciliation lives on the loose path).
+        let op = if matches!(op, BinOp::EqStrict | BinOp::NeStrict)
+            && (self.expr_width_est(&l) > 1 || self.expr_width_est(&r) > 1)
+        {
+            match op {
+                BinOp::EqStrict => BinOp::Eq,
+                _ => BinOp::Ne,
+            }
+        } else {
+            op
+        };
         let (l, r) = self.wrap_mixed_compare(op, l, r);
         if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
             && (self.expr_is_signed(&l) || self.expr_is_signed(&r))
@@ -91,7 +106,14 @@ impl<'a> Lower<'a> {
     fn wrap_mixed_compare(&self, op: BinOp, l: Expr, r: Expr) -> (Expr, Expr) {
         if !matches!(
             op,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            BinOp::Eq
+                | BinOp::EqStrict
+                | BinOp::Ne
+                | BinOp::NeStrict
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
         ) {
             return (l, r);
         }
@@ -125,7 +147,11 @@ impl<'a> Lower<'a> {
         signed: bool,
         width: usize,
     ) -> (Expr, Expr) {
-        if matches!(op, BinOp::Eq | BinOp::Ne) && !signed {
+        if matches!(
+            op,
+            BinOp::Eq | BinOp::EqStrict | BinOp::Ne | BinOp::NeStrict
+        ) && !signed
+        {
             // Unsigned equality: zero-pad the vector and wrap the integer
             // as a signed value in N+1 bits, then compare bitwise.
             return (

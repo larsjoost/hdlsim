@@ -1,8 +1,10 @@
 //! `boolean'image` must spell `true`/`false` for runtime (non-folded)
 //! operands too. The decimal fallback of the string conversion reads as
 //! `-1`/`1`/`0` depending on the comparison encoding — actively misleading
-//! in a testbench transcript. X/unknown stays visible as `x`, and
-//! `integer'image` keeps its decimal rendering.
+//! in a testbench transcript. `integer'image` keeps its decimal rendering.
+//! Scalar equality is a value comparison (the predefined operator yields a
+//! boolean: `'U' = '1'` is false); wide comparisons with metavalues still
+//! yield x and stay visible as such.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,8 +112,10 @@ fn boolean_image_renders_true_false_at_runtime() {
     assert!(out.contains("LT=true"), "{}", out);
     assert!(out.contains("EQ=true"), "{}", out);
     assert!(out.contains("NE=false"), "{}", out);
-    // Unknown stays visible as x.
-    assert!(out.contains("UNK=x"), "{}", out);
+    // Scalar equality is the predefined value comparison: an uninitialized
+    // ('U') scalar compares as a distinct value, so the result is a definite
+    // false — not x and not the decimal fallback.
+    assert!(out.contains("UNK=false"), "{}", out);
     // Control: integer'image keeps its decimal rendering.
     assert!(out.contains("INT=-1"), "{}", out);
     let _ = fs::remove_dir_all(&dir);

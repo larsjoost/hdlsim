@@ -210,8 +210,15 @@ pub(super) fn vhdl_binop(op: &str) -> Option<BinOp> {
         "/" => BinOp::Div,
         "mod" | "rem" => BinOp::Mod,
         "**" => BinOp::Pow,
-        "=" => BinOp::Eq,
-        "/=" => BinOp::Ne,
+        // VHDL equality is a predefined value comparison (LRM 7.2), not the
+        // X-propagating loose ops: `'U' = '0'` is FALSE and `'U' /= '0'` is
+        // TRUE, so a guarded wait whose condition reads `sig /= '0'` while
+        // the signal is still uninitialized must be taken. The lowering
+        // keeps the strict ops for scalar operands; wide (composite) ones
+        // are rewritten back to the loose ops in `mark_signed_compare`,
+        // where an X condition takes no action.
+        "=" => BinOp::EqStrict,
+        "/=" => BinOp::NeStrict,
         "?=" => BinOp::EqM,
         "?/=" => BinOp::NeM,
         "<" => BinOp::Lt,

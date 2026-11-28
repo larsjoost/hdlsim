@@ -475,8 +475,10 @@ impl<'a> Lower<'a> {
             }
             let mut cond: Option<Expr> = None;
             for c in choices {
+                // Strict equality: a metavalue selector ('U'/'X') must match
+                // a metavalue choice and never X-propagate into the OR chain.
                 let e = Expr::Bin {
-                    op: BinOp::Eq,
+                    op: BinOp::EqStrict,
                     l: Box::new(sel.clone()),
                     r: Box::new(self.lower_expr(c, &self.consts.clone())),
                 };
