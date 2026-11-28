@@ -9,6 +9,7 @@
 //! Assertions check the lossless CST via `debug_sexp` snapshots.
 
 use super::*;
+use crate::diagnostic::Severity;
 use crate::source::SourceDb;
 
 pub(super) fn parse_str(src: &str) -> (ParsedFile, SourceDb) {
